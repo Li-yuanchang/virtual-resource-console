@@ -189,26 +189,122 @@ npm --workspace apps/api run build
 
 ### 本机运行策略
 
-可通过以下文件维护环境相关策略：
+`runtime-policy.json` 用来放每个部署环境自己的策略。它不随仓库提交，适合保存内网网段、DNS、默认 IP 池、VM 名称转 IP 规则、root 初始口令模板、XenServer 网卡选择规则等本地口径。
+
+默认读取路径：
 
 ```text
 ~/.virtual-resource-console/runtime-policy.json
 ```
 
-仓库提供了不含真实环境信息的示例：
+首次使用可以复制仓库里的示例文件：
 
 ```bash
+mkdir -p ~/.virtual-resource-console
 cp config/runtime-policy.example.json ~/.virtual-resource-console/runtime-policy.json
+chmod 600 ~/.virtual-resource-console/runtime-policy.json
 ```
 
-运行策略支持配置：
+也可以通过环境变量指定其它路径：
 
-- `managedIpPattern`：可识别和展示的 IPv4 白名单正则
-- `ipInference`：从 VM 名称推断 IP 的短 IP / 主机号规则
-- `provisioning.defaultDns`：创建 VM 默认 DNS
-- `provisioning.rootPasswordTemplate`：初始 root 口令模板，支持 `{first}`、`{second}`、`{third}`、`{fourth}`、`{ip}`
-- `provisioning.providerIpPools`：各 Provider 的默认 IP 池
-- `xenserver.networkDeviceRules`：XenServer 创建 VM 时按 IP 前缀选择 PIF 设备
+```bash
+export VRC_RUNTIME_POLICY_FILE=/path/to/runtime-policy.json
+```
+
+如果配置文件不存在或读取失败，系统会使用安全默认值继续启动，不会因为缺少该文件报错；只是不会带入你的现场网段、DNS、口令模板或网卡映射。
+
+#### 配置示例
+
+下面是一个脱敏示例，使用文档保留网段 `192.0.2.0/24`。实际使用时请替换成自己的环境值，不要把真实配置提交到仓库。
+
+```json
+{
+  "managedIpPattern": "^192\\.0\\.2\\.[0-9]{1,3}$",
+  "ipInference": {
+    "enabled": true,
+    "shortIpBasePrefix": "192.0",
+    "shortIpThirdOctets": ["2"],
+    "hostOnlyPrefix": "192.0.2"
+  },
+  "provisioning": {
+    "defaultDns": ["1.1.1.1"],
+    "rootPasswordTemplate": "",
+    "providerIpPools": {
+      "xenserver": [
+        {
+          "id": "xenserver-example",
+          "name": "XenServer 示例网段",
+          "prefix": "192.0.2",
+          "gateway": "192.0.2.254",
+          "startHost": 20,
+          "endHost": 250,
+          "networkName": "VM Network"
+        }
+      ]
+    }
+  },
+  "xenserver": {
+    "networkDeviceRules": [
+      {
+        "ipPrefix": "192.0.2.",
+        "device": "eth0"
+      }
+    ]
+  }
+}
+```
+
+#### 字段说明
+
+| 字段 | 说明 |
+|------|------|
+| `managedIpPattern` | 可识别和展示的 IPv4 白名单正则；为空时接受合法 IPv4 |
+| `ipInference.enabled` | 是否允许从 VM 名称推断 IP |
+| `ipInference.shortIpBasePrefix` | 短 IP 推断的前两段，例如 `192.0` |
+| `ipInference.shortIpThirdOctets` | 允许识别的第三段，例如名称里出现 `2.111` 时可推断为 `192.0.2.111` |
+| `ipInference.hostOnlyPrefix` | 只有主机号时使用的前三段，例如名称 `111-test` 可推断为 `192.0.2.111` |
+| `provisioning.defaultDns` | 创建 VM 时 IP 池默认 DNS |
+| `provisioning.rootPasswordTemplate` | 初始 root 口令模板；为空时不自动生成 root 口令 |
+| `provisioning.providerIpPools` | 各 Provider 的默认 IP 池，key 支持 `xenserver`、`vmware`、`proxmox`、`libvirt` |
+| `xenserver.networkDeviceRules` | XenServer 创建 VM 时按 IP 前缀选择 PIF 设备 |
+
+`rootPasswordTemplate` 支持以下占位符：
+
+| 占位符 | 含义 |
+|--------|------|
+| `{first}` | IP 第一段 |
+| `{second}` | IP 第二段 |
+| `{third}` | IP 第三段 |
+| `{fourth}` | IP 第四段 |
+| `{ip}` | 完整 IP |
+
+IP 池字段说明：
+
+| 字段 | 说明 |
+|------|------|
+| `id` | IP 池唯一 ID |
+| `name` | 页面展示名称 |
+| `prefix` | 网段前三段，例如 `192.0.2` |
+| `gateway` | 网关地址 |
+| `dns` | 可选；不填时使用 `provisioning.defaultDns` |
+| `startHost` / `endHost` | 可分配主机号范围 |
+| `networkName` | 可选；创建 VM 时优先使用指定网络 / VLAN / PortGroup |
+| `vlan` | 可选；用于页面展示和后续扩展 |
+
+#### 配置生效方式
+
+`runtime-policy.json` 由 API 进程启动后读取。修改后建议重启本地服务：
+
+```bash
+npm run local:stop
+npm run local:start
+```
+
+开发模式下也可以停止并重新执行：
+
+```bash
+npm run dev
+```
 
 ### 环境变量
 
