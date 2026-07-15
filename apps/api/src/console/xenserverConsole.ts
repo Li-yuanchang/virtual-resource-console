@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { XMLParser } from "fast-xml-parser";
+import { constants as cryptoConstants } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { connect as netConnect, type Socket } from "node:net";
@@ -13,6 +14,9 @@ const XAPI_PORT = 443;
 const XAPI_TIMEOUT_MS = 15_000;
 const CONSOLE_CONNECT_TIMEOUT_MS = 20_000;
 const MAX_CLOSE_REASON_BYTES = 110;
+const LEGACY_TLS_CIPHERS = "DEFAULT@SECLEVEL=0";
+const LEGACY_TLS_SECURE_OPTIONS =
+  typeof cryptoConstants.SSL_OP_LEGACY_SERVER_CONNECT === "number" ? cryptoConstants.SSL_OP_LEGACY_SERVER_CONNECT : 0;
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -26,13 +30,42 @@ interface ConsoleQuery {
   vmId?: string;
 }
 
+interface ConsolePreflightBody {
+  connectionId?: string;
+  vmId?: string;
+}
+
 interface XenConsoleSession {
   sessionId: string;
   consoleUrl: URL;
+  apiHost: string;
+  tunnelHosts: string[];
   logout(): Promise<void>;
 }
 
 export async function registerXenServerConsoleRoutes(server: FastifyInstance): Promise<void> {
+  server.post("/api/console/xenserver/preflight", async (request, reply) => {
+    let session: XenConsoleSession | null = null;
+    let tunnel: Socket | null = null;
+    try {
+      session = await openXenConsoleSession(server, request);
+      tunnel = await openConsoleTunnel(session, server);
+      cleanupTunnel(tunnel);
+      await session.logout();
+      return {
+        ok: true,
+        consoleHost: session.consoleUrl.hostname,
+        tunnelHosts: session.tunnelHosts,
+      };
+    } catch (error) {
+      cleanupTunnel(tunnel);
+      await session?.logout();
+      const message = error instanceof Error ? error.message : "XenServer 控制台预检失败";
+      server.log.warn({ error }, "xenserver console preflight failed");
+      return reply.code(502).send({ ok: false, message });
+    }
+  });
+
   server.get("/api/console/xenserver", { websocket: true }, (socket, request) => {
     const pendingClientMessages: Buffer[] = [];
     let tunnel: Socket | null = null;
@@ -62,14 +95,14 @@ export async function registerXenServerConsoleRoutes(server: FastifyInstance): P
       void session?.logout();
     });
 
-    void openXenConsoleSession(request)
+    void openXenConsoleSession(server, request)
       .then(async (openedSession) => {
         if (closed) {
           await openedSession.logout();
           return;
         }
         session = openedSession;
-        tunnel = await openConsoleTunnel(openedSession);
+        tunnel = await openConsoleTunnel(openedSession, server);
         if (closed) {
           cleanupTunnel(tunnel);
           await openedSession.logout();
@@ -103,12 +136,12 @@ export async function registerXenServerConsoleRoutes(server: FastifyInstance): P
   });
 }
 
-async function openXenConsoleSession(request: FastifyRequest): Promise<XenConsoleSession> {
-  const query = request.query as ConsoleQuery;
-  if (!query.connectionId || !query.vmId) {
+async function openXenConsoleSession(server: FastifyInstance, request: FastifyRequest): Promise<XenConsoleSession> {
+  const params = readConsoleParams(request);
+  if (!params.connectionId || !params.vmId) {
     throw new Error("控制台参数不完整：缺少连接或 VM。");
   }
-  const stored = resolveStoredConnection(query.connectionId);
+  const stored = resolveStoredConnection(params.connectionId);
   if (stored.providerType !== "xenserver") {
     throw new Error("当前控制台代理只处理 XenServer。");
   }
@@ -119,36 +152,83 @@ async function openXenConsoleSession(request: FastifyRequest): Promise<XenConsol
     username: stored.username,
     password: stored.password,
   };
-  const location = await getXenConsoleLocation(connection, query.vmId);
+  const location = await getXenConsoleLocation(connection, params.vmId);
   if (!location) {
     throw new Error("未读取到 XenServer 控制台地址，请确认 VM 正在运行且存在 RFB 控制台。");
   }
 
   const consoleUrl = normalizeConsoleUrl(location, stored.host);
-  const apiHost = consoleUrl.hostname || stored.host;
-  const sessionId = await loginWithPassword({ ...connection, host: apiHost });
+  const apiHosts = uniqueHosts([stored.host, consoleUrl.hostname]);
+  const tunnelHosts = uniqueHosts([consoleUrl.hostname, stored.host]);
+  server.log.info(
+    {
+      connectionId: params.connectionId,
+      vmId: params.vmId,
+      consoleHost: consoleUrl.hostname,
+      configuredHost: stored.host,
+      apiHosts,
+      tunnelHosts,
+      consolePath: `${consoleUrl.pathname}${consoleUrl.search}`,
+    },
+    "opening xenserver console session",
+  );
+  const loginResult = await loginWithPasswordFallback(connection, apiHosts);
 
   return {
-    sessionId,
+    sessionId: loginResult.sessionId,
     consoleUrl,
-    logout: () => logoutSession(apiHost, sessionId),
+    apiHost: loginResult.host,
+    tunnelHosts,
+    logout: () => logoutSession(loginResult.host, loginResult.sessionId),
   };
 }
 
-async function openConsoleTunnel(session: XenConsoleSession): Promise<Socket> {
-  try {
-    return await openConsoleTunnelOnce(session, false);
-  } catch (error) {
-    if (session.consoleUrl.protocol === "https:" && isUnsupportedTlsProtocol(error)) {
-      return openConsoleTunnelOnce(session, true);
+async function openConsoleTunnel(session: XenConsoleSession, server?: FastifyInstance): Promise<Socket> {
+  let lastError: unknown;
+  for (const host of session.tunnelHosts) {
+    try {
+      return await openConsoleTunnelForHost(session, host);
+    } catch (error) {
+      lastError = error;
+      server?.log.warn(
+        {
+          error,
+          host,
+          consoleHost: session.consoleUrl.hostname,
+          apiHost: session.apiHost,
+          consolePath: `${session.consoleUrl.pathname}${session.consoleUrl.search}`,
+        },
+        "xenserver console tunnel host failed",
+      );
     }
-    throw error;
+  }
+  throw normalizeTunnelError(lastError);
+}
+
+async function openConsoleTunnelForHost(session: XenConsoleSession, host: string): Promise<Socket> {
+  if (session.consoleUrl.protocol !== "https:") {
+    return openConsoleTunnelOnce(session, host, true);
+  }
+
+  try {
+    return await openConsoleTunnelOnce(session, host, false, false);
+  } catch (error) {
+    if (!isUnsupportedTlsProtocol(error)) {
+      throw error;
+    }
+    try {
+      return await openConsoleTunnelOnce(session, host, false, true);
+    } catch (legacyError) {
+      if (isUnsupportedTlsProtocol(legacyError)) {
+        return openConsoleTunnelOnce(session, host, true);
+      }
+      throw legacyError;
+    }
   }
 }
 
-function openConsoleTunnelOnce(session: XenConsoleSession, forcePlainTcp: boolean): Promise<Socket> {
+function openConsoleTunnelOnce(session: XenConsoleSession, host: string, forcePlainTcp: boolean, legacyTls = false): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const host = session.consoleUrl.hostname;
     const useTls = session.consoleUrl.protocol === "https:" && !forcePlainTcp;
     const defaultPort = session.consoleUrl.protocol === "https:" && !forcePlainTcp ? XAPI_PORT : 80;
     const port = Number(session.consoleUrl.port || defaultPort);
@@ -158,6 +238,7 @@ function openConsoleTunnelOnce(session: XenConsoleSession, forcePlainTcp: boolea
           port,
           servername: host,
           rejectUnauthorized: false,
+          ...(legacyTls ? legacyTlsOptions() : {}),
         })
       : netConnect({ host, port });
     let handshake = Buffer.alloc(0);
@@ -171,10 +252,11 @@ function openConsoleTunnelOnce(session: XenConsoleSession, forcePlainTcp: boolea
 
     const sendConnectRequest = () => {
       const path = `${session.consoleUrl.pathname}${session.consoleUrl.search}`;
+      const hostHeader = port === defaultPort ? host : `${host}:${port}`;
       socket.write(
         [
           `CONNECT ${path} HTTP/1.1`,
-          `Host: ${session.consoleUrl.host}`,
+          `Host: ${hostHeader}`,
           `Cookie: session_id=${session.sessionId}`,
           "Connection: keep-alive",
           "",
@@ -224,6 +306,19 @@ function openConsoleTunnelOnce(session: XenConsoleSession, forcePlainTcp: boolea
   });
 }
 
+async function loginWithPasswordFallback(input: XenConnectionInput, hosts: string[]): Promise<{ host: string; sessionId: string }> {
+  let lastError: unknown;
+  for (const host of hosts) {
+    try {
+      const sessionId = await loginWithPassword({ ...input, host });
+      return { host, sessionId };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("XenAPI 登录失败。");
+}
+
 async function loginWithPassword(input: XenConnectionInput): Promise<string> {
   try {
     return await callSessionLogin(input, [input.username, input.password, "1.0", "virtual-resource-console"]);
@@ -260,15 +355,22 @@ async function logoutSession(host: string, sessionId: string): Promise<void> {
 }
 
 function xmlRpcRequest(host: string, body: string): Promise<string> {
-  return xmlRpcRequestOnce(host, body, "https:").catch((error) => {
+  return xmlRpcRequestOnce(host, body, "https:", false).catch(async (error) => {
     if (isUnsupportedTlsProtocol(error)) {
-      return xmlRpcRequestOnce(host, body, "http:");
+      try {
+        return await xmlRpcRequestOnce(host, body, "https:", true);
+      } catch (legacyError) {
+        if (isUnsupportedTlsProtocol(legacyError)) {
+          return xmlRpcRequestOnce(host, body, "http:", false);
+        }
+        throw legacyError;
+      }
     }
     throw error;
   });
 }
 
-function xmlRpcRequestOnce(host: string, body: string, protocol: "http:" | "https:"): Promise<string> {
+function xmlRpcRequestOnce(host: string, body: string, protocol: "http:" | "https:", legacyTls: boolean): Promise<string> {
   return new Promise((resolve, reject) => {
     const requestFactory = protocol === "https:" ? httpsRequest : httpRequest;
     const request = requestFactory(
@@ -277,7 +379,7 @@ function xmlRpcRequestOnce(host: string, body: string, protocol: "http:" | "http
         port: protocol === "https:" ? XAPI_PORT : 80,
         method: "POST",
         path: "/",
-        ...(protocol === "https:" ? { rejectUnauthorized: false } : {}),
+        ...(protocol === "https:" ? { rejectUnauthorized: false, ...(legacyTls ? legacyTlsOptions() : {}) } : {}),
         timeout: XAPI_TIMEOUT_MS,
         headers: {
           "Content-Type": "text/xml",
@@ -325,6 +427,58 @@ function normalizeConsoleUrl(location: string, fallbackHost: string): URL {
   }
   const path = location.startsWith("/") ? location : `/${location}`;
   return new URL(`https://${fallbackHost}${path}`);
+}
+
+function legacyTlsOptions() {
+  return {
+    minVersion: "TLSv1" as const,
+    ciphers: LEGACY_TLS_CIPHERS,
+    ...(LEGACY_TLS_SECURE_OPTIONS ? { secureOptions: LEGACY_TLS_SECURE_OPTIONS } : {}),
+  };
+}
+
+function readConsoleParams(request: FastifyRequest): ConsoleQuery {
+  const query = request.query as ConsoleQuery;
+  const body = request.body && typeof request.body === "object" ? (request.body as ConsolePreflightBody) : {};
+  return {
+    connectionId: body.connectionId || query.connectionId,
+    vmId: body.vmId || query.vmId,
+  };
+}
+
+function uniqueHosts(hosts: Array<string | undefined>): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const host of hosts) {
+    const normalized = host?.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function normalizeTunnelError(error: unknown): Error {
+  if (!(error instanceof Error)) {
+    return new Error("XenServer 控制台流连接失败。");
+  }
+  if (isHostResolutionError(error)) {
+    return new Error(`XenServer 控制台主机解析失败：${error.message}`);
+  }
+  if (isConnectRefusedOrTimeout(error)) {
+    return new Error(`XenServer 控制台流连接失败：${error.message}`);
+  }
+  return error;
+}
+
+function isHostResolutionError(error: Error): boolean {
+  const message = error.message;
+  return message.includes("ENOTFOUND") || message.includes("EAI_AGAIN") || message.includes("getaddrinfo");
+}
+
+function isConnectRefusedOrTimeout(error: Error): boolean {
+  const message = error.message;
+  return message.includes("ECONNREFUSED") || message.includes("ETIMEDOUT") || message.includes("超时") || message.includes("timeout");
 }
 
 function readXmlRpcFault(fault: unknown): string {
@@ -382,7 +536,13 @@ function closeWithError(socket: WebSocket, message: string): void {
 
 function isUnsupportedTlsProtocol(error: unknown): boolean {
   const message = error instanceof Error ? error.message : "";
-  return message.includes("unsupported protocol") || message.includes("wrong version number") || message.includes("EPROTO");
+  const normalizedMessage = message.toLowerCase();
+  return (
+    normalizedMessage.includes("unsupported protocol") ||
+    normalizedMessage.includes("unsupported_protocol") ||
+    normalizedMessage.includes("wrong version number") ||
+    normalizedMessage.includes("eproto")
+  );
 }
 
 function truncateCloseReason(message: string): string {

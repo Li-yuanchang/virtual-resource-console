@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -12,8 +13,9 @@ const execFileAsync = promisify(execFile);
 const cacheDir = join(homedir(), ".virtual-resource-console", "iso-cache");
 const generatedDir = join(homedir(), ".virtual-resource-console", "generated-isos");
 const centosBootIsoLabel = "VRCCENTOS7";
+const centosKickstartIsoLabel = "VRCKS";
 
-export type XenInstallMediaMode = "offline-iso" | "http-boot-iso";
+export type XenInstallMediaMode = "offline-iso" | "http-boot-iso" | "cdrom-http-ks";
 
 interface SourceIsoInfo {
   srUuid: string;
@@ -21,6 +23,7 @@ interface SourceIsoInfo {
   remotePath: string;
   mountDir: string;
   sizeBytes: number;
+  volumeLabel: string;
 }
 
 export interface XenUnattendedIsoInput {
@@ -32,6 +35,7 @@ export interface XenUnattendedIsoInput {
   ipPool: IpPoolConfig;
   macAddress?: string;
   installSource?: VmProvisionInstallSourceRef;
+  onProgress?: (message: string) => void;
 }
 
 export interface XenUnattendedIsoResult {
@@ -40,18 +44,22 @@ export interface XenUnattendedIsoResult {
   registryId?: string;
 }
 
-// 默认使用离线自包含 ISO，避免新 VM 安装阶段依赖开发机或临时 HTTP 地址。
+// 默认复用 XenServer ISO SR 上的原始 ISO，只通过 HTTP 下发 Kickstart，避免每台 VM 重复生成和上传大 ISO。
 export function resolveXenInstallMediaMode(): XenInstallMediaMode {
-  const rawMode = process.env.VRC_XEN_INSTALL_MEDIA_MODE?.trim().toLowerCase();
+  const rawMode = process.env.VRC_XEN_INSTALL_MEDIA_MODE?.trim().toLowerCase() ?? "";
+  if (rawMode === "offline" || rawMode === "offline-iso") return "offline-iso";
   if (rawMode === "http" || rawMode === "http-boot" || rawMode === "http-boot-iso") return "http-boot-iso";
-  return "offline-iso";
+  if (["cdrom-http-ks", "cdrom-plus-http-ks", "iso-http-ks", "raw-iso-http-ks"].includes(rawMode)) return "cdrom-http-ks";
+  return "http-boot-iso";
 }
 
 export async function prepareXenCentosUnattendedIso(input: XenUnattendedIsoInput): Promise<XenUnattendedIsoResult> {
   ensureDir(cacheDir);
   ensureDir(generatedDir);
+  input.onProgress?.("检查本地 ISO 生成工具");
   await assertIsoGeneratorAvailable();
   const mediaMode = resolveXenInstallMediaMode();
+  input.onProgress?.("读取 XenServer 源 ISO 信息");
   const source = await readSourceIsoInfo(input.connection, input.sourceIsoId, mediaMode === "http-boot-iso");
   const isoName = `vrc-${safeFileName(input.vm.name)}-unattended-${Date.now().toString(36)}.iso`;
   const remotePath = `${dirname(source.remotePath)}/${isoName}`;
@@ -71,13 +79,17 @@ export async function prepareXenCentosUnattendedIso(input: XenUnattendedIsoInput
   try {
     const localOutputIso = join(generatedDir, isoName);
     if (mediaMode === "offline-iso") {
+      input.onProgress?.("缓存源 ISO 并生成离线无人值守 ISO");
       const localSourceIso = await ensureLocalSourceIso(input.connection, source);
       await generateCentosOfflineUnattendedIso(localSourceIso, localOutputIso, input);
     } else {
+      input.onProgress?.("缓存启动文件并生成 HTTP Boot ISO");
       const bootFiles = await ensureLocalBootFiles(input.connection, source);
       await generateCentosHttpBootIso(bootFiles, localOutputIso, input);
     }
+    input.onProgress?.("上传无人值守 ISO 到 XenServer ISO SR");
     await uploadIso(input.connection, localOutputIso, remotePath);
+    input.onProgress?.("扫描 ISO SR 并登记无人值守 ISO");
     const isoId = await scanAndFindUploadedIso(input.connection, source.srUuid, isoName);
     await markGeneratedIsoOnXen(input.connection, {
       isoId,
@@ -96,6 +108,55 @@ export async function prepareXenCentosUnattendedIso(input: XenUnattendedIsoInput
     };
   } catch (error) {
     markGeneratedIsoStatus(registry.id, "failed", error instanceof Error ? error.message : "无人值守 ISO 生成失败");
+    throw error;
+  }
+}
+
+export async function prepareXenCentosKickstartIso(input: XenUnattendedIsoInput): Promise<XenUnattendedIsoResult> {
+  ensureDir(generatedDir);
+  input.onProgress?.("生成小型 Kickstart 启动 ISO");
+  await assertIsoGeneratorAvailable();
+  const source = await readSourceIsoInfo(input.connection, input.sourceIsoId, true);
+  const isoName = `vrc-${safeFileName(input.vm.name)}-ks-${Date.now().toString(36)}.iso`;
+  const remotePath = `${dirname(source.remotePath)}/${isoName}`;
+  const registry = registerGeneratedIso({
+    taskId: input.installSource?.taskId || input.installSource?.id || `xen-ks-${Date.now().toString(36)}`,
+    providerType: "xenserver",
+    connectionId: undefined,
+    hostId: input.hostId,
+    vmName: input.vm.name,
+    vmIp: input.vm.ip,
+    sourceIsoId: input.sourceIsoId,
+    sourceIsoName: input.sourceIsoName,
+    isoSrUuid: source.srUuid,
+    isoName,
+    isoPath: remotePath,
+  });
+  try {
+    const localOutputIso = join(generatedDir, isoName);
+    const bootFiles = await ensureLocalBootLoaderFiles(input.connection, source);
+    await generateCentosKickstartBootIso(bootFiles, source.volumeLabel, localOutputIso, input);
+    input.onProgress?.("上传小型 Kickstart 启动 ISO 到 XenServer ISO SR");
+    await uploadIso(input.connection, localOutputIso, remotePath);
+    input.onProgress?.("扫描 ISO SR 并登记 Kickstart ISO");
+    const isoId = await scanAndFindUploadedIso(input.connection, source.srUuid, isoName);
+    await markGeneratedIsoOnXen(input.connection, {
+      isoId,
+      registryId: registry.id,
+      taskId: registry.taskId,
+      vmName: input.vm.name,
+    });
+    markGeneratedIsoUploaded(registry.id, {
+      isoVdiUuid: isoId,
+      message: "Kickstart 启动 ISO 已上传并登记",
+    });
+    return {
+      isoId,
+      isoName,
+      registryId: registry.id,
+    };
+  } catch (error) {
+    markGeneratedIsoStatus(registry.id, "failed", error instanceof Error ? error.message : "Kickstart 启动 ISO 生成失败");
     throw error;
   }
 }
@@ -138,6 +199,7 @@ async function readSourceIsoInfo(connection: XenConnectionInput, sourceIsoId: st
       'remote_path="/var/run/sr-mount/$sr_uuid/$location"',
       'mount_dir="/tmp/vrc-source-iso-$iso_uuid"',
       '[ -f "$remote_path" ] || { echo "未找到源 ISO 文件：$remote_path" >&2; exit 6; }',
+      'volume_label="$(blkid -p -s LABEL -o value "$remote_path" 2>/dev/null || true)"',
       mountForBootFiles
         ? [
             'mkdir -p "$mount_dir"',
@@ -150,11 +212,11 @@ async function readSourceIsoInfo(connection: XenConnectionInput, sourceIsoId: st
           ].join("\n")
         : 'mount_dir=""',
       'printf "SIZE\\t%s\\n" "$(stat -c %s "$remote_path" 2>/dev/null || wc -c < "$remote_path")"',
-      'printf "ISO\\t%s\\t%s\\t%s\\t%s\\n" "$sr_uuid" "$location" "$remote_path" "$mount_dir"',
+      'printf "ISO\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$sr_uuid" "$location" "$remote_path" "$mount_dir" "$volume_label"',
     ].join("\n"),
   );
   const line = output.split(/\r?\n/).find((item) => item.startsWith("ISO\t"));
-  const [, srUuid = "", location = "", remotePath = "", mountDir = ""] = line?.split("\t") ?? [];
+  const [, srUuid = "", location = "", remotePath = "", mountDir = "", volumeLabel = ""] = line?.split("\t") ?? [];
   if (!srUuid || !location || !remotePath) {
     throw new Error("未读取到 XenServer 源 ISO 文件路径，无法生成无人值守 ISO。");
   }
@@ -164,6 +226,7 @@ async function readSourceIsoInfo(connection: XenConnectionInput, sourceIsoId: st
     remotePath,
     mountDir,
     sizeBytes: Number(output.split(/\r?\n/).find((item) => item.startsWith("SIZE\t"))?.split("\t")[1]) || 0,
+    volumeLabel: volumeLabel || "CentOS 7 x86_64",
   };
 }
 
@@ -171,10 +234,13 @@ interface LocalBootFiles {
   isolinuxBin: string;
   vmlinuz: string;
   initrd: string;
-  squashfs: string;
-  treeInfo: string;
-  discInfo: string;
-  buildTag: string;
+}
+
+interface LocalBootLoaderFiles {
+  isolinuxBin: string;
+  vmlinuz: string;
+  initrd: string;
+  isolinuxFiles: string[];
 }
 
 async function ensureLocalBootFiles(connection: XenConnectionInput, source: SourceIsoInfo): Promise<LocalBootFiles> {
@@ -188,29 +254,43 @@ async function ensureLocalBootFiles(connection: XenConnectionInput, source: Sour
     isolinuxBin: join(localDir, "isolinux.bin"),
     vmlinuz: join(localDir, "vmlinuz"),
     initrd: join(localDir, "initrd.img"),
-    squashfs: join(localDir, "squashfs.img"),
-    treeInfo: join(localDir, ".treeinfo"),
-    discInfo: join(localDir, ".discinfo"),
-    buildTag: join(localDir, "CentOS_BuildTag"),
   };
-  if (
-    existsSync(files.isolinuxBin) &&
-    existsSync(files.vmlinuz) &&
-    existsSync(files.initrd) &&
-    existsSync(files.squashfs) &&
-    existsSync(files.treeInfo) &&
-    existsSync(files.discInfo) &&
-    existsSync(files.buildTag)
-  ) {
+  if (existsSync(files.isolinuxBin) && existsSync(files.vmlinuz) && existsSync(files.initrd)) {
     return files;
   }
   await downloadFile(connection, `${source.mountDir}/isolinux/isolinux.bin`, files.isolinuxBin);
   await downloadFirstExisting(connection, [`${source.mountDir}/images/pxeboot/vmlinuz`, `${source.mountDir}/isolinux/vmlinuz`], files.vmlinuz);
   await downloadFirstExisting(connection, [`${source.mountDir}/images/pxeboot/initrd.img`, `${source.mountDir}/isolinux/initrd.img`], files.initrd);
-  await downloadFile(connection, `${source.mountDir}/LiveOS/squashfs.img`, files.squashfs);
-  await downloadFile(connection, `${source.mountDir}/.treeinfo`, files.treeInfo);
-  await downloadFile(connection, `${source.mountDir}/.discinfo`, files.discInfo);
-  await downloadFile(connection, `${source.mountDir}/CentOS_BuildTag`, files.buildTag);
+  return files;
+}
+
+async function ensureLocalBootLoaderFiles(connection: XenConnectionInput, source: SourceIsoInfo): Promise<LocalBootLoaderFiles> {
+  const sourceKey = `${safeFileName(source.srUuid)}__${safeFileName(source.location)}__boot`;
+  const localDir = join(cacheDir, sourceKey);
+  if (existsSync(localDir) && !statSync(localDir).isDirectory()) {
+    rmSync(localDir, { force: true });
+  }
+  ensureDir(localDir);
+  const files = {
+    isolinuxBin: join(localDir, "isolinux.bin"),
+    vmlinuz: join(localDir, "vmlinuz"),
+    initrd: join(localDir, "initrd.img"),
+    isolinuxFiles: [] as string[],
+  };
+  const isolinuxFilesDir = join(localDir, "isolinux-files");
+  ensureDir(isolinuxFilesDir);
+  files.isolinuxFiles = listLocalFiles(isolinuxFilesDir);
+  if (existsSync(files.isolinuxBin) && existsSync(files.vmlinuz) && existsSync(files.initrd) && files.isolinuxFiles.length) {
+    return files;
+  }
+  await downloadFile(connection, `${source.mountDir}/isolinux/isolinux.bin`, files.isolinuxBin);
+  await downloadFirstExisting(connection, [`${source.mountDir}/images/pxeboot/vmlinuz`, `${source.mountDir}/isolinux/vmlinuz`], files.vmlinuz);
+  await downloadFirstExisting(connection, [`${source.mountDir}/images/pxeboot/initrd.img`, `${source.mountDir}/isolinux/initrd.img`], files.initrd);
+  const isolinuxNames = await listRemoteIsolinuxFiles(connection, `${source.mountDir}/isolinux`);
+  for (const name of isolinuxNames) {
+    await downloadFile(connection, `${source.mountDir}/isolinux/${name}`, join(isolinuxFilesDir, name));
+  }
+  files.isolinuxFiles = listLocalFiles(isolinuxFilesDir);
   return files;
 }
 
@@ -226,16 +306,11 @@ async function generateCentosHttpBootIso(
   ensureDir(workDir);
   ensureDir(isolinuxDir);
   ensureDir(pxebootDir);
-  ensureDir(join(workDir, "LiveOS"));
   copyFileSync(bootFiles.isolinuxBin, join(isolinuxDir, "isolinux.bin"));
   copyFileSync(bootFiles.vmlinuz, join(isolinuxDir, "vmlinuz"));
   copyFileSync(bootFiles.initrd, join(isolinuxDir, "initrd.img"));
   copyFileSync(bootFiles.vmlinuz, join(pxebootDir, "vmlinuz"));
   copyFileSync(bootFiles.initrd, join(pxebootDir, "initrd.img"));
-  copyFileSync(bootFiles.squashfs, join(workDir, "LiveOS", "squashfs.img"));
-  copyFileSync(bootFiles.treeInfo, join(workDir, ".treeinfo"));
-  copyFileSync(bootFiles.discInfo, join(workDir, ".discinfo"));
-  copyFileSync(bootFiles.buildTag, join(workDir, "CentOS_BuildTag"));
   const isolinuxPath = join(isolinuxDir, "isolinux.cfg");
   const installUrls = buildInstallUrls(input);
   writeFileSync(isolinuxPath, buildCentosIsolinuxConfig(), "utf8");
@@ -268,9 +343,65 @@ prompt 0
 timeout 10
 label linux
   kernel vmlinuz
-  append initrd=initrd.img inst.stage2=${installUrls.repoUrl} inst.ks=${installUrls.ksUrl} rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0
+  append initrd=initrd.img inst.repo=${installUrls.repoUrl} inst.ks=${installUrls.ksUrl} rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0
 `;
   }
+}
+
+async function generateCentosKickstartBootIso(
+  bootFiles: LocalBootLoaderFiles,
+  sourceVolumeLabel: string,
+  outputIso: string,
+  input: XenUnattendedIsoInput,
+): Promise<void> {
+  const workDir = join(generatedDir, `${safeFileName(input.vm.name)}-ks-work`);
+  const isolinuxDir = join(workDir, "isolinux");
+  rmSync(workDir, { recursive: true, force: true });
+  rmSync(outputIso, { force: true });
+  ensureDir(workDir);
+  ensureDir(isolinuxDir);
+  for (const isolinuxFile of bootFiles.isolinuxFiles) {
+    copyFileSync(isolinuxFile, join(isolinuxDir, isolinuxFile.split("/").pop() || "isolinux-file"));
+  }
+  copyFileSync(bootFiles.isolinuxBin, join(isolinuxDir, "isolinux.bin"));
+  copyFileSync(bootFiles.vmlinuz, join(isolinuxDir, "vmlinuz"));
+  copyFileSync(bootFiles.initrd, join(isolinuxDir, "initrd.img"));
+  writeFileSync(join(workDir, "ks.cfg"), buildOfflineCentosKickstart(input), "utf8");
+  writeFileSync(join(isolinuxDir, "isolinux.cfg"), buildKickstartBootIsolinuxConfig(input, sourceVolumeLabel), "utf8");
+  const xorriso = resolveXorrisoPath();
+  await execFileAsync(xorriso, [
+    "-as",
+    "mkisofs",
+    "-o",
+    outputIso,
+    "-b",
+    "isolinux/isolinux.bin",
+    "-c",
+    "isolinux/boot.cat",
+    "-no-emul-boot",
+    "-boot-load-size",
+    "4",
+    "-boot-info-table",
+    "-R",
+    "-J",
+    "-V",
+    centosKickstartIsoLabel,
+    workDir,
+  ]);
+}
+
+function buildKickstartBootIsolinuxConfig(input: XenUnattendedIsoInput, sourceVolumeLabel: string): string {
+  const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
+  const macBinding = input.macAddress ? ` ifname=eth0:${input.macAddress}` : "";
+  const stage2Label = escapeAnacondaLabel(sourceVolumeLabel);
+  return `default linux
+prompt 0
+timeout 10
+label linux
+  menu label Install ${input.vm.name}
+  kernel vmlinuz
+  append initrd=initrd.img inst.stage2=hd:LABEL=${stage2Label} inst.ks=hd:LABEL=${centosKickstartIsoLabel}:/ks.cfg rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0
+`;
 }
 
 function buildInstallUrls(input: XenUnattendedIsoInput): { repoUrl: string; ksUrl: string } {
@@ -370,12 +501,16 @@ menuentry 'Install ${input.vm.name}' {
 `;
 }
 
-function buildOfflineCentosKickstart(input: XenUnattendedIsoInput): string {
+export function buildOfflineCentosKickstart(input: Pick<XenUnattendedIsoInput, "vm" | "ipPool">): string {
   const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
   const dns = sanitizeKickstartValue(input.ipPool.dns[0] ?? "");
   const gateway = sanitizeKickstartValue(input.ipPool.gateway);
   const ip = sanitizeKickstartValue(input.vm.ip);
   const rootPassword = sanitizeKickstartValue(input.vm.rootPassword ?? "");
+  const rootPasswordEntry = shellSingleQuote(`root:${rootPassword}`);
+  const rootPasswordValue = shellSingleQuote(rootPassword || "changeme");
+  const rootPasswordHashValue = md5Crypt(rootPassword || "changeme");
+  const rootPasswordHash = shellSingleQuote(rootPasswordHashValue);
   const hostname = sanitizeKickstartValue(input.vm.name);
   return `#version=DEVEL
 install
@@ -383,7 +518,7 @@ cdrom
 lang en_US.UTF-8
 keyboard us
 timezone Asia/Shanghai --isUtc
-rootpw --plaintext ${rootPassword}
+rootpw --iscrypted ${rootPasswordHashValue}
 auth --enableshadow --passalgo=sha512
 selinux --disabled
 firewall --disabled
@@ -400,7 +535,7 @@ net-tools
 openssh-server
 -dracut-config-rescue
 %end
-%post
+%post --log=/root/vrc-kickstart-post.log
 cat > /etc/sysconfig/network-scripts/ifcfg-eth0 <<'VRC_IFCFG'
 TYPE=Ethernet
 DEVICE=eth0
@@ -414,15 +549,55 @@ DNS1=${dns}
 DEFROUTE=yes
 IPV6INIT=no
 VRC_IFCFG
+authconfig --enableshadow --passalgo=sha512 --update || true
+printf '%s\\n' ${rootPasswordEntry} | chpasswd || true
+printf '%s\\n' ${rootPasswordValue} | passwd --stdin root || true
+usermod -p ${rootPasswordHash} root || true
+passwd --unlock root || true
+for key in PermitRootLogin PasswordAuthentication UsePAM; do
+  case "$key" in
+    PermitRootLogin) value=yes ;;
+    PasswordAuthentication) value=yes ;;
+    UsePAM) value=yes ;;
+  esac
+  if grep -Eq "^[#[:space:]]*$key[[:space:]]+" /etc/ssh/sshd_config; then
+    sed -ri "s|^[#[:space:]]*$key[[:space:]]+.*|$key $value|" /etc/ssh/sshd_config
+  else
+    printf '%s %s\\n' "$key" "$value" >> /etc/ssh/sshd_config
+  fi
+done
 systemctl enable network || true
 systemctl disable firewalld || true
 systemctl enable sshd
+%end
+%post --nochroot --log=/tmp/vrc-kickstart-eject.log
+eject /dev/sr0 >/dev/null 2>&1 || true
+eject /dev/sr1 >/dev/null 2>&1 || true
 %end
 `;
 }
 
 async function uploadIso(connection: XenConnectionInput, localPath: string, remotePath: string): Promise<void> {
-  await uploadFile(connection, localPath, remotePath);
+  try {
+    await uploadFile(connection, localPath, remotePath);
+  } catch (error) {
+    await cleanupFailedGeneratedIsoUpload(connection, remotePath).catch(() => undefined);
+    const sizeMiB = Math.ceil(statSync(localPath).size / 1024 / 1024);
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`上传无人值守 ISO 失败：${detail}。目标 ISO SR 可能空间不足或 SMB 写入失败；本次 ISO 大小约 ${sizeMiB} MiB。`);
+  }
+}
+
+async function cleanupFailedGeneratedIsoUpload(connection: XenConnectionInput, remotePath: string): Promise<void> {
+  const fileName = remotePath.split("/").pop() ?? "";
+  if (!fileName.startsWith("vrc-") || !fileName.endsWith(".iso")) return;
+  await runRemoteCommand(
+    connection,
+    [
+      `remote_path='${escapeShellValue(remotePath)}'`,
+      'case "$remote_path" in */vrc-*.iso) rm -f "$remote_path" ;; esac',
+    ].join("\n"),
+  );
 }
 
 async function scanAndFindUploadedIso(connection: XenConnectionInput, srUuid: string, isoName: string): Promise<string> {
@@ -490,6 +665,29 @@ async function downloadFirstExisting(connection: XenConnectionInput, remotePaths
     }
   }
   throw lastError instanceof Error ? lastError : new Error(`未找到可下载的启动文件：${remotePaths.join(", ")}`);
+}
+
+async function listRemoteIsolinuxFiles(connection: XenConnectionInput, remoteDir: string): Promise<string[]> {
+  const output = await runRemoteCommand(
+    connection,
+    [
+      `remote_dir='${escapeShellValue(remoteDir)}'`,
+      'find "$remote_dir" -maxdepth 1 -type f -printf "%f\\n" 2>/dev/null || true',
+    ].join("\n"),
+  );
+  return output
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter((item) => /^[A-Za-z0-9_.-]+$/.test(item));
+}
+
+function listLocalFiles(localDir: string): string[] {
+  try {
+    return readdirSync(localDir)
+      .map((item) => join(localDir, item));
+  } catch {
+    return [];
+  }
 }
 
 function uploadFile(connection: XenConnectionInput, localPath: string, remotePath: string): Promise<void> {
@@ -601,6 +799,55 @@ function escapeAnacondaLabel(value: string): string {
 
 function sanitizeKickstartValue(value: string): string {
   return value.replace(/[\r\n]/g, "").trim();
+}
+
+function md5Crypt(password: string, salt = "vrcinst"): string {
+  const magic = "$1$";
+  const normalizedSalt = salt.replace(/^\$1\$/, "").split("$")[0].slice(0, 8);
+  const passwordBuffer = Buffer.from(password, "utf8");
+  const saltBuffer = Buffer.from(normalizedSalt, "utf8");
+  let ctx = Buffer.concat([passwordBuffer, Buffer.from(magic), saltBuffer]);
+  const alternate = createHash("md5").update(passwordBuffer).update(saltBuffer).update(passwordBuffer).digest();
+  for (let remaining = passwordBuffer.length; remaining > 0; remaining -= 16) {
+    ctx = Buffer.concat([ctx, alternate.subarray(0, Math.min(16, remaining))]);
+  }
+  for (let i = passwordBuffer.length; i > 0; i >>= 1) {
+    ctx = Buffer.concat([ctx, Buffer.from([i & 1 ? 0 : passwordBuffer[0]])]);
+  }
+  let final = createHash("md5").update(ctx).digest();
+  for (let i = 0; i < 1000; i += 1) {
+    let loop = Buffer.alloc(0);
+    loop = Buffer.concat([loop, i & 1 ? passwordBuffer : final]);
+    if (i % 3) loop = Buffer.concat([loop, saltBuffer]);
+    if (i % 7) loop = Buffer.concat([loop, passwordBuffer]);
+    loop = Buffer.concat([loop, i & 1 ? final : passwordBuffer]);
+    final = createHash("md5").update(loop).digest();
+  }
+  return `${magic}${normalizedSalt}$${toCrypt64(final)}`;
+}
+
+function toCrypt64(final: Buffer): string {
+  const alphabet = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  const encode = (value: number, length: number) => {
+    let result = "";
+    for (let i = 0; i < length; i += 1) {
+      result += alphabet[value & 0x3f];
+      value >>= 6;
+    }
+    return result;
+  };
+  return [
+    encode((final[0] << 16) | (final[6] << 8) | final[12], 4),
+    encode((final[1] << 16) | (final[7] << 8) | final[13], 4),
+    encode((final[2] << 16) | (final[8] << 8) | final[14], 4),
+    encode((final[3] << 16) | (final[9] << 8) | final[15], 4),
+    encode((final[4] << 16) | (final[10] << 8) | final[5], 4),
+    encode(final[11], 2),
+  ].join("");
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function ensureDir(path: string): void {

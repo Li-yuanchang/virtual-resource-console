@@ -1,8 +1,11 @@
 import { request as httpsRequest } from "node:https";
+import { createReadStream, statSync } from "node:fs";
 import { XMLParser } from "fast-xml-parser";
 import { assessVmReclaim } from "./analysis/reclaimStateMachine.js";
+import { getGeneratedIso, markGeneratedIsoStatus, markGeneratedIsoUploaded, registerGeneratedIso } from "./generatedIsoStore.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
 import { inferIpv4FromName, isManagedIpv4 } from "./runtimePolicy.js";
+import { ensureVmwareCentosBootFiles, generateVmwareCentosKickstartIso, removeLocalVmwareKickstartIso } from "./vmwareUnattendedIso.js";
 import type {
   HostNode,
   IsoImage,
@@ -39,6 +42,8 @@ interface ServiceContent {
   propertyCollector: ManagedRef;
   sessionManager: ManagedRef;
   viewManager: ManagedRef;
+  fileManager: ManagedRef;
+  performanceManager: ManagedRef;
   aboutName: string;
   aboutFullName: string;
   apiVersion: string;
@@ -63,6 +68,21 @@ interface VmwareDiskInfo {
   storageRepository?: string;
 }
 
+interface VmwarePerformanceCounter {
+  id: number;
+  multiplier: number;
+}
+
+interface VmwareNetworkCounterConfig {
+  received: VmwarePerformanceCounter;
+  transmitted: VmwarePerformanceCounter;
+}
+
+interface VmwareNetworkRates {
+  receivedBytesPerSecond: number | null;
+  transmittedBytesPerSecond: number | null;
+}
+
 interface VmwareIsoSearchResult {
   datastore: string;
   folderPath: string;
@@ -77,13 +97,44 @@ interface VmwareCreatePlacement {
   folder: ManagedRef;
   datastore: ManagedRef;
   datastoreName: string;
+  datacenterName: string;
   network?: ManagedRef;
   networkName?: string;
 }
 
+type VmwareProvisionStrategyId = "template-clone" | "kickstart";
+
+interface VmwareProvisionStrategy {
+  id: VmwareProvisionStrategyId;
+  execute(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult>;
+}
+
+class VmwareProvisionStrategyRegistry {
+  private readonly strategies = new Map<VmwareProvisionStrategyId, VmwareProvisionStrategy>();
+
+  register(strategy: VmwareProvisionStrategy): void {
+    this.strategies.set(strategy.id, strategy);
+  }
+
+  execute(strategyId: string, input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
+    const strategy = this.strategies.get(strategyId as VmwareProvisionStrategyId);
+    if (!strategy) throw new Error(`VMware 暂不支持安装策略：${strategyId}`);
+    return strategy.execute(input, request);
+  }
+}
+
+const defaultVmwareStrategyBySource = new Map<VmProvisionRequest["sourceType"], VmwareProvisionStrategyId>([
+  ["template", "template-clone"],
+  ["iso", "kickstart"],
+]);
+
 const SOAP_NS = "urn:vim25";
 const SOAP_TIMEOUT_MS = 60_000;
 const DEFAULT_VMWARE_PORT = 443;
+const VMWARE_PERFORMANCE_COUNTER_CACHE_MS = 60 * 60 * 1000;
+const VMWARE_PERFORMANCE_COUNTER_RETRY_MS = 5 * 60 * 1000;
+
+const vmwareNetworkCounterCache = new Map<string, { value: VmwareNetworkCounterConfig | null; expiresAtMs: number }>();
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -97,6 +148,18 @@ const xmlParser = new XMLParser({
 
 export class VmwareProvider implements VirtualizationProvider<XenConnectionInput> {
   readonly type = "vmware" as const;
+  private readonly provisionStrategies = new VmwareProvisionStrategyRegistry();
+
+  constructor() {
+    this.provisionStrategies.register({
+      id: "template-clone",
+      execute: (input, request) => this.cloneTemplates(input, request),
+    });
+    this.provisionStrategies.register({
+      id: "kickstart",
+      execute: (input, request) => this.installFromIso(input, request),
+    });
+  }
 
   async testConnection(input: XenConnectionInput) {
     const session = await VmwareSoapSession.login(input);
@@ -155,6 +218,9 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
         "config.hardware.numCPU",
         "config.hardware.memoryMB",
         "config.hardware.device",
+        "summary.config.numVirtualDisks",
+        "summary.storage.committed",
+        "summary.storage.uncommitted",
         "runtime.powerState",
         "runtime.host",
         "guest.ipAddress",
@@ -303,7 +369,7 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
         vmId,
         action,
         accepted: true,
-        message: `${vmwareActionLabel(action)}已提交：${vm.name}`,
+        message: `${vmwareActionLabel(action)}完成：${vm.name}`,
       };
     } finally {
       await session.logout();
@@ -311,10 +377,85 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
   }
 
   async createVms(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
-    if (request.sourceType === "template") {
-      return this.cloneTemplates(input, request);
+    const strategyId = request.installStrategy || defaultVmwareStrategyBySource.get(request.sourceType);
+    if (!strategyId) throw new Error(`VMware 未配置 ${request.sourceType} 对应的安装策略。`);
+    return this.provisionStrategies.execute(strategyId, input, request);
+  }
+
+  async installFromIso(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
+    if (!request.isoId) throw new Error("VMware 无人值守安装需要选择系统 ISO。");
+    const images = await this.listIsoImages(input);
+    const iso = images.find((item) => item.id === request.isoId || item.providerId === request.isoId);
+    if (!iso) throw new Error(`未找到 VMware 系统 ISO：${request.isoName || request.isoId}`);
+    if (!iso.name.toLowerCase().includes("centos-7")) {
+      throw new Error("当前 VMware 无人值守安装仅支持 CentOS 7 ISO。");
     }
-    throw new Error("VMware ISO 模式只能进入安装界面，不能自动装好系统；一键安装请使用克隆源策略。");
+    const session = await VmwareSoapSession.login(input);
+    const created: VmProvisionCreatedVm[] = [];
+    try {
+      const placement = await session.resolveCreatePlacement(request, iso);
+      const bootFiles = await ensureVmwareCentosBootFiles({
+        cacheKey: `${request.connectionId || input.host}|${iso.storageRepository}|${iso.path || iso.providerId}|${iso.sizeBytes || 0}`,
+        readRange: (start, end) => session.readDatastoreRange(placement.datacenterName, iso.storageRepository, iso.path || iso.name, start, end),
+      });
+      for (const item of request.planItems) {
+        const generated = await generateVmwareCentosKickstartIso({
+          bootFiles,
+          vm: item,
+          ipPool: request.ipPool,
+        });
+        const remotePath = `ISOs/${generated.isoName}`;
+        const registry = registerGeneratedIso({
+          taskId: request.taskId || `vmware-${Date.now().toString(36)}`,
+          providerType: "vmware",
+          connectionId: request.connectionId,
+          hostId: request.hostId,
+          vmName: item.name,
+          vmIp: item.ip,
+          sourceIsoId: iso.id,
+          sourceIsoName: iso.name,
+          isoSrUuid: placement.datastoreName,
+          isoName: generated.isoName,
+          isoPath: remotePath,
+        });
+        try {
+          await session.uploadDatastoreFile(placement.datacenterName, placement.datastoreName, remotePath, generated.localPath);
+          markGeneratedIsoUploaded(registry.id, { isoVdiUuid: `${placement.datastoreName}:${remotePath}`, message: "VMware Kickstart ISO 已上传" });
+          const bootIso: IsoImage = {
+            id: `vmware:${placement.datastoreName}:${generated.isoName}`,
+            providerId: `${placement.datastoreName}:${generated.isoName}`,
+            name: generated.isoName,
+            storageRepository: placement.datastoreName,
+            path: remotePath,
+          };
+          const vmRef = await session.createIsoVm(placement, request, item, bootIso, iso);
+          markGeneratedIsoStatus(registry.id, "attached", `已挂载到 ${item.name}`);
+          if (request.autoStart) await session.powerOnVm(vmRef.value);
+          created.push({
+            id: vmRef.value,
+            providerId: vmRef.value,
+            name: item.name,
+            powerState: request.autoStart ? "running" : "halted",
+            ip: item.ip,
+            generatedIsoRegistryId: registry.id,
+          });
+        } catch (error) {
+          markGeneratedIsoStatus(registry.id, "failed", error instanceof Error ? error.message : "VMware 无人值守安装准备失败");
+          await session.deleteDatastoreFile(placement.datacenterName, placement.datastoreName, remotePath).catch(() => undefined);
+          throw error;
+        } finally {
+          removeLocalVmwareKickstartIso(generated.localPath);
+        }
+      }
+      return {
+        accepted: true,
+        providerType: this.type,
+        message: `VMware 无人值守安装已启动：${created.length} 台 VM`,
+        created,
+      };
+    } finally {
+      await session.logout();
+    }
   }
 
   async cloneTemplates(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
@@ -350,8 +491,43 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
     }
   }
 
-  async collectMetrics(_input: XenConnectionInput, _query: MetricQuery): Promise<MetricSample[]> {
-    return [];
+  async collectMetrics(input: XenConnectionInput, query: MetricQuery): Promise<MetricSample[]> {
+    if (query.targetType !== "vm" || query.targetIds.length === 0) return [];
+    const connectionId = query.connectionId || connectionKey(input);
+    const targetIds = new Set(query.targetIds.map(normalizeVmwareTargetId));
+    const sampledAtMs = Date.now();
+    const sampledAt = new Date(sampledAtMs).toISOString();
+    const session = await VmwareSoapSession.login(input);
+    try {
+      const vmObjects = await session.retrieveContainerProperties("VirtualMachine", [
+        "config.uuid",
+        "config.instanceUuid",
+        "config.hardware.numCPU",
+        "config.hardware.memoryMB",
+        "config.hardware.device",
+        "runtime.maxCpuUsage",
+        "summary.quickStats.overallCpuUsage",
+        "summary.quickStats.guestMemoryUsage",
+        "summary.quickStats.hostMemoryUsage",
+        "summary.storage.committed",
+        "summary.storage.uncommitted",
+        "guest.disk",
+      ]);
+      const matchedVms = vmObjects.flatMap((item) => {
+        const providerId = vmwareProviderId(item);
+        const targetId = targetIds.has(item.ref.value) ? item.ref.value : targetIds.has(providerId) ? providerId : "";
+        return targetId ? [{ item, targetId }] : [];
+      });
+      const networkCounters = await resolveVmwareNetworkCounters(session, connectionId);
+      const networkRates = networkCounters
+        ? await session.queryVmNetworkRates(matchedVms.map(({ item }) => item.ref), networkCounters).catch(() => new Map())
+        : new Map<string, VmwareNetworkRates>();
+      return matchedVms.flatMap(({ item, targetId }) =>
+        toVmwareMetricSamples(item, { connectionId, targetId, sampledAt, sampledAtMs }, networkRates.get(item.ref.value)),
+      );
+    } finally {
+      await session.logout();
+    }
   }
 
   async collectHostInventory(input: XenConnectionInput): Promise<HostInventory> {
@@ -394,6 +570,23 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
     } finally {
       await session.logout();
     }
+  }
+}
+
+export async function cleanupRegisteredVmwareGeneratedIso(input: XenConnectionInput, registryId: string): Promise<void> {
+  const record = getGeneratedIso(registryId);
+  if (!record) throw new Error(`未找到生成 ISO 登记记录：${registryId}`);
+  if (record.providerType !== "vmware") throw new Error(`生成 ISO 不是 VMware 类型：${registryId}`);
+  if (!record.isoName.startsWith("vrc-") || !record.isoName.endsWith(".iso")) {
+    throw new Error("登记文件不是受管的 VMware 临时 ISO，拒绝删除。");
+  }
+  const session = await VmwareSoapSession.login(input);
+  try {
+    await session.removeVmCdromsByName(record.vmName);
+    await session.deleteDatastoreFileTask(record.isoSrUuid, record.isoPath);
+    markGeneratedIsoStatus(registryId, "deleted", "VMware 临时 Kickstart ISO 已清理");
+  } finally {
+    await session.logout();
   }
 }
 
@@ -443,6 +636,75 @@ export class VmwareSoapSession {
     return objects;
   }
 
+  async getPerformanceCounters(): Promise<XmlValue> {
+    if (!this.content.performanceManager.value) return undefined;
+    const [performanceManager] = await this.retrieveObjectProperties(this.content.performanceManager, ["perfCounter"]);
+    return performanceManager?.props.get("perfCounter");
+  }
+
+  async queryVmNetworkRates(
+    vmRefs: ManagedRef[],
+    counters: VmwareNetworkCounterConfig,
+  ): Promise<Map<string, VmwareNetworkRates>> {
+    if (!this.content.performanceManager.value || vmRefs.length === 0) return new Map();
+    const response = await this.call("QueryPerf", `
+      <QueryPerf xmlns="${SOAP_NS}">
+        ${managedRefXml("_this", this.content.performanceManager)}
+        ${vmRefs.map((vmRef) => `
+          <querySpec>
+            ${managedRefXml("entity", { ...vmRef, type: "VirtualMachine" })}
+            <maxSample>1</maxSample>
+            <metricId><counterId>${counters.received.id}</counterId><instance>*</instance></metricId>
+            <metricId><counterId>${counters.transmitted.id}</counterId><instance>*</instance></metricId>
+            <intervalId>20</intervalId>
+          </querySpec>
+        `).join("")}
+      </QueryPerf>
+    `);
+    return parseVmwareNetworkRates(response?.returnval, counters);
+  }
+
+  async resolveDatacenterName(): Promise<string> {
+    const datacenters = await this.retrieveContainerProperties("Datacenter", ["name"]);
+    return textOf(datacenters[0]?.props.get("name")) || "ha-datacenter";
+  }
+
+  async removeVmCdromsByName(vmName: string): Promise<void> {
+    const vms = await this.retrieveContainerProperties("VirtualMachine", ["name", "config.hardware.device"]);
+    const vm = vms.find((item) => textOf(item.props.get("name")) === vmName);
+    if (!vm) return;
+    const cdroms = collectVirtualCdroms(vm.props.get("config.hardware.device")).filter((item) => item.fileName);
+    if (!cdroms.length) return;
+    const response = await this.call("ReconfigVM_Task", `
+      <ReconfigVM_Task xmlns="${SOAP_NS}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        ${managedRefXml("_this", { type: "VirtualMachine", value: vm.ref.value })}
+        <spec>
+          ${cdroms.map((cdrom) => `<deviceChange><operation>edit</operation><device xsi:type="VirtualCdrom"><key>${cdrom.key}</key><deviceInfo><label>${escapeXml(cdrom.label)}</label><summary>Remote device</summary></deviceInfo><backing xsi:type="VirtualCdromRemotePassthroughBackingInfo"><deviceName></deviceName><useAutoDetect>true</useAutoDetect><exclusive>false</exclusive></backing><connectable><startConnected>false</startConnected><allowGuestControl>true</allowGuestControl><connected>false</connected></connectable><controllerKey>${cdrom.controllerKey}</controllerKey><unitNumber>${cdrom.unitNumber}</unitNumber></device></deviceChange>`).join("")}
+        </spec>
+      </ReconfigVM_Task>
+    `);
+    await this.waitForTaskResult({ ...readManagedRef(response?.returnval), type: "Task" });
+  }
+
+  async deleteDatastoreFileTask(datastoreName: string, datastorePath: string): Promise<void> {
+    const datacenters = await this.retrieveContainerProperties("Datacenter", ["name"]);
+    const datacenter = datacenters[0]?.ref;
+    const response = await this.call("DeleteDatastoreFile_Task", `
+      <DeleteDatastoreFile_Task xmlns="${SOAP_NS}">
+        ${managedRefXml("_this", this.content.fileManager)}
+        <name>[${escapeXml(datastoreName)}] ${escapeXml(datastorePath)}</name>
+        ${datacenter ? managedRefXml("datacenter", { type: "Datacenter", value: datacenter.value }) : ""}
+      </DeleteDatastoreFile_Task>
+    `);
+    try {
+      await this.waitForTaskResult({ ...readManagedRef(response?.returnval), type: "Task" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/FileNotFound|was not found/i.test(message)) return;
+      throw error;
+    }
+  }
+
   async acquireWebMksTicket(vmMoid: string): Promise<string> {
     const response = await this.call("AcquireTicket", `
       <AcquireTicket xmlns="${SOAP_NS}">
@@ -488,20 +750,20 @@ export class VmwareSoapSession {
   async resolveCreatePlacement(request: VmProvisionRequest, iso?: IsoImage): Promise<VmwareCreatePlacement> {
     const [hostObjects, datacenterObjects, datastoreObjects] = await Promise.all([
       this.retrieveContainerProperties("HostSystem", ["name", "parent", "datastore", "network"]),
-      this.retrieveContainerProperties("Datacenter", ["vmFolder"]),
+      this.retrieveContainerProperties("Datacenter", ["name", "vmFolder"]),
       this.retrieveContainerProperties("Datastore", ["name", "summary.freeSpace", "summary.accessible"]),
     ]);
     const hostObject = hostObjects.find((item) => item.ref.value === request.hostId) ?? hostObjects[0];
     if (!hostObject) throw new Error("未找到可用于创建 VM 的 VMware Host。");
-    const computeResource = readOptionalManagedRef(hostObject.props.get("parent"));
+    const computeResource = readOptionalManagedRefAs(hostObject.props.get("parent"), "ComputeResource");
     if (!computeResource) throw new Error(`VMware Host ${textOf(hostObject.props.get("name")) || hostObject.ref.value} 没有关联计算资源。`);
     const [computeResourceProps] = await this.retrieveObjectProperties(computeResource, ["resourcePool"]);
-    const resourcePool = readOptionalManagedRef(computeResourceProps?.props.get("resourcePool"));
+    const resourcePool = readOptionalManagedRefAs(computeResourceProps?.props.get("resourcePool"), "ResourcePool");
     if (!resourcePool) throw new Error("未找到 VMware ResourcePool，无法创建 VM。");
-    const folder = readOptionalManagedRef(datacenterObjects[0]?.props.get("vmFolder"));
+    const folder = readOptionalManagedRefAs(datacenterObjects[0]?.props.get("vmFolder"), "Folder");
     if (!folder) throw new Error("未找到 VMware VM Folder，无法创建 VM。");
 
-    const hostDatastores = new Set(collectManagedRefs(hostObject.props.get("datastore"), "Datastore").map((item) => item.value));
+    const hostDatastores = new Set(collectManagedRefsAs(hostObject.props.get("datastore"), "Datastore").map((item) => item.value));
     const datastore = datastoreObjects
       .filter((item) => !hostDatastores.size || hostDatastores.has(item.ref.value))
       .filter((item) => textOf(item.props.get("summary.accessible")) !== "false")
@@ -514,7 +776,7 @@ export class VmwareSoapSession {
       })[0];
     if (!datastore) throw new Error("未找到 VMware 可用 Datastore，无法创建虚拟硬盘。");
 
-    const networks = await this.resolveNetworkObjects(collectManagedRefs(hostObject.props.get("network"), "Network"));
+    const networks = await this.resolveNetworkObjects(collectManagedRefsAs(hostObject.props.get("network"), "Network"));
     const preferredNetwork = request.ipPool.networkName?.trim();
     const network =
       (preferredNetwork ? networks.find((item) => textOf(item.props.get("name")) === preferredNetwork) : undefined) ??
@@ -527,6 +789,7 @@ export class VmwareSoapSession {
       folder,
       datastore: datastore.ref,
       datastoreName: textOf(datastore.props.get("name")),
+      datacenterName: textOf(datacenterObjects[0]?.props.get("name")) || "ha-datacenter",
       network: network?.ref,
       networkName: network ? textOf(network.props.get("name")) : undefined,
     };
@@ -537,6 +800,7 @@ export class VmwareSoapSession {
     request: VmProvisionRequest,
     item: VmProvisionRequest["planItems"][number],
     iso: IsoImage,
+    sourceIso?: IsoImage,
   ): Promise<ManagedRef> {
     const diskKb = Math.max(Math.floor(item.diskGiB), 1) * 1024 * 1024;
     const isoFileName = vmwareIsoFileName(iso);
@@ -548,6 +812,7 @@ export class VmwareSoapSession {
               <key>-50</key>
               <deviceInfo>
                 <label>Network adapter 1</label>
+                <summary>${escapeXml(placement.networkName ?? "VM Network")}</summary>
               </deviceInfo>
               <backing xsi:type="VirtualEthernetCardNetworkBackingInfo">
                 <deviceName>${escapeXml(placement.networkName ?? "VM Network")}</deviceName>
@@ -595,6 +860,7 @@ export class VmwareSoapSession {
               <key>-100</key>
               <deviceInfo>
                 <label>Hard disk 1</label>
+                <summary>${Math.max(Math.floor(item.diskGiB), 1)} GiB thin provisioned disk</summary>
               </deviceInfo>
               <backing xsi:type="VirtualDiskFlatVer2BackingInfo">
                 <fileName>[${escapeXml(placement.datastoreName)}]</fileName>
@@ -612,6 +878,7 @@ export class VmwareSoapSession {
               <key>-200</key>
               <deviceInfo>
                 <label>CD/DVD drive 1</label>
+                <summary>${escapeXml(iso.name)}</summary>
               </deviceInfo>
               <backing xsi:type="VirtualCdromIsoBackingInfo">
                 <fileName>${escapeXml(isoFileName)}</fileName>
@@ -626,6 +893,21 @@ export class VmwareSoapSession {
               <unitNumber>0</unitNumber>
             </device>
           </deviceChange>
+          ${sourceIso ? `
+          <deviceChange>
+            <operation>add</operation>
+            <device xsi:type="VirtualCdrom">
+              <key>-201</key>
+              <deviceInfo><label>CD/DVD drive 2</label><summary>${escapeXml(sourceIso.name)}</summary></deviceInfo>
+              <backing xsi:type="VirtualCdromIsoBackingInfo">
+                <fileName>${escapeXml(vmwareIsoFileName(sourceIso))}</fileName>
+                ${managedRefXml("datastore", placement.datastore)}
+              </backing>
+              <connectable><startConnected>true</startConnected><allowGuestControl>true</allowGuestControl><connected>false</connected></connectable>
+              <controllerKey>200</controllerKey>
+              <unitNumber>1</unitNumber>
+            </device>
+          </deviceChange>` : ""}
           ${networkDevice}
         </config>
         ${managedRefXml("pool", placement.resourcePool)}
@@ -699,6 +981,80 @@ export class VmwareSoapSession {
       </PowerOnVM_Task>
     `);
     await this.waitForTaskResult({ ...readManagedRef(response?.returnval), type: "Task" });
+  }
+
+  async uploadDatastoreFile(datacenterName: string, datastoreName: string, datastorePath: string, localPath: string): Promise<void> {
+    const size = statSync(localPath).size;
+    const path = datastoreHttpPath(datacenterName, datastoreName, datastorePath);
+    await new Promise<void>((resolve, reject) => {
+      const req = httpsRequest({
+        hostname: this.input.host,
+        port: this.input.port || DEFAULT_VMWARE_PORT,
+        path,
+        method: "PUT",
+        rejectUnauthorized: false,
+        headers: { Cookie: this.cookie, "Content-Type": "application/octet-stream", "Content-Length": size },
+        timeout: SOAP_TIMEOUT_MS,
+      }, (response) => {
+        response.resume();
+        response.on("end", () => {
+          if (response.statusCode && response.statusCode >= 200 && response.statusCode < 300) resolve();
+          else reject(new Error(`VMware Datastore 上传失败：HTTP ${response.statusCode || 0}`));
+        });
+      });
+      req.on("timeout", () => req.destroy(new Error("VMware Datastore 上传超时。")));
+      req.on("error", reject);
+      createReadStream(localPath).on("error", reject).pipe(req);
+    });
+  }
+
+  async readDatastoreRange(datacenterName: string, datastoreName: string, datastorePath: string, start: number, end: number): Promise<Buffer> {
+    const path = datastoreHttpPath(datacenterName, datastoreName, datastorePath);
+    return new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const req = httpsRequest({
+        hostname: this.input.host,
+        port: this.input.port || DEFAULT_VMWARE_PORT,
+        path,
+        method: "GET",
+        rejectUnauthorized: false,
+        headers: { Cookie: this.cookie, Range: `bytes=${start}-${end}` },
+        timeout: SOAP_TIMEOUT_MS,
+      }, (response) => {
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          if (response.statusCode === 206) resolve(Buffer.concat(chunks));
+          else reject(new Error(`VMware Datastore Range 读取失败：HTTP ${response.statusCode || 0}`));
+        });
+      });
+      req.on("timeout", () => req.destroy(new Error("VMware Datastore Range 读取超时。")));
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
+  async deleteDatastoreFile(datacenterName: string, datastoreName: string, datastorePath: string): Promise<void> {
+    const path = datastoreHttpPath(datacenterName, datastoreName, datastorePath);
+    await new Promise<void>((resolve, reject) => {
+      const req = httpsRequest({
+        hostname: this.input.host,
+        port: this.input.port || DEFAULT_VMWARE_PORT,
+        path,
+        method: "DELETE",
+        rejectUnauthorized: false,
+        headers: { Cookie: this.cookie },
+        timeout: SOAP_TIMEOUT_MS,
+      }, (response) => {
+        response.resume();
+        response.on("end", () => {
+          if (response.statusCode === 404 || (response.statusCode && response.statusCode >= 200 && response.statusCode < 300)) resolve();
+          else reject(new Error(`VMware Datastore 清理失败：HTTP ${response.statusCode || 0}`));
+        });
+      });
+      req.on("timeout", () => req.destroy(new Error("VMware Datastore 清理超时。")));
+      req.on("error", reject);
+      req.end();
+    });
   }
 
   async shutdownGuest(vmMoid: string): Promise<void> {
@@ -879,6 +1235,8 @@ async function retrieveServiceContent(input: XenConnectionInput): Promise<Servic
     propertyCollector: readManagedRef(returnval.propertyCollector),
     sessionManager: readManagedRef(returnval.sessionManager),
     viewManager: readManagedRef(returnval.viewManager),
+    fileManager: readManagedRef(returnval.fileManager),
+    performanceManager: readManagedRef(returnval.perfManager),
     aboutName: textOf(returnval.about?.name),
     aboutFullName: textOf(returnval.about?.fullName),
     apiVersion: textOf(returnval.about?.apiVersion),
@@ -1122,9 +1480,16 @@ function toStorageRepository(item: PropertyObject): StorageRepository {
 }
 
 function toVmNode(item: PropertyObject, connectionId: string): VmNode {
-  const providerId = textOf(item.props.get("config.uuid")) || textOf(item.props.get("config.instanceUuid")) || item.ref.value;
+  const providerId = vmwareProviderId(item);
   const host = readOptionalManagedRef(item.props.get("runtime.host"));
   const disks = collectVirtualDisks(item.props.get("config.hardware.device"), providerId);
+  const configuredDiskBytes = disks.reduce((sum, disk) => sum + disk.virtualSizeBytes, 0);
+  const storageCommittedBytes = numberOf(item.props.get("summary.storage.committed"));
+  const storageUncommittedBytes = numberOf(item.props.get("summary.storage.uncommitted"));
+  const storageProvisionedBytes = Math.max(storageCommittedBytes + storageUncommittedBytes, 0);
+  const diskVirtualBytes = configuredDiskBytes || storageProvisionedBytes;
+  const reportedDiskCount = numberOf(item.props.get("summary.config.numVirtualDisks"));
+  const diskCount = disks.length || reportedDiskCount || (diskVirtualBytes > 0 ? 1 : 0);
   const name = textOf(item.props.get("name")) || providerId;
   const vm: VmNode = {
     id: `${connectionId}:vm:${providerId}`,
@@ -1134,9 +1499,11 @@ function toVmNode(item: PropertyObject, connectionId: string): VmNode {
     powerState: normalizePowerState(textOf(item.props.get("runtime.powerState"))),
     cpuCount: numberOf(item.props.get("config.hardware.numCPU")),
     memoryBytes: numberOf(item.props.get("config.hardware.memoryMB")) * 1024 * 1024,
-    diskVirtualBytes: disks.reduce((sum, disk) => sum + disk.virtualSizeBytes, 0),
-    diskCount: disks.length,
-    diskSizeSummary: disks.map((disk) => `${bytesToGib(disk.virtualSizeBytes).toFixed(1)} GiB`).join(" + ") || undefined,
+    diskVirtualBytes,
+    diskCount,
+    diskSizeSummary:
+      disks.map((disk) => `${bytesToGib(disk.virtualSizeBytes).toFixed(1)} GiB`).join(" + ") ||
+      (diskVirtualBytes > 0 ? `${bytesToGib(diskVirtualBytes).toFixed(1)} GiB` : undefined),
     hostId: host?.value,
     ipAddresses: collectGuestIps(item.props.get("guest.ipAddress"), item.props.get("guest.net"), name),
     guestOs: normalizeGuestOs(
@@ -1151,6 +1518,9 @@ function toVmNode(item: PropertyObject, connectionId: string): VmNode {
     metadata: {
       managedObjectId: item.ref.value,
       disks,
+      storageCommittedBytes,
+      storageUncommittedBytes,
+      diskCapacitySource: configuredDiskBytes > 0 ? "virtual-device" : storageProvisionedBytes > 0 ? "storage-summary" : "unavailable",
     },
   };
   const assessment = assessVmReclaim({
@@ -1175,6 +1545,187 @@ function toVmNode(item: PropertyObject, connectionId: string): VmNode {
   vm.reclaimLevel = assessment.reclaimLevel;
   vm.reclaimReason = assessment.reclaimReason;
   return vm;
+}
+
+function vmwareProviderId(item: PropertyObject): string {
+  return textOf(item.props.get("config.uuid")) || textOf(item.props.get("config.instanceUuid")) || item.ref.value;
+}
+
+function normalizeVmwareTargetId(value: string): string {
+  return value.includes(":vm:") ? value.split(":vm:").pop() || value : value;
+}
+
+async function resolveVmwareNetworkCounters(
+  session: VmwareSoapSession,
+  connectionId: string,
+): Promise<VmwareNetworkCounterConfig | null> {
+  const now = Date.now();
+  const cached = vmwareNetworkCounterCache.get(connectionId);
+  if (cached && now < cached.expiresAtMs) return cached.value;
+  const value = findVmwareNetworkCounters(await session.getPerformanceCounters());
+  vmwareNetworkCounterCache.set(connectionId, {
+    value,
+    expiresAtMs: now + (value ? VMWARE_PERFORMANCE_COUNTER_CACHE_MS : VMWARE_PERFORMANCE_COUNTER_RETRY_MS),
+  });
+  return value;
+}
+
+function findVmwareNetworkCounters(value: XmlValue): VmwareNetworkCounterConfig | null {
+  let received: VmwarePerformanceCounter | null = null;
+  let transmitted: VmwarePerformanceCounter | null = null;
+  const visit = (node: XmlValue) => {
+    if (node == null || (received && transmitted)) return;
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+      return;
+    }
+    if (typeof node !== "object") return;
+    const id = numberOf(node.key);
+    const group = textOf(node.groupInfo?.key);
+    const name = textOf(node.nameInfo?.key);
+    const rollup = textOf(node.rollupType);
+    if (id > 0 && group === "net" && rollup === "average" && (name === "received" || name === "transmitted")) {
+      const counter = { id, multiplier: vmwarePerformanceUnitMultiplier(textOf(node.unitInfo?.key)) };
+      if (name === "received") received = counter;
+      if (name === "transmitted") transmitted = counter;
+      return;
+    }
+    for (const child of Object.values(node)) visit(child);
+  };
+  visit(value);
+  return received && transmitted ? { received, transmitted } : null;
+}
+
+function vmwarePerformanceUnitMultiplier(unit: string): number {
+  const normalized = unit.toLowerCase();
+  if (normalized === "kilobytespersecond") return 1024;
+  if (normalized === "megabytespersecond") return 1024 * 1024;
+  return 1;
+}
+
+function parseVmwareNetworkRates(
+  value: XmlValue,
+  counters: VmwareNetworkCounterConfig,
+): Map<string, VmwareNetworkRates> {
+  const result = new Map<string, VmwareNetworkRates>();
+  for (const entity of collectVmwarePerfEntities(value)) {
+    const vmId = readManagedRef(entity.entity).value;
+    if (!vmId) continue;
+    const series = toArray(entity.value);
+    result.set(vmId, {
+      receivedBytesPerSecond: vmwareCounterSeriesValue(series, counters.received),
+      transmittedBytesPerSecond: vmwareCounterSeriesValue(series, counters.transmitted),
+    });
+  }
+  return result;
+}
+
+function collectVmwarePerfEntities(value: XmlValue): XmlValue[] {
+  if (value == null) return [];
+  if (Array.isArray(value)) return value.flatMap(collectVmwarePerfEntities);
+  if (typeof value !== "object") return [];
+  if (value.entity && value.value) return [value];
+  return Object.values(value).flatMap(collectVmwarePerfEntities);
+}
+
+function vmwareCounterSeriesValue(series: XmlValue[], counter: VmwarePerformanceCounter): number | null {
+  const matching = series.filter((item) => numberOf(item.id?.counterId) === counter.id);
+  const aggregate = matching.find((item) => textOf(item.id?.instance) === "");
+  const selected = aggregate ? [aggregate] : matching;
+  const values = selected
+    .map((item) => latestVmwarePerfValue(item.value))
+    .filter((value): value is number => value != null && value >= 0);
+  return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) * counter.multiplier : null;
+}
+
+function latestVmwarePerfValue(value: XmlValue): number | null {
+  const values = collectTextValues(value)
+    .map(Number)
+    .filter((item) => Number.isFinite(item));
+  return values.length > 0 ? values[values.length - 1] : null;
+}
+
+function toVmwareMetricSamples(
+  item: PropertyObject,
+  context: { connectionId: string; targetId: string; sampledAt: string; sampledAtMs: number },
+  networkRates?: VmwareNetworkRates,
+): MetricSample[] {
+  const samples: MetricSample[] = [];
+  const pushSample = (metric: MetricSample["metric"], value: number | null, unit: MetricSample["unit"]) => {
+    if (value == null) return;
+    samples.push({
+      id: `${context.connectionId}:${context.targetId}:${metric}:${context.sampledAtMs}`,
+      connectionId: context.connectionId,
+      targetType: "vm",
+      targetId: context.targetId,
+      metric,
+      value,
+      unit,
+      sampledAt: context.sampledAt,
+    });
+  };
+
+  const cpuUsageMhz = nonNegativeNumberOf(item.props.get("summary.quickStats.overallCpuUsage"));
+  const cpuCapacityMhz = positiveNumberOf(item.props.get("runtime.maxCpuUsage"));
+  const memoryTotalMb = positiveNumberOf(item.props.get("config.hardware.memoryMB"));
+  const guestMemoryMb = positiveNumberOf(item.props.get("summary.quickStats.guestMemoryUsage"));
+  const hostMemoryMb = positiveNumberOf(item.props.get("summary.quickStats.hostMemoryUsage"));
+  const memoryUsedMb = hostMemoryMb ?? guestMemoryMb;
+  const guestDiskUsage = collectVmwareGuestDiskUsage(item.props.get("guest.disk"));
+  const configuredDiskBytes = collectVirtualDisks(item.props.get("config.hardware.device"), context.targetId)
+    .reduce((sum, disk) => sum + disk.virtualSizeBytes, 0);
+  const storageCommittedBytes = positiveNumberOf(item.props.get("summary.storage.committed"));
+  const storageUncommittedBytes = nonNegativeNumberOf(item.props.get("summary.storage.uncommitted"));
+  const storageProvisionedBytes =
+    storageCommittedBytes == null ? null : storageCommittedBytes + (storageUncommittedBytes ?? 0);
+  const diskUsedBytes = guestDiskUsage?.usedBytes ?? null;
+  const diskTotalBytes = guestDiskUsage?.totalBytes ?? (configuredDiskBytes > 0 ? configuredDiskBytes : storageProvisionedBytes);
+
+  pushSample("cpu_usage", cpuUsageMhz != null && cpuCapacityMhz != null ? Math.min(cpuUsageMhz / cpuCapacityMhz, 1) : null, "ratio");
+  pushSample("memory_used", memoryUsedMb == null ? null : Math.min(memoryUsedMb, memoryTotalMb ?? memoryUsedMb) * 1024 * 1024, "bytes");
+  pushSample("memory_total", memoryTotalMb == null ? null : memoryTotalMb * 1024 * 1024, "bytes");
+  pushSample("disk_used", diskUsedBytes == null ? null : Math.min(diskUsedBytes, diskTotalBytes ?? diskUsedBytes), "bytes");
+  pushSample("disk_total", diskTotalBytes, "bytes");
+  pushSample("net_rx", networkRates?.receivedBytesPerSecond ?? null, "bytes_per_sec");
+  pushSample("net_tx", networkRates?.transmittedBytesPerSecond ?? null, "bytes_per_sec");
+  return samples;
+}
+
+function collectVmwareGuestDiskUsage(value: XmlValue): { usedBytes: number; totalBytes: number } | null {
+  let usedBytes = 0;
+  let totalBytes = 0;
+  const visit = (node: XmlValue) => {
+    if (node == null) return;
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+      return;
+    }
+    if (typeof node !== "object") return;
+    const capacityText = textOf(node.capacity);
+    const freeSpaceText = textOf(node.freeSpace);
+    if (capacityText && freeSpaceText) {
+      const capacity = Number(capacityText);
+      const freeSpace = Number(freeSpaceText);
+      if (Number.isFinite(capacity) && capacity > 0 && Number.isFinite(freeSpace) && freeSpace >= 0) {
+        totalBytes += capacity;
+        usedBytes += Math.max(capacity - Math.min(freeSpace, capacity), 0);
+        return;
+      }
+    }
+    for (const child of Object.values(node)) visit(child);
+  };
+  visit(value);
+  return totalBytes > 0 ? { usedBytes, totalBytes } : null;
+}
+
+function positiveNumberOf(value: XmlValue): number | null {
+  const number = Number(textOf(value));
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function nonNegativeNumberOf(value: XmlValue): number | null {
+  const number = Number(textOf(value));
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 function collectVirtualDisks(value: XmlValue, vmId: string): VmwareDiskInfo[] {
@@ -1207,6 +1758,34 @@ function collectVirtualDisks(value: XmlValue, vmId: string): VmwareDiskInfo[] {
   };
   visit(value);
   return disks;
+}
+
+function collectVirtualCdroms(value: XmlValue): Array<{ key: number; controllerKey: number; unitNumber: number; label: string; fileName: string; datastore: string; connected: boolean }> {
+  const cdroms: Array<{ key: number; controllerKey: number; unitNumber: number; label: string; fileName: string; datastore: string; connected: boolean }> = [];
+  const visit = (node: XmlValue) => {
+    if (node == null) return;
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+      return;
+    }
+    if (typeof node !== "object") return;
+    if (textOf(node["@type"]).includes("VirtualCdrom")) {
+      const key = numberOf(node.key);
+      if (key) cdroms.push({
+        key,
+        controllerKey: numberOf(node.controllerKey),
+        unitNumber: numberOf(node.unitNumber),
+        label: textOf(node.deviceInfo?.label) || "CD/DVD drive",
+        fileName: textOf(node.backing?.fileName),
+        datastore: textOf(node.backing?.datastore),
+        connected: textOf(node.connectable?.connected) === "true",
+      });
+      return;
+    }
+    for (const child of Object.values(node)) visit(child);
+  };
+  visit(value);
+  return cdroms;
 }
 
 function parseVmwareIsoResults(value: XmlValue, datastoreName: string): VmwareIsoSearchResult[] {
@@ -1273,12 +1852,15 @@ function inferIpv4FromVmName(name: string): string {
 }
 
 function summarizeVmItems(items: VmNode[], total = items.length): VmInventorySummary {
+  const runningItems = items.filter((vm) => vm.powerState === "running");
   return {
     total,
-    running: items.filter((vm) => vm.powerState === "running").length,
+    running: runningItems.length,
     halted: items.filter((vm) => vm.powerState === "halted").length,
     vcpu: items.reduce((sum, vm) => sum + vm.cpuCount, 0),
+    runningVcpu: runningItems.reduce((sum, vm) => sum + vm.cpuCount, 0),
     memoryBytes: items.reduce((sum, vm) => sum + vm.memoryBytes, 0),
+    runningMemoryBytes: runningItems.reduce((sum, vm) => sum + vm.memoryBytes, 0),
     diskBytes: items.reduce((sum, vm) => sum + Math.max(vm.diskVirtualBytes ?? 0, 0), 0),
   };
 }
@@ -1303,6 +1885,30 @@ function readManagedRef(node: XmlValue): ManagedRef {
 function readOptionalManagedRef(node: XmlValue): ManagedRef | undefined {
   const ref = readManagedRef(node);
   return ref.value ? ref : undefined;
+}
+
+function readOptionalManagedRefAs(node: XmlValue, type: string): ManagedRef | undefined {
+  const value = textOf(node);
+  return value ? { type, value } : undefined;
+}
+
+function collectManagedRefsAs(value: XmlValue, type: string): ManagedRef[] {
+  const refs: ManagedRef[] = [];
+  const visit = (node: XmlValue) => {
+    if (node == null) return;
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+      return;
+    }
+    if (typeof node !== "object") return;
+    if ("#text" in node && textOf(node)) {
+      refs.push({ type, value: textOf(node) });
+      return;
+    }
+    for (const child of Object.values(node)) visit(child);
+  };
+  visit(value);
+  return refs;
 }
 
 function collectManagedRefs(value: XmlValue, type?: string): ManagedRef[] {
@@ -1361,6 +1967,11 @@ function normalizeVmwareIsoId(isoId: string): string {
 function vmwareIsoFileName(iso: IsoImage): string {
   const path = iso.path || normalizeVmwareIsoId(iso.providerId).split(":").slice(1).join(":") || iso.name;
   return `[${iso.storageRepository}] ${path}`;
+}
+
+function datastoreHttpPath(datacenterName: string, datastoreName: string, datastorePath: string): string {
+  const encodedPath = datastorePath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+  return `/folder/${encodedPath}?dcPath=${encodeURIComponent(datacenterName)}&dsName=${encodeURIComponent(datastoreName)}`;
 }
 
 function vmwareGuestIdForProvision(request: VmProvisionRequest): string {

@@ -85,7 +85,9 @@ export interface VmInventorySummary {
   running: number;
   halted: number;
   vcpu: number;
+  runningVcpu?: number;
   memoryBytes: number;
+  runningMemoryBytes?: number;
   diskBytes?: number;
 }
 
@@ -229,6 +231,8 @@ export interface VmProvisionInstallSourceRef {
 }
 
 export interface VmProvisionRequest {
+  taskId?: string;
+  installStrategy?: "template-clone" | "kickstart" | "manual-iso";
   connectionId?: string;
   providerType: ProviderType;
   hostId?: string;
@@ -252,6 +256,7 @@ export interface VmProvisionCreatedVm {
   powerState: PowerState;
   ip?: string;
   macAddress?: string;
+  generatedIsoRegistryId?: string;
 }
 
 export interface VmProvisionResult {
@@ -295,6 +300,10 @@ export interface ProvisionTaskVm {
   ip?: string;
   powerState?: PowerState;
   status: ProvisionTaskStatus;
+  currentStep?: ProvisionTaskStepKey;
+  progressPercent?: number;
+  installPackageTotal?: number;
+  installPackageDone?: number;
   message?: string;
 }
 
@@ -307,6 +316,8 @@ export interface ProvisionTask {
   title: string;
   status: ProvisionTaskStatus;
   currentStep: ProvisionTaskStepKey;
+  progressPercent: number;
+  eventSeq: number;
   message: string;
   createdAt: string;
   updatedAt: string;
@@ -335,7 +346,17 @@ export interface MetricSample {
   connectionId: string;
   targetType: "host" | "vm" | "storage" | "network";
   targetId: string;
-  metric: "cpu_usage" | "memory_usage" | "disk_read" | "disk_write" | "net_rx" | "net_tx";
+  metric:
+    | "cpu_usage"
+    | "memory_usage"
+    | "memory_used"
+    | "memory_total"
+    | "disk_used"
+    | "disk_total"
+    | "disk_read"
+    | "disk_write"
+    | "net_rx"
+    | "net_tx";
   value: number;
   unit: "ratio" | "bytes" | "bytes_per_sec";
   sampledAt: string;
@@ -369,6 +390,8 @@ export interface StorageRepository {
   usedGiB: number;
   virtualGiB: number;
   shared: boolean;
+  hostId?: string;
+  content?: string[];
 }
 
 export interface NetworkInterface {
@@ -406,6 +429,10 @@ export interface VmSummary {
 export interface VmMetricSnapshot {
   uuid: string;
   cpuUsage: number | null;
+  memoryUsedBytes?: number | null;
+  memoryTotalBytes?: number | null;
+  diskUsedBytes?: number | null;
+  diskTotalBytes?: number | null;
   diskReadRate: number | null;
   diskWriteRate: number | null;
   networkRxRate: number | null;

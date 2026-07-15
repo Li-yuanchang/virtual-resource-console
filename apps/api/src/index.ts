@@ -2,7 +2,11 @@ import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import websocket from "@fastify/websocket";
 import { execFile } from "node:child_process";
+import { createReadStream } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import path from "node:path";
 import Fastify from "fastify";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { z } from "zod";
 import { registerProxmoxConsoleRoutes } from "./console/proxmoxConsole.js";
@@ -16,9 +20,10 @@ import {
   resolveStoredConnection,
   saveStoredConnection,
 } from "./connectionStore.js";
-import { publishXenInstallSources, registerInstallSourceRoutes, resolveInstallSourcePublicBaseUrl, shouldUseXenKickstart } from "./installSourceService.js";
+import { cleanupXenInstallSources, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
 import { listIpLeases, releaseIpLeases, reserveIpLeases } from "./ipLeaseStore.js";
 import { buildIsoImageCacheKey, getIsoImageCache, saveIsoImageCache } from "./isoImageStore.js";
+import { getGeneratedIso } from "./generatedIsoStore.js";
 import { getProvisioningConfig, saveProvisioningConfig } from "./provisioningStore.js";
 import {
   createProvisionTask,
@@ -26,13 +31,27 @@ import {
   getProvisionTask,
   listProvisionTasks,
   markProvisionTaskStep,
+  subscribeProvisionTask,
+  updateProvisionTaskVm,
   updateProvisionTaskVms,
 } from "./provisionTaskStore.js";
 import { runProvisioningVerifier } from "./provisioningVerifier.js";
 import { ProviderRegistry } from "./providers/provider.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
-import { ProxmoxProvider } from "./proxmox.js";
+import { cleanupRegisteredProxmoxGeneratedIso, ProxmoxProvider } from "./proxmox.js";
 import { getRuntimePolicy } from "./runtimePolicy.js";
+import {
+  deleteUiBackgroundImage,
+  getAppPreferences,
+  getConnectionPreferences,
+  getUiBackgroundImagePath,
+  getUiPreferences,
+  saveAppPreferences,
+  saveConnectionPreferences,
+  saveUiBackgroundImage,
+  saveUiPreferences,
+} from "./uiPreferenceStore.js";
+import { cleanupRegisteredXenGeneratedIso, resolveXenInstallMediaMode } from "./xenserverUnattendedIso.js";
 import type {
   HostNode,
   IsoImage,
@@ -45,7 +64,7 @@ import type {
   VmProvisionRequest,
   XenConnectionInput,
 } from "./types.js";
-import { VmwareProvider } from "./vmware.js";
+import { cleanupRegisteredVmwareGeneratedIso, VmwareProvider } from "./vmware.js";
 import { metricSamplesToVmSnapshots, XenServerProvider } from "./xenserver.js";
 
 const server = Fastify({
@@ -92,6 +111,34 @@ interface HostInventoryCapability {
 }
 
 const providerTypeSchema = z.enum(["xenserver", "vmware", "proxmox", "libvirt"]);
+const uiPreferencesSchema = z.object({
+  theme: z.enum(["graphite-sage", "basalt-copper", "mist-teal"]).optional(),
+  toneMode: z.enum(["system", "light", "dark"]).optional(),
+  accentColor: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
+  successColor: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
+  warningColor: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
+  dangerColor: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
+  backgroundMode: z.enum(["default", "solid", "image"]).optional(),
+  backgroundColor: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
+  backgroundOpacity: z.coerce.number().min(5).max(60).optional(),
+  backgroundBlur: z.coerce.number().min(0).max(16).optional(),
+  backgroundOverlay: z.coerce.number().min(0).max(35).optional(),
+  showIconTooltips: z.boolean().optional(),
+  truncateLongNames: z.boolean().optional(),
+  throttleConsoleResize: z.boolean().optional(),
+});
+const connectionPreferencesSchema = z.object({
+  selectedConnectionId: z.string().optional(),
+  providerType: providerTypeSchema.optional(),
+  host: z.string().optional(),
+  port: z.coerce.number().int().positive().max(65535).optional(),
+  username: z.string().optional(),
+  connectionName: z.string().optional(),
+});
+const appPreferencesSchema = z.object({
+  ui: uiPreferencesSchema.optional(),
+  connection: connectionPreferencesSchema.optional(),
+});
 
 const connectionSchema = z.object({
   connectionId: z.string().optional(),
@@ -250,6 +297,7 @@ const provisionVmsSchema = connectionSchema.extend({
   hostId: z.string().optional(),
   environmentTemplateId: z.string().optional(),
   sourceType: z.enum(["iso", "template"]),
+  installStrategy: z.enum(["template-clone", "kickstart", "manual-iso"]).optional(),
   isoId: z.string().optional(),
   isoName: z.string().optional(),
   templateName: z.string().optional(),
@@ -286,6 +334,108 @@ server.get("/api/health", async () => ({
 server.get("/api/connections", async () => ({
   connections: listStoredConnections(),
 }));
+
+server.get("/api/preferences/ui", async () => ({
+  preferences: getUiPreferences(),
+}));
+
+server.get("/api/preferences/ui/background-image", async (_request, reply) => {
+  const imagePath = getUiBackgroundImagePath();
+  const preferences = getUiPreferences();
+  if (!imagePath || !preferences.backgroundImageMime) {
+    return reply.status(404).send({ message: "尚未设置工作区背景图片" });
+  }
+  reply.header("Cache-Control", "private, max-age=31536000, immutable");
+  reply.type(preferences.backgroundImageMime);
+  return reply.send(createReadStream(imagePath));
+});
+
+server.get("/api/preferences", async () => ({
+  preferences: getAppPreferences(),
+}));
+
+server.patch("/api/preferences", async (request, reply) => {
+  const parsed = appPreferencesSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "应用偏好配置格式不正确",
+      issues: parsed.error.issues,
+    });
+  }
+  return {
+    preferences: saveAppPreferences(parsed.data),
+  };
+});
+
+server.patch("/api/preferences/ui", async (request, reply) => {
+  const parsed = uiPreferencesSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "UI 偏好配置格式不正确",
+      issues: parsed.error.issues,
+    });
+  }
+  return {
+    preferences: saveUiPreferences(parsed.data),
+  };
+});
+
+server.post("/api/preferences/ui/background-image", async (request, reply) => {
+  const file = await request.file({
+    limits: {
+      files: 1,
+      fileSize: 16 * 1024 * 1024,
+    },
+  });
+  if (!file) {
+    return reply.status(400).send({ message: "请选择背景图片" });
+  }
+  if (file.mimetype !== "image/jpeg" && file.mimetype !== "image/png" && file.mimetype !== "image/webp") {
+    return reply.status(400).send({ message: "背景图片仅支持 JPG、PNG 和 WebP" });
+  }
+
+  const content = await file.toBuffer();
+  saveUiBackgroundImage(content);
+  const updatedAt = new Date().toISOString();
+  return {
+    preferences: saveUiPreferences({
+      backgroundMode: "image",
+      backgroundImageName: path.basename(file.filename).slice(0, 240),
+      backgroundImageMime: file.mimetype,
+      backgroundImageUpdatedAt: updatedAt,
+      backgroundOpacity: Math.max(getUiPreferences().backgroundOpacity, 32),
+    }),
+  };
+});
+
+server.delete("/api/preferences/ui/background-image", async () => {
+  deleteUiBackgroundImage();
+  return {
+    preferences: saveUiPreferences({
+      backgroundMode: "default",
+      backgroundImageName: "",
+      backgroundImageMime: "",
+      backgroundImageUpdatedAt: "",
+    }),
+  };
+});
+
+server.get("/api/preferences/connection", async () => ({
+  preferences: getConnectionPreferences(),
+}));
+
+server.patch("/api/preferences/connection", async (request, reply) => {
+  const parsed = connectionPreferencesSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "连接偏好配置格式不正确",
+      issues: parsed.error.issues,
+    });
+  }
+  return {
+    preferences: saveConnectionPreferences(parsed.data),
+  };
+});
 
 server.get("/api/provisioning/config", async () => ({
   config: getProvisioningConfig(),
@@ -393,6 +543,47 @@ server.get("/api/provisioning/tasks/:taskId", async (request, reply) => {
   return { task };
 });
 
+server.get("/api/provisioning/tasks/:taskId/events", (request, reply) => {
+  const params = z.object({ taskId: z.string().min(1) }).safeParse(request.params);
+  if (!params.success) {
+    return reply.status(400).send({ message: "任务 ID 不正确。" });
+  }
+  const task = getProvisionTask(params.data.taskId);
+  if (!task) {
+    return reply.status(404).send({ message: "未找到创建任务。" });
+  }
+
+  reply.hijack();
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  const lastEventId = parseLastEventId(request.headers["last-event-id"]);
+  const sendTask = (nextTask: typeof task) => {
+    if (reply.raw.writableEnded || reply.raw.destroyed) return;
+    reply.raw.write(`id: ${nextTask.eventSeq}\n`);
+    reply.raw.write("event: task\n");
+    reply.raw.write(`data: ${JSON.stringify({ task: nextTask })}\n\n`);
+  };
+  if (lastEventId == null || task.eventSeq > lastEventId) {
+    sendTask(task);
+  }
+
+  const unsubscribe = subscribeProvisionTask(params.data.taskId, sendTask);
+  const heartbeat = setInterval(() => {
+    if (reply.raw.writableEnded || reply.raw.destroyed) return;
+    reply.raw.write(": keep-alive\n\n");
+  }, 15000);
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  };
+  request.raw.once("close", cleanup);
+});
+
 server.post("/api/provisioning/preflight", async (request, reply) => {
   const parsed = provisionPreflightSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -454,70 +645,163 @@ server.post("/api/provisioning/vms", async (request, reply) => {
       title: `${providerLabel(resolved.providerType)} 创建 ${parsed.data.planItems.length} 台 VM`,
       planItems: parsed.data.planItems,
     });
-    let executableRequest = requestData;
-    // Provisioning 状态机先发布安装源，再交给平台 Provider 创建 VM。
-    // 这样 XenServer/PVE/VMware 只替换执行策略，不改变任务生命周期。
-    if (shouldUseXenKickstart(requestData)) {
-      markProvisionTaskStep(task.id, "publish-source", "running", "正在发布集中安装源");
-      try {
-        executableRequest = await publishXenInstallSources({
-          connection: resolved.connection,
-          request: requestData,
-          taskId: task.id,
-        });
-        markProvisionTaskStep(task.id, "publish-source", "success", "集中安装源已发布");
-      } catch (error) {
-        markProvisionTaskStep(task.id, "publish-source", "failed", toClientErrorMessage(error, "发布安装源失败"));
-        finishProvisionTask(task.id, "failed", toClientErrorMessage(error, "发布安装源失败"));
-        throw error;
-      }
-    } else {
-      markProvisionTaskStep(task.id, "publish-source", "skipped", "当前策略不需要集中安装源");
-    }
-    markProvisionTaskStep(task.id, "create-vm", "running", "正在调用虚拟化平台创建 VM");
-    let result;
-    try {
-      result = await provider.createVms(resolved.connection, executableRequest);
-    } catch (error) {
-      markProvisionTaskStep(task.id, "create-vm", "failed", toClientErrorMessage(error, "创建 VM 失败"));
-      finishProvisionTask(task.id, "failed", toClientErrorMessage(error, "创建 VM 失败"));
-      throw error;
-    }
-    result.taskId = task.id;
-    markProvisionTaskStep(task.id, "create-vm", "success", result.message);
-    updateProvisionTaskVms(
-      task.id,
-      executableRequest.planItems.map((item) => {
-        const created = result.created.find((vm) => vm.name === item.name);
-        return {
-          id: created?.id,
-          providerId: created?.providerId,
-          name: item.name,
-          ip: item.ip,
-          powerState: created?.powerState,
-          status: "running",
-          message: "VM 已创建，等待系统启动验证",
-        };
-      }),
-    );
-    runProvisioningVerifier({
-      taskId: task.id,
-      connection: resolved.connection,
-      request: executableRequest,
-      created: result.created,
-    });
-    return {
+    setTimeout(() => {
+      void runProvisionTaskExecution({
+        taskId: task.id,
+        provider,
+        connection: resolved.connection,
+        request: requestData,
+      }).catch((error) => {
+        server.log.error({ error, taskId: task.id }, "failed to execute provisioning task");
+        if (getProvisionTask(task.id)?.status !== "failed") {
+          finishProvisionTask(task.id, "failed", toClientErrorMessage(error, "创建虚拟机失败"));
+        }
+      });
+    }, 0);
+    return reply.status(202).send({
       operatedAt: new Date().toISOString(),
-      result,
+      result: {
+        accepted: true,
+        providerType: resolved.providerType,
+        message: "创建任务已提交，正在后台执行。",
+        created: [],
+        taskId: task.id,
+      },
       task: getProvisionTask(task.id),
-    };
+    });
   } catch (error) {
-    request.log.error({ error }, "failed to provision virtual machines");
+    request.log.error({ error }, "failed to accept virtual machine provisioning task");
     return reply.status(502).send({
-      message: toClientErrorMessage(error, "创建虚拟机失败"),
+      message: toClientErrorMessage(error, "提交创建任务失败"),
     });
   }
 });
+
+async function runProvisionTaskExecution(input: {
+  taskId: string;
+  provider: VirtualizationProvider<XenConnectionInput>;
+  connection: XenConnectionInput;
+  request: VmProvisionRequest;
+}) {
+  const taskStartedAt = Date.now();
+  const timingContext = {
+    taskId: input.taskId,
+    providerType: input.request.providerType,
+    hostId: input.request.hostId,
+    vmCount: input.request.planItems.length,
+  };
+  server.log.info({ ...timingContext }, "provision task started");
+  let executableRequest = input.request;
+  // Provisioning 状态机先发布安装源，再交给平台 Provider 创建 VM。
+  // 这样 XenServer/PVE/VMware 只替换执行策略，不改变任务生命周期。
+  if (shouldUseXenKickstart(input.request)) {
+    const phaseStartedAt = Date.now();
+    markProvisionTaskStep(input.taskId, "publish-source", "running", "正在登记集中安装源和 Kickstart 地址");
+    try {
+      executableRequest = await publishXenInstallSources({
+        connection: input.connection,
+        request: input.request,
+        taskId: input.taskId,
+      });
+      server.log.info({ ...timingContext, phase: "publish-source", elapsedMs: Date.now() - phaseStartedAt }, "provision phase timing");
+      markProvisionTaskStep(input.taskId, "publish-source", "success", "集中安装源 URL 已发布，等待 VM 安装器拉取");
+    } catch (error) {
+      server.log.warn({ ...timingContext, phase: "publish-source", elapsedMs: Date.now() - phaseStartedAt, error }, "provision phase failed");
+      markProvisionTaskStep(input.taskId, "publish-source", "failed", toClientErrorMessage(error, "发布安装源失败"));
+      finishProvisionTask(input.taskId, "failed", toClientErrorMessage(error, "发布安装源失败"));
+      await cleanupXenInstallSources(input.taskId);
+      throw error;
+    }
+  } else {
+    markProvisionTaskStep(input.taskId, "publish-source", "skipped", "当前策略不需要集中安装源");
+  }
+
+  markProvisionTaskStep(input.taskId, "create-vm", "running", "正在准备虚拟化平台创建 VM");
+  if (!input.provider.createVms) {
+    markProvisionTaskStep(input.taskId, "create-vm", "failed", `当前平台暂不支持一键创建虚拟机：${input.request.providerType}`);
+    finishProvisionTask(input.taskId, "failed", `当前平台暂不支持一键创建虚拟机：${input.request.providerType}`);
+    await cleanupXenInstallSources(input.taskId);
+    return;
+  }
+  let result;
+  try {
+    const phaseStartedAt = Date.now();
+    result = await input.provider.createVms(input.connection, { ...executableRequest, taskId: input.taskId }, {
+      markStep: (stepKey, status, message) => {
+        markProvisionTaskStep(input.taskId, stepKey, status, message);
+      },
+      updateVm: (vmName, patch, message) => {
+        updateProvisionTaskVm(input.taskId, vmName, patch, message);
+      },
+      recordTiming: (phase, elapsedMs, details) => {
+        server.log.info({ ...timingContext, phase, elapsedMs, details }, "provision provider timing");
+      },
+    });
+    server.log.info({ ...timingContext, phase: "provider-create-vms", elapsedMs: Date.now() - phaseStartedAt }, "provision phase timing");
+  } catch (error) {
+    markProvisionTaskStep(input.taskId, "create-vm", "failed", toClientErrorMessage(error, "创建 VM 失败"));
+    finishProvisionTask(input.taskId, "failed", toClientErrorMessage(error, "创建 VM 失败"));
+    await cleanupXenInstallSources(input.taskId);
+    throw error;
+  }
+
+  result.taskId = input.taskId;
+  markProvisionTaskStep(input.taskId, "create-vm", "success", result.message);
+  updateProvisionTaskVms(
+    input.taskId,
+    executableRequest.planItems.map((item) => {
+      const created = result.created.find((vm) => vm.name === item.name);
+      return {
+        id: created?.id,
+        providerId: created?.providerId,
+        name: item.name,
+        ip: item.ip,
+        powerState: created?.powerState,
+        status: executableRequest.autoStart ? "running" : "success",
+        currentStep: executableRequest.autoStart ? "boot" : "create-vm",
+        progressPercent: executableRequest.autoStart ? undefined : 100,
+        message: executableRequest.autoStart ? "VM 已创建，等待系统启动验证" : "VM 已创建，未设置自动启动",
+      };
+    }),
+  );
+  runProvisioningVerifier({
+    taskId: input.taskId,
+    connection: input.connection,
+    request: executableRequest,
+    created: result.created,
+    onTiming: (phase, elapsedMs, details) => {
+      server.log.info({ ...timingContext, phase, elapsedMs, details }, "provision verifier timing");
+    },
+    onComplete: async ({ status }) => {
+      if (status !== "success") {
+        server.log.warn({ ...timingContext }, "provision verifier failed; generated media retained for safe recovery");
+        return;
+      }
+      await cleanupGeneratedIsos(input.connection, result.created);
+      await cleanupXenInstallSources(input.taskId);
+    },
+  });
+  server.log.info({ ...timingContext, phase: "submit-to-verifier", elapsedMs: Date.now() - taskStartedAt }, "provision task submitted to verifier");
+}
+
+async function cleanupGeneratedIsos(connection: XenConnectionInput, created: { generatedIsoRegistryId?: string; name?: string }[]): Promise<void> {
+  for (const vm of created) {
+    if (!vm.generatedIsoRegistryId) continue;
+    try {
+      const record = getGeneratedIso(vm.generatedIsoRegistryId);
+      if (record?.providerType === "vmware") {
+        await cleanupRegisteredVmwareGeneratedIso(connection, vm.generatedIsoRegistryId);
+      } else if (record?.providerType === "proxmox") {
+        await cleanupRegisteredProxmoxGeneratedIso(connection, vm.generatedIsoRegistryId);
+      } else {
+        await cleanupRegisteredXenGeneratedIso(connection, vm.generatedIsoRegistryId);
+      }
+      server.log.info({ vmName: vm.name, registryId: vm.generatedIsoRegistryId }, "cleaned generated iso");
+    } catch (error) {
+      server.log.warn({ vmName: vm.name, registryId: vm.generatedIsoRegistryId, error }, "failed to clean generated iso");
+    }
+  }
+}
 
 server.post("/api/connections", async (request, reply) => {
   const parsed = saveConnectionSchema.safeParse(request.body);
@@ -878,6 +1162,7 @@ server.post("/api/metrics/snapshot", async (request, reply) => {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
     const samples = await provider.collectMetrics(resolved.connection, {
+      connectionId: resolved.connectionId,
       targetType: parsed.data.targetType,
       targetIds: parsed.data.targetIds,
     });
@@ -895,10 +1180,130 @@ server.post("/api/metrics/snapshot", async (request, reply) => {
   }
 });
 
+registerWebStaticRoutes();
+
 const port = Number(process.env.PORT ?? 3987);
 const host = process.env.HOST ?? "0.0.0.0";
 
 await server.listen({ host, port });
+
+function registerWebStaticRoutes() {
+  const webDistDir = resolveWebDistDir();
+  server.setNotFoundHandler(async (request, reply) => {
+    if (request.url.startsWith("/api") || (request.method !== "GET" && request.method !== "HEAD")) {
+      return reply.status(404).send({ message: "未找到接口。" });
+    }
+    const staticResponse = await resolveStaticFile(webDistDir, request.url);
+    if (!staticResponse.ok) {
+      return reply.status(staticResponse.status).send({ message: staticResponse.message });
+    }
+    reply.type(staticResponse.contentType);
+    if (staticResponse.cacheControl) {
+      reply.header("Cache-Control", staticResponse.cacheControl);
+    }
+    return reply.send(createReadStream(staticResponse.filePath));
+  });
+}
+
+function resolveWebDistDir() {
+  if (process.env.VRC_WEB_DIST_DIR) {
+    return path.resolve(process.env.VRC_WEB_DIST_DIR);
+  }
+  const currentDir = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(currentDir, "../../web/dist");
+}
+
+async function resolveStaticFile(
+  webDistDir: string,
+  rawUrl: string,
+): Promise<
+  | { ok: true; filePath: string; contentType: string; cacheControl?: string }
+  | { ok: false; status: number; message: string }
+> {
+  try {
+    await access(webDistDir);
+  } catch {
+    return {
+      ok: false,
+      status: 404,
+      message: `Web 静态资源不存在，请先执行 npm run build，或通过 VRC_WEB_DIST_DIR 指定 dist 目录：${webDistDir}`,
+    };
+  }
+
+  const requestPath = parseStaticRequestPath(rawUrl);
+  const relativePath = requestPath === "/" ? "index.html" : requestPath.slice(1);
+  const filePath = path.resolve(webDistDir, relativePath);
+  if (!isPathInside(filePath, webDistDir)) {
+    return { ok: false, status: 403, message: "静态资源路径不允许访问。" };
+  }
+
+  const directFile = await findReadableFile(filePath);
+  if (directFile) {
+    return {
+      ok: true,
+      filePath: directFile,
+      contentType: contentTypeForFile(directFile),
+      cacheControl: requestPath.startsWith("/assets/") ? "public, max-age=31536000, immutable" : "no-cache",
+    };
+  }
+
+  if (path.extname(requestPath)) {
+    return { ok: false, status: 404, message: "静态资源不存在。" };
+  }
+
+  const indexFile = path.resolve(webDistDir, "index.html");
+  const readableIndex = await findReadableFile(indexFile);
+  if (!readableIndex) {
+    return { ok: false, status: 404, message: "Web 入口文件不存在，请重新构建前端。" };
+  }
+  return {
+    ok: true,
+    filePath: readableIndex,
+    contentType: "text/html; charset=utf-8",
+    cacheControl: "no-cache",
+  };
+}
+
+function parseStaticRequestPath(rawUrl: string) {
+  try {
+    return decodeURIComponent(new URL(rawUrl, "http://vrc.local").pathname);
+  } catch {
+    return "/";
+  }
+}
+
+async function findReadableFile(filePath: string) {
+  try {
+    const fileStat = await stat(filePath);
+    return fileStat.isFile() ? filePath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPathInside(filePath: string, parentDir: string) {
+  const relative = path.relative(parentDir, filePath);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function contentTypeForFile(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase();
+  const contentTypes: Record<string, string> = {
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".ico": "image/x-icon",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".txt": "text/plain; charset=utf-8",
+    ".webp": "image/webp",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+  };
+  return contentTypes[ext] ?? "application/octet-stream";
+}
 
 async function refreshIsoImages(
   cacheKey: string,
@@ -988,12 +1393,15 @@ function hasHostInventory(provider: unknown): provider is HostInventoryCapabilit
 }
 
 function summarizeVmItems(items: VmNode[]): VmInventorySummary {
+  const runningItems = items.filter((vm) => vm.powerState === "running");
   return {
     total: items.length,
-    running: items.filter((vm) => vm.powerState === "running").length,
+    running: runningItems.length,
     halted: items.filter((vm) => vm.powerState === "halted").length,
     vcpu: items.reduce((sum, vm) => sum + vm.cpuCount, 0),
+    runningVcpu: runningItems.reduce((sum, vm) => sum + vm.cpuCount, 0),
     memoryBytes: items.reduce((sum, vm) => sum + vm.memoryBytes, 0),
+    runningMemoryBytes: runningItems.reduce((sum, vm) => sum + vm.memoryBytes, 0),
     diskBytes: items.reduce((sum, vm) => sum + Math.max(vm.diskVirtualBytes ?? 0, 0), 0),
   };
 }
@@ -1016,6 +1424,7 @@ function buildProvisionRequestData(
     hostId: input.hostId,
     environmentTemplateId: input.environmentTemplateId,
     sourceType: input.sourceType,
+    installStrategy: input.installStrategy,
     isoId: input.isoId,
     isoName: input.isoName,
     templateName: input.templateName,
@@ -1038,6 +1447,12 @@ async function runProvisionPreflight(
   request: VmProvisionRequest,
   raw: ProvisionPreflightInput,
 ): Promise<ProvisionPreflightCheck[]> {
+  const startedAt = Date.now();
+  const timingContext = {
+    providerType,
+    hostId: request.hostId,
+    vmCount: request.planItems.length,
+  };
   const checks: ProvisionPreflightCheck[] = [];
   const validationErrors = validateProvisionPlan(providerType, request, raw);
   checks.push({
@@ -1050,6 +1465,7 @@ async function runProvisionPreflight(
   const inventory = hasHostInventory(provider) ? await provider.collectHostInventory(connection).catch(() => undefined) : undefined;
   const hosts = inventory?.hosts ?? (await provider.listHosts(connection, { hostId: request.hostId }).catch(() => []));
   const targetHost = request.hostId ? hosts.find((host) => host.providerId === request.hostId || host.id === request.hostId) : hosts[0];
+  server.log.info({ ...timingContext, phase: "preflight-host-inventory", elapsedMs: Date.now() - startedAt }, "provision preflight timing");
   checks.push({
     key: "host",
     label: "物理机",
@@ -1064,16 +1480,114 @@ async function runProvisionPreflight(
         }
       : undefined,
   });
+  const currentVmsPromise = measureProvisionPreflightCheck(timingContext, "vm-list", () =>
+    provider.listVms(connection, { hostId: request.hostId, page: 1, pageSize: 1000 }),
+  );
+  const isoChecksPromise = measureProvisionPreflightCheck(timingContext, "iso", () => runProvisionIsoPreflight(provider, connection, providerType, request));
+  const currentVms = await currentVmsPromise;
+  checks.push(
+    await measureProvisionPreflightCheck(timingContext, "resource", () =>
+      runProvisionResourcePreflight(request, targetHost, inventory?.storage ?? [], currentVms.items),
+    ),
+  );
 
-  const isoChecks = await runProvisionIsoPreflight(provider, connection, providerType, request);
+  const isoChecks = await isoChecksPromise;
   checks.push(...isoChecks);
   checks.push(runInstallSourcePreflight(request));
-  checks.push(await runProvisionVmConflictPreflight(provider, connection, request));
-  checks.push(await runProvisionIpConflictPreflight(provider, connection, request));
+  checks.push(await measureProvisionPreflightCheck(timingContext, "vm-name", async () => runProvisionVmConflictPreflight(request, currentVms.items)));
+  checks.push(await measureProvisionPreflightCheck(timingContext, "ip-conflict", async () => runProvisionIpConflictPreflight(request, currentVms.items)));
   checks.push(runProvisionIpLeasePreflight(request));
-  checks.push(await runProvisionIpReachabilityPreflight(request));
+  checks.push(await measureProvisionPreflightCheck(timingContext, "ip-ping", () => runProvisionIpReachabilityPreflight(request)));
+  server.log.info({ ...timingContext, phase: "preflight-total", elapsedMs: Date.now() - startedAt }, "provision preflight timing");
 
   return checks;
+}
+
+async function measureProvisionPreflightCheck<T>(
+  context: Record<string, unknown>,
+  phase: string,
+  worker: () => Promise<T>,
+): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    const result = await worker();
+    server.log.info({ ...context, phase: `preflight-${phase}`, elapsedMs: Date.now() - startedAt }, "provision preflight timing");
+    return result;
+  } catch (error) {
+    server.log.warn({ ...context, phase: `preflight-${phase}`, elapsedMs: Date.now() - startedAt, error }, "provision preflight failed");
+    throw error;
+  }
+}
+
+function runProvisionResourcePreflight(
+  request: VmProvisionRequest,
+  targetHost: HostNode | undefined,
+  storage: StorageRepository[],
+  currentVms: VmNode[],
+): Promise<ProvisionPreflightCheck> {
+  if (!targetHost) {
+    return Promise.resolve({
+      key: "resource",
+      label: "资源容量",
+      status: "warning",
+      message: "未读取到目标物理机，无法校验内存和存储余量",
+    });
+  }
+
+  const plannedCpu = request.planItems.reduce((sum, item) => sum + Math.max(Math.floor(item.cpu), 1), 0);
+  const plannedMemoryBytes = request.planItems.reduce((sum, item) => sum + Math.max(Math.floor(item.memoryGiB), 1), 0) * 1024 ** 3;
+  const plannedDiskGiB = request.planItems.reduce((sum, item) => sum + Math.max(Math.floor(item.diskGiB), 1), 0);
+  const runningVcpu = currentVms
+    .filter((vm) => vm.powerState === "running")
+    .reduce((sum, vm) => sum + Math.max(vm.cpuCount || 0, 0), 0);
+  const memoryFreeBytes = Math.max(targetHost.memoryFreeBytes ?? 0, 0);
+  const targetStorage = storage.filter((item) => !item.hostId || item.hostId === targetHost.providerId || item.hostId === targetHost.id);
+  const vmStorage = request.providerType === "proxmox"
+    ? targetStorage.filter((item) => !item.content?.length || item.content.includes("images") || item.content.includes("rootdir"))
+    : targetStorage;
+  const storagePhysicalGiB = vmStorage.reduce((sum, item) => sum + positiveNumber(item.physicalGiB), 0);
+  const storageUsedGiB = vmStorage.reduce((sum, item) => sum + positiveNumber(item.usedGiB), 0);
+  const storageFreeGiB = Math.max(storagePhysicalGiB - storageUsedGiB, 0);
+  const storageFreeByRepository = vmStorage.map((item) => ({
+    name: item.name,
+    freeGiB: Math.max(positiveNumber(item.physicalGiB) - positiveNumber(item.usedGiB), 0),
+  }));
+  const largestStorageFreeGiB = storageFreeByRepository.reduce((max, item) => Math.max(max, item.freeGiB), 0);
+
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  if (memoryFreeBytes < plannedMemoryBytes) {
+    errors.push(`内存余量不足：剩余 ${formatBytes(memoryFreeBytes)}，计划新增 ${formatBytes(plannedMemoryBytes)}`);
+  }
+  if (request.providerType === "proxmox" && storagePhysicalGiB > 0 && largestStorageFreeGiB < plannedDiskGiB) {
+    const capacity = storageFreeByRepository
+      .sort((left, right) => right.freeGiB - left.freeGiB)
+      .map((item) => `${item.name} ${formatNumber(item.freeGiB)} GiB`)
+      .join("、");
+    errors.push(`没有单个 PVE 存储可容纳计划磁盘 ${formatNumber(plannedDiskGiB)} GiB；当前余量：${capacity}`);
+  } else if (storagePhysicalGiB > 0 && storageFreeGiB < plannedDiskGiB) {
+    errors.push(`存储余量不足：剩余 ${formatNumber(storageFreeGiB)} GiB，计划新增 ${formatNumber(plannedDiskGiB)} GiB`);
+  } else if (storagePhysicalGiB <= 0) {
+    warnings.push("未读取到存储容量，无法校验硬盘余量");
+  }
+
+  return Promise.resolve({
+    key: "resource",
+    label: "资源容量",
+    status: errors.length ? "error" : warnings.length ? "warning" : "success",
+    message: errors.length ? errors.join("；") : warnings.length ? warnings.join("；") : "内存和存储容量检查通过",
+    details: {
+      cpuCores: Math.max(targetHost.cpuCores || 0, 0),
+      runningVcpu,
+      plannedCpu,
+      memoryFreeBytes,
+      plannedMemoryBytes,
+      storageFreeGiB,
+      largestStorageFreeGiB,
+      storageFreeByRepository,
+      plannedDiskGiB,
+    },
+  });
 }
 
 function runInstallSourcePreflight(request: VmProvisionRequest): ProvisionPreflightCheck {
@@ -1085,65 +1599,11 @@ function runInstallSourcePreflight(request: VmProvisionRequest): ProvisionPrefli
       message: "当前策略不需要集中安装源",
     };
   }
-  try {
-    const baseUrl = resolveInstallSourcePublicBaseUrl();
-    const networkCheck = assessInstallSourceNetwork(baseUrl, request);
-    if (networkCheck) {
-      return networkCheck;
-    }
-    return {
-      key: "install-source",
-      label: "安装源",
-      status: "success",
-      message: `集中安装源地址格式可用：${baseUrl}`,
-    };
-  } catch (error) {
-    return {
-      key: "install-source",
-      label: "安装源",
-      status: "error",
-      message: toClientErrorMessage(error, "集中安装源地址不可用"),
-    };
-  }
-}
-
-function assessInstallSourceNetwork(baseUrl: string, request: VmProvisionRequest): ProvisionPreflightCheck | undefined {
-  const url = new URL(baseUrl);
-  const installHost = url.hostname;
-  if (!isIpv4(installHost)) {
-    return {
-      key: "install-source-network",
-      label: "安装源网络",
-      status: "warning",
-      message: `安装源使用域名 ${installHost}，请确认新 VM 安装阶段能解析并访问该地址。`,
-      details: { baseUrl, host: installHost },
-    };
-  }
-
-  const vmIps = request.planItems.map((item) => item.ip).filter(isIpv4);
-  const vmCidr = request.ipPool.cidr;
-  const installHostInVmCidr = cidrContainsIp(vmCidr, installHost);
-  const installHostSameSubnet = vmIps.some((ip) => sameIpv4Subnet(ip, installHost, 24));
-  if (installHostInVmCidr || installHostSameSubnet) {
-    return undefined;
-  }
-
-  const crossSubnetAllowed = process.env.VRC_ALLOW_CROSS_SUBNET_INSTALL_SOURCE === "true";
-  const status: ProvisionPreflightCheck["status"] = crossSubnetAllowed ? "warning" : "error";
   return {
-    key: "install-source-network",
-    label: "安装源网络",
-    status,
-    message: crossSubnetAllowed
-      ? `安装源 ${baseUrl} 不在 VM IP 池 ${vmCidr || vmIps.join(", ")} 内，已按配置允许跨网段；请确认路由、防火墙和网关可达。`
-      : `安装源 ${baseUrl} 不在 VM IP 池 ${vmCidr || vmIps.join(", ")} 内。新 VM 安装阶段大概率无法拉取 Kickstart；请把 VRC 安装源部署到 VM 可访问网段，或配置离线自包含 ISO 策略。`,
-    details: {
-      baseUrl,
-      installHost,
-      vmCidr,
-      vmIps,
-      allowOverride: "VRC_ALLOW_CROSS_SUBNET_INSTALL_SOURCE=true",
-    },
+    key: "install-source",
+    label: "安装源",
+    status: "success",
+    message: "统一由目标 XenServer 物理机发布任务级安装源",
   };
 }
 
@@ -1193,44 +1653,34 @@ async function runProvisionIsoPreflight(
   ];
 }
 
-async function runProvisionVmConflictPreflight(
-  provider: VirtualizationProvider<XenConnectionInput>,
-  connection: XenConnectionInput,
+function runProvisionVmConflictPreflight(
   request: VmProvisionRequest,
+  currentVms: VmNode[],
 ): Promise<ProvisionPreflightCheck> {
   const names = new Set(request.planItems.map((item) => item.name.trim()).filter(Boolean));
-  const conflicts: string[] = [];
-  for (const name of names) {
-    const result = await provider.listVms(connection, { hostId: request.hostId, page: 1, pageSize: 20, keyword: name }).catch(() => undefined);
-    const matched = result?.items.find((vm) => vm.name === name);
-    if (matched) conflicts.push(`${matched.name} (${matched.powerState})`);
-  }
-  return {
+  const conflicts = currentVms.filter((vm) => names.has(vm.name)).map((vm) => `${vm.name} (${vm.powerState})`);
+  return Promise.resolve({
     key: "vm-name",
     label: "VM 名称",
     status: conflicts.length ? "error" : "success",
     message: conflicts.length ? `发现同名 VM：${conflicts.join("、")}` : "未发现同名 VM",
-  };
+  });
 }
 
-async function runProvisionIpConflictPreflight(
-  provider: VirtualizationProvider<XenConnectionInput>,
-  connection: XenConnectionInput,
+function runProvisionIpConflictPreflight(
   request: VmProvisionRequest,
+  currentVms: VmNode[],
 ): Promise<ProvisionPreflightCheck> {
   const ips = new Set(request.planItems.map((item) => item.ip.trim()).filter(isIpv4));
-  const conflicts: string[] = [];
-  for (const ip of ips) {
-    const result = await provider.listVms(connection, { hostId: request.hostId, page: 1, pageSize: 50, keyword: ip }).catch(() => undefined);
-    const matched = result?.items.find((vm) => vm.ipAddresses.includes(ip));
-    if (matched) conflicts.push(`${ip}：${matched.name} (${matched.powerState})`);
-  }
-  return {
+  const conflicts = currentVms.flatMap((vm) =>
+    vm.ipAddresses.filter((ip) => ips.has(ip)).map((ip) => `${ip}：${vm.name} (${vm.powerState})`),
+  );
+  return Promise.resolve({
     key: "ip",
     label: "IP 占用",
     status: conflicts.length ? "error" : "success",
     message: conflicts.length ? `发现已占用 IP：${conflicts.join("、")}` : "目标平台清单内未发现 IP 占用",
-  };
+  });
 }
 
 function runProvisionIpLeasePreflight(request: VmProvisionRequest): ProvisionPreflightCheck {
@@ -1337,6 +1787,28 @@ function isIpv4(value: string | undefined) {
   if (!value) return false;
   const parts = value.split(".");
   return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+}
+
+function positiveNumber(value: number | undefined): number {
+  return Number.isFinite(value) && value !== undefined && value > 0 ? value : 0;
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(value);
+}
+
+function formatBytes(value: number): string {
+  const gib = value / 1024 ** 3;
+  if (gib >= 1) return `${formatNumber(gib)} GiB`;
+  const mib = value / 1024 ** 2;
+  return `${formatNumber(mib)} MiB`;
+}
+
+function parseLastEventId(value: string | string[] | undefined): number | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function ipv4ToNumber(ip: string): number {

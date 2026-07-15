@@ -18,6 +18,9 @@ import type {
   VmQuery,
   VmSnapshot,
   XenConnectionInput,
+  ProvisionTaskStepKey,
+  ProvisionTaskStepStatus,
+  ProvisionTaskVm,
 } from "../types.js";
 
 export interface ConnectionTestResult {
@@ -25,6 +28,12 @@ export interface ConnectionTestResult {
   providerType: ProviderType;
   hostName: string;
   message?: string;
+}
+
+export interface ProvisionProgressReporter {
+  markStep(stepKey: ProvisionTaskStepKey, status: ProvisionTaskStepStatus, message?: string): void;
+  updateVm(vmName: string, patch: Partial<ProvisionTaskVm>, message?: string): void;
+  recordTiming?(phase: string, elapsedMs: number, details?: Record<string, unknown>): void;
 }
 
 export interface VirtualizationProvider<C> {
@@ -40,7 +49,7 @@ export interface VirtualizationProvider<C> {
   listIsoImages?(connection: C, scope?: ProviderScope): Promise<IsoImage[]>;
   listVmSnapshots(connection: C, vmId: string): Promise<VmSnapshot[]>;
   performVmAction?(connection: C, vmId: string, action: VmPowerAction): Promise<VmActionResult>;
-  createVms?(connection: C, request: VmProvisionRequest): Promise<VmProvisionResult>;
+  createVms?(connection: C, request: VmProvisionRequest, reporter?: ProvisionProgressReporter): Promise<VmProvisionResult>;
   collectMetrics(connection: C, query: MetricQuery): Promise<MetricSample[]>;
 }
 

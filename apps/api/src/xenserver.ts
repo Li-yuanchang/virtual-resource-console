@@ -1,6 +1,6 @@
 import { Client } from "ssh2";
 import { assessVmReclaim } from "./analysis/reclaimStateMachine.js";
-import type { VirtualizationProvider } from "./providers/provider.js";
+import type { ProvisionProgressReporter, VirtualizationProvider } from "./providers/provider.js";
 import { buildXenServerPolicyEnv } from "./runtimePolicy.js";
 import type {
   HostNode,
@@ -29,7 +29,7 @@ import type {
   XenConnectionInput,
   XenOverview,
 } from "./types.js";
-import { prepareXenCentosUnattendedIso, resolveXenInstallMediaMode } from "./xenserverUnattendedIso.js";
+import { cleanupRegisteredXenGeneratedIso, prepareXenCentosUnattendedIso, resolveXenInstallMediaMode } from "./xenserverUnattendedIso.js";
 
 const HOST_INVENTORY_SCRIPT = String.raw`
 bytes_to_gib() {
@@ -124,6 +124,8 @@ running="0"
 halted="0"
 vcpu_total="0"
 memory_gib_total="0"
+running_vcpu_total="0"
+running_memory_gib_total="0"
 vm_list="$(xe vm-list is-control-domain=false --minimal 2>/dev/null | tr ',' ' ')"
 for vm in $vm_list; do
   resident="$(xe vm-param-get uuid="$vm" param-name=resident-on 2>/dev/null | clean_one_line)"
@@ -158,13 +160,15 @@ for vm in $vm_list; do
   total=$((total+1))
   if [ "$power" = "running" ]; then
     running=$((running+1))
+    running_vcpu_total="$(awk -v a="$running_vcpu_total" -v b="$(num_or_zero "$vcpu_count")" 'BEGIN { printf "%.0f", a + b }')"
+    running_memory_gib_total="$(awk -v a="$running_memory_gib_total" -v b="$mem_gib" 'BEGIN { printf "%.1f", a + b }')"
   elif [ "$power" = "halted" ]; then
     halted=$((halted+1))
   fi
   vcpu_total="$(awk -v a="$vcpu_total" -v b="$(num_or_zero "$vcpu_count")" 'BEGIN { printf "%.0f", a + b }')"
   memory_gib_total="$(awk -v a="$memory_gib_total" -v b="$mem_gib" 'BEGIN { printf "%.1f", a + b }')"
 done
-printf 'SUMMARY\t%s\t%s\t%s\t%s\t%s\n' "$total" "$running" "$halted" "$vcpu_total" "$memory_gib_total"
+printf 'SUMMARY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$total" "$running" "$halted" "$vcpu_total" "$memory_gib_total" "$running_vcpu_total" "$running_memory_gib_total"
 `;
 
 const VM_LIST_SCRIPT = String.raw`
@@ -457,6 +461,22 @@ printf 'OK\t%s\t%s\t%s\t%s\n' "$VRC_VM_ACTION" "$VRC_VM_UUID" "$name" "$forced"
 `;
 
 const VM_CREATE_SCRIPT = String.raw`
+vrc_now_ms() {
+  now="$(date +%s%3N 2>/dev/null || date +%s000)"
+  case "$now" in
+    *N*) date +%s000 ;;
+    *) printf "%s" "$now" ;;
+  esac
+}
+vrc_timing_start() {
+  VRC_TIMING_STEP="$1"
+  VRC_TIMING_STARTED="$(vrc_now_ms)"
+}
+vrc_timing_end() {
+  ended="$(vrc_now_ms)"
+  elapsed="$(awk -v s="$VRC_TIMING_STARTED" -v e="$ended" 'BEGIN { printf "%.0f", e - s }')"
+  printf 'TIMING\t%s\t%s\n' "$VRC_TIMING_STEP" "$elapsed"
+}
 clean_one_line() {
   tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
 }
@@ -471,6 +491,52 @@ require_value() {
 }
 is_number() {
   echo "$1" | awk '{ exit !($1 ~ /^[0-9]+$/ && $1 > 0) }'
+}
+is_pif_usable() {
+  pif_uuid="$1"
+  pif_device="$(xe pif-param-get uuid="$pif_uuid" param-name=device 2>/dev/null | clean_one_line)"
+  pif_attached="$(xe pif-param-get uuid="$pif_uuid" param-name=currently-attached 2>/dev/null | clean_one_line)"
+  if [ "$pif_attached" != "true" ]; then
+    return 1
+  fi
+  if [ -n "$pif_device" ] && [ -r "/sys/class/net/$pif_device/carrier" ]; then
+    carrier="$(cat "/sys/class/net/$pif_device/carrier" 2>/dev/null || true)"
+    if [ "$carrier" != "1" ]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+is_network_usable_on_host() {
+  network_uuid="$1"
+  if [ -z "$network_uuid" ] || [ "$network_uuid" = "<not in database>" ]; then
+    return 1
+  fi
+  if [ -z "$VRC_HOST_UUID" ]; then
+    return 0
+  fi
+  for pif_uuid in $(xe pif-list host-uuid="$VRC_HOST_UUID" network-uuid="$network_uuid" --minimal 2>/dev/null | tr ',' ' '); do
+    if is_pif_usable "$pif_uuid"; then
+      return 0
+    fi
+  done
+  return 1
+}
+is_network_attached_on_host() {
+  network_uuid="$1"
+  if [ -z "$network_uuid" ] || [ "$network_uuid" = "<not in database>" ]; then
+    return 1
+  fi
+  if [ -z "$VRC_HOST_UUID" ]; then
+    return 0
+  fi
+  for pif_uuid in $(xe pif-list host-uuid="$VRC_HOST_UUID" network-uuid="$network_uuid" --minimal 2>/dev/null | tr ',' ' '); do
+    pif_attached="$(xe pif-param-get uuid="$pif_uuid" param-name=currently-attached 2>/dev/null | clean_one_line)"
+    if [ "$pif_attached" = "true" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 find_template() {
   if [ -n "$VRC_TEMPLATE_NAME" ]; then
@@ -516,10 +582,36 @@ find_sr() {
 find_network() {
   if [ -n "$VRC_NETWORK_NAME" ]; then
     network="$(xe network-list name-label="$VRC_NETWORK_NAME" --minimal 2>/dev/null | first_uuid)"
-    if [ -n "$network" ]; then
+    if [ -n "$network" ] && is_network_attached_on_host "$network"; then
       printf "%s" "$network"
       return
     fi
+    echo "指定网络不可用或未挂载到目标物理机：$VRC_NETWORK_NAME" >&2
+    exit 3
+  fi
+  ip_prefix="$(printf "%s" "$VRC_IP" | awk -F. 'NF == 4 { printf "%s.%s.%s.", $1, $2, $3 }')"
+  if [ -n "$ip_prefix" ] && [ -n "$VRC_HOST_UUID" ]; then
+    for peer_vm in $(xe vm-list is-control-domain=false --minimal 2>/dev/null | tr ',' ' '); do
+      if [ "$peer_vm" = "$vm_uuid" ]; then
+        continue
+      fi
+      resident_host="$(xe vm-param-get uuid="$peer_vm" param-name=resident-on 2>/dev/null | clean_one_line)"
+      if [ "$resident_host" != "$VRC_HOST_UUID" ]; then
+        continue
+      fi
+      peer_networks="$(xe vm-param-get uuid="$peer_vm" param-name=networks 2>/dev/null | clean_one_line)"
+      case "$peer_networks" in
+        *"$ip_prefix"*)
+          for peer_vif in $(xe vif-list vm-uuid="$peer_vm" currently-attached=true --minimal 2>/dev/null | tr ',' ' '); do
+            peer_network="$(xe vif-param-get uuid="$peer_vif" param-name=network-uuid 2>/dev/null | clean_one_line)"
+            if is_network_usable_on_host "$peer_network"; then
+              printf "%s" "$peer_network"
+              return
+            fi
+          done
+          ;;
+      esac
+    done
   fi
   while IFS='|' read -r prefix device; do
     if [ -z "$prefix" ] || [ -z "$device" ]; then
@@ -527,8 +619,15 @@ find_network() {
     fi
     case "$VRC_IP" in
       "$prefix"*)
-        pif="$(xe pif-list device="$device" --minimal 2>/dev/null | first_uuid)"
+        if [ -n "$VRC_HOST_UUID" ]; then
+          pif="$(xe pif-list host-uuid="$VRC_HOST_UUID" device="$device" --minimal 2>/dev/null | first_uuid)"
+        else
+          pif="$(xe pif-list device="$device" --minimal 2>/dev/null | first_uuid)"
+        fi
         if [ -n "$pif" ]; then
+          if ! is_pif_usable "$pif"; then
+            continue
+          fi
           network="$(xe pif-param-get uuid="$pif" param-name=network-uuid 2>/dev/null | clean_one_line)"
           if [ -n "$network" ] && [ "$network" != "<not in database>" ]; then
             printf "%s" "$network"
@@ -636,17 +735,24 @@ prepare_unattended_install() {
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
     return
   fi
-  require_value "安装源 URL" "$VRC_INSTALL_REPO_URL"
-  require_value "Kickstart URL" "$VRC_INSTALL_KS_URL"
-
   # Provider 只消费 VRC 集中安装源 URL，不在 Dom0 生成 ks.cfg 或启动临时 HTTP 服务。
-  xe vm-param-set uuid="$vm_uuid" other-config:install-repository="$VRC_INSTALL_REPO_URL" >/dev/null 2>&1 || true
-  xe vm-param-add uuid="$vm_uuid" param-name=other-config install-repository="$VRC_INSTALL_REPO_URL" >/dev/null 2>&1 || true
   ifname_arg=""
   if [ -n "$VRC_MAC" ]; then
     ifname_arg="ifname=eth0:$VRC_MAC"
   fi
-  xe vm-param-set uuid="$vm_uuid" PV-args="inst.stage2=$VRC_INSTALL_REPO_URL inst.ks=$VRC_INSTALL_KS_URL rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
+  if [ "$VRC_INSTALL_MEDIA_MODE" = "cdrom-http-ks" ]; then
+    require_value "Kickstart URL" "$VRC_INSTALL_KS_URL"
+    xe vm-param-set uuid="$vm_uuid" PV-args="inst.stage2=cdrom inst.ks=$VRC_INSTALL_KS_URL rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=cdrom-http-ks >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-ks-url="$VRC_INSTALL_KS_URL" >/dev/null 2>&1 || true
+    return
+  fi
+  require_value "Kickstart URL" "$VRC_INSTALL_KS_URL"
+  require_value "安装源 URL" "$VRC_INSTALL_REPO_URL"
+  xe vm-param-set uuid="$vm_uuid" other-config:install-repository="$VRC_INSTALL_REPO_URL" >/dev/null 2>&1 || true
+  xe vm-param-add uuid="$vm_uuid" param-name=other-config install-repository="$VRC_INSTALL_REPO_URL" >/dev/null 2>&1 || true
+  xe vm-param-set uuid="$vm_uuid" PV-args="inst.repo=$VRC_INSTALL_REPO_URL inst.ks=$VRC_INSTALL_KS_URL rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
   xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=kickstart >/dev/null 2>&1 || true
   xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
   xe vm-param-set uuid="$vm_uuid" other-config:vrc-ks-url="$VRC_INSTALL_KS_URL" >/dev/null 2>&1 || true
@@ -665,35 +771,52 @@ if xe vm-list name-label="$VRC_VM_NAME" --minimal 2>/dev/null | grep -q .; then
   echo "虚拟机名称已存在：$VRC_VM_NAME" >&2
   exit 3
 fi
+vrc_timing_start "find-sr"
 sr_uuid="$(find_sr)"
+vrc_timing_end
 if [ -z "$sr_uuid" ]; then
   echo "未找到可写入虚拟磁盘的 SR" >&2
   exit 3
 fi
+vrc_timing_start "find-network"
 network_uuid="$(find_network)"
+vrc_timing_end
 require_value "ISO UUID" "$VRC_ISO_UUID"
+vrc_timing_start "verify-iso"
 if ! xe vdi-param-get uuid="$VRC_ISO_UUID" param-name=name-label >/dev/null 2>&1; then
   echo "未找到 ISO：$VRC_ISO_UUID" >&2
   exit 3
 fi
+vrc_timing_end
+vrc_timing_start "find-template"
 template_name="$(find_template)"
+vrc_timing_end
 if [ -z "$template_name" ]; then
   echo "未找到可用于 ISO 安装的系统类型：CentOS 7 (64-bit) / Other install media" >&2
   exit 3
 fi
+vrc_timing_start "vm-install"
 vm_uuid="$(xe vm-install template="$template_name" new-name-label="$VRC_VM_NAME" sr-uuid="$sr_uuid")"
+vrc_timing_end
 if [ -z "$vm_uuid" ]; then
   echo "创建 VM 失败：$VRC_VM_NAME" >&2
   exit 4
 fi
+vrc_timing_start "configure-vm"
 if [ -n "$VRC_HOST_UUID" ]; then
   xe vm-param-set uuid="$vm_uuid" affinity="$VRC_HOST_UUID" >/dev/null
 fi
 xe vm-param-set uuid="$vm_uuid" VCPUs-max="$VRC_CPU" >/dev/null
 xe vm-param-set uuid="$vm_uuid" VCPUs-at-startup="$VRC_CPU" >/dev/null
 xe vm-memory-limits-set uuid="$vm_uuid" static-min=134217728 dynamic-min="$VRC_MEMORY_BYTES" dynamic-max="$VRC_MEMORY_BYTES" static-max="$VRC_MEMORY_BYTES" >/dev/null
+vrc_timing_end
+vrc_timing_start "ensure-disk"
 ensure_disk "$vm_uuid" "$sr_uuid" "$VRC_DISK_BYTES"
+vrc_timing_end
+vrc_timing_start "ensure-network"
 ensure_network "$vm_uuid" "$network_uuid"
+vrc_timing_end
+vrc_timing_start "boot-params"
 xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
 prepare_unattended_install "$vm_uuid" "$template_name"
 if should_use_unattended_install "$template_name"; then
@@ -703,9 +826,18 @@ else
   attach_iso "$vm_uuid" "$VRC_ISO_UUID"
   xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc >/dev/null 2>&1 || true
 fi
+vrc_timing_end
 power="halted"
 if [ "$VRC_AUTO_START" = "true" ]; then
+  vrc_timing_start "vm-start"
   xe vm-start uuid="$vm_uuid" >/dev/null
+  if should_use_unattended_install "$template_name"; then
+    (
+      sleep 180
+      xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=c >/dev/null 2>&1 || true
+    ) >/dev/null 2>&1 &
+  fi
+  vrc_timing_end
   power="running"
 fi
 printf 'CREATED\t%s\t%s\t%s\t%s\t%s\n' "$vm_uuid" "$VRC_VM_NAME" "$power" "$VRC_IP" "$VRC_MAC"
@@ -810,6 +942,9 @@ fi
 `;
 
 const METRICS_SCRIPT = String.raw`
+is_number() {
+  echo "$1" | awk '{ exit !($1 ~ /^-?[0-9]+(\.[0-9]+)?$/) }'
+}
 sum_metric_family() {
   vm="$1"
   pattern="$2"
@@ -836,18 +971,18 @@ fi
 for vm in $vm_list; do
   power="$(xe vm-param-get uuid="$vm" param-name=power-state 2>/dev/null || true)"
   if [ "$power" != "running" ]; then
-    printf 'METRIC\t%s\t\t\t\t\t\n' "$vm"
+    printf 'METRIC\t%s\t\t\t\t\t\t\t\t\t\n' "$vm"
     continue
   fi
   vcpu_max="$(xe vm-param-get uuid="$vm" param-name=VCPUs-max 2>/dev/null || true)"
   vcpu_start="$(xe vm-param-get uuid="$vm" param-name=VCPUs-at-startup 2>/dev/null || true)"
   vcpu_live="$(xe vm-param-get uuid="$vm" param-name=VCPUs-number 2>/dev/null || true)"
-  cpu_divisor="$vcpu_max"
+  cpu_divisor="$vcpu_live"
   if [ -z "$cpu_divisor" ] || [ "$cpu_divisor" = "0" ] || [ "$cpu_divisor" = "<not in database>" ]; then
     cpu_divisor="$vcpu_start"
   fi
   if [ -z "$cpu_divisor" ] || [ "$cpu_divisor" = "0" ] || [ "$cpu_divisor" = "<not in database>" ]; then
-    cpu_divisor="$vcpu_live"
+    cpu_divisor="$vcpu_max"
   fi
   if [ -z "$cpu_divisor" ] || [ "$cpu_divisor" = "0" ] || [ "$cpu_divisor" = "<not in database>" ]; then
     cpu_divisor="$(xe vm-data-source-list uuid="$vm" 2>/dev/null | awk -F: '/name_label/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | grep -E '^cpu[0-9]+$' | wc -l | awk '{print $1}')"
@@ -857,11 +992,36 @@ for vm in $vm_list; do
   if [ -n "$cpu_total" ] && [ -n "$cpu_divisor" ] && [ "$cpu_divisor" != "0" ]; then
     cpu_usage="$(awk -v a="$cpu_total" -v c="$cpu_divisor" 'BEGIN { printf "%.6f", a / c }')"
   fi
+  memory_total="$(xe vm-param-get uuid="$vm" param-name=memory-actual 2>/dev/null || true)"
+  memory_free_kib="$(sum_metric_family "$vm" '^memory_internal_free$')"
+  memory_used=""
+  if is_number "$memory_total" && is_number "$memory_free_kib" && awk -v total="$memory_total" -v free="$memory_free_kib" 'BEGIN { exit !(total>0 && free>=0) }'; then
+    memory_used="$(awk -v total="$memory_total" -v free="$memory_free_kib" 'BEGIN { used=total-(free*1024); if (used<0) used=0; if (used>total) used=total; printf "%.0f", used }')"
+  else
+    memory_total=""
+  fi
+  disk_total="0"
+  disk_count="0"
+  for vbd in $(xe vbd-list vm-uuid="$vm" type=Disk --minimal 2>/dev/null | tr ',' ' '); do
+    vdi="$(xe vbd-param-get uuid="$vbd" param-name=vdi-uuid 2>/dev/null | tr -d '\r\n')"
+    [ -z "$vdi" ] && continue
+    virtual_size="$(xe vdi-param-get uuid="$vdi" param-name=virtual-size 2>/dev/null | tr -d '\r\n')"
+    if is_number "$virtual_size"; then
+      disk_total="$(awk -v a="$disk_total" -v b="$virtual_size" 'BEGIN { printf "%.0f", a + b }')"
+      disk_count=$((disk_count+1))
+    fi
+  done
+  if [ "$disk_count" = "0" ]; then
+    disk_total=""
+  fi
+  # XenAPI exposes VDI allocation, not guest filesystem usage. Keep disk_used empty
+  # so the UI shows configured capacity without a misleading utilisation wave.
+  disk_used=""
   disk_read="$(sum_metric_family "$vm" '^vbd_.*_read$')"
   disk_write="$(sum_metric_family "$vm" '^vbd_.*_write$')"
   net_rx="$(sum_metric_family "$vm" '^vif_.*_rx$')"
   net_tx="$(sum_metric_family "$vm" '^vif_.*_tx$')"
-  printf 'METRIC\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vm" "$cpu_usage" "$disk_read" "$disk_write" "$net_rx" "$net_tx"
+  printf 'METRIC\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vm" "$cpu_usage" "$memory_used" "$memory_total" "$disk_used" "$disk_total" "$disk_read" "$disk_write" "$net_rx" "$net_tx"
 done
 `;
 
@@ -872,7 +1032,22 @@ clean_one_line() {
 if [ -z "$VRC_VM_UUID" ]; then
   exit 0
 fi
-xe console-list vm-uuid="$VRC_VM_UUID" params=location --minimal 2>/dev/null | tr ',' '\n' | head -1 | clean_one_line
+wait_seconds="$VRC_CONSOLE_WAIT_SECONDS"
+if [ -z "$wait_seconds" ]; then
+  wait_seconds="30"
+fi
+deadline=$(( $(date +%s) + wait_seconds ))
+while true; do
+  location="$(xe console-list vm-uuid="$VRC_VM_UUID" params=location --minimal 2>/dev/null | tr ',' '\n' | head -1 | clean_one_line)"
+  if [ -n "$location" ]; then
+    printf "%s" "$location"
+    exit 0
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    exit 0
+  fi
+  sleep 2
+done
 `;
 
 interface HostInventory {
@@ -1004,11 +1179,11 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
           ? `关机完成：${name}`
           : action === "start" && forced === "true"
             ? `开机完成：${name}`
-            : `${xenActionLabel(action)}已提交：${name}`,
+            : `${xenActionLabel(action)}完成：${name}`,
     };
   }
 
-  async createVms(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
+  async createVms(input: XenConnectionInput, request: VmProvisionRequest, reporter?: ProvisionProgressReporter): Promise<VmProvisionResult> {
     if (request.sourceType === "template") {
       throw new Error("XenServer 当前不使用克隆源策略；请选择 VRC 创建模板中的 ISO/Kickstart 策略。");
     }
@@ -1021,12 +1196,18 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     const installMediaMode = resolveXenInstallMediaMode();
     for (const item of request.planItems) {
       const macAddress = macAddressForProvisionItem(item);
+      reporter?.updateVm(item.name, {
+        status: "running",
+        currentStep: "create-vm",
+        message: "准备 XenServer VM 创建参数",
+      });
       // XenServer Provider 属于平台策略层；无人值守安装源必须由 Provisioning 编排层提前发布。
       if (shouldUseUnattendedIso && installMediaMode === "http-boot-iso" && !item.installSource) {
         throw new Error("XenServer Kickstart 安装缺少集中安装源，请先发布安装源后再创建 VM。");
       }
+      const isoStartedAt = Date.now();
       const provisionIso =
-        request.sourceType === "iso" && shouldUseUnattendedIso && request.isoId
+        request.sourceType === "iso" && shouldUseUnattendedIso && request.isoId && installMediaMode !== "cdrom-http-ks"
           ? await prepareXenCentosUnattendedIso({
               connection: input,
               sourceIsoId: request.isoId,
@@ -1036,34 +1217,91 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
               ipPool: request.ipPool,
               macAddress,
               installSource: item.installSource,
+              onProgress: (message) => {
+                reporter?.markStep("create-vm", "running", `${item.name}：${message}`);
+                reporter?.updateVm(item.name, {
+                  status: "running",
+                  currentStep: "create-vm",
+                  message,
+                });
+              },
             })
           : { isoId: request.isoId ?? "", isoName };
-      const output = await runRemoteScript(input, VM_CREATE_SCRIPT, {
-        env: {
-          VRC_SOURCE_TYPE: request.sourceType,
-          VRC_VM_NAME: item.name,
-          VRC_IP: item.ip,
-          VRC_GATEWAY: sanitizePlainText(request.ipPool.gateway),
-          VRC_DNS: sanitizePlainText(request.ipPool.dns[0] ?? ""),
-          VRC_NETMASK: cidrToNetmask(request.ipPool.cidr) || "255.255.255.0",
-          VRC_ROOT_PASSWORD: sanitizePlainText(item.rootPassword),
-          VRC_LOGIN_USERNAME: sanitizePlainText(item.loginUsername),
-          VRC_HOST_UUID: sanitizeUuid(request.hostId),
-          VRC_ISO_UUID: sanitizeUuid(provisionIso.isoId),
-          VRC_ISO_NAME: sanitizePlainText(provisionIso.isoName),
-          VRC_INSTALL_REPO_URL: sanitizeUrl(item.installSource?.repoUrl),
-          VRC_INSTALL_KS_URL: sanitizeUrl(item.installSource?.ksUrl),
-          VRC_INSTALL_MEDIA_MODE: installMediaMode,
-          VRC_MAC: sanitizeMac(macAddress),
-          VRC_TEMPLATE_NAME: xenTemplateNameForProvision(request),
-          VRC_CPU: String(Math.max(Math.floor(item.cpu), 1)),
-          VRC_MEMORY_BYTES: String(Math.max(Math.floor(item.memoryGiB), 1) * 1024 ** 3),
-          VRC_DISK_BYTES: String(Math.max(Math.floor(item.diskGiB), 1) * 1024 ** 3),
-          VRC_NETWORK_NAME: sanitizePlainText(request.ipPool.networkName),
-          VRC_AUTO_START: request.autoStart ? "true" : "false",
-        },
+      reporter?.recordTiming?.("xenserver-prepare-install-media", Date.now() - isoStartedAt, {
+        vmName: item.name,
+        installMediaMode,
+        generatedIso: provisionIso.isoId !== (request.isoId ?? ""),
       });
+      if (shouldUseUnattendedIso && installMediaMode === "cdrom-http-ks") {
+        reporter?.markStep("create-vm", "running", `${item.name}：复用原始 ISO，通过物理机 HTTP 拉取 Kickstart`);
+        reporter?.updateVm(item.name, {
+          status: "running",
+          currentStep: "create-vm",
+          message: "复用原始 ISO，通过物理机 HTTP 拉取 Kickstart",
+        });
+      }
+      reporter?.updateVm(item.name, {
+        status: "running",
+        currentStep: "create-vm",
+        message: "正在 XenServer 上创建 VM、磁盘、网卡并挂载安装介质",
+      });
+      const createScriptStartedAt = Date.now();
+      let output: string;
+      try {
+        output = await runRemoteScript(input, VM_CREATE_SCRIPT, {
+          env: {
+            VRC_SOURCE_TYPE: request.sourceType,
+            VRC_VM_NAME: item.name,
+            VRC_IP: item.ip,
+            VRC_GATEWAY: sanitizePlainText(request.ipPool.gateway),
+            VRC_DNS: sanitizePlainText(request.ipPool.dns[0] ?? ""),
+            VRC_NETMASK: cidrToNetmask(request.ipPool.cidr) || "255.255.255.0",
+            VRC_ROOT_PASSWORD: sanitizePlainText(item.rootPassword),
+            VRC_LOGIN_USERNAME: sanitizePlainText(item.loginUsername),
+            VRC_HOST_UUID: sanitizeUuid(request.hostId),
+            VRC_ISO_UUID: sanitizeUuid(provisionIso.isoId),
+            VRC_ISO_NAME: sanitizePlainText(provisionIso.isoName),
+            VRC_INSTALL_REPO_URL: sanitizeUrl(item.installSource?.repoUrl),
+            VRC_INSTALL_KS_URL: sanitizeUrl(item.installSource?.ksUrl),
+            VRC_SOURCE_ISO_UUID: "",
+            VRC_INSTALL_MEDIA_MODE: installMediaMode,
+            VRC_MAC: sanitizeMac(macAddress),
+            VRC_TEMPLATE_NAME: xenTemplateNameForProvision(request),
+            VRC_CPU: String(Math.max(Math.floor(item.cpu), 1)),
+            VRC_MEMORY_BYTES: String(Math.max(Math.floor(item.memoryGiB), 1) * 1024 ** 3),
+            VRC_DISK_BYTES: String(Math.max(Math.floor(item.diskGiB), 1) * 1024 ** 3),
+            VRC_NETWORK_NAME: sanitizePlainText(request.ipPool.networkName),
+            VRC_AUTO_START: request.autoStart ? "true" : "false",
+          },
+        });
+      } catch (error) {
+        if (provisionIso.registryId) {
+          await cleanupRegisteredXenGeneratedIso(input, provisionIso.registryId).catch(() => undefined);
+        }
+        throw error;
+      }
+      const createScriptElapsedMs = Date.now() - createScriptStartedAt;
+      reporter?.recordTiming?.("xenserver-create-script-total", createScriptElapsedMs, {
+        vmName: item.name,
+        installMediaMode,
+      });
+      for (const timing of parseProvisionScriptTimings(output)) {
+        reporter?.recordTiming?.(`xenserver-create-script:${timing.phase}`, timing.elapsedMs, {
+          vmName: item.name,
+          installMediaMode,
+        });
+      }
       const createdVm = parseCreatedVm(output, item);
+      createdVm.generatedIsoRegistryId = provisionIso.registryId;
+      reporter?.updateVm(item.name, {
+        id: createdVm.id,
+        providerId: createdVm.providerId,
+        powerState: createdVm.powerState,
+        status: request.autoStart ? "running" : "success",
+        currentStep: request.autoStart ? "boot" : "create-vm",
+        progressPercent: request.autoStart ? undefined : 100,
+        message: request.autoStart ? "VM 已创建并启动，等待系统安装与启动验证" : "VM 已创建，未设置自动启动",
+      });
       created.push(createdVm);
     }
     return {
@@ -1144,6 +1382,22 @@ function parseCreatedVm(output: string, fallback: { name: string; ip: string }):
     ip,
     macAddress: macAddress || undefined,
   };
+}
+
+function parseProvisionScriptTimings(output: string): Array<{ phase: string; elapsedMs: number }> {
+  return output
+    .trim()
+    .split(/\r?\n/)
+    .filter((item) => item.startsWith("TIMING\t"))
+    .map((line) => {
+      const [, phase = "", rawElapsedMs = ""] = line.split("\t");
+      const elapsedMs = Number(rawElapsedMs);
+      return {
+        phase,
+        elapsedMs: Number.isFinite(elapsedMs) ? elapsedMs : 0,
+      };
+    })
+    .filter((item) => item.phase);
 }
 
 function runRemoteScript(input: XenConnectionInput, script: string, options: ScriptOptions = {}): Promise<string> {
@@ -1307,7 +1561,9 @@ function parseVmSummary(output: string): VmInventorySummary {
       running: 0,
       halted: 0,
       vcpu: 0,
+      runningVcpu: 0,
       memoryBytes: 0,
+      runningMemoryBytes: 0,
     };
   }
   const cols = line.split("\t");
@@ -1316,7 +1572,9 @@ function parseVmSummary(output: string): VmInventorySummary {
     running: parseNumber(cols[2]),
     halted: parseNumber(cols[3]),
     vcpu: parseNumber(cols[4]),
+    runningVcpu: parseNumber(cols[6]),
     memoryBytes: gibToBytes(parseNumber(cols[5])),
+    runningMemoryBytes: gibToBytes(parseNumber(cols[7])),
   };
 }
 
@@ -1391,15 +1649,22 @@ function isXenInstallMedia(image: IsoImage): boolean {
   const name = image.name.trim().toLowerCase();
   const path = (image.path ?? "").trim().toLowerCase();
   const repository = image.storageRepository.trim().toLowerCase();
+  const filename = path || name;
 
   if (!name && !path) return false;
   if (name.startsWith("old version of ")) return false;
   if (name === "xencenter.iso" || path === "xencenter.iso") return false;
+  if (isGeneratedProvisioningIso(filename)) return false;
   if (repository.includes("dvd drives") && !path.endsWith(".iso")) return false;
   if (repository.includes("xenserver tools")) {
     return name === "xs-tools.iso" || name === "guest-tools.iso" || path.endsWith("xs-tools.iso") || path.endsWith("guest-tools.iso");
   }
   return name.endsWith(".iso") || path.endsWith(".iso");
+}
+
+function isGeneratedProvisioningIso(filename: string): boolean {
+  if (!filename.startsWith("vrc-") || !filename.endsWith(".iso")) return false;
+  return /-(unattended|ks|boot|full)(?:-|\.iso)/.test(filename);
 }
 
 function compareXenInstallMedia(left: IsoImage, right: IsoImage): number {
@@ -1432,10 +1697,14 @@ function parseMetricSamples(output: string, connectionId: string): MetricSample[
     const vmId = cols[1] ?? "";
     const values: Array<[MetricSample["metric"], number | null]> = [
       ["cpu_usage", parseNullableNumber(cols[2])],
-      ["disk_read", parseNullableNumber(cols[3])],
-      ["disk_write", parseNullableNumber(cols[4])],
-      ["net_rx", parseNullableNumber(cols[5])],
-      ["net_tx", parseNullableNumber(cols[6])],
+      ["memory_used", parseNullableNumber(cols[3])],
+      ["memory_total", parseNullableNumber(cols[4])],
+      ["disk_used", parseNullableNumber(cols[5])],
+      ["disk_total", parseNullableNumber(cols[6])],
+      ["disk_read", parseNullableNumber(cols[7])],
+      ["disk_write", parseNullableNumber(cols[8])],
+      ["net_rx", parseNullableNumber(cols[9])],
+      ["net_tx", parseNullableNumber(cols[10])],
     ];
     for (const [metric, value] of values) {
       if (value == null) continue;
@@ -1446,7 +1715,12 @@ function parseMetricSamples(output: string, connectionId: string): MetricSample[
         targetId: vmId,
         metric,
         value,
-        unit: metric === "cpu_usage" ? "ratio" : "bytes_per_sec",
+        unit:
+          metric === "cpu_usage"
+            ? "ratio"
+            : metric === "memory_used" || metric === "memory_total" || metric === "disk_used" || metric === "disk_total"
+              ? "bytes"
+              : "bytes_per_sec",
         sampledAt,
       });
     }
@@ -1500,6 +1774,10 @@ export function metricSamplesToVmSnapshots(samples: MetricSample[]): VmMetricSna
       ({
         uuid: sample.targetId,
         cpuUsage: null,
+        memoryUsedBytes: null,
+        memoryTotalBytes: null,
+        diskUsedBytes: null,
+        diskTotalBytes: null,
         diskReadRate: null,
         diskWriteRate: null,
         networkRxRate: null,
@@ -1507,6 +1785,10 @@ export function metricSamplesToVmSnapshots(samples: MetricSample[]): VmMetricSna
         sampledAt: sample.sampledAt,
       } satisfies VmMetricSnapshot);
     if (sample.metric === "cpu_usage") snapshot.cpuUsage = sample.value;
+    if (sample.metric === "memory_used") snapshot.memoryUsedBytes = sample.value;
+    if (sample.metric === "memory_total") snapshot.memoryTotalBytes = sample.value;
+    if (sample.metric === "disk_used") snapshot.diskUsedBytes = sample.value;
+    if (sample.metric === "disk_total") snapshot.diskTotalBytes = sample.value;
     if (sample.metric === "disk_read") snapshot.diskReadRate = sample.value;
     if (sample.metric === "disk_write") snapshot.diskWriteRate = sample.value;
     if (sample.metric === "net_rx") snapshot.networkRxRate = sample.value;
@@ -1520,6 +1802,7 @@ export async function getXenConsoleLocation(input: XenConnectionInput, vmId: str
   const output = await runRemoteScript(input, CONSOLE_LOCATION_SCRIPT, {
     env: {
       VRC_VM_UUID: sanitizeUuid(vmId),
+      VRC_CONSOLE_WAIT_SECONDS: "30",
     },
   });
   return output.trim();

@@ -55,28 +55,43 @@ function defaultProvisioningConfig(): ProvisioningConfig {
         description: "按 IP 池生成 root 密码，执行无人值守安装并验收 SSH 启动。",
       },
       {
-        id: "vmware-linux-clone-standard",
-        name: "VMware Linux 克隆环境",
+        id: "vmware-centos7-standard",
+        name: "VMware CentOS 7 标准环境",
         providerType: "vmware",
-        sourceType: "template",
+        sourceType: "iso",
+        isoNamePattern: "CentOS-7-x86_64-DVD-1511.iso",
         specId: "linux-standard",
         ipPoolId: "",
         vmNamePrefix: "vmware-linux",
         autoStart: true,
-        installStrategy: "template-clone",
-        description: "使用克隆源生成 VM，写入规格、静态 IP，并验收 SSH 启动。",
+        installStrategy: "kickstart",
+        description: "使用 ESXi Datastore 原版 ISO 与任务级 Kickstart 启动 ISO 执行无人值守安装。",
       },
       {
-        id: "pve-linux-cloudinit-standard",
-        name: "PVE Linux cloud-init 环境",
+        id: "pve-openeuler-kickstart-standard",
+        name: "PVE openEuler ARM 标准环境",
         providerType: "proxmox",
-        sourceType: "template",
+        sourceType: "iso",
+        isoNamePattern: "openEuler-22.03-LTS-SP4-aarch64-dvd.iso",
         specId: "linux-standard",
         ipPoolId: "",
-        vmNamePrefix: "pve-linux",
+        vmNamePrefix: "openeuler",
         autoStart: true,
-        installStrategy: "template-clone",
-        description: "使用 cloud-init 克隆源生成 VM，写入规格、静态 IP，并验收 SSH 启动。",
+        installStrategy: "kickstart",
+        description: "使用 PVE 宿主机原版 openEuler ARM ISO 与任务级 Kickstart 介质执行无人值守安装。",
+      },
+      {
+        id: "pve-kylin-kickstart-standard",
+        name: "PVE Kylin Server ARM 标准环境",
+        providerType: "proxmox",
+        sourceType: "iso",
+        isoNamePattern: "Kylin-Server-V10-SP3-2403-Release-20240426-arm64.iso",
+        specId: "linux-standard",
+        ipPoolId: "",
+        vmNamePrefix: "kylin",
+        autoStart: true,
+        installStrategy: "kickstart",
+        description: "使用 PVE 宿主机原版 Kylin Server ARM ISO 与任务级 Kickstart 介质执行无人值守安装。",
       },
     ],
     specTemplates: [
@@ -132,8 +147,9 @@ function mergeDefaultEnvironmentTemplates(
   current: EnvironmentProvisioningTemplate[],
   defaults: EnvironmentProvisioningTemplate[],
 ): EnvironmentProvisioningTemplate[] {
-  const existingIds = new Set(current.map((item) => item.id));
-  return [...current, ...defaults.filter((item) => !existingIds.has(item.id))];
+  const migrated = current.filter((item) => item.id !== "vmware-linux-clone-standard" && item.id !== "pve-linux-cloudinit-standard");
+  const existingIds = new Set(migrated.map((item) => item.id));
+  return [...migrated, ...defaults.filter((item) => !existingIds.has(item.id))];
 }
 
 function normalizeEnvironmentTemplate(

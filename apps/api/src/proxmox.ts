@@ -1,6 +1,13 @@
 import { request as httpsRequest } from "node:https";
 import { assessVmReclaim } from "./analysis/reclaimStateMachine.js";
+import { getGeneratedIso, markGeneratedIsoStatus, markGeneratedIsoUploaded, registerGeneratedIso } from "./generatedIsoStore.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
+import {
+  buildProxmoxInstallerArgs,
+  cleanupProxmoxKickstartArtifacts,
+  prepareProxmoxArmKickstartArtifacts,
+  resolveProxmoxArmDistribution,
+} from "./proxmoxUnattended.js";
 import { inferIpv4FromName, isManagedIpv4 } from "./runtimePolicy.js";
 import type {
   HostNode,
@@ -95,6 +102,28 @@ interface ProxmoxVm {
 
 interface ProxmoxVmStatus {
   status?: string;
+  cpu?: number;
+  cpus?: number;
+  mem?: number;
+  maxmem?: number;
+  disk?: number;
+  maxdisk?: number;
+  diskread?: number;
+  diskwrite?: number;
+  netin?: number;
+  netout?: number;
+}
+
+interface ProxmoxGuestAgentFsInfo {
+  disk?: Array<Record<string, unknown>>;
+  mountpoint?: string;
+  type?: string;
+  "total-bytes"?: number;
+  "used-bytes"?: number;
+}
+
+interface ProxmoxGuestAgentFsInfoResponse {
+  result?: ProxmoxGuestAgentFsInfo[];
 }
 
 type ProxmoxVmConfig = Record<string, string | number | boolean | undefined>;
@@ -118,9 +147,62 @@ interface ProxmoxInventory {
 
 const DEFAULT_PROXMOX_PORT = 8006;
 const PROXMOX_TIMEOUT_MS = 18_000;
+const PROXMOX_METRIC_COUNTER_TTL_MS = 10 * 60 * 1000;
+const PROXMOX_GUEST_FS_REFRESH_MS = 30 * 1000;
+const PROXMOX_GUEST_FS_RETRY_MS = 5 * 60 * 1000;
+
+interface ProxmoxMetricCounters {
+  sampledAtMs: number;
+  diskReadBytes: number | null;
+  diskWriteBytes: number | null;
+  networkRxBytes: number | null;
+  networkTxBytes: number | null;
+}
+
+interface ProxmoxGuestFsCacheEntry {
+  value?: ProxmoxGuestAgentFsInfoResponse;
+  expiresAtMs: number;
+  retryAfterMs: number;
+  pending?: Promise<void>;
+}
+
+const proxmoxMetricCounters = new Map<string, ProxmoxMetricCounters>();
+const proxmoxGuestFsCache = new Map<string, ProxmoxGuestFsCacheEntry>();
+
+type ProxmoxProvisionStrategyId = "template-clone" | "kickstart";
+
+interface ProxmoxProvisionStrategy {
+  id: ProxmoxProvisionStrategyId;
+  execute(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult>;
+}
+
+class ProxmoxProvisionStrategyRegistry {
+  private readonly strategies = new Map<ProxmoxProvisionStrategyId, ProxmoxProvisionStrategy>();
+
+  register(strategy: ProxmoxProvisionStrategy): void {
+    this.strategies.set(strategy.id, strategy);
+  }
+
+  execute(strategyId: string, input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
+    const strategy = this.strategies.get(strategyId as ProxmoxProvisionStrategyId);
+    if (!strategy) throw new Error(`PVE 暂不支持安装策略：${strategyId}`);
+    return strategy.execute(input, request);
+  }
+}
+
+const defaultProxmoxStrategyBySource = new Map<VmProvisionRequest["sourceType"], ProxmoxProvisionStrategyId>([
+  ["template", "template-clone"],
+  ["iso", "kickstart"],
+]);
 
 export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInput> {
   readonly type = "proxmox" as const;
+  private readonly provisionStrategies = new ProxmoxProvisionStrategyRegistry();
+
+  constructor() {
+    this.provisionStrategies.register({ id: "template-clone", execute: (input, request) => this.cloneCloudInitTemplates(input, request) });
+    this.provisionStrategies.register({ id: "kickstart", execute: (input, request) => this.installArmIsoWithKickstart(input, request) });
+  }
 
   async testConnection(input: XenConnectionInput) {
     const client = await ProxmoxClient.login(input);
@@ -263,13 +345,16 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     const status = await client.get<ProxmoxVmStatus>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/current`);
     if (action === "start") {
       if (status.status === "running") throw new Error("虚拟机已在运行。");
-      await client.post(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`);
+      const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`);
+      await client.waitForTask(node, upid);
     } else if (action === "shutdown") {
       if (status.status !== "running") throw new Error("虚拟机未运行，无需关机。");
       try {
-        await client.post(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/shutdown`);
+        const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/shutdown`);
+        await client.waitForTask(node, upid);
       } catch {
-        await client.post(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/stop`);
+        const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/stop`);
+        await client.waitForTask(node, upid);
         return {
           vmId,
           action,
@@ -279,21 +364,119 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
       }
     } else {
       if (status.status === "running") throw new Error("虚拟机正在运行，请先关机后再删除。");
-      await client.delete(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}`);
+      const upid = await client.delete<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}`);
+      await client.waitForTask(node, upid);
     }
     return {
       vmId,
       action,
       accepted: true,
-      message: `${proxmoxActionLabel(action)}已提交：${vmId}`,
+      message: `${proxmoxActionLabel(action)}完成：${vmId}`,
     };
   }
 
   async createVms(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
-    if (request.sourceType === "template") {
-      return this.cloneCloudInitTemplates(input, request);
+    const strategyId = request.installStrategy || defaultProxmoxStrategyBySource.get(request.sourceType);
+    if (!strategyId) throw new Error(`PVE 未配置 ${request.sourceType} 对应的安装策略。`);
+    return this.provisionStrategies.execute(strategyId, input, request);
+  }
+
+  async installArmIsoWithKickstart(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
+    if (!request.isoId) throw new Error("PVE Kickstart 安装需要选择系统 ISO。");
+    const images = await this.listIsoImages(input, { hostId: request.hostId });
+    const iso = images.find((item) => item.id === request.isoId || item.providerId === request.isoId);
+    if (!iso) throw new Error(`未找到 PVE 系统 ISO：${request.isoName || request.isoId}`);
+    const distribution = resolveProxmoxArmDistribution(iso.name);
+    if (!distribution) throw new Error("当前 PVE Kickstart 策略仅支持 openEuler/Kylin ARM64 ISO。");
+    const client = await ProxmoxClient.login(input);
+    const targetNode = request.hostId || await pickProxmoxNode(client);
+    const storage = await pickProxmoxVmStorage(client, targetNode, plannedDiskGiB(request));
+    const bridge = await pickProxmoxBridge(client, targetNode, request.ipPool.networkName);
+    const created: VmProvisionCreatedVm[] = [];
+    for (const item of request.planItems) {
+      const vmid = Number(await client.get<number | string>("/cluster/nextid"));
+      const platformVmName = safeProxmoxVmName(item.name);
+      const artifacts = await prepareProxmoxArmKickstartArtifacts({
+        connection: input,
+        taskId: request.taskId || `pve-${Date.now().toString(36)}`,
+        sourceIsoVolid: iso.providerId,
+        vm: item,
+        ipPool: request.ipPool,
+      });
+      const registry = registerGeneratedIso({
+        taskId: request.taskId || `pve-${Date.now().toString(36)}`,
+        providerType: "proxmox",
+        connectionId: request.connectionId,
+        hostId: targetNode,
+        vmName: platformVmName,
+        vmIp: item.ip,
+        sourceIsoId: iso.id,
+        sourceIsoName: iso.name,
+        isoSrUuid: "local",
+        isoName: artifacts.isoName,
+        isoPath: artifacts.isoPath,
+      });
+      markGeneratedIsoUploaded(registry.id, { isoVdiUuid: artifacts.taskDir, message: "PVE Kickstart 配置 ISO 已生成" });
+      let vmCreated = false;
+      try {
+        const createTask = await client.post<string>(`/nodes/${encodeURIComponent(targetNode)}/qemu`, new URLSearchParams({
+          vmid: String(vmid),
+          name: platformVmName,
+          arch: "aarch64",
+          bios: "ovmf",
+          machine: "virt",
+          cpu: "host",
+          sockets: "1",
+          cores: String(Math.max(Math.floor(item.cpu), 1)),
+          memory: String(Math.max(Math.floor(item.memoryGiB), 1) * 1024),
+          scsihw: "virtio-scsi-pci",
+          scsi0: `${storage}:${Math.max(Math.floor(item.diskGiB), 1)}`,
+          scsi1: `${iso.providerId},media=cdrom`,
+          scsi2: `${artifacts.isoVolid},media=cdrom`,
+          efidisk0: `${storage}:0,efitype=4m,pre-enrolled-keys=0`,
+          net0: `virtio,bridge=${bridge}`,
+          boot: "order=scsi0",
+          ostype: "l26",
+          agent: "1",
+          args: buildProxmoxInstallerArgs({ artifacts, vm: item, ipPool: request.ipPool }),
+        }));
+        await client.waitForTask(targetNode, createTask);
+        vmCreated = true;
+        markGeneratedIsoStatus(registry.id, "attached", `已挂载到 ${item.name}`);
+        if (request.autoStart) {
+          const startTask = await client.post<string>(`/nodes/${encodeURIComponent(targetNode)}/qemu/${vmid}/status/start`);
+          await client.waitForTask(targetNode, startTask);
+          // QEMU 已加载本次 installer kernel/initrd；删除持久 args，确保安装后重启从 scsi0 系统盘启动。
+          await client.put(
+            `/nodes/${encodeURIComponent(targetNode)}/qemu/${vmid}/config`,
+            new URLSearchParams({ delete: "args" }),
+          );
+        }
+        created.push({
+          id: `${targetNode}:${vmid}`,
+          providerId: `${targetNode}:${vmid}`,
+          name: item.name,
+          powerState: request.autoStart ? "running" : "halted",
+          ip: item.ip,
+          generatedIsoRegistryId: registry.id,
+        });
+      } catch (error) {
+        markGeneratedIsoStatus(registry.id, "failed", error instanceof Error ? error.message : "PVE Kickstart 安装准备失败");
+        if (vmCreated) {
+          await client.post<string>(`/nodes/${encodeURIComponent(targetNode)}/qemu/${vmid}/status/stop`).then((upid) => client.waitForTask(targetNode, upid)).catch(() => undefined);
+          await client.delete<string>(`/nodes/${encodeURIComponent(targetNode)}/qemu/${vmid}`).then((upid) => client.waitForTask(targetNode, upid)).catch(() => undefined);
+        }
+        await cleanupProxmoxKickstartArtifacts(input, { isoPath: artifacts.isoPath, taskDir: artifacts.taskDir }).catch(() => undefined);
+        markGeneratedIsoStatus(registry.id, "deleted", `PVE 创建失败后临时介质已清理：${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      }
     }
-    throw new Error("PVE ISO 模式只能进入安装界面，不能自动装好系统；一键安装请使用 cloud-init 克隆源策略。");
+    return {
+      accepted: true,
+      providerType: this.type,
+      message: `PVE ${distribution === "kylin" ? "Kylin" : "openEuler"} 无人值守安装已启动：${created.length} 台 VM`,
+      created,
+    };
   }
 
   async cloneCloudInitTemplates(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
@@ -304,7 +487,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     const template = findProxmoxTemplate(inventory, templateName);
     if (!template) throw new Error(`未找到 PVE cloud-init 克隆源：${templateName}`);
     const targetNode = request.hostId || template.node;
-    const storage = await pickProxmoxVmStorage(client, targetNode);
+    const storage = await pickProxmoxVmStorage(client, targetNode, plannedDiskGiB(request));
     const created: VmProvisionCreatedVm[] = [];
     for (const item of request.planItems) {
       const vmid = await client.get<number | string>("/cluster/nextid");
@@ -355,8 +538,30 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     };
   }
 
-  async collectMetrics(_input: XenConnectionInput, _query: MetricQuery): Promise<MetricSample[]> {
-    return [];
+  async collectMetrics(input: XenConnectionInput, query: MetricQuery): Promise<MetricSample[]> {
+    if (query.targetType !== "vm" || query.targetIds.length === 0) return [];
+    const client = await ProxmoxClient.login(input);
+    const connectionId = query.connectionId || connectionKey(input);
+    const sampledAtMs = Date.now();
+    const sampledAt = new Date(sampledAtMs).toISOString();
+    pruneProxmoxMetricCounters(sampledAtMs);
+
+    const samples = await Promise.all(
+      query.targetIds.map(async (targetId) => {
+        const [node, vmId] = parseVmProviderId(targetId);
+        if (!node || !vmId) return [];
+        const vmPath = `/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(vmId)}`;
+        const status = await client.get<ProxmoxVmStatus>(`${vmPath}/status/current`);
+        const guestFsInfo = getCachedProxmoxGuestFsInfo(client, vmPath, `${connectionId}:${targetId}`, sampledAtMs);
+        return toProxmoxMetricSamples(status, {
+          connectionId,
+          targetId,
+          sampledAt,
+          sampledAtMs,
+        }, guestFsInfo);
+      }),
+    );
+    return samples.flat();
   }
 
   async collectHostInventory(input: XenConnectionInput): Promise<{
@@ -374,10 +579,43 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     }
     return {
       hosts,
-      storage: Array.from(inventory.storageByNode.values()).flat().map(toStorageRepository),
+      storage: Array.from(inventory.storageByNode.entries()).flatMap(([node, storage]) =>
+        storage.map((item) => toStorageRepository(item, node)),
+      ),
       networks: Array.from(inventory.networksByNode.entries()).flatMap(([node, networks]) => toNetworkInterfaces(node, networks)),
     };
   }
+}
+
+export async function cleanupRegisteredProxmoxGeneratedIso(input: XenConnectionInput, registryId: string): Promise<void> {
+  const record = getGeneratedIso(registryId);
+  if (!record) throw new Error(`未找到生成 ISO 登记记录：${registryId}`);
+  if (record.providerType !== "proxmox") throw new Error(`生成 ISO 不是 PVE 类型：${registryId}`);
+  if (!record.isoVdiUuid) throw new Error(`PVE 临时介质缺少任务目录登记：${registryId}`);
+  const client = await ProxmoxClient.login(input);
+  const inventory = await collectInventory(input);
+  const matched = Array.from(inventory.vmsByNode.entries()).flatMap(([node, vms]) =>
+    vms.filter((vm) => vm.name === record.vmName).map((vm) => ({ node, vmid: vm.vmid })),
+  )[0];
+  if (matched) {
+    await client.put(
+      `/nodes/${encodeURIComponent(matched.node)}/qemu/${matched.vmid}/config`,
+      new URLSearchParams({ delete: "args,scsi1,scsi2" }),
+    );
+  }
+  await cleanupProxmoxKickstartArtifacts(input, { isoPath: record.isoPath, taskDir: record.isoVdiUuid });
+  markGeneratedIsoStatus(registryId, "deleted", "PVE Kickstart 临时介质已清理");
+}
+
+export async function startProxmoxVmFromDiskIfStopped(input: XenConnectionInput, vmId: string): Promise<boolean> {
+  const [node, id] = parseVmProviderId(vmId);
+  if (!node || !id) throw new Error(`PVE VM 标识不完整：${vmId}`);
+  const client = await ProxmoxClient.login(input);
+  const status = await client.get<ProxmoxVmStatus>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/current`);
+  if (status.status !== "stopped") return false;
+  const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`);
+  await client.waitForTask(node, upid);
+  return true;
 }
 
 class ProxmoxClient {
@@ -416,6 +654,22 @@ class ProxmoxClient {
 
   async delete<T = unknown>(path: string): Promise<T> {
     return proxmoxRequest<T>(this.input, "DELETE", path, undefined, this.login);
+  }
+
+  async waitForTask(node: string, upid: string): Promise<void> {
+    if (!upid) return;
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 120_000) {
+      const status = await this.get<{ status?: string; exitstatus?: string }>(
+        `/nodes/${encodeURIComponent(node)}/tasks/${encodeURIComponent(upid)}/status`,
+      );
+      if (status.status === "stopped") {
+        if (!status.exitstatus || status.exitstatus === "OK") return;
+        throw new Error(`PVE 任务失败：${status.exitstatus}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+    throw new Error("PVE 任务执行超时。");
   }
 }
 
@@ -553,17 +807,35 @@ function buildProxmoxIpConfig(ip: string, pool: { cidr: string; gateway: string 
   return `ip=${ip}/${mask},gw=${pool.gateway}`;
 }
 
+function safeProxmoxVmName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63) || "vrc-vm";
+}
+
 async function pickProxmoxNode(client: ProxmoxClient): Promise<string> {
   const nodes = await client.get<ProxmoxNode[]>("/nodes");
   return nodes.find((node) => node.status === "online")?.node ?? nodes[0]?.node ?? "";
 }
 
-async function pickProxmoxVmStorage(client: ProxmoxClient, node: string): Promise<string> {
+async function pickProxmoxVmStorage(client: ProxmoxClient, node: string, requiredGiB: number): Promise<string> {
   const storage = await client.get<ProxmoxStorage[]>(`/nodes/${encodeURIComponent(node)}/storage`);
   const candidates = storage.filter((item) => storageSupportsContent(item, "images") || storageSupportsContent(item, "rootdir"));
-  const best = candidates.sort((left, right) => (right.avail ?? 0) - (left.avail ?? 0))[0];
-  if (!best) throw new Error(`PVE 节点 ${node} 未找到支持 VM 磁盘的存储。`);
+  if (!candidates.length) throw new Error(`PVE 节点 ${node} 未找到支持 VM 磁盘的存储。`);
+  const requiredBytes = Math.max(requiredGiB, 1) * 1024 ** 3;
+  const best = candidates
+    .filter((item) => (item.avail ?? 0) >= requiredBytes)
+    .sort((left, right) => (right.avail ?? 0) - (left.avail ?? 0))[0];
+  if (!best) {
+    const capacity = candidates
+      .sort((left, right) => (right.avail ?? 0) - (left.avail ?? 0))
+      .map((item) => `${item.storage} ${bytesToGib(item.avail ?? 0).toFixed(1)} GiB`)
+      .join("、");
+    throw new Error(`PVE 节点 ${node} 没有单个存储可容纳计划磁盘 ${requiredGiB} GiB；当前余量：${capacity}`);
+  }
   return best.storage;
+}
+
+function plannedDiskGiB(request: VmProvisionRequest): number {
+  return request.planItems.reduce((sum, item) => sum + Math.max(Math.floor(item.diskGiB), 1), 0);
 }
 
 async function pickProxmoxBridge(client: ProxmoxClient, node: string, preferred?: string): Promise<string> {
@@ -666,7 +938,7 @@ function cidrToNetmask(cidr: string): string {
   return [24, 16, 8, 0].map((shift) => String((mask >>> shift) & 255)).join(".");
 }
 
-function toStorageRepository(item: ProxmoxStorage): StorageRepository {
+function toStorageRepository(item: ProxmoxStorage, hostId: string): StorageRepository {
   const total = item.total ?? 0;
   const used = item.used ?? 0;
   return {
@@ -676,6 +948,8 @@ function toStorageRepository(item: ProxmoxStorage): StorageRepository {
     usedGiB: bytesToGib(used),
     virtualGiB: bytesToGib(used),
     shared: item.shared === 1,
+    hostId,
+    content: item.content?.split(",").map((value) => value.trim()).filter(Boolean),
   };
 }
 
@@ -768,6 +1042,132 @@ function parseVmProviderId(value: string): [string, string] {
   return [parts?.[0] ?? "", parts?.[1] ?? ""];
 }
 
+function toProxmoxMetricSamples(
+  status: ProxmoxVmStatus,
+  context: { connectionId: string; targetId: string; sampledAt: string; sampledAtMs: number },
+  guestFsInfo?: ProxmoxGuestAgentFsInfoResponse,
+): MetricSample[] {
+  const samples: MetricSample[] = [];
+  const pushSample = (metric: MetricSample["metric"], value: number | null, unit: MetricSample["unit"]) => {
+    if (value == null) return;
+    samples.push({
+      id: `${context.connectionId}:${context.targetId}:${metric}:${context.sampledAtMs}`,
+      connectionId: context.connectionId,
+      targetType: "vm",
+      targetId: context.targetId,
+      metric,
+      value,
+      unit,
+      sampledAt: context.sampledAt,
+    });
+  };
+
+  const cpuUsage = finiteNonNegative(status.cpu);
+  const memoryTotal = finitePositive(status.maxmem);
+  const memoryUsed = clampToTotal(finiteNonNegative(status.mem), memoryTotal);
+  const guestDiskUsage = summarizeProxmoxGuestDiskUsage(guestFsInfo);
+  const diskTotal = guestDiskUsage?.totalBytes ?? finitePositive(status.maxdisk);
+  // PVE reports status.disk as zero when guest filesystem usage is unavailable.
+  // Only Guest Agent fsinfo has the semantics required for a utilisation ratio.
+  const diskUsed = guestDiskUsage?.usedBytes ?? null;
+  pushSample("cpu_usage", cpuUsage == null ? null : Math.min(cpuUsage, 1), "ratio");
+  pushSample("memory_used", memoryUsed, "bytes");
+  pushSample("memory_total", memoryTotal, "bytes");
+  pushSample("disk_used", diskUsed, "bytes");
+  pushSample("disk_total", diskTotal, "bytes");
+
+  const counterKey = `${context.connectionId}:${context.targetId}`;
+  const currentCounters: ProxmoxMetricCounters = {
+    sampledAtMs: context.sampledAtMs,
+    diskReadBytes: finiteNonNegative(status.diskread),
+    diskWriteBytes: finiteNonNegative(status.diskwrite),
+    networkRxBytes: finiteNonNegative(status.netin),
+    networkTxBytes: finiteNonNegative(status.netout),
+  };
+  const previousCounters = proxmoxMetricCounters.get(counterKey);
+  const elapsedSeconds = previousCounters ? (context.sampledAtMs - previousCounters.sampledAtMs) / 1000 : 0;
+  if (previousCounters && elapsedSeconds > 0) {
+    pushSample("disk_read", counterRate(currentCounters.diskReadBytes, previousCounters.diskReadBytes, elapsedSeconds), "bytes_per_sec");
+    pushSample("disk_write", counterRate(currentCounters.diskWriteBytes, previousCounters.diskWriteBytes, elapsedSeconds), "bytes_per_sec");
+    pushSample("net_rx", counterRate(currentCounters.networkRxBytes, previousCounters.networkRxBytes, elapsedSeconds), "bytes_per_sec");
+    pushSample("net_tx", counterRate(currentCounters.networkTxBytes, previousCounters.networkTxBytes, elapsedSeconds), "bytes_per_sec");
+  }
+  proxmoxMetricCounters.set(counterKey, currentCounters);
+  return samples;
+}
+
+function finiteNonNegative(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function finitePositive(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function summarizeProxmoxGuestDiskUsage(
+  response: ProxmoxGuestAgentFsInfoResponse | undefined,
+): { usedBytes: number; totalBytes: number } | null {
+  const fileSystems = response?.result?.filter((item) => {
+    const totalBytes = finitePositive(item["total-bytes"]);
+    return totalBytes != null && Array.isArray(item.disk) && item.disk.length > 0;
+  }) ?? [];
+  if (fileSystems.length === 0) return null;
+  const totalBytes = fileSystems.reduce((sum, item) => sum + (finitePositive(item["total-bytes"]) ?? 0), 0);
+  const usedBytes = fileSystems.reduce((sum, item) => sum + (finiteNonNegative(item["used-bytes"]) ?? 0), 0);
+  return totalBytes > 0 ? { usedBytes: Math.min(usedBytes, totalBytes), totalBytes } : null;
+}
+
+function clampToTotal(value: number | null, total: number | null): number | null {
+  if (value == null) return null;
+  return total == null ? value : Math.min(value, total);
+}
+
+function counterRate(current: number | null, previous: number | null, elapsedSeconds: number): number | null {
+  if (current == null || previous == null || current < previous || elapsedSeconds <= 0) return null;
+  return (current - previous) / elapsedSeconds;
+}
+
+function pruneProxmoxMetricCounters(now: number): void {
+  for (const [key, value] of proxmoxMetricCounters.entries()) {
+    if (now - value.sampledAtMs > PROXMOX_METRIC_COUNTER_TTL_MS) proxmoxMetricCounters.delete(key);
+  }
+  for (const [key, value] of proxmoxGuestFsCache.entries()) {
+    if (!value.pending && now >= Math.max(value.expiresAtMs, value.retryAfterMs) + PROXMOX_METRIC_COUNTER_TTL_MS) {
+      proxmoxGuestFsCache.delete(key);
+    }
+  }
+}
+
+function getCachedProxmoxGuestFsInfo(
+  client: ProxmoxClient,
+  vmPath: string,
+  cacheKey: string,
+  now: number,
+): ProxmoxGuestAgentFsInfoResponse | undefined {
+  const cached = proxmoxGuestFsCache.get(cacheKey);
+  if (cached?.value && now < cached.expiresAtMs) return cached.value;
+  if (cached?.pending || (cached && now < cached.retryAfterMs)) return cached?.value;
+
+  const entry = cached ?? { expiresAtMs: 0, retryAfterMs: 0 };
+  entry.pending = client
+    .get<ProxmoxGuestAgentFsInfoResponse>(`${vmPath}/agent/get-fsinfo`)
+    .then((value) => {
+      entry.value = value;
+      entry.expiresAtMs = Date.now() + PROXMOX_GUEST_FS_REFRESH_MS;
+      entry.retryAfterMs = 0;
+    })
+    .catch(() => {
+      entry.value = undefined;
+      entry.expiresAtMs = 0;
+      entry.retryAfterMs = Date.now() + PROXMOX_GUEST_FS_RETRY_MS;
+    })
+    .finally(() => {
+      entry.pending = undefined;
+    });
+  proxmoxGuestFsCache.set(cacheKey, entry);
+  return entry.value;
+}
+
 function parseDiskSize(value: string): number {
   const match = value.match(/size=(\d+(?:\.\d+)?)([KMGTP]?)/i);
   if (!match) return 0;
@@ -785,12 +1185,15 @@ function parseDiskSize(value: string): number {
 }
 
 function summarizeVmItems(items: VmNode[], total = items.length): VmInventorySummary {
+  const runningItems = items.filter((vm) => vm.powerState === "running");
   return {
     total,
-    running: items.filter((vm) => vm.powerState === "running").length,
+    running: runningItems.length,
     halted: items.filter((vm) => vm.powerState === "halted").length,
     vcpu: items.reduce((sum, vm) => sum + vm.cpuCount, 0),
+    runningVcpu: runningItems.reduce((sum, vm) => sum + vm.cpuCount, 0),
     memoryBytes: items.reduce((sum, vm) => sum + vm.memoryBytes, 0),
+    runningMemoryBytes: runningItems.reduce((sum, vm) => sum + vm.memoryBytes, 0),
     diskBytes: items.reduce((sum, vm) => sum + Math.max(vm.diskVirtualBytes ?? 0, 0), 0),
   };
 }
@@ -874,5 +1277,14 @@ function toProxmoxErrorMessage(statusCode: number, parsed: { errors?: unknown; d
   if (statusCode === 403 || text.includes("permission")) {
     return "Proxmox VE 账号权限不足，需要节点、存储和 VM 清单读取权限。";
   }
-  return `Proxmox VE API HTTP ${statusCode}`;
+  const detail = Array.from(new Set(collectProxmoxErrorText(parsed.errors ?? parsed.data))).filter(Boolean).slice(0, 6).join("；");
+  return detail ? `Proxmox VE API HTTP ${statusCode}：${detail}` : `Proxmox VE API HTTP ${statusCode}`;
+}
+
+function collectProxmoxErrorText(value: unknown): string[] {
+  if (value == null) return [];
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return [String(value)];
+  if (Array.isArray(value)) return value.flatMap(collectProxmoxErrorText);
+  if (typeof value === "object") return Object.entries(value).flatMap(([key, item]) => [key, ...collectProxmoxErrorText(item)]);
+  return [];
 }

@@ -52,14 +52,9 @@ export function saveIsoImageCache(input: Omit<IsoImageCacheEntry, "updatedAt">, 
 }
 
 function mergeImages(cachedImages: IsoImage[], liveImages: IsoImage[], now: string): IsoImage[] {
-  const liveKeys = new Set(liveImages.map((image) => getImageCacheKey(image)));
-  const merged = [
-    ...liveImages.map((image) => tagImageCacheState(image, now, true)),
-    ...cachedImages
-      .filter((image) => !liveKeys.has(getImageCacheKey(image)))
-      .map((image) => tagImageCacheState(image, now, false)),
-  ];
-  return normalizeImages(merged, now);
+  void cachedImages;
+  // ISO 列表用于创建 VM 时选择安装源，刷新后已经不存在的镜像不应继续出现在下拉框。
+  return normalizeImages(liveImages.map((image) => tagImageCacheState(image, now, true)), now);
 }
 
 function tagImageCacheState(image: IsoImage, now: string, seen: boolean): IsoImage {
@@ -79,6 +74,7 @@ function tagImageCacheState(image: IsoImage, now: string, seen: boolean): IsoIma
 function normalizeImages(images: IsoImage[], now = new Date().toISOString()): IsoImage[] {
   const byId = new Map<string, IsoImage>();
   for (const image of images) {
+    if (isVrcGeneratedIso(image)) continue;
     const key = getImageCacheKey(image);
     const id = image.id || image.providerId || key;
     byId.set(key, {
@@ -101,6 +97,12 @@ function normalizeImages(images: IsoImage[], now = new Date().toISOString()): Is
       sensitivity: "base",
     }),
   );
+}
+
+function isVrcGeneratedIso(image: IsoImage): boolean {
+  const name = image.name?.trim() || "";
+  const fileName = image.path?.trim().split("/").pop() || "";
+  return name.startsWith("vrc-") || fileName.startsWith("vrc-");
 }
 
 function getImageCacheKey(image: IsoImage): string {

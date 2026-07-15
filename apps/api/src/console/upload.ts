@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,9 +13,14 @@ import type { XenConnectionInput } from "../types.js";
 
 const uploadRoot = "/tmp/vrc-uploads";
 const uploadReadyTimeoutMs = 15_000;
+const uploadOperationTimeoutMs = 20_000;
+const minFileUploadTimeoutMs = 60_000;
+const fileUploadTimeoutPerMiBMs = 2_500;
 const maxUploadFiles = 8;
+const uploadProgressRetentionMs = 5 * 60_000;
 
 interface ConsoleUploadFieldMap {
+  uploadId?: string;
   connectionId?: string;
   providerType?: string;
   vmIp?: string;
@@ -40,40 +46,133 @@ interface ConsoleUploadResult {
   }>;
 }
 
+type ConsoleUploadProgressStage = "queued" | "receiving" | "connecting" | "preparing" | "uploading" | "completed" | "failed";
+
+interface ConsoleUploadProgressEvent {
+  uploadId: string;
+  seq: number;
+  stage: ConsoleUploadProgressStage;
+  message: string;
+  percent?: number;
+  bytesTransferred?: number;
+  totalBytes?: number;
+  speedBytesPerSecond?: number;
+  fileName?: string;
+  remotePath?: string;
+  createdAt: string;
+}
+
+interface ConsoleUploadProgressState {
+  uploadId: string;
+  seq: number;
+  listeners: Set<(event: ConsoleUploadProgressEvent) => void>;
+  lastEvent?: ConsoleUploadProgressEvent;
+  expireTimer?: NodeJS.Timeout;
+  startedAt: number;
+  lastBytesTransferred: number;
+  lastProgressAt: number;
+  lastPublishedAt: number;
+}
+
+type UploadProgressReporter = (event: Omit<ConsoleUploadProgressEvent, "uploadId" | "seq" | "createdAt">) => void;
+
+const uploadProgressStates = new Map<string, ConsoleUploadProgressState>();
+
 export async function registerConsoleUploadRoutes(server: FastifyInstance): Promise<void> {
+  server.get("/api/console/upload/:uploadId/events", (request, reply) => {
+    const params = request.params as { uploadId?: string };
+    const uploadId = normalizeUploadId(params.uploadId);
+    if (!uploadId) {
+      return reply.status(400).send({ message: "上传 ID 不正确" });
+    }
+
+    const state = getUploadProgressState(uploadId);
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    const sendProgress = (event: ConsoleUploadProgressEvent) => {
+      if (reply.raw.writableEnded || reply.raw.destroyed) return;
+      reply.raw.write(`id: ${event.seq}\n`);
+      reply.raw.write("event: progress\n");
+      reply.raw.write(`data: ${JSON.stringify({ progress: event })}\n\n`);
+    };
+    state.listeners.add(sendProgress);
+    if (state.lastEvent) {
+      sendProgress(state.lastEvent);
+    } else {
+      publishUploadProgress(uploadId, { stage: "queued", message: "等待浏览器开始上传" });
+    }
+    const heartbeat = setInterval(() => {
+      if (reply.raw.writableEnded || reply.raw.destroyed) return;
+      reply.raw.write(": keep-alive\n\n");
+    }, 15000);
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      state.listeners.delete(sendProgress);
+      scheduleUploadProgressCleanup(uploadId);
+    };
+    request.raw.once("close", cleanup);
+    return undefined;
+  });
+
   server.post("/api/console/upload", async (request, reply) => {
     const { fields, files, tempDir } = await readMultipartUpload(request);
+    const uploadId = normalizeUploadId(fields.uploadId) || randomUUID();
+    const reportProgress = createUploadProgressReporter(uploadId);
     try {
       const vmIp = normalizeVmIp(fields.vmIp);
       if (!vmIp) {
+        reportProgress({ stage: "failed", message: "缺少 VM IP，无法上传到虚拟机" });
         return reply.code(400).send({ message: "缺少 VM IP，无法上传到虚拟机" });
       }
       if (!files.length) {
+        reportProgress({ stage: "failed", message: "没有收到可上传文件" });
         return reply.code(400).send({ message: "没有收到可上传文件" });
       }
 
       const username = fields.username?.trim() || "root";
       const password = fields.password?.trim() || deriveRootPassword(vmIp);
       if (!password) {
+        reportProgress({ stage: "failed", message: "缺少 VM 登录密码，当前只支持按 IP 规则自动推导的 root 账号" });
         return reply.code(400).send({ message: "缺少 VM 登录密码，当前只支持按 IP 规则自动推导的 root 账号" });
       }
 
       const remoteDir = sanitizeRemoteDir(fields.remoteDir || uploadRoot);
       let uploaded: ConsoleUploadResult["uploaded"];
       try {
+        reportProgress({
+          stage: "connecting",
+          message: `正在连接 VM ${vmIp} 的 SSH/SFTP`,
+          percent: 0,
+          totalBytes: files.reduce((total, file) => total + file.size, 0),
+        });
         uploaded = await uploadFilesToGuest(resolveUploadTransport(fields, vmIp), {
           username,
           password,
           remoteDir,
           files,
+          progress: reportProgress,
         });
       } catch (error) {
+        reportProgress({ stage: "failed", message: formatUploadError(error, vmIp) });
         return reply.code(resolveUploadErrorStatus(error)).send({ message: formatUploadError(error, vmIp) });
       }
       const result: ConsoleUploadResult = {
         message: `已上传 ${uploaded.length} 个文件到 ${remoteDir}`,
         uploaded,
       };
+      reportProgress({
+        stage: "completed",
+        message: result.message,
+        percent: 100,
+        bytesTransferred: files.reduce((total, file) => total + file.size, 0),
+        totalBytes: files.reduce((total, file) => total + file.size, 0),
+      });
       return result;
     } finally {
       await rm(tempDir, { recursive: true, force: true });
@@ -93,7 +192,7 @@ async function readMultipartUpload(request: FastifyRequest): Promise<{
   for await (const part of request.parts()) {
     if (part.type === "field") {
       const fieldName = part.fieldname as keyof ConsoleUploadFieldMap;
-      if (["connectionId", "providerType", "vmIp", "vmName", "username", "password", "remoteDir"].includes(fieldName)) {
+      if (["uploadId", "connectionId", "providerType", "vmIp", "vmName", "username", "password", "remoteDir"].includes(fieldName)) {
         fields[fieldName] = String(part.value ?? "");
       }
       continue;
@@ -147,6 +246,7 @@ interface UploadGuestInput {
   password: string;
   remoteDir: string;
   files: LocalUploadFile[];
+  progress?: UploadProgressReporter;
 }
 
 function resolveUploadTransport(fields: ConsoleUploadFieldMap, vmIp: string): UploadTransport {
@@ -177,11 +277,12 @@ async function uploadFilesToGuest(transport: UploadTransport, input: UploadGuest
       algorithms: guestSshAlgorithms(),
     },
     async (client, sftp) => {
-      await execGuestCommand(client, `mkdir -p ${shellQuote(input.remoteDir)}`);
+      input.progress?.({ stage: "preparing", message: `正在确认远端目录 ${input.remoteDir}` });
+      await ensureRemoteDir(sftp, input.remoteDir);
       const uploaded: ConsoleUploadResult["uploaded"] = [];
       for (const file of input.files) {
         const remotePath = `${input.remoteDir}/${file.safeName}`;
-        await fastPut(sftp, file.localPath, remotePath);
+        await fastPut(sftp, file, remotePath, input.progress);
         uploaded.push({
           name: file.originalName,
           remotePath,
@@ -223,11 +324,12 @@ function uploadFilesToGuestByJumpHost(transport: Extract<UploadTransport, { type
               algorithms: guestSshAlgorithms(),
             },
             async (client, sftp) => {
-              await execGuestCommand(client, `mkdir -p ${shellQuote(input.remoteDir)}`);
+              input.progress?.({ stage: "preparing", message: `正在确认远端目录 ${input.remoteDir}` });
+              await ensureRemoteDir(sftp, input.remoteDir);
               const uploaded: ConsoleUploadResult["uploaded"] = [];
               for (const file of input.files) {
                 const remotePath = `${input.remoteDir}/${file.safeName}`;
-                await fastPut(sftp, file.localPath, remotePath);
+                await fastPut(sftp, file, remotePath, input.progress);
                 uploaded.push({
                   name: file.originalName,
                   remotePath,
@@ -292,13 +394,46 @@ function withGuestSftp<T>(config: ConnectConfig, task: (client: Client, sftp: SF
   });
 }
 
+function ensureRemoteDir(sftp: SFTPWrapper, remoteDir: string): Promise<void> {
+  const parts = remoteDir.split("/").filter(Boolean);
+  let current = "";
+  return parts.reduce<Promise<void>>(async (previous, part) => {
+    await previous;
+    current = `${current}/${part}`;
+    await ensureRemoteDirSegment(sftp, current);
+  }, Promise.resolve());
+}
+
+function ensureRemoteDirSegment(sftp: SFTPWrapper, remoteDir: string): Promise<void> {
+  return withTimeout(new Promise((resolve, reject) => {
+    sftp.stat(remoteDir, (statError, stats) => {
+      if (!statError) {
+        if (stats.isDirectory()) {
+          resolve();
+        } else {
+          reject(new Error(`${remoteDir} 已存在但不是目录`));
+        }
+        return;
+      }
+      sftp.mkdir(remoteDir, (mkdirError) => {
+        if (mkdirError && !/failure/i.test(mkdirError.message)) {
+          reject(mkdirError);
+          return;
+        }
+        resolve();
+      });
+    });
+  }), uploadOperationTimeoutMs, `创建远端目录 ${remoteDir} 超时`);
+}
+
 function execGuestCommand(client: Client, command: string): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return withTimeout(new Promise((resolve, reject) => {
     client.exec(command, (error, stream) => {
       if (error) {
         reject(error);
         return;
       }
+      stream.resume();
       let stderr = "";
       stream
         .on("close", (code: number) => {
@@ -312,13 +447,143 @@ function execGuestCommand(client: Client, command: string): Promise<void> {
           stderr += chunk.toString("utf8");
         });
     });
+  }), uploadOperationTimeoutMs, "远端命令执行超时");
+}
+
+function fastPut(sftp: SFTPWrapper, file: LocalUploadFile, remotePath: string, progress?: UploadProgressReporter): Promise<void> {
+  const timeoutMs = resolveFileUploadTimeoutMs(file.size);
+  let lastProgressBytes = 0;
+  let lastProgressReportAt = 0;
+  return withTimeout(new Promise((resolve, reject) => {
+    progress?.({
+      stage: "uploading",
+      message: `正在写入 ${file.originalName}`,
+      percent: 0,
+      bytesTransferred: 0,
+      totalBytes: file.size,
+      fileName: file.originalName,
+      remotePath,
+    });
+    sftp.fastPut(
+      file.localPath,
+      remotePath,
+      {
+        step: (bytesTransferred, _chunk, totalBytes) => {
+          if (bytesTransferred === lastProgressBytes && bytesTransferred !== totalBytes) return;
+          const now = Date.now();
+          const isFinalStep = bytesTransferred >= totalBytes;
+          if (!isFinalStep && now - lastProgressReportAt < 300) return;
+          lastProgressBytes = bytesTransferred;
+          lastProgressReportAt = now;
+          progress?.({
+            stage: "uploading",
+            message: `正在写入 ${file.originalName}`,
+            percent: totalBytes > 0 ? Math.min(99, Math.round((bytesTransferred / totalBytes) * 100)) : undefined,
+            bytesTransferred,
+            totalBytes,
+            fileName: file.originalName,
+            remotePath,
+          });
+        },
+      },
+      (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        progress?.({
+          stage: "uploading",
+          message: `${file.originalName} 写入完成`,
+          percent: 100,
+          bytesTransferred: file.size,
+          totalBytes: file.size,
+          fileName: file.originalName,
+          remotePath,
+        });
+        resolve();
+      },
+    );
+  }), timeoutMs, `SFTP 写入 ${file.originalName} 超时`);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
   });
 }
 
-function fastPut(sftp: SFTPWrapper, localPath: string, remotePath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, (error) => (error ? reject(error) : resolve()));
-  });
+function resolveFileUploadTimeoutMs(size: number) {
+  const mib = Math.max(1, Math.ceil(size / 1024 / 1024));
+  return Math.max(minFileUploadTimeoutMs, mib * fileUploadTimeoutPerMiBMs);
+}
+
+function normalizeUploadId(value?: string) {
+  const candidate = value?.trim();
+  if (!candidate) return "";
+  return /^[\w-]{8,80}$/.test(candidate) ? candidate : "";
+}
+
+function getUploadProgressState(uploadId: string) {
+  let state = uploadProgressStates.get(uploadId);
+  if (!state) {
+    state = {
+      uploadId,
+      seq: 0,
+      listeners: new Set(),
+      startedAt: Date.now(),
+      lastBytesTransferred: 0,
+      lastProgressAt: Date.now(),
+      lastPublishedAt: 0,
+    };
+    uploadProgressStates.set(uploadId, state);
+  }
+  if (state.expireTimer) {
+    clearTimeout(state.expireTimer);
+    state.expireTimer = undefined;
+  }
+  return state;
+}
+
+function createUploadProgressReporter(uploadId: string): UploadProgressReporter {
+  getUploadProgressState(uploadId);
+  return (event) => publishUploadProgress(uploadId, event);
+}
+
+function publishUploadProgress(uploadId: string, event: Omit<ConsoleUploadProgressEvent, "uploadId" | "seq" | "createdAt">) {
+  const state = getUploadProgressState(uploadId);
+  const now = Date.now();
+  const bytesTransferred = event.bytesTransferred ?? state.lastBytesTransferred;
+  const deltaBytes = bytesTransferred - state.lastBytesTransferred;
+  const deltaMs = now - state.lastProgressAt;
+  const speedBytesPerSecond = event.speedBytesPerSecond ?? (deltaBytes > 0 && deltaMs > 0 ? Math.round((deltaBytes / deltaMs) * 1000) : undefined);
+
+  state.lastBytesTransferred = bytesTransferred;
+  state.lastProgressAt = now;
+  state.seq += 1;
+  state.lastPublishedAt = now;
+  const progressEvent: ConsoleUploadProgressEvent = {
+    uploadId,
+    seq: state.seq,
+    createdAt: new Date(now).toISOString(),
+    ...event,
+    bytesTransferred: event.bytesTransferred,
+    speedBytesPerSecond,
+  };
+  state.lastEvent = progressEvent;
+  for (const listener of state.listeners) listener(progressEvent);
+  if (event.stage === "completed" || event.stage === "failed") scheduleUploadProgressCleanup(uploadId);
+}
+
+function scheduleUploadProgressCleanup(uploadId: string) {
+  const state = uploadProgressStates.get(uploadId);
+  if (!state || state.expireTimer) return;
+  state.expireTimer = setTimeout(() => {
+    uploadProgressStates.delete(uploadId);
+  }, uploadProgressRetentionMs);
 }
 
 function guestSshAlgorithms(): ConnectConfig["algorithms"] {
