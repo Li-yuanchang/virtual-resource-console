@@ -130,6 +130,62 @@ npm run dev
 - API: `http://127.0.0.1:3987`
 - Web: `http://127.0.0.1:5173`
 
+### 内网单端口部署
+
+构建后，API 会在同一个端口托管 Web 静态资源。部署到内网服务器后，普通用户直接访问服务地址即可，不需要安装 CLI。
+
+```bash
+npm install
+npm run build
+HOST=0.0.0.0 PORT=3987 npm run start:server
+```
+
+访问地址：
+
+```text
+http://<内网服务器 IP 或域名>:3987/
+```
+
+接口仍然位于同源 `/api/*`，例如：
+
+```text
+http://<内网服务器 IP 或域名>:3987/api/health
+```
+
+也可以使用 Docker：
+
+```bash
+docker build -t virtual-resource-console .
+docker run -d --name vrc -p 3987:3987 -v "$HOME/.virtual-resource-console:/root/.virtual-resource-console" virtual-resource-console
+```
+
+XenServer 无人值守安装源由目标物理机按任务发布，不需要配置客户端本机安装源地址。
+
+### Chrome 插件
+
+插件是轻入口：它不直接连接 XenServer，也不保存平台密码，只连接本机或内网 VRC 服务。
+
+构建插件：
+
+```bash
+npm run pack:extension
+```
+
+Chrome 开发模式调试：
+
+1. 打开 `chrome://extensions/`。
+2. 开启 Developer mode。
+3. Load unpacked 选择 `apps/chrome-extension/dist`。
+4. 在插件里填写 `http://<内网服务器 IP 或域名>:3987`，点击“检测服务”。
+
+如果希望插件自动启动本机 VRC 服务，macOS 上先安装 Native Messaging Host：
+
+```bash
+npm run install:native-host
+```
+
+安装后，插件里的“启动本机服务”会优先请求 Native Host 启动 `127.0.0.1:3987`。如果没有安装 Native Host，会尝试 `vrc://start` 唤起本机客户端；仍不可用时，按内网服务器地址使用。
+
 ### Electron 桌面端开发
 
 ```bash
@@ -313,9 +369,12 @@ npm run dev
 | `HOST` | API 监听地址，默认本地脚本使用 `0.0.0.0` |
 | `PORT` | API 端口，默认 `3987` |
 | `VRC_RUNTIME_POLICY_FILE` | 自定义运行策略配置文件路径 |
-| `VRC_INSTALL_SOURCE_BASE_URL` | 创建 VM 时暴露给新 VM 访问的安装源地址 |
-| `VRC_ALLOW_CROSS_SUBNET_INSTALL_SOURCE` | 是否允许跨网段安装源校验，默认关闭 |
 | `VRC_XEN_INSTALL_MEDIA_MODE` | XenServer 安装介质模式 |
+| `VRC_XEN_HOST_INSTALL_SOURCE_PORT` | XenServer 物理机安装源租约起始端口，默认 `3988` |
+| `VRC_XEN_HOST_INSTALL_SOURCE_PORT_COUNT` | XenServer 物理机安装源端口探测数量，默认 `20` |
+| `VRC_XEN_HOST_INSTALL_SOURCE_ROOT` | XenServer 物理机安装源临时目录，默认 `/var/run/vrc-install-source` |
+
+XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进入 ISO 镜像缓存；任务完成并切回硬盘启动后会按登记记录自动清理。
 
 请使用本机 shell、`.env.local` 或部署环境配置这些变量，不要把包含真实地址、账号、密码、token 的文件提交到仓库。
 
@@ -345,6 +404,7 @@ npm run dev
 | 创建 VM | `POST /api/provisioning/preflight`, `POST /api/provisioning/vms` |
 | 创建任务 | `GET /api/provisioning/tasks`, `GET /api/provisioning/tasks/:taskId` |
 | 控制台 | `/api/console/xenserver`, `/api/console/vmware`, `/api/console/proxmox` |
+| 控制台上传 | `POST /api/console/upload`, `GET /api/console/upload/:uploadId/events` |
 
 ---
 
@@ -355,6 +415,14 @@ npm run dev
 - 资源盘点接口应避免首屏一次性读取所有 VM、磁盘、快照和指标
 - 变更类能力需要保留确认、审计和失败提示语义
 - 前端样式遵循已有 Element Plus 与项目主题变量，不新增一次性颜色体系
+
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| `docs/分发与打包策略.md` | Chrome 插件、内网服务器、macOS / Windows 桌面客户端和多形态交付策略 |
+
+其它设计、原型和排查文档默认保留在本地 `docs/` 目录，不随仓库提交。
 
 ---
 

@@ -92,15 +92,49 @@ is_usable_lan_ip() {
 }
 
 cd "$ROOT_DIR"
+lan_ip="$(detect_lan_ip)"
+
+write_api_launch_agent() {
+  python3 - "$API_LAUNCH_AGENT" "$ROOT_DIR" "$LOG_DIR" <<'PY'
+import plistlib
+import shlex
+import sys
+
+plist_path, root_dir, log_dir = sys.argv[1:4]
+command = (
+    f"cd {shlex.quote(root_dir)} && "
+    f"HOST=0.0.0.0 PORT=3987 "
+    "./node_modules/.bin/tsx apps/api/src/index.ts"
+)
+data = {
+    "Label": "com.virtual-resource-console.api",
+    "ProgramArguments": [
+        "/bin/zsh",
+        "-lc",
+        command,
+    ],
+    "WorkingDirectory": root_dir,
+    "RunAtLoad": True,
+    "KeepAlive": True,
+    "EnvironmentVariables": {
+        "NODE_ENV": "development",
+    },
+    "StandardOutPath": f"{log_dir}/api.launchd.log",
+    "StandardErrorPath": f"{log_dir}/api.launchd.err.log",
+}
+with open(plist_path, "wb") as fp:
+    plistlib.dump(data, fp)
+PY
+}
 
 if [[ -f "$API_LAUNCH_AGENT" ]]; then
   if launchctl print "$USER_DOMAIN/$API_LAUNCH_LABEL" >/dev/null 2>&1; then
-    echo "API 已由 launchd 托管运行: $API_LAUNCH_LABEL"
-  else
-    launchctl bootstrap "$USER_DOMAIN" "$API_LAUNCH_AGENT"
-    launchctl enable "$USER_DOMAIN/$API_LAUNCH_LABEL"
-    echo "API 已交给 launchd 启动: $API_LAUNCH_LABEL"
+    launchctl bootout "$USER_DOMAIN" "$API_LAUNCH_AGENT" 2>/dev/null || launchctl bootout "$USER_DOMAIN/$API_LAUNCH_LABEL" 2>/dev/null || true
   fi
+  write_api_launch_agent
+  launchctl bootstrap "$USER_DOMAIN" "$API_LAUNCH_AGENT"
+  launchctl enable "$USER_DOMAIN/$API_LAUNCH_LABEL"
+  echo "API 已交给 launchd 启动: $API_LAUNCH_LABEL"
   echo "API 日志: $LOG_DIR/api.launchd.log"
 elif is_running "$API_PID_FILE"; then
   echo "API 已运行: $(cat "$API_PID_FILE")"
@@ -110,15 +144,12 @@ else
   lan_ip="$(detect_lan_ip)"
   export HOST="${HOST:-0.0.0.0}"
   export PORT="${PORT:-3987}"
-  export VRC_INSTALL_SOURCE_BASE_URL="${VRC_INSTALL_SOURCE_BASE_URL:-http://$lan_ip:$PORT}"
   nohup npm --workspace apps/api run dev:serve >"$LOG_DIR/api.log" 2>&1 &
   echo "$!" >"$API_PID_FILE"
   echo "API 已启动: $(cat "$API_PID_FILE")"
   echo "API 日志: $LOG_DIR/api.log"
-  echo "安装源地址: $VRC_INSTALL_SOURCE_BASE_URL"
 fi
 
-lan_ip="$(detect_lan_ip)"
 if [[ -f "$WEB_LAUNCH_AGENT" ]]; then
   if launchctl print "$USER_DOMAIN/$WEB_LAUNCH_LABEL" >/dev/null 2>&1; then
     echo "Web 已由 launchd 托管运行: $WEB_LAUNCH_LABEL"

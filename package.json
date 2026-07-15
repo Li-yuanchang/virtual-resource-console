@@ -6,6 +6,7 @@
   "workspaces": [
     "apps/api",
     "apps/web",
+    "apps/chrome-extension",
     "apps/electron"
   ],
   "scripts": {
@@ -15,6 +16,13 @@
     "local:stop": "bash scripts/stop-local.sh",
     "local:status": "bash scripts/status-local.sh",
     "build": "npm --workspace apps/api run build && npm --workspace apps/web run build",
+    "build:extension": "npm --workspace apps/chrome-extension run build",
+    "install:native-host": "node scripts/install-chrome-native-host-macos.mjs",
+    "pack:electron": "npm run build && npm --workspace apps/electron run pack",
+    "pack:extension": "npm run build:extension && node scripts/pack-chrome-extension.mjs",
+    "dist:mac": "npm run build && npm --workspace apps/electron run dist:mac",
+    "dist:win": "npm run build && npm --workspace apps/electron run dist:win",
+    "start:server": "npm --workspace apps/api run start",
     "typecheck": "npm --workspace apps/api run typecheck && npm --workspace apps/web run typecheck"
   },
   "devDependencies": {

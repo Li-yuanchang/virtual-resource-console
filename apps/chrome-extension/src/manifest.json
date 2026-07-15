@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Virtual Resource Console",
+  "version": "0.1.0",
+  "description": "Connect to a local or intranet Virtual Resource Console service.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxYQTZuNxstCujGx8Y4znS/KMsfzdf/yfzlU6gDCE3KI/Fa3258Y5qpMEV57rR8w4pPKOdYlxYHphr1U2Yywgqjm+cQZtYbaSS68QTOWUi7kN5mpp83QKfjdergytNlvtRYb8yezb4MGRuAflLR69ZUZmBuoo7YD//Z0b5YLf7Ia6mGINi2YYSYE2DBQq0vPIvvG+MOaFJzIKj8JmC1dZYk2xEH3aoXnhZppjsUOKn4Uhalvv6yYqtR1mOzBLA5g7CwpOCBQnipx6h4x08MwJ0QA+Ai2ayPN5E+7K/ZYC8Xq7W2TyQP/73RgjOM8Am7UGFDbHGk2i1VvOy3B3SVum8wIDAQAB",
+  "permissions": ["storage", "tabs", "nativeMessaging"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "action": {
+    "default_title": "Virtual Resource Console",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html"
+}

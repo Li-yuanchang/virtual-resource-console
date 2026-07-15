@@ -1,0 +1,16 @@
+node_modules/
+apps/*/dist/
+.runtime/
+.codex/
+.git/
+.DS_Store
+release/
+*.log
+*.tsbuildinfo
+.env
+.env.*
+runtime-policy.json
+runtime-policy.local.json
+connections*.json
+credentials*.json
+secrets*.json

@@ -1,12 +1,119 @@
 {
   "name": "@vrc/electron",
-  "version": "0.1.0",
+  "version": "0.1.11",
   "private": true,
+  "description": "Desktop shell for Virtual Resource Console.",
   "main": "main.cjs",
   "scripts": {
-    "dev": "electron ."
+    "dev": "electron .",
+    "pack": "electron-builder --dir",
+    "predist:mac": "node ../../scripts/prepare-electron-runtime.mjs darwin-arm64",
+    "dist:mac": "electron-builder --mac",
+    "predist:win": "node ../../scripts/prepare-electron-runtime.mjs win-x64",
+    "dist:win": "electron-builder --win --x64"
   },
   "devDependencies": {
-    "electron": "^38.2.2"
+    "electron": "38.2.2",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.virtualresource.console",
+    "electronVersion": "38.2.2",
+    "productName": "VRC",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "assets/**",
+      "package.json"
+    ],
+    "asar": true,
+    "extraResources": [
+      {
+        "from": "../api/dist",
+        "to": "api"
+      },
+      {
+        "from": "../api/package.json",
+        "to": "api/package.json"
+      },
+      {
+        "from": "../web/dist",
+        "to": "web"
+      },
+      {
+        "from": "assets",
+        "to": "assets"
+      },
+      {
+        "from": ".runtime",
+        "to": "runtime",
+        "filter": [
+          "node-*/**/*"
+        ]
+      },
+      {
+        "from": "../../node_modules",
+        "to": "node_modules",
+        "filter": [
+          "**/*",
+          "!@vrc{,/**}",
+          "!.bin{,/**}",
+          "!electron{,/**}",
+          "!electron-builder{,/**}",
+          "!@electron{,/**}",
+          "!app-builder-bin{,/**}",
+          "!builder-util{,/**}",
+          "!builder-util-runtime{,/**}",
+          "!dmg-builder{,/**}",
+          "!electron-publish{,/**}",
+          "!*.tsbuildinfo"
+        ]
+      }
+    ],
+    "mac": {
+      "icon": "assets/app-icon.icns",
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "assets/app-icon.ico",
+      "extraFiles": [
+        {
+          "from": "portable/Start Virtual Resource Console.cmd",
+          "to": "Start Virtual Resource Console.cmd"
+        },
+        {
+          "from": "portable/README.txt",
+          "to": "README.txt"
+        }
+      ],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "VRC"
+    }
   }
 }
