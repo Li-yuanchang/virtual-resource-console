@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { ArrowLeft, Brush, Check, Connection, Delete, Loading, Plus, Refresh, Search, Setting, Tickets } from "@element-plus/icons-vue";
+import { ArrowLeft, Brush, Check, Connection, Delete, Download, Loading, Picture, Plus, Refresh, RefreshLeft, Search, Setting, Tickets, Upload } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import ConsoleDialog from "./components/ConsoleDialog.vue";
 import HostVmPanel from "./components/HostVmPanel.vue";
@@ -64,10 +64,31 @@ interface VmActionState {
   message?: string;
 }
 
+interface HostResourceFingerprint {
+  running: number;
+  runningVcpu: number;
+  totalVms: number;
+  memoryFreeBytes: number;
+  storageUsedGiB: number;
+}
+
 interface ProvisioningProgressState {
   title: string;
   message: string;
   status: "running" | "success" | "error";
+}
+
+interface ProvisionConsoleTargetItem {
+  key: string;
+  name: string;
+  ip?: string;
+  status: ProvisionTask["vms"][number]["status"];
+  message?: string;
+  progressPercent?: number;
+  currentStep?: ProvisionTask["vms"][number]["currentStep"];
+  installPackageDone?: number;
+  installPackageTotal?: number;
+  target: VmConsoleTarget | null;
 }
 
 interface ActivityEntry {
@@ -79,47 +100,169 @@ interface ActivityEntry {
   status: "info" | "pending" | "success" | "warning" | "error";
 }
 
+interface ConsoleUploadResultEvent {
+  vmName: string;
+  vmIp: string;
+  status: "success" | "error";
+  message: string;
+  files: string[];
+  remotePaths: string[];
+}
+
 type ActivityStatusFilter = "all" | ActivityEntry["status"];
 type UiTheme = "graphite-sage" | "basalt-copper" | "mist-teal";
+type UiToneMode = "system" | "light" | "dark";
+type UiBackgroundMode = "default" | "solid" | "image";
 type WorkspaceMode = "empty" | "overview" | "connection" | "settings";
 type SettingsPanel = "appearance" | "connection" | "templates" | "logs";
 type VmPowerFilter = "all" | "running" | "stopped";
+type AccountImportMode = "excel" | "json" | "fixed";
+type AccountImportStatus = "new" | "update" | "error";
+
+interface UiPreferences {
+  theme: UiTheme;
+  toneMode: UiToneMode;
+  accentColor: string;
+  successColor: string;
+  warningColor: string;
+  dangerColor: string;
+  backgroundMode: UiBackgroundMode;
+  backgroundColor: string;
+  backgroundImageName: string;
+  backgroundImageMime: string;
+  backgroundImageUpdatedAt: string;
+  backgroundOpacity: number;
+  backgroundBlur: number;
+  backgroundOverlay: number;
+  showIconTooltips: boolean;
+  truncateLongNames: boolean;
+  throttleConsoleResize: boolean;
+}
+
+interface ConnectionPreferences {
+  selectedConnectionId: string;
+  providerType: ProviderType;
+  host: string;
+  port: number;
+  username: string;
+  connectionName: string;
+}
+
+interface AppPreferences {
+  ui: UiPreferences;
+  connection: ConnectionPreferences;
+}
+
+interface AppearanceImportConfig {
+  [key: string]: unknown;
+  baseTheme?: unknown;
+  theme?: unknown;
+  toneMode?: unknown;
+  colors?: Record<string, unknown>;
+  background?: Record<string, unknown>;
+}
+
+interface AccountImportDraft {
+  rowNo: number;
+  providerType: ProviderType | "";
+  host: string;
+  port: number;
+  name: string;
+  username: string;
+  password: string;
+  status: AccountImportStatus;
+  statusText: string;
+  statusDetail: string;
+  existingName?: string;
+  matchedId?: string;
+}
 
 const VM_SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
 const VRC_TOAST_DURATION_MS = 3000;
 const activityStatusOptions: ActivityStatusFilter[] = ["all", "pending", "success", "warning", "error", "info"];
-const themeOptions: Array<{ value: UiTheme; label: string; name: string; tone: string; description: string; colors: [string, string, string, string] }> = [
+const themeOptions: Array<{
+  value: UiTheme;
+  label: string;
+  name: string;
+  tone: string;
+  description: string;
+  colors: [string, string, string, string];
+  accentColor: string;
+  successColor: string;
+  warningColor: string;
+  dangerColor: string;
+}> = [
   {
     value: "graphite-sage",
-    label: "石墨绿",
-    name: "Graphite Sage",
-    tone: "推荐",
-    description: "低噪声、长时间看列表不累，适合默认主题。",
-    colors: ["#f5f6f2", "#fbfbf7", "#426b57", "#b77935"],
+    label: "石墨青",
+    name: "石墨青",
+    tone: "当前默认",
+    description: "低饱和灰绿，适合长时间查看资源和状态。",
+    colors: ["#f5f6f2", "#fbfbf7", "#426b57", "#27302a"],
+    accentColor: "#426b57",
+    successColor: "#477a45",
+    warningColor: "#b77935",
+    dangerColor: "#a5483d",
   },
   {
     value: "basalt-copper",
-    label: "岩铜",
-    name: "Basalt Copper",
-    tone: "专业客户端",
-    description: "铜色只做重点，整体更接近桌面运维工具。",
-    colors: ["#f4f2ed", "#fcfaf5", "#9b5f35", "#5f6f68"],
+    label: "玄武铜",
+    name: "玄武铜",
+    tone: "暖色",
+    description: "暖灰底配铜色强调，层级清楚但不刺眼。",
+    colors: ["#f4f2ed", "#fcfaf5", "#9b5f35", "#2f2b24"],
+    accentColor: "#9b5f35",
+    successColor: "#4f7549",
+    warningColor: "#b77935",
+    dangerColor: "#a34f42",
   },
   {
     value: "mist-teal",
     label: "雾青",
-    name: "Mist Teal",
-    tone: "轻量",
-    description: "更清爽，适合 Web 感更强的控制台版本。",
-    colors: ["#f3f6f4", "#fbfcfa", "#2f6f68", "#ad7833"],
+    name: "雾青",
+    tone: "清爽",
+    description: "偏冷的青灰色，适合信息密度较高的列表。",
+    colors: ["#f3f6f4", "#fbfcfa", "#2f6f68", "#22302d"],
+    accentColor: "#2f6f68",
+    successColor: "#4d7a50",
+    warningColor: "#ad7833",
+    dangerColor: "#a3483f",
   },
 ];
+const accentColorPresets = ["#426b57", "#2f6f68", "#315f92", "#6a5b88", "#9b5f35", "#8a4f5d"];
+const defaultUiPreferences: UiPreferences = {
+  theme: normalizeTheme(document.documentElement.dataset.theme || localStorage.getItem("vrc.theme")),
+  toneMode: "light",
+  accentColor: "#426b57",
+  successColor: "#477a45",
+  warningColor: "#b77935",
+  dangerColor: "#a5483d",
+  backgroundMode: "default",
+  backgroundColor: "#edf1ee",
+  backgroundImageName: "",
+  backgroundImageMime: "",
+  backgroundImageUpdatedAt: "",
+  backgroundOpacity: 32,
+  backgroundBlur: 0,
+  backgroundOverlay: 8,
+  showIconTooltips: true,
+  truncateLongNames: true,
+  throttleConsoleResize: true,
+};
+const defaultConnectionPreferences: ConnectionPreferences = {
+  selectedConnectionId: localStorage.getItem("vrc.connectionId") || "",
+  providerType: normalizeProviderType(localStorage.getItem("vrc.providerType")),
+  host: localStorage.getItem("vrc.host") || "",
+  port: Number(localStorage.getItem("vrc.port") || defaultPortForProvider(normalizeProviderType(localStorage.getItem("vrc.providerType")))),
+  username: localStorage.getItem("vrc.username") || "root",
+  connectionName: "",
+};
 
 const connection = reactive({
-  providerType: (localStorage.getItem("vrc.providerType") as ProviderType) || "xenserver",
-  host: localStorage.getItem("vrc.host") || "",
-  port: Number(localStorage.getItem("vrc.port") || defaultPortForProvider((localStorage.getItem("vrc.providerType") as ProviderType) || "xenserver")),
-  username: localStorage.getItem("vrc.username") || "root",
+  providerType: defaultConnectionPreferences.providerType,
+  host: defaultConnectionPreferences.host,
+  port: defaultConnectionPreferences.port,
+  username: defaultConnectionPreferences.username,
   password: "",
 });
 
@@ -127,8 +270,8 @@ const inventory = ref<HostsResponse | null>(null);
 const vms = ref<VmsResponse | null>(null);
 const vmSummary = ref<VmInventorySummary | null>(null);
 const storedConnections = ref<StoredConnectionSummary[]>([]);
-const selectedConnectionId = ref(localStorage.getItem("vrc.connectionId") || "");
-const connectionName = ref("");
+const selectedConnectionId = ref(defaultConnectionPreferences.selectedConnectionId);
+const connectionName = ref(defaultConnectionPreferences.connectionName);
 const connectionSearch = ref("");
 const showConnectionEditor = ref(true);
 const showActivityPanel = ref(false);
@@ -147,9 +290,22 @@ const activityEntries = ref<ActivityEntry[]>([
 ]);
 const selectedHostId = ref("");
 const connectionSettingsVisible = ref(false);
+const accountImportVisible = ref(false);
+const accountImportMode = ref<AccountImportMode>("excel");
+const accountImportText = ref("");
+const accountImportFileName = ref("");
+const accountImportDrafts = ref<AccountImportDraft[]>([]);
+const accountImportError = ref("");
+const parsingAccountImport = ref(false);
+const importingAccounts = ref(false);
+const accountImportFileInput = ref<HTMLInputElement | null>(null);
+const appearanceImageFileInput = ref<HTMLInputElement | null>(null);
+const appearanceJsonFileInput = ref<HTMLInputElement | null>(null);
+const appearanceImageUploading = ref(false);
 const vmDetailVisible = ref(false);
 const consoleDialogVisible = ref(false);
 const consoleTarget = ref<VmConsoleTarget | null>(null);
+const consoleProvisionTaskId = ref("");
 const loadingHosts = ref(false);
 const loadingVmSummary = ref(false);
 const loadingVms = ref(false);
@@ -158,6 +314,8 @@ const testing = ref(false);
 const savingConnection = ref(false);
 const errorMessage = ref("");
 const successMessage = ref("");
+const connectionFeedbackText = ref("");
+const connectionFeedbackKind = ref<"" | "success" | "error">("");
 const search = ref("");
 const vmPowerFilter = ref<VmPowerFilter>("all");
 const storageDetailVisible = ref(false);
@@ -180,14 +338,24 @@ const hostOverviewSearch = ref("");
 const hostOverviewMatchMode = ref<"exact" | "fuzzy">("exact");
 const vmSearchCache = ref<Record<string, VmSearchCacheEntry>>({});
 const currentTheme = ref<UiTheme>(normalizeTheme(document.documentElement.dataset.theme || localStorage.getItem("vrc.theme")));
+const uiPreferences = reactive<UiPreferences>({ ...defaultUiPreferences });
+const uiPreferencesLoaded = ref(false);
+const systemDark = ref(window.matchMedia("(prefers-color-scheme: dark)").matches);
+const isElectron = /Electron/i.test(navigator.userAgent);
+const isMacElectron = isElectron && /Mac/i.test(navigator.platform);
+const isWindowsElectron = isElectron && /Win/i.test(navigator.platform);
 let hostOverviewRequestSeq = 0;
 let vmSearchRequestSeq = 0;
 let activitySeq = 0;
 let lastErrorToast = "";
 let lastErrorToastAt = 0;
 let vmSearchTimer: ReturnType<typeof setTimeout> | undefined;
+let connectionPreferenceSaveTimer: ReturnType<typeof setTimeout> | undefined;
+let appearanceMediaQuery: MediaQueryList | undefined;
 const provisioningPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const provisioningTaskMarks = new Map<string, string>();
+const provisioningEventSources = new Map<string, EventSource>();
+const provisioningTaskPayloads = new Map<string, VmCreateRequest>();
 
 const hosts = computed(() => inventory.value?.hosts ?? []);
 const storage = computed(() => inventory.value?.storage ?? []);
@@ -202,13 +370,27 @@ const connectionActionPendingMessage = computed(() => {
   if (loadingHosts.value) return "正在读取物理机、存储、网络和 VM 清单";
   return "";
 });
-const connectionFeedbackMessage = computed(() => connectionActionPendingMessage.value || errorMessage.value || successMessage.value);
+const connectionFeedbackMessage = computed(() => connectionActionPendingMessage.value || connectionFeedbackText.value);
 const connectionFeedbackStatus = computed(() => {
   if (connectionActionPendingMessage.value) return "loading";
-  if (errorMessage.value) return "error";
-  if (successMessage.value) return "success";
-  return "";
+  return connectionFeedbackKind.value;
 });
+const accountImportSummary = computed(() => {
+  const rows = accountImportDrafts.value;
+  return {
+    total: rows.length,
+    importable: rows.filter((row) => row.status !== "error").length,
+    update: rows.filter((row) => row.status === "update").length,
+    error: rows.filter((row) => row.status === "error").length,
+  };
+});
+const accountImportCanConfirm = computed(() => accountImportSummary.value.importable > 0 && !parsingAccountImport.value && !importingAccounts.value);
+const accountImportPlaceholder = computed(() =>
+  accountImportMode.value === "json"
+    ? `[{"平台":"XenServer","主机":"192.0.2.77","服务器名称":"xenserver-1","登录账号":"root","登录密码":"change-me"}]`
+    : "XenServer 192.0.2.77 xenserver-1 root change-me\nXenServer 192.0.2.6 xenserver-3 change-me",
+);
+const accountImportUpdateNotes = computed(() => accountImportDrafts.value.filter((row) => row.status === "update").slice(0, 3));
 const provisioningReservedIps = computed(() => {
   const ips = new Set<string>();
   for (const item of storedConnections.value) {
@@ -222,6 +404,47 @@ const provisioningReservedIps = computed(() => {
   }
   return Array.from(ips);
 });
+const activeConsoleProvisionTask = computed(() =>
+  consoleProvisionTaskId.value && activeProvisionTask.value?.id === consoleProvisionTaskId.value ? activeProvisionTask.value : null,
+);
+function buildProvisionConsoleTargets(task: ProvisionTask | null) {
+  if (!task) return [];
+  return task.vms.map((taskVm, index) => {
+    const target = resolveProvisionTaskVmConsoleTarget(taskVm);
+    return {
+      key: taskVm.providerId || taskVm.id || `${taskVm.name}:${taskVm.ip || index}`,
+      name: taskVm.name,
+      ip: taskVm.ip,
+      status: taskVm.status,
+      message: taskVm.message,
+      progressPercent: taskVm.progressPercent,
+      currentStep: taskVm.currentStep,
+      installPackageDone: taskVm.installPackageDone,
+      installPackageTotal: taskVm.installPackageTotal,
+      target,
+    };
+  });
+}
+const provisionConsoleTargets = computed<ProvisionConsoleTargetItem[]>(() => buildProvisionConsoleTargets(activeConsoleProvisionTask.value));
+const activeProvisionConsoleTargets = computed<ProvisionConsoleTargetItem[]>(() => buildProvisionConsoleTargets(activeProvisionTask.value));
+const provisionInlineConsoleTarget = ref<VmConsoleTarget | null>(null);
+const activeProvisionConsoleAvailable = computed(() => {
+  return activeProvisionConsoleTargets.value.some((item) => !!item.target);
+});
+watch(
+  () => [activeProvisionTask.value?.id, activeProvisionConsoleTargets.value.map((item) => item.target?.vmId || item.key).join("|")] as const,
+  () => {
+    if (!activeProvisionTask.value) {
+      provisionInlineConsoleTarget.value = null;
+      return;
+    }
+    const targets = activeProvisionConsoleTargets.value;
+    const currentVmId = provisionInlineConsoleTarget.value?.vmId;
+    if (currentVmId && targets.some((item) => item.target?.vmId === currentVmId)) return;
+    provisionInlineConsoleTarget.value = targets.find((item) => item.target)?.target ?? null;
+  },
+  { immediate: true },
+);
 const showWorkspacePlaceholder = computed(
   () => workspaceMode.value === "empty" && !loadingHosts.value && !inventory.value && !hostOverviewRows.value.length && !loadingHostOverview.value,
 );
@@ -314,17 +537,22 @@ const vmTotals = computed(() => {
       running: vmSummary.value.running,
       halted: vmSummary.value.halted,
       vcpu: vmSummary.value.vcpu,
+      runningVcpu: vmSummary.value.runningVcpu ?? vmSummary.value.vcpu,
       memoryBytes: vmSummary.value.memoryBytes,
+      runningMemoryBytes: vmSummary.value.runningMemoryBytes ?? vmSummary.value.memoryBytes,
       diskBytes: vmSummary.value.diskBytes ?? null,
     };
   }
   const items = vms.value?.items ?? [];
+  const runningItems = items.filter((vm) => vm.powerState === "running");
   return {
     all: vms.value?.total ?? items.length,
-    running: items.filter((vm) => vm.powerState === "running").length,
+    running: runningItems.length,
     halted: items.filter((vm) => vm.powerState === "halted").length,
     vcpu: items.reduce((sum, vm) => sum + vm.cpuCount, 0),
+    runningVcpu: runningItems.reduce((sum, vm) => sum + vm.cpuCount, 0),
     memoryBytes: items.reduce((sum, vm) => sum + vm.memoryBytes, 0),
+    runningMemoryBytes: runningItems.reduce((sum, vm) => sum + vm.memoryBytes, 0),
     diskBytes: items.reduce((sum, vm) => sum + positive(vm.diskVirtualBytes ?? 0), 0),
   };
 });
@@ -332,8 +560,7 @@ const vmTotals = computed(() => {
 const resourceSummary = computed(() => {
   const host = selectedHost.value;
   const cpuTotal = positive(host?.cpuCores ?? 0);
-  const cpuAllocated = positive(vmTotals.value.vcpu);
-  const cpuOver = Math.max(cpuAllocated - cpuTotal, 0);
+  const cpuAllocated = positive(vmTotals.value.runningVcpu);
   const memoryTotalGiB = (host?.memoryTotalBytes ?? 0) / 1024 / 1024 / 1024;
   const memoryUsedGiB = hostUsage.value.memoryUsedBytes / 1024 / 1024 / 1024;
   const storageTotalGiB = storageTotals.value.physicalGiB;
@@ -342,18 +569,18 @@ const resourceSummary = computed(() => {
   return [
     {
       key: "cpu",
-      name: "CPU 分配",
-      usedName: "已分配",
-      freeName: "剩余",
-      overName: "超配",
+      name: "运行 CPU",
+      usedName: "运行占用",
+      freeName: "物理核心",
+      overName: "",
       unit: "vCPU",
       capacityUnit: "核",
       used: Math.min(cpuAllocated, cpuTotal),
-      free: cpuOver > 0 ? 0 : Math.max(cpuTotal - cpuAllocated, 0),
-      over: cpuOver,
+      free: Math.max(cpuTotal - cpuAllocated, 0),
+      over: 0,
       total: cpuTotal,
-      headline: `${formatNumber(cpuAllocated)} vCPU / ${formatNumber(cpuTotal)} 核`,
-      subline: cpuOver > 0 ? `超配 ${formatNumber(cpuOver)} vCPU` : `剩余 ${formatNumber(Math.max(cpuTotal - cpuAllocated, 0))} 核`,
+      headline: `${formatNumber(cpuAllocated)} 运行 vCPU / ${formatNumber(cpuTotal)} 核`,
+      subline: `运行 ${formatNumber(cpuAllocated)} vCPU · ${formatNumber(cpuTotal)} 个物理核心`,
       percent: cpuTotal > 0 ? Math.round((cpuAllocated / cpuTotal) * 100) : 0,
     },
     {
@@ -417,7 +644,8 @@ const hostOverviewTotals = computed(() => {
 const hostOverviewMetricCards = computed(() => {
   const rows = hostOverviewRows.value.filter(hasOverviewInventory);
   const readyRows = rows.filter((row) => row.summary && row.status !== "error");
-  const cpuFree = readyRows.reduce((sum, row) => sum + hostCpuPlan(row).plannedFree, 0);
+  const physicalCpuCores = readyRows.reduce((sum, row) => sum + hostCpuPlan(row).cores, 0);
+  const runningVcpu = readyRows.reduce((sum, row) => sum + hostCpuPlan(row).allocated, 0);
   const memoryFree = readyRows.reduce((sum, row) => sum + hostMemoryPlan(row).free, 0);
   const storageTight = readyRows.filter((row) => {
     const storagePlan = hostStoragePlan(row);
@@ -449,10 +677,10 @@ const hostOverviewMetricCards = computed(() => {
     },
     {
       key: "cpu",
-      label: "CPU 余量",
-      value: `${formatNumber(cpuFree)} vCPU`,
-      detail: "按 4x 规划口径估算",
-      className: cpuFree < 12 ? "overview-metric-warning" : "",
+      label: "运行 vCPU",
+      value: `${formatNumber(runningVcpu)} vCPU`,
+      detail: `${formatNumber(physicalCpuCores)} 个物理核心`,
+      className: "",
     },
     {
       key: "memory",
@@ -520,11 +748,6 @@ const overviewEmptyState = computed(() => {
     detail: "点击左侧资源总览加载物理机清单",
   };
 });
-const vmLoadStatusText = computed(() => {
-  if (loadingVms.value) return "自动加载中";
-  if (vms.value) return `已加载 ${vms.value.items.length} / ${vms.value.total}`;
-  return "等待自动加载";
-});
 const vmSearchStatusText = computed(() => {
   const keyword = overviewSearchKeyword.value;
   if (!keyword) return "";
@@ -534,11 +757,35 @@ const vmSearchStatusText = computed(() => {
   if (overviewVmSearchLoading.value) return `VM IP 缓存 ${cached} / ${total} · 加载中`;
   return `VM IP 匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台 · 缓存 ${cached} / ${total}`;
 });
+const resolvedAppearanceDark = computed(() => uiPreferences.toneMode === "dark" || (uiPreferences.toneMode === "system" && systemDark.value));
+const appearanceBackgroundImageUrl = computed(() =>
+  uiPreferences.backgroundImageUpdatedAt
+    ? `/api/preferences/ui/background-image?v=${encodeURIComponent(uiPreferences.backgroundImageUpdatedAt)}`
+    : "",
+);
+const workspaceAppearanceStyle = computed<Record<string, string>>(() => ({
+  "--vrc-workspace-background-color": uiPreferences.backgroundMode === "solid" ? uiPreferences.backgroundColor : "transparent",
+  "--vrc-workspace-background-image":
+    uiPreferences.backgroundMode === "image" && appearanceBackgroundImageUrl.value ? `url(${JSON.stringify(appearanceBackgroundImageUrl.value)})` : "none",
+  "--vrc-workspace-background-opacity": String(uiPreferences.backgroundOpacity / 100),
+  "--vrc-workspace-background-blur": `${uiPreferences.backgroundBlur}px`,
+  "--vrc-workspace-background-overlay": String(uiPreferences.backgroundOverlay / 100),
+}));
+const appearanceBackgroundPreviewStyle = computed(() => ({
+  backgroundImage: appearanceBackgroundImageUrl.value ? `url(${JSON.stringify(appearanceBackgroundImageUrl.value)})` : "none",
+}));
 
 onMounted(async () => {
+  appearanceMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+  systemDark.value = appearanceMediaQuery.matches;
+  appearanceMediaQuery.addEventListener("change", handleAppearanceMediaChange);
+  await loadAppPreferences();
   await loadStoredConnections();
-  if (selectedConnectionId.value) {
+  if (selectedConnectionId.value && storedConnections.value.some((item) => item.id === selectedConnectionId.value)) {
     applyStoredConnection(selectedConnectionId.value);
+  } else if (selectedConnectionId.value) {
+    selectedConnectionId.value = "";
+    void saveConnectionPreferences(buildConnectionPreferencesFromState());
   }
   if (storedConnections.value.length) {
     await loadHostOverview();
@@ -546,8 +793,12 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  appearanceMediaQuery?.removeEventListener("change", handleAppearanceMediaChange);
+  if (connectionPreferenceSaveTimer) clearTimeout(connectionPreferenceSaveTimer);
   for (const timer of provisioningPollTimers.values()) clearTimeout(timer);
   provisioningPollTimers.clear();
+  for (const source of provisioningEventSources.values()) source.close();
+  provisioningEventSources.clear();
 });
 
 watch(hostOverviewSearch, (value) => {
@@ -579,19 +830,375 @@ watch(
   },
 );
 
+watch(
+  () => [selectedConnectionId.value, connection.providerType, connection.host, connection.port, connection.username, connectionName.value] as const,
+  () => {
+    if (!uiPreferencesLoaded.value) return;
+    queueConnectionPreferenceSave();
+  },
+);
+
 function normalizeTheme(value?: string | null): UiTheme {
   return value === "basalt-copper" || value === "mist-teal" || value === "graphite-sage" ? value : "graphite-sage";
 }
 
-function applyTheme(theme: UiTheme) {
+function normalizeProviderType(value?: string | null): ProviderType {
+  return value === "vmware" || value === "proxmox" || value === "libvirt" || value === "xenserver" ? value : "xenserver";
+}
+
+async function loadAppPreferences() {
+  try {
+    const result = await postJson<{ preferences: Partial<AppPreferences> }>("/api/preferences", undefined, "GET");
+    const connectionPreferences = shouldUseLegacyConnectionPreferences(result.preferences.connection)
+      ? defaultConnectionPreferences
+      : result.preferences.connection;
+    applyUiPreferences(result.preferences.ui ?? defaultUiPreferences);
+    applyConnectionPreferences(connectionPreferences ?? defaultConnectionPreferences);
+    if (connectionPreferences === defaultConnectionPreferences && hasLegacyConnectionPreferences()) {
+      void saveConnectionPreferences(buildConnectionPreferencesFromState()).then(clearLegacyConnectionPreferences);
+    }
+  } catch (error) {
+    applyUiPreferences(defaultUiPreferences);
+    applyConnectionPreferences(defaultConnectionPreferences);
+    setErrorMessage(error instanceof Error ? `读取本地偏好失败：${error.message}` : "读取本地偏好失败", false);
+  } finally {
+    uiPreferencesLoaded.value = true;
+  }
+}
+
+function applyUiPreferences(preferences: Partial<UiPreferences>) {
+  const theme = normalizeTheme(preferences.theme);
+  const themeOption = themeOptions.find((item) => item.value === theme) ?? themeOptions[0];
+  uiPreferences.theme = theme;
+  uiPreferences.toneMode = preferences.toneMode === "system" || preferences.toneMode === "dark" ? preferences.toneMode : "light";
+  uiPreferences.accentColor = normalizeHexColor(preferences.accentColor, themeOption.accentColor);
+  uiPreferences.successColor = normalizeHexColor(preferences.successColor, themeOption.successColor);
+  uiPreferences.warningColor = normalizeHexColor(preferences.warningColor, themeOption.warningColor);
+  uiPreferences.dangerColor = normalizeHexColor(preferences.dangerColor, themeOption.dangerColor);
+  uiPreferences.backgroundMode =
+    preferences.backgroundMode === "solid" || preferences.backgroundMode === "image" ? preferences.backgroundMode : "default";
+  uiPreferences.backgroundColor = normalizeHexColor(preferences.backgroundColor, defaultUiPreferences.backgroundColor);
+  uiPreferences.backgroundImageName = typeof preferences.backgroundImageName === "string" ? preferences.backgroundImageName : "";
+  uiPreferences.backgroundImageMime = typeof preferences.backgroundImageMime === "string" ? preferences.backgroundImageMime : "";
+  uiPreferences.backgroundImageUpdatedAt = typeof preferences.backgroundImageUpdatedAt === "string" ? preferences.backgroundImageUpdatedAt : "";
+  uiPreferences.backgroundOpacity = normalizeAppearanceNumber(preferences.backgroundOpacity, 5, 60, defaultUiPreferences.backgroundOpacity);
+  uiPreferences.backgroundBlur = normalizeAppearanceNumber(preferences.backgroundBlur, 0, 16, defaultUiPreferences.backgroundBlur);
+  uiPreferences.backgroundOverlay = normalizeAppearanceNumber(preferences.backgroundOverlay, 0, 35, defaultUiPreferences.backgroundOverlay);
+  uiPreferences.showIconTooltips = preferences.showIconTooltips ?? defaultUiPreferences.showIconTooltips;
+  uiPreferences.truncateLongNames = preferences.truncateLongNames ?? defaultUiPreferences.truncateLongNames;
+  uiPreferences.throttleConsoleResize = preferences.throttleConsoleResize ?? defaultUiPreferences.throttleConsoleResize;
+  applyThemeToDocument(uiPreferences.theme);
+  applyAppearanceToDocument();
+  document.documentElement.dataset.iconTooltips = String(uiPreferences.showIconTooltips);
+  document.documentElement.dataset.truncateLongNames = String(uiPreferences.truncateLongNames);
+  document.documentElement.dataset.consoleResizeThrottle = String(uiPreferences.throttleConsoleResize);
+}
+
+function applyThemeToDocument(theme: UiTheme) {
   currentTheme.value = theme;
+  uiPreferences.theme = theme;
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("vrc.theme", theme);
+}
+
+function applyTheme(theme: UiTheme) {
+  const themeOption = themeOptions.find((item) => item.value === theme) ?? themeOptions[0];
+  applyThemeToDocument(theme);
+  uiPreferences.accentColor = themeOption.accentColor;
+  uiPreferences.successColor = themeOption.successColor;
+  uiPreferences.warningColor = themeOption.warningColor;
+  uiPreferences.dangerColor = themeOption.dangerColor;
+  applyAppearanceToDocument();
+  void saveUiPreferences({
+    theme,
+    accentColor: themeOption.accentColor,
+    successColor: themeOption.successColor,
+    warningColor: themeOption.warningColor,
+    dangerColor: themeOption.dangerColor,
+  });
+}
+
+function updateUiPreference<K extends keyof UiPreferences>(key: K, value: UiPreferences[K]) {
+  uiPreferences[key] = value;
+  if (key === "theme") {
+    applyThemeToDocument(value as UiTheme);
+  }
+  applyAppearanceToDocument();
+  void saveUiPreferences({ [key]: value } as Partial<UiPreferences>);
+}
+
+function applyAppearanceToDocument() {
+  const style = document.documentElement.style;
+  style.setProperty("--vrc-accent", uiPreferences.accentColor);
+  style.setProperty("--vrc-accent-hover", `color-mix(in srgb, ${uiPreferences.accentColor} 82%, black)`);
+  style.setProperty("--vrc-accent-soft", `color-mix(in srgb, ${uiPreferences.accentColor} 13%, var(--vrc-surface))`);
+  style.setProperty("--vrc-success", uiPreferences.successColor);
+  style.setProperty("--vrc-warning", uiPreferences.warningColor);
+  style.setProperty("--vrc-danger", uiPreferences.dangerColor);
+  style.setProperty("color-scheme", resolvedAppearanceDark.value ? "dark" : "light");
+  document.documentElement.dataset.tone = resolvedAppearanceDark.value ? "dark" : "light";
+
+  const darkThemeVariables: Record<string, string> = {
+    "--vrc-bg": "#171a19",
+    "--vrc-surface": "#202422",
+    "--vrc-surface-muted": "#292e2b",
+    "--vrc-surface-raised": "#252a27",
+    "--vrc-border": "#383f3b",
+    "--vrc-border-strong": "#56605a",
+    "--vrc-text": "#e7ebe8",
+    "--vrc-text-muted": "#a6aea9",
+    "--vrc-text-subtle": "#7e8882",
+    "--vrc-tooltip-bg": "#0f1210",
+  };
+  for (const [name, value] of Object.entries(darkThemeVariables)) {
+    if (resolvedAppearanceDark.value) style.setProperty(name, value);
+    else style.removeProperty(name);
+  }
+}
+
+function handleAppearanceMediaChange(event: MediaQueryListEvent) {
+  systemDark.value = event.matches;
+  if (uiPreferences.toneMode === "system") applyAppearanceToDocument();
+}
+
+function normalizeHexColor(value: unknown, fallback: string) {
+  return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : fallback;
+}
+
+function normalizeAppearanceNumber(value: unknown, min: number, max: number, fallback: number) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback;
+}
+
+async function saveUiPreferences(preferences: Partial<UiPreferences>) {
+  try {
+    const result = await postJson<{ preferences: Partial<UiPreferences> }>("/api/preferences/ui", preferences, "PATCH");
+    applyUiPreferences(result.preferences);
+  } catch (error) {
+    setErrorMessage(error instanceof Error ? `保存本地偏好失败：${error.message}` : "保存本地偏好失败");
+  }
+}
+
+function setAppearanceAccentColor(color: string) {
+  updateUiPreference("accentColor", normalizeHexColor(color, uiPreferences.accentColor));
+}
+
+function updateAppearanceColor(key: "accentColor" | "successColor" | "warningColor" | "dangerColor" | "backgroundColor", color: string | null) {
+  if (!color) return;
+  updateUiPreference(key, normalizeHexColor(color, uiPreferences[key]));
+}
+
+function persistAppearanceNumber(key: "backgroundOpacity" | "backgroundBlur" | "backgroundOverlay") {
+  persistAppearancePreference(key);
+}
+
+function persistAppearancePreference<K extends keyof UiPreferences>(key: K) {
+  applyAppearanceToDocument();
+  void saveUiPreferences({ [key]: uiPreferences[key] } as Partial<UiPreferences>);
+}
+
+function selectAppearanceImage() {
+  appearanceImageFileInput.value?.click();
+}
+
+async function handleAppearanceImageChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file || appearanceImageUploading.value) return;
+
+  try {
+    await validateAppearanceImage(file);
+    appearanceImageUploading.value = true;
+    const formData = new FormData();
+    formData.append("file", file);
+    const response = await fetch("/api/preferences/ui/background-image", { method: "POST", body: formData });
+    const result = (await response.json()) as { preferences?: Partial<UiPreferences>; message?: string };
+    if (!response.ok || !result.preferences) throw new Error(result.message || "上传背景图片失败");
+    applyUiPreferences(result.preferences);
+    ElMessage.success({ message: "背景图片已应用", duration: VRC_TOAST_DURATION_MS });
+  } catch (error) {
+    ElMessage.error({ message: error instanceof Error ? error.message : "上传背景图片失败", duration: VRC_TOAST_DURATION_MS });
+  } finally {
+    appearanceImageUploading.value = false;
+  }
+}
+
+async function validateAppearanceImage(file: File) {
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+    throw new Error("背景图片仅支持 JPG、PNG 和 WebP");
+  }
+  if (file.size > 16 * 1024 * 1024) {
+    throw new Error("背景图片不能超过 16MB");
+  }
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const image = new Image();
+      image.addEventListener("load", () => resolve(), { once: true });
+      image.addEventListener("error", () => reject(new Error("图片无法读取，请更换文件")), { once: true });
+      image.src = objectUrl;
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+function selectAppearanceJson() {
+  appearanceJsonFileInput.value?.click();
+}
+
+async function handleAppearanceJsonChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  try {
+    const config = JSON.parse(await file.text()) as AppearanceImportConfig;
+    const preferences = normalizeImportedAppearance(config);
+    const result = await postJson<{ preferences: Partial<UiPreferences> }>("/api/preferences/ui", preferences, "PATCH");
+    applyUiPreferences(result.preferences);
+    ElMessage.success({ message: "主题配置已载入", duration: VRC_TOAST_DURATION_MS });
+  } catch (error) {
+    ElMessage.error({ message: error instanceof Error ? error.message : "主题配置文件格式不正确", duration: VRC_TOAST_DURATION_MS });
+  }
+}
+
+function normalizeImportedAppearance(config: AppearanceImportConfig): Partial<UiPreferences> {
+  const importedTheme = config.baseTheme ?? config.theme;
+  const theme = normalizeTheme(typeof importedTheme === "string" ? importedTheme : undefined);
+  const themeOption = themeOptions.find((item) => item.value === theme) ?? themeOptions[0];
+  const colors = config.colors ?? config;
+  const background = config.background ?? config;
+  return {
+    theme,
+    toneMode: config.toneMode === "system" || config.toneMode === "dark" ? config.toneMode : "light",
+    accentColor: normalizeHexColor(colors.accent ?? colors.accentColor, themeOption.accentColor),
+    successColor: normalizeHexColor(colors.success ?? colors.successColor, themeOption.successColor),
+    warningColor: normalizeHexColor(colors.warning ?? colors.warningColor, themeOption.warningColor),
+    dangerColor: normalizeHexColor(colors.danger ?? colors.dangerColor, themeOption.dangerColor),
+    backgroundMode: background.mode === "solid" || background.mode === "image" ? background.mode : "default",
+    backgroundColor: normalizeHexColor(background.color ?? background.backgroundColor, defaultUiPreferences.backgroundColor),
+    backgroundOpacity: normalizeAppearanceNumber(background.opacity ?? background.backgroundOpacity, 5, 60, defaultUiPreferences.backgroundOpacity),
+    backgroundBlur: normalizeAppearanceNumber(background.blur ?? background.backgroundBlur, 0, 16, defaultUiPreferences.backgroundBlur),
+    backgroundOverlay: normalizeAppearanceNumber(background.overlay ?? background.backgroundOverlay, 0, 35, defaultUiPreferences.backgroundOverlay),
+  };
+}
+
+function exportAppearanceConfig() {
+  const config = {
+    version: 1,
+    baseTheme: uiPreferences.theme,
+    toneMode: uiPreferences.toneMode,
+    colors: {
+      accent: uiPreferences.accentColor,
+      success: uiPreferences.successColor,
+      warning: uiPreferences.warningColor,
+      danger: uiPreferences.dangerColor,
+    },
+    background: {
+      mode: uiPreferences.backgroundMode,
+      color: uiPreferences.backgroundColor,
+      imageName: uiPreferences.backgroundImageName,
+      opacity: uiPreferences.backgroundOpacity,
+      blur: uiPreferences.backgroundBlur,
+      overlay: uiPreferences.backgroundOverlay,
+    },
+  };
+  const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "vrc-theme.json";
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+async function resetAppearancePreferences() {
+  try {
+    const response = await fetch("/api/preferences/ui/background-image", { method: "DELETE" });
+    const deleted = (await response.json()) as { preferences?: Partial<UiPreferences>; message?: string };
+    if (!response.ok) throw new Error(deleted.message || "清除背景图片失败");
+    const themeOption = themeOptions[0];
+    const result = await postJson<{ preferences: Partial<UiPreferences> }>(
+      "/api/preferences/ui",
+      {
+        theme: themeOption.value,
+        toneMode: "light",
+        accentColor: themeOption.accentColor,
+        successColor: themeOption.successColor,
+        warningColor: themeOption.warningColor,
+        dangerColor: themeOption.dangerColor,
+        backgroundMode: "default",
+        backgroundColor: defaultUiPreferences.backgroundColor,
+        backgroundOpacity: defaultUiPreferences.backgroundOpacity,
+        backgroundBlur: defaultUiPreferences.backgroundBlur,
+        backgroundOverlay: defaultUiPreferences.backgroundOverlay,
+      },
+      "PATCH",
+    );
+    applyUiPreferences(result.preferences);
+    ElMessage.success({ message: "外观设置已重置", duration: VRC_TOAST_DURATION_MS });
+  } catch (error) {
+    ElMessage.error({ message: error instanceof Error ? error.message : "重置外观失败", duration: VRC_TOAST_DURATION_MS });
+  }
+}
+
+function applyConnectionPreferences(preferences: Partial<ConnectionPreferences>) {
+  selectedConnectionId.value = typeof preferences.selectedConnectionId === "string" ? preferences.selectedConnectionId : defaultConnectionPreferences.selectedConnectionId;
+  connection.providerType = normalizeProviderType(preferences.providerType);
+  connection.host = typeof preferences.host === "string" ? preferences.host : defaultConnectionPreferences.host;
+  connection.port = normalizePort(preferences.port, connection.providerType);
+  connection.username = typeof preferences.username === "string" && preferences.username.trim() ? preferences.username : defaultConnectionPreferences.username;
+  connectionName.value = typeof preferences.connectionName === "string" ? preferences.connectionName : defaultConnectionPreferences.connectionName;
+}
+
+function buildConnectionPreferencesFromState(): ConnectionPreferences {
+  return {
+    selectedConnectionId: selectedConnectionId.value,
+    providerType: connection.providerType,
+    host: connection.host.trim(),
+    port: normalizePort(connection.port, connection.providerType),
+    username: connection.username.trim() || "root",
+    connectionName: connectionName.value.trim(),
+  };
+}
+
+async function saveConnectionPreferences(preferences: Partial<ConnectionPreferences>) {
+  try {
+    await postJson<{ preferences: ConnectionPreferences }>("/api/preferences/connection", preferences, "PATCH");
+  } catch (error) {
+    setErrorMessage(error instanceof Error ? `保存连接偏好失败：${error.message}` : "保存连接偏好失败", false);
+  }
+}
+
+function queueConnectionPreferenceSave() {
+  if (connectionPreferenceSaveTimer) clearTimeout(connectionPreferenceSaveTimer);
+  connectionPreferenceSaveTimer = setTimeout(() => {
+    connectionPreferenceSaveTimer = undefined;
+    void saveConnectionPreferences(buildConnectionPreferencesFromState());
+  }, 300);
+}
+
+function hasLegacyConnectionPreferences() {
+  return ["vrc.connectionId", "vrc.providerType", "vrc.host", "vrc.port", "vrc.username"].some((key) => localStorage.getItem(key));
+}
+
+function clearLegacyConnectionPreferences() {
+  for (const key of ["vrc.connectionId", "vrc.providerType", "vrc.host", "vrc.port", "vrc.username"]) {
+    localStorage.removeItem(key);
+  }
+}
+
+function shouldUseLegacyConnectionPreferences(preferences?: Partial<ConnectionPreferences>) {
+  if (!hasLegacyConnectionPreferences()) return false;
+  if (!preferences) return true;
+  return !preferences.selectedConnectionId && !preferences.host && normalizeProviderType(preferences.providerType) === "xenserver";
 }
 
 function openSettingsWorkspace() {
   workspaceMode.value = "settings";
   settingsPanel.value = "appearance";
+  clearConnectionFeedback();
   connectionSettingsVisible.value = false;
   vmDetailVisible.value = false;
   hostDetailVisible.value = false;
@@ -621,6 +1228,7 @@ async function loadStoredConnections() {
 function applyStoredConnection(connectionId: string) {
   const stored = storedConnections.value.find((item) => item.id === connectionId);
   if (!stored) return;
+  clearConnectionFeedback();
   selectedConnectionId.value = stored.id;
   connection.providerType = stored.providerType;
   connection.host = stored.host;
@@ -629,7 +1237,7 @@ function applyStoredConnection(connectionId: string) {
   connection.password = "";
   connectionName.value = stored.name;
   showConnectionEditor.value = false;
-  localStorage.setItem("vrc.connectionId", stored.id);
+  void saveConnectionPreferences(buildConnectionPreferencesFromState());
   pushActivity("选择连接", {
     target: stored.name,
     detail: `${providerLabel(stored.providerType)} · ${stored.host}:${stored.port}`,
@@ -656,8 +1264,8 @@ async function selectConnectionAndLoad(connectionId: string) {
 function startNewConnection() {
   workspaceMode.value = "settings";
   settingsPanel.value = "connection";
+  clearConnectionFeedback();
   selectedConnectionId.value = "";
-  localStorage.removeItem("vrc.connectionId");
   connectionName.value = "";
   connection.password = "";
   inventory.value = null;
@@ -675,8 +1283,12 @@ function startNewConnection() {
 }
 
 async function saveConnection() {
+  clearConnectionFeedback();
   const direct = buildDirectConnectionPayload();
-  if (!direct) return;
+  if (!direct) {
+    setConnectionFeedback("error", errorMessage.value || "连接信息不完整");
+    return;
+  }
   clearMessages();
   savingConnection.value = true;
 
@@ -687,17 +1299,16 @@ async function saveConnection() {
       name: connectionName.value.trim() || `${direct.providerType}:${direct.host}`,
     });
     selectedConnectionId.value = result.connection.id;
-    localStorage.setItem("vrc.connectionId", result.connection.id);
     await loadStoredConnections();
     applyStoredConnection(result.connection.id);
-    setSuccessMessage(`连接已保存：${result.connection.name}。下次可直接加载资源。`);
+    setConnectionSuccessMessage(`连接已保存：${result.connection.name}。下次可直接加载资源。`);
     pushActivity("保存连接", {
       target: result.connection.name,
       detail: `${providerLabel(result.connection.providerType)} · ${result.connection.host}:${result.connection.port}`,
       status: "success",
     });
   } catch (error) {
-    setErrorMessage(error instanceof Error ? error.message : "保存连接失败");
+    setConnectionErrorMessage(error instanceof Error ? error.message : "保存连接失败");
   } finally {
     savingConnection.value = false;
   }
@@ -723,27 +1334,375 @@ async function deleteConnection() {
   try {
     await postJson(`/api/connections/${selectedConnectionId.value}`, undefined, "DELETE");
     selectedConnectionId.value = "";
-    localStorage.removeItem("vrc.connectionId");
+    void saveConnectionPreferences(buildConnectionPreferencesFromState());
     await loadStoredConnections();
-    setSuccessMessage("保存的连接已删除。");
+    setConnectionSuccessMessage("保存的连接已删除。");
     pushActivity("删除连接", {
       target: deletedConnection?.name || "保存连接",
       detail: deletedConnection ? `${providerLabel(deletedConnection.providerType)} · ${deletedConnection.host}:${deletedConnection.port}` : "本地连接配置已删除",
       status: "warning",
     });
   } catch (error) {
-    setErrorMessage(error instanceof Error ? error.message : "删除连接失败");
+    setConnectionErrorMessage(error instanceof Error ? error.message : "删除连接失败");
   }
 }
 
 async function loadSelectedConnectionResources() {
   if (!selectedConnectionId.value) {
     showConnectionEditor.value = true;
-    setErrorMessage("还没有保存连接。请先填写 Host、用户名和密码，点“保存”，之后就能加载资源。");
-    successMessage.value = "";
+    setConnectionErrorMessage("还没有保存连接。请先填写 Host、用户名和密码，点“保存”，之后就能加载资源。");
     return;
   }
+  clearConnectionFeedback();
   await loadHostInventory();
+}
+
+function openAccountImportDialog() {
+  accountImportVisible.value = true;
+  accountImportMode.value = "excel";
+  accountImportError.value = "";
+  accountImportDrafts.value = [];
+  accountImportFileName.value = "";
+  accountImportText.value = "";
+}
+
+function switchAccountImportMode(mode: AccountImportMode) {
+  accountImportMode.value = mode;
+  accountImportError.value = "";
+}
+
+function triggerAccountImportFile() {
+  accountImportFileInput.value?.click();
+}
+
+function downloadAccountImportTemplate() {
+  const rows = [
+    ["平台", "主机", "服务器名称", "登录账号", "登录密码", "端口"],
+    ["XenServer", "192.0.2.77", "xenserver-1", "root", "change-me", "22"],
+    ["VMware", "192.0.2.27", "vmware-27", "root", "change-me", "443"],
+  ];
+  const csv = rows.map((row) => row.map((cell) => `"${cell.replace(/"/g, '""')}"`).join(",")).join("\n");
+  const url = URL.createObjectURL(new Blob([`\ufeff${csv}`], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "vrc-server-account-template.csv";
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+async function handleAccountImportFileChange(event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0];
+  if (file) {
+    await parseAccountImportFile(file);
+  }
+  (event.target as HTMLInputElement).value = "";
+}
+
+async function handleAccountImportDrop(event: DragEvent) {
+  const file = event.dataTransfer?.files?.[0];
+  if (file) {
+    accountImportMode.value = "excel";
+    await parseAccountImportFile(file);
+  }
+}
+
+async function parseAccountImport() {
+  accountImportError.value = "";
+  accountImportDrafts.value = [];
+  parsingAccountImport.value = true;
+  try {
+    if (accountImportMode.value === "json") {
+      accountImportDrafts.value = normalizeAccountImportRows(parseAccountImportJson(accountImportText.value));
+    } else if (accountImportMode.value === "fixed") {
+      accountImportDrafts.value = normalizeAccountImportRows(parseFixedAccountImport(accountImportText.value));
+    } else if (accountImportFileName.value) {
+      accountImportError.value = "文件已解析，可直接检查预览结果。";
+    } else {
+      accountImportError.value = "请先选择 .xlsx / .csv 文件。";
+    }
+  } catch (error) {
+    accountImportError.value = error instanceof Error ? error.message : "解析失败";
+  } finally {
+    parsingAccountImport.value = false;
+  }
+}
+
+async function parseAccountImportFile(file: File) {
+  accountImportError.value = "";
+  accountImportDrafts.value = [];
+  parsingAccountImport.value = true;
+  accountImportFileName.value = file.name;
+  try {
+    const lowerName = file.name.toLowerCase();
+    if (lowerName.endsWith(".csv")) {
+      accountImportDrafts.value = normalizeAccountImportRows(parseCsvAccountImport(await file.text()));
+    } else if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls")) {
+      const XLSX = await import("xlsx");
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
+      const firstSheetName = workbook.SheetNames[0];
+      if (!firstSheetName) throw new Error("Excel 文件没有工作表");
+      const sheet = workbook.Sheets[firstSheetName];
+      accountImportDrafts.value = normalizeAccountImportRows(XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" }));
+    } else {
+      throw new Error("只支持 .xlsx / .xls / .csv 文件");
+    }
+  } catch (error) {
+    accountImportError.value = error instanceof Error ? error.message : "文件解析失败";
+  } finally {
+    parsingAccountImport.value = false;
+  }
+}
+
+function parseAccountImportJson(text: string): Array<Record<string, unknown>> {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error("请粘贴 JSON 数组或包含 connections/accounts 的对象");
+  const parsed = JSON.parse(trimmed) as unknown;
+  if (Array.isArray(parsed)) return parsed.filter(isRecord);
+  if (isRecord(parsed)) {
+    const nested = parsed.connections ?? parsed.accounts ?? parsed.items;
+    if (Array.isArray(nested)) return nested.filter(isRecord);
+  }
+  throw new Error("JSON 格式应为数组，或包含 connections / accounts / items 数组");
+}
+
+function parseFixedAccountImport(text: string): Array<Record<string, unknown>> {
+  return text
+    .split(/\r?\n/)
+    .map((line, index) => ({ line: line.trim(), rowNo: index + 1 }))
+    .filter((item) => item.line && !item.line.startsWith("#"))
+    .map((item) => {
+      const parts = item.line.split(/\s+/);
+      if (parts.length < 4) {
+        return { rowNo: item.rowNo, platform: parts[0] ?? "", host: parts[1] ?? "", name: parts[2] ?? "", password: "", error: "固定格式至少需要 4 列" };
+      }
+      if (parts.length === 4) {
+        return { rowNo: item.rowNo, platform: parts[0], host: parts[1], name: parts[2], username: "root", password: parts[3] };
+      }
+      return { rowNo: item.rowNo, platform: parts[0], host: parts[1], name: parts[2], username: parts[3], password: parts.slice(4).join(" ") };
+    });
+}
+
+function parseCsvAccountImport(text: string): Array<Record<string, unknown>> {
+  const rows = parseDelimitedRows(text);
+  if (rows.length < 2) return [];
+  const headers = rows[0].map((item) => item.trim());
+  return rows.slice(1).map((row, index) => {
+    const record: Record<string, unknown> = { rowNo: index + 2 };
+    headers.forEach((header, columnIndex) => {
+      record[header] = row[columnIndex] ?? "";
+    });
+    return record;
+  });
+}
+
+function parseDelimitedRows(text: string) {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    const next = text[index + 1];
+    if (char === '"' && inQuotes && next === '"') {
+      cell += '"';
+      index++;
+    } else if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if ((char === "," || char === "\t") && !inQuotes) {
+      row.push(cell);
+      cell = "";
+    } else if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && next === "\n") index++;
+      row.push(cell);
+      if (row.some((value) => value.trim())) rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  row.push(cell);
+  if (row.some((value) => value.trim())) rows.push(row);
+  return rows;
+}
+
+function normalizeAccountImportRows(records: Array<Record<string, unknown>>): AccountImportDraft[] {
+  if (!records.length) return [];
+  return records.map((record, index) => normalizeAccountImportRow(record, index + 1));
+}
+
+function normalizeAccountImportRow(record: Record<string, unknown>, fallbackRowNo: number): AccountImportDraft {
+  const explicitError = textCell(record.error);
+  const providerType = normalizeImportProvider(textCell(readImportCell(record, ["平台", "platform", "provider", "providerType"])));
+  const host = textCell(readImportCell(record, ["主机", "Host", "host", "管理地址", "服务器地址", "ip", "IP"]));
+  const name = textCell(readImportCell(record, ["服务器名称", "服务器名", "连接名", "name", "serverName"])) || host;
+  const username = textCell(readImportCell(record, ["登录账号", "账号", "用户名", "username", "user"])) || "root";
+  const password = textCell(readImportCell(record, ["登录密码", "密码", "password"]));
+  const portValue = Number(textCell(readImportCell(record, ["端口", "port"])));
+  const port = Number.isFinite(portValue) && portValue > 0 ? portValue : providerType ? defaultPortForProvider(providerType) : 0;
+  const matched = providerType ? storedConnections.value.find((item) => item.providerType === providerType && item.host === host && item.port === port) : undefined;
+  const errors = [
+    explicitError,
+    providerType ? "" : "平台不支持",
+    host ? "" : "主机必填",
+    isImportHostValid(host) ? "" : "主机格式错误",
+    name ? "" : "服务器名称必填",
+    username ? "" : "账号必填",
+    password ? "" : "密码必填",
+    port > 0 && port <= 65535 ? "" : "端口错误",
+  ].filter(Boolean);
+  return {
+    rowNo: Number(record.rowNo) || fallbackRowNo,
+    providerType,
+    host,
+    port,
+    name,
+    username,
+    password,
+    status: errors.length ? "error" : matched ? "update" : "new",
+    statusText: errors[0] || (matched ? "相同 IP" : "新增"),
+    statusDetail: errors[0] || buildAccountImportStatusDetail({ matched, name, username, port }),
+    existingName: matched?.name,
+    matchedId: matched?.id,
+  };
+}
+
+function buildAccountImportStatusDetail(options: { matched: StoredConnectionSummary | undefined; name: string; username: string; port: number }) {
+  if (!options.matched) return "将新增保存连接";
+  const changes = [
+    options.matched.name !== options.name ? `名称：${options.matched.name} -> ${options.name}` : "",
+    options.matched.username !== options.username ? `账号：${options.matched.username} -> ${options.username}` : "",
+    options.matched.port !== options.port ? `端口：${options.matched.port} -> ${options.port}` : "",
+  ].filter(Boolean);
+  return changes.length ? `已存在相同 IP/端口，将更新 ${changes.join("，")}，并覆盖密码` : `已存在相同 IP/端口：${options.matched.name}，将覆盖密码`;
+}
+
+function readImportCell(record: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    if (record[key] !== undefined) return record[key];
+  }
+  const normalizedEntries = Object.entries(record).map(([key, value]) => [key.trim().toLowerCase(), value] as const);
+  for (const key of keys) {
+    const found = normalizedEntries.find(([entryKey]) => entryKey === key.trim().toLowerCase());
+    if (found) return found[1];
+  }
+  return "";
+}
+
+function normalizeImportProvider(value: string): ProviderType | "" {
+  const normalized = value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (["xenserver", "xcpng", "xen"].includes(normalized)) return "xenserver";
+  if (["vmware", "vsphere", "esxi"].includes(normalized)) return "vmware";
+  if (["proxmox", "proxmoxve", "pve"].includes(normalized)) return "proxmox";
+  if (["kvm", "libvirt"].includes(normalized)) return "libvirt";
+  return "";
+}
+
+function textCell(value: unknown) {
+  return value === undefined || value === null ? "" : String(value).trim();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isImportHostValid(value: string) {
+  return !!value && !/\s/.test(value) && value.length <= 255;
+}
+
+async function confirmAccountImport() {
+  const rows = accountImportDrafts.value.filter((row) => row.status !== "error");
+  if (!rows.length) return;
+  const updateRows = rows.filter((row) => row.status === "update");
+  const newRows = rows.filter((row) => row.status === "new");
+  const updatePreview = updateRows
+    .slice(0, 5)
+    .map((row) => `${row.existingName || row.name} -> ${row.name} (${row.host}:${row.port})`)
+    .join("\n");
+  try {
+    await confirmVrcAction({
+      heading: "导入服务器账号",
+      tone: updateRows.length ? "含覆盖更新" : "新增连接",
+      summary: `新增 ${newRows.length} 条 / 更新 ${updateRows.length} 条 / 跳过错误 ${accountImportSummary.value.error} 条`,
+      detail: updateRows.length
+        ? `确认后会先逐条测试连接；全部通过才保存。将按“平台 + 主机 + 端口”覆盖已存在连接的名称、账号和密码。\n${updatePreview}${updateRows.length > 5 ? `\n... 还有 ${updateRows.length - 5} 条更新` : ""}`
+        : "确认后会先逐条测试连接；全部通过才保存。不会自动加载资源，也不会修改 XenServer 主机、虚拟机、存储或网络。",
+      confirmButtonText: "测试并导入",
+      customClass: "account-import-confirm-message-box",
+    });
+  } catch {
+    return;
+  }
+  importingAccounts.value = true;
+  accountImportError.value = "";
+  try {
+    const failedRows = await testAccountImportRows(rows);
+    if (failedRows.length) {
+      accountImportError.value = `有 ${failedRows.length} 条连接测试失败，未导入任何账号。请修正密码、账号或地址后重新解析/导入。`;
+      setConnectionErrorMessage(accountImportError.value);
+      return;
+    }
+    for (const row of rows) {
+      await postJson<{ connection: StoredConnectionSummary }>("/api/connections", {
+        id: row.matchedId,
+        name: row.name,
+        providerType: row.providerType,
+        host: row.host,
+        port: row.port,
+        username: row.username,
+        password: row.password,
+      });
+    }
+    const shouldRefreshSelectedConnection = rows.some((row) => row.matchedId && row.matchedId === selectedConnectionId.value);
+    await loadStoredConnections();
+    if (shouldRefreshSelectedConnection && selectedConnectionId.value) {
+      applyStoredConnection(selectedConnectionId.value);
+    }
+    accountImportVisible.value = false;
+    setConnectionSuccessMessage(`连接测试全部通过，已导入 ${rows.length} 个服务器账号，其中 ${rows.filter((row) => row.status === "update").length} 个覆盖更新。`);
+    pushActivity("导入服务器账号", {
+      target: "连接配置",
+      detail: `${rows.length} 条账号配置测试通过并保存`,
+      status: "success",
+    });
+  } catch (error) {
+    accountImportError.value = error instanceof Error ? error.message : "导入失败";
+    setConnectionErrorMessage(accountImportError.value);
+  } finally {
+    importingAccounts.value = false;
+  }
+}
+
+async function testAccountImportRows(rows: AccountImportDraft[]) {
+  const failedRows: AccountImportDraft[] = [];
+  for (const row of rows) {
+    try {
+      await postJson<{ hostName?: string }>("/api/connections/test", {
+        providerType: row.providerType,
+        host: row.host,
+        port: row.port,
+        username: row.username,
+        password: row.password,
+      });
+    } catch (error) {
+      failedRows.push(row);
+      markAccountImportRowFailed(row, error instanceof Error ? error.message : "连接测试失败");
+    }
+  }
+  return failedRows;
+}
+
+function markAccountImportRowFailed(row: AccountImportDraft, message: string) {
+  accountImportDrafts.value = accountImportDrafts.value.map((item) =>
+    item === row || (item.rowNo === row.rowNo && item.host === row.host && item.port === row.port)
+      ? {
+          ...item,
+          status: "error",
+          statusText: "测试失败",
+          statusDetail: message,
+        }
+      : item,
+  );
 }
 
 async function loadHostOverview() {
@@ -905,21 +1864,25 @@ async function loadHostOverviewSummary(row: HostOverviewRow, requestId = hostOve
 }
 
 async function testConnection() {
+  clearConnectionFeedback();
   const payload = buildConnectionPayload();
-  if (!payload) return;
+  if (!payload) {
+    setConnectionFeedback("error", errorMessage.value || "连接信息不完整");
+    return;
+  }
   testing.value = true;
   clearMessages();
 
   try {
     const result = await postJson<{ hostName?: string }>("/api/connections/test", payload);
-    setSuccessMessage(`测试连接成功：${result.hostName || connection.host}`);
+    setConnectionSuccessMessage(`测试连接成功：${result.hostName || connection.host}`);
     pushActivity("连接测试成功", {
       target: result.hostName || connection.host,
       detail: `${providerLabel(connection.providerType)} · ${connection.host}:${connection.port}`,
       status: "success",
     });
   } catch (error) {
-    setErrorMessage(error instanceof Error ? error.message : "测试连接失败");
+    setConnectionErrorMessage(error instanceof Error ? error.message : "测试连接失败");
     pushActivity("连接测试失败", {
       target: connection.host,
       detail: errorMessage.value,
@@ -942,7 +1905,7 @@ async function openHostOverview(row: HostOverviewRow) {
   connection.password = "";
   connectionName.value = row.connection.name;
   showConnectionEditor.value = false;
-  localStorage.setItem("vrc.connectionId", row.connection.id);
+  void saveConnectionPreferences(buildConnectionPreferencesFromState());
 
   inventory.value = row.inventory;
   selectedHostId.value = row.host.providerId;
@@ -1187,6 +2150,8 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
   const installModeText =
     payload.providerType === "xenserver"
       ? "将创建 VM、虚拟硬盘、网卡，挂载系统 ISO，写入无人值守安装参数，并开机打开控制台。"
+      : payload.providerType === "vmware" && payload.sourceType === "iso"
+        ? "将创建 VMware VM、虚拟硬盘和网卡，挂载 ESXi 原版 ISO 与任务级 Kickstart ISO，并启动无人值守安装。"
       : payload.sourceType === "template"
         ? "将按克隆源生成 VM，写入 CPU、内存、磁盘和静态 IP，并启动打开控制台。"
         : "将创建 VM 并挂载 ISO。该模式不会自动装好系统。";
@@ -1225,22 +2190,9 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
   };
   provisioningSubmitting.value = true;
   loadingVms.value = true;
-  const preflightToast = ElMessage({
-    type: "info",
-    message: "创建预检中...",
-    duration: 0,
-    showClose: false,
-  });
   try {
-    pushActivity("请求创建虚拟机", {
-      target,
-      detail: "执行创建预检",
-      status: "pending",
-    });
     const preflight = await postJson<ProvisionPreflightResponse>("/api/provisioning/preflight", payload);
-    preflightToast.close();
     const blockingChecks = preflight.checks.filter((check) => check.status === "error");
-    const warningChecks = preflight.checks.filter((check) => check.status === "warning");
     if (blockingChecks.length) {
       const detailText = formatProvisionPreflightChecks(blockingChecks);
       setErrorMessage(detailText);
@@ -1259,16 +2211,7 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
       loadingVms.value = false;
       return;
     }
-    if (warningChecks.length) {
-      showToast("warning", formatProvisionPreflightChecks(warningChecks));
-    }
-    pushActivity(warningChecks.length ? "创建预检有提醒" : "创建预检通过", {
-      target,
-      detail: warningChecks.length ? formatProvisionPreflightChecks(warningChecks) : "检查项通过",
-      status: warningChecks.length ? "warning" : "success",
-    });
   } catch (error) {
-    preflightToast.close();
     setErrorMessage(error instanceof Error ? error.message : "创建预检失败");
     provisioningProgress.value = {
       title: "创建预检失败",
@@ -1290,24 +2233,15 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
     message: "正在向虚拟化平台提交创建请求",
     status: "running",
   };
-  pushActivity("提交创建虚拟机", {
-    target,
-    detail,
-    status: "pending",
-  });
   try {
     const response = await postJson<VmProvisionResponse>("/api/provisioning/vms", {
       ...payload,
       confirmToken: "CONFIRMED",
     });
     successMessage.value = response.result.message;
-    showToast("success", response.result.message);
-    pushActivity("创建虚拟机成功", {
-      target,
-      detail: response.result.created.map((item) => item.name).join(", "),
-      status: "success",
-    });
     if (response.result.taskId || response.task?.id) {
+      const taskId = response.result.taskId || response.task?.id || "";
+      if (taskId) provisioningTaskPayloads.set(taskId, payload);
       activeProvisionTask.value = response.task ?? null;
       provisioningProgress.value = {
         title: "创建任务执行中",
@@ -1315,16 +2249,18 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
         status: "running",
       };
       keepSubmittingForTask = true;
-      pollProvisioningTask(response.result.taskId || response.task?.id || "");
+      listenProvisioningTask(taskId);
+    } else {
+      showToast("success", response.result.message);
+      await reserveProvisioningIpsAfterCreate(payload);
+      await Promise.all([loadVmSummary({ silent: true }), loadVms({ silent: true })]);
+      syncSelectedOverviewRowAfterVmChange();
     }
-    await reserveProvisioningIpsAfterCreate(payload);
-    await Promise.all([loadVmSummary({ silent: true }), loadVms({ silent: true })]);
-    syncSelectedOverviewRowAfterVmChange();
     if (!keepSubmittingForTask) {
       provisioningVisible.value = false;
       provisioningProgress.value = null;
     }
-    if (payload.autoStart && response.result.created[0]) {
+    if (payload.autoStart && !activeProvisionTask.value && response.result.created[0]) {
       openCreatedVmConsole(response.result.created[0]);
     }
   } catch (error) {
@@ -1358,34 +2294,7 @@ async function pollProvisioningTask(taskId: string) {
     try {
       const response = await postJson<ProvisionTaskResponse>(`/api/provisioning/tasks/${encodeURIComponent(taskId)}`, undefined, "GET");
       const task = response.task;
-      const mark = `${task.status}:${task.currentStep}:${task.updatedAt}`;
-      if (provisioningTaskMarks.get(taskId) !== mark) {
-        provisioningTaskMarks.set(taskId, mark);
-        pushActivity(provisionTaskActivityTitle(task.status), {
-          target: task.title,
-          detail: task.message,
-          status: provisionTaskActivityStatus(task.status),
-        });
-        activeProvisionTask.value = task;
-        provisioningProgress.value = {
-          title: provisionTaskActivityTitle(task.status),
-          message: task.message,
-          status: task.status === "success" ? "success" : task.status === "failed" ? "error" : "running",
-        };
-        if (task.status === "success") {
-          successMessage.value = task.message;
-          showToast("success", task.message);
-          provisioningSubmitting.value = false;
-          loadingVms.value = false;
-          await Promise.all([loadVmSummary({ silent: true }), loadVms({ silent: true })]);
-          syncSelectedOverviewRowAfterVmChange();
-        }
-        if (task.status === "failed") {
-          setErrorMessage(task.message);
-          provisioningSubmitting.value = false;
-          loadingVms.value = false;
-        }
-      }
+      await applyProvisioningTaskUpdate(task);
       if (task.status === "running" || task.status === "pending") {
         provisioningPollTimers.set(taskId, setTimeout(poll, 5000));
       } else {
@@ -1408,6 +2317,77 @@ async function pollProvisioningTask(taskId: string) {
     }
   };
   provisioningPollTimers.set(taskId, setTimeout(poll, 800));
+}
+
+function listenProvisioningTask(taskId: string) {
+  if (!taskId) return;
+  if (typeof EventSource === "undefined") {
+    pollProvisioningTask(taskId);
+    return;
+  }
+  if (provisioningEventSources.has(taskId) || provisioningPollTimers.has(taskId)) return;
+  const source = new EventSource(`/api/provisioning/tasks/${encodeURIComponent(taskId)}/events`);
+  provisioningEventSources.set(taskId, source);
+  const closeSource = () => {
+    source.close();
+    provisioningEventSources.delete(taskId);
+  };
+  source.addEventListener("task", (event) => {
+    try {
+      const parsed = JSON.parse((event as MessageEvent).data) as ProvisionTaskResponse;
+      void applyProvisioningTaskUpdate(parsed.task).then(() => {
+        if (parsed.task.status !== "running" && parsed.task.status !== "pending") closeSource();
+      });
+    } catch (error) {
+      closeSource();
+      pollProvisioningTask(taskId);
+    }
+  });
+  source.onerror = () => {
+    closeSource();
+    pollProvisioningTask(taskId);
+  };
+}
+
+async function applyProvisioningTaskUpdate(task: ProvisionTask) {
+  const mark = `${task.status}:${task.currentStep}:${task.updatedAt}:${task.eventSeq}`;
+  if (provisioningTaskMarks.get(task.id) === mark) return;
+  provisioningTaskMarks.set(task.id, mark);
+  if (task.status === "success" || task.status === "failed") {
+    pushActivity(provisionTaskActivityTitle(task.status), {
+      target: task.title,
+      detail: task.message,
+      status: provisionTaskActivityStatus(task.status),
+    });
+  }
+  activeProvisionTask.value = task;
+  if (consoleProvisionTaskId.value === task.id && !consoleTarget.value) {
+    openProvisionTaskConsole(task, false);
+  }
+  provisioningProgress.value = {
+    title: provisionTaskActivityTitle(task.status),
+    message: task.message,
+    status: task.status === "success" ? "success" : task.status === "failed" ? "error" : "running",
+  };
+  if (task.status === "success") {
+    successMessage.value = task.message;
+    showToast("success", task.message);
+    provisioningSubmitting.value = false;
+    loadingVms.value = false;
+    const payload = provisioningTaskPayloads.get(task.id);
+    if (payload) {
+      await reserveProvisioningIpsAfterCreate(payload);
+      provisioningTaskPayloads.delete(task.id);
+    }
+    await Promise.all([loadVmSummary({ silent: true }), loadVms({ silent: true })]);
+    syncSelectedOverviewRowAfterVmChange();
+  }
+  if (task.status === "failed") {
+    setErrorMessage(task.message);
+    provisioningSubmitting.value = false;
+    loadingVms.value = false;
+    provisioningTaskPayloads.delete(task.id);
+  }
 }
 
 async function reserveProvisioningIpsAfterCreate(payload: VmCreateRequest) {
@@ -1439,6 +2419,7 @@ async function reserveProvisioningIpsAfterCreate(payload: VmCreateRequest) {
 }
 
 function openCreatedVmConsole(created: VmProvisionCreatedVm) {
+  consoleProvisionTaskId.value = "";
   const refreshedVm = vms.value?.items.find((item) => item.providerId === created.providerId || item.id === created.id);
   const consoleVm: VmNode =
     refreshedVm ?? {
@@ -1475,6 +2456,63 @@ function openCreatedVmConsole(created: VmProvisionCreatedVm) {
   consoleTarget.value = target;
   consoleDialogVisible.value = true;
   pushActivity(`打开控制台：${created.name}`);
+}
+
+function resolveProvisionTaskVmConsoleTarget(taskVm: ProvisionTask["vms"][number]): VmConsoleTarget | null {
+  const providerId = taskVm.providerId || taskVm.id;
+  if (!providerId) return null;
+  const refreshedVm = vms.value?.items.find((item) => item.providerId === providerId || item.id === providerId || item.name === taskVm.name);
+  const inferredPowerState = taskVm.powerState || (taskVm.status === "running" ? "running" : "halted");
+  const consoleVm: VmNode =
+    refreshedVm ?? {
+      id: taskVm.id || providerId,
+      connectionId: selectedConnectionId.value,
+      hostId: selectedHost.value?.providerId,
+      providerId,
+      name: taskVm.name,
+      powerState: inferredPowerState,
+      cpuCount: 0,
+      memoryBytes: 0,
+      ipAddresses: taskVm.ip ? [taskVm.ip] : [],
+      toolsStatus: "unknown",
+      reclaimLevel: "KEEP",
+      reclaimReason: "新建虚拟机",
+      metadata: connection.providerType === "vmware" ? { managedObjectId: providerId } : undefined,
+    };
+  return resolveVmConsoleTarget({
+    connection: {
+      id: selectedConnectionId.value,
+      providerType: connection.providerType,
+      host: connection.host,
+      port: connection.port,
+      username: connection.username,
+    },
+    vm: consoleVm,
+    hostName: selectedHost.value?.name,
+    hostAddress: selectedHost.value?.address,
+  });
+}
+
+function openProvisionTaskConsole(task: ProvisionTask, notifyIfUnavailable = true) {
+  consoleProvisionTaskId.value = task.id;
+  const firstTarget = task.vms.map((vm) => resolveProvisionTaskVmConsoleTarget(vm)).find(Boolean) ?? null;
+  if (!firstTarget) {
+    if (notifyIfUnavailable) showToast("warning", "创建任务已提交，但 VM 控制台入口还未就绪。");
+    return false;
+  }
+  consoleTarget.value = firstTarget;
+  consoleDialogVisible.value = true;
+  return true;
+}
+
+function handleSelectProvisionConsoleTarget(item: ProvisionConsoleTargetItem) {
+  if (!item.target) return;
+  consoleTarget.value = item.target;
+}
+
+function handleSelectProvisionInlineConsoleTarget(item: ProvisionConsoleTargetItem) {
+  if (!item.target) return;
+  provisionInlineConsoleTarget.value = item.target;
 }
 
 function exportCsv() {
@@ -1522,7 +2560,7 @@ function exportHostOverviewCsv() {
       row.error ?? "",
     ];
   });
-  const header = ["平台", "连接", "物理机", "管理 IP", "状态", "CPU", "CPU 余量", "内存", "内存余量", "存储", "存储余量", "运行 VM / 总 VM", "创建评估", "评估原因", "错误"];
+  const header = ["平台", "连接", "物理机", "管理 IP", "状态", "CPU", "CPU 运行情况", "内存", "内存余量", "存储", "存储余量", "运行 VM / 总 VM", "创建评估", "评估原因", "错误"];
   const csv = [header, ...rows].map((row) => row.map((cell) => `"${String(cell).replaceAll("\"", "\"\"")}"`).join(",")).join("\n");
   const blob = new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -1538,6 +2576,7 @@ function handleVmSelectionChange(rows: VmNode[]) {
 }
 
 function handleOpenVmConsole(target: VmConsoleTarget) {
+  consoleProvisionTaskId.value = "";
   consoleTarget.value = target;
   consoleDialogVisible.value = true;
 }
@@ -1583,6 +2622,7 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
   }
 
   clearMessages();
+  const resourceBaseline = captureSelectedHostResourceFingerprint();
   setVmActionState(vm, {
     action,
     status: "running",
@@ -1615,6 +2655,7 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
       showToast("success", response.result.message);
       removeVmRow(vm);
     }
+    await refreshSelectedHostResources(action, resourceBaseline);
     pushActivity(`${meta.label}完成`, {
       target: vmTarget,
       detail: vmActionCompleteMessage(action),
@@ -1693,6 +2734,7 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
   }
 
   clearMessages();
+  const resourceBaseline = captureSelectedHostResourceFingerprint();
   for (const vm of actionableRows) {
     setVmActionState(vm, {
       action,
@@ -1747,6 +2789,10 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
       scheduleClearVmActionState(vm, 3600);
       failed.push(`${vm.name}：${error instanceof Error ? error.message : `${meta.label}失败`}`);
     }
+  }
+
+  if (successCount > 0) {
+    await refreshSelectedHostResources(action, resourceBaseline);
   }
 
   const summary = `批量${meta.label}完成：成功 ${successCount} 台，失败 ${failed.length} 台`;
@@ -1896,6 +2942,7 @@ function sleep(ms: number) {
 }
 
 function openConsoleAfterStart(vm: VmNode) {
+  consoleProvisionTaskId.value = "";
   const refreshedVm = vms.value?.items.find((item) => item.providerId === vm.providerId || item.id === vm.id);
   const consoleVm: VmNode = {
     ...(refreshedVm ?? vm),
@@ -1940,6 +2987,97 @@ function syncSelectedOverviewRowAfterVmChange() {
       loading: false,
     },
   };
+}
+
+function captureSelectedHostResourceFingerprint(): HostResourceFingerprint | null {
+  const host = selectedHost.value;
+  if (!host) return null;
+  return buildHostResourceFingerprint(host, inventory.value?.storage ?? [], vmSummary.value);
+}
+
+function buildHostResourceFingerprint(
+  host: HostNodeItem,
+  hostStorage: HostsResponse["storage"],
+  summary: VmInventorySummary | null,
+): HostResourceFingerprint {
+  return {
+    running: summary?.running ?? 0,
+    runningVcpu: summary?.runningVcpu ?? summary?.vcpu ?? 0,
+    totalVms: summary?.total ?? 0,
+    memoryFreeBytes: host.memoryFreeBytes ?? 0,
+    storageUsedGiB: hostStorage.reduce((sum, item) => sum + positive(item.usedGiB), 0),
+  };
+}
+
+function hostResourceChangeObserved(
+  action: VmPowerAction,
+  baseline: HostResourceFingerprint | null,
+  current: HostResourceFingerprint,
+) {
+  if (!baseline) return true;
+  if (action === "start") {
+    return current.running > baseline.running || current.runningVcpu > baseline.runningVcpu || current.memoryFreeBytes < baseline.memoryFreeBytes;
+  }
+  if (action === "shutdown") {
+    return current.running < baseline.running || current.runningVcpu < baseline.runningVcpu || current.memoryFreeBytes > baseline.memoryFreeBytes;
+  }
+  return current.storageUsedGiB < baseline.storageUsedGiB;
+}
+
+async function refreshSelectedHostResources(action: VmPowerAction, baseline: HostResourceFingerprint | null) {
+  const payload = buildConnectionPayload();
+  const hostId = selectedHost.value?.providerId;
+  if (!payload || !hostId) return;
+  const attempts = action === "delete" ? 5 : 3;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt > 0) await sleep(action === "delete" ? 800 : 500);
+    try {
+      const [hostInventory, summaryResult] = await Promise.all([
+        postJson<HostsResponse>("/api/inventory/hosts", payload),
+        postJson<{ summary: VmInventorySummary }>("/api/inventory/vm-summary", {
+          ...payload,
+          hostId,
+          page: 1,
+          pageSize: 500,
+        }),
+      ]);
+      const refreshedHost = hostInventory.hosts.find((item) => item.providerId === hostId || item.id === hostId);
+      if (!refreshedHost) throw new Error("刷新结果中未找到当前物理机");
+
+      inventory.value = hostInventory;
+      vmSummary.value = summaryResult.summary;
+      const overviewConnectionId = selectedConnectionId.value;
+      hostOverviewRows.value = hostOverviewRows.value.map((row) => {
+        const sameConnection = !overviewConnectionId || row.connection.id === overviewConnectionId;
+        const sameHost = row.host.providerId === hostId || row.host.id === hostId;
+        return sameConnection && sameHost
+          ? {
+              ...row,
+              inventory: hostInventory,
+              host: refreshedHost,
+              summary: summaryResult.summary,
+              status: "ready",
+              error: undefined,
+            }
+          : row;
+      });
+
+      const current = buildHostResourceFingerprint(refreshedHost, hostInventory.storage, summaryResult.summary);
+      if (hostResourceChangeObserved(action, baseline, current)) return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastError) {
+    pushActivity("刷新物理机资源失败", {
+      target: selectedHost.value?.name || connection.host,
+      detail: lastError instanceof Error ? lastError.message : "资源刷新失败",
+      status: "warning",
+    });
+  }
 }
 
 function updateHostOverviewRow(key: string, patch: Partial<HostOverviewRow>) {
@@ -1998,26 +3136,25 @@ async function runLimited<T>(items: T[], limit: number, worker: (item: T) => Pro
 }
 
 function summarizeVms(items: VmNode[], total = items.length): VmInventorySummary {
+  const runningItems = items.filter((vm) => vm.powerState === "running");
   return {
     total,
-    running: items.filter((vm) => vm.powerState === "running").length,
+    running: runningItems.length,
     halted: items.filter((vm) => vm.powerState === "halted").length,
     vcpu: items.reduce((sum, vm) => sum + vm.cpuCount, 0),
+    runningVcpu: runningItems.reduce((sum, vm) => sum + vm.cpuCount, 0),
     memoryBytes: items.reduce((sum, vm) => sum + vm.memoryBytes, 0),
+    runningMemoryBytes: runningItems.reduce((sum, vm) => sum + vm.memoryBytes, 0),
     diskBytes: items.reduce((sum, vm) => sum + positive(vm.diskVirtualBytes ?? 0), 0),
   };
 }
 
 function hostCpuPlan(row: HostOverviewRow) {
   const cores = positive(row.host.cpuCores);
-  const allocated = positive(row.summary?.vcpu ?? 0);
-  const plannedCapacity = cores * 4;
+  const allocated = positive(row.summary?.runningVcpu ?? row.summary?.vcpu ?? 0);
   return {
     cores,
     allocated,
-    physicalFree: Math.max(cores - allocated, 0),
-    over: Math.max(allocated - cores, 0),
-    plannedFree: Math.max(plannedCapacity - allocated, 0),
     percent: percent(allocated, cores),
   };
 }
@@ -2050,21 +3187,19 @@ function hostRecommendation(row: HostOverviewRow) {
   if (row.status === "error") return { label: "异常", className: "recommend-bad", reason: row.error || "连接失败" };
   if (!hasOverviewInventory(row)) return { label: "加载中", className: "recommend-wait", reason: "等待物理机基础信息" };
   if (!row.summary) return { label: "加载中", className: "recommend-wait", reason: "等待 VM 加载" };
-  const cpu = hostCpuPlan(row);
   const memory = hostMemoryPlan(row);
   const storagePlan = hostStoragePlan(row);
-  if (cpu.plannedFree < 4 || memory.free < 8 * 1024 ** 3 || storagePlan.freeGiB < 100) {
-    return { label: "不适合", className: "recommend-bad", reason: bottleneckText(cpu, memory, storagePlan) };
+  if (memory.free < 8 * 1024 ** 3 || storagePlan.freeGiB < 100) {
+    return { label: "不适合", className: "recommend-bad", reason: bottleneckText(memory, storagePlan) };
   }
-  if (cpu.plannedFree < 12 || memory.free < 32 * 1024 ** 3 || storagePlan.freeGiB < 500) {
-    return { label: "资源紧张", className: "recommend-warn", reason: bottleneckText(cpu, memory, storagePlan) };
+  if (memory.free < 32 * 1024 ** 3 || storagePlan.freeGiB < 500) {
+    return { label: "资源紧张", className: "recommend-warn", reason: bottleneckText(memory, storagePlan) };
   }
-  return { label: "适合", className: "recommend-good", reason: `余量 ${formatNumber(cpu.plannedFree)} vCPU / ${formatBytes(memory.free)} / ${formatNumber(storagePlan.freeGiB)} GiB` };
+  return { label: "适合", className: "recommend-good", reason: `余量 ${formatBytes(memory.free)} 内存 / ${formatNumber(storagePlan.freeGiB)} GiB 存储` };
 }
 
-function bottleneckText(cpu: ReturnType<typeof hostCpuPlan>, memory: ReturnType<typeof hostMemoryPlan>, storagePlan: ReturnType<typeof hostStoragePlan>) {
+function bottleneckText(memory: ReturnType<typeof hostMemoryPlan>, storagePlan: ReturnType<typeof hostStoragePlan>) {
   const reasons: string[] = [];
-  if (cpu.plannedFree < 12) reasons.push(`CPU 余量 ${formatNumber(cpu.plannedFree)} vCPU`);
   if (memory.free < 32 * 1024 ** 3) reasons.push(`内存剩余 ${formatBytes(memory.free)}`);
   if (storagePlan.freeGiB < 500) reasons.push(`存储剩余 ${formatNumber(storagePlan.freeGiB)} GiB`);
   return reasons.join(" · ") || "资源正常";
@@ -2093,15 +3228,15 @@ function overviewRowLoading(row: HostOverviewRow) {
 function overviewCpuMain(row: HostOverviewRow) {
   if (!hasOverviewInventory(row)) return "-";
   const cpu = hostCpuPlan(row);
-  if (!row.summary) return `余量 ${formatNumber(cpu.cores * 4)} vCPU`;
-  return `余量 ${formatNumber(cpu.plannedFree)} vCPU`;
+  if (!row.summary) return `${formatNumber(cpu.cores)} 个物理核心`;
+  return `运行 ${formatNumber(cpu.allocated)} vCPU`;
 }
 
 function overviewCpuSubline(row: HostOverviewRow) {
   if (!hasOverviewInventory(row)) return "读取中";
   if (!row.summary) return "分配加载中";
   const cpu = hostCpuPlan(row);
-  return `已分配 ${formatNumber(cpu.allocated)} / 4x ${formatNumber(cpu.cores * 4)}`;
+  return `${formatNumber(cpu.cores)} 个物理核心`;
 }
 
 function overviewMemoryMain(row: HostOverviewRow) {
@@ -2137,8 +3272,7 @@ function overviewResourceMeterPercent(row: HostOverviewRow, type: "cpu" | "memor
 function overviewResourceMeterWarning(row: HostOverviewRow, type: "cpu" | "memory" | "storage") {
   if (!hasOverviewInventory(row)) return false;
   if (type === "cpu") {
-    const cpu = hostCpuPlan(row);
-    return cpu.over > 0 || cpu.percent >= 80 || cpu.plannedFree < 12;
+    return false;
   }
   if (type === "memory") {
     const memory = hostMemoryPlan(row);
@@ -2249,19 +3383,37 @@ function buildDirectConnectionPayload() {
 
 function persistConnection(payload: ReturnType<typeof buildConnectionPayload>) {
   if (!payload) return;
-  localStorage.setItem("vrc.providerType", payload.providerType);
   if ("connectionId" in payload) {
-    localStorage.setItem("vrc.connectionId", payload.connectionId);
+    void saveConnectionPreferences({
+      selectedConnectionId: payload.connectionId,
+      providerType: payload.providerType,
+    });
     return;
   }
-  localStorage.setItem("vrc.host", payload.host);
-  localStorage.setItem("vrc.port", String(payload.port));
-  localStorage.setItem("vrc.username", payload.username);
+  void saveConnectionPreferences({
+    selectedConnectionId: selectedConnectionId.value,
+    providerType: payload.providerType,
+    host: payload.host,
+    port: payload.port,
+    username: payload.username,
+    connectionName: connectionName.value,
+  });
 }
 
 function clearMessages() {
   errorMessage.value = "";
   successMessage.value = "";
+  clearConnectionFeedback();
+}
+
+function clearConnectionFeedback() {
+  connectionFeedbackText.value = "";
+  connectionFeedbackKind.value = "";
+}
+
+function setConnectionFeedback(kind: "success" | "error", message: string) {
+  connectionFeedbackText.value = message;
+  connectionFeedbackKind.value = kind;
 }
 
 function setErrorMessage(message: string, bubble = true) {
@@ -2279,6 +3431,16 @@ function setSuccessMessage(message: string) {
   successMessage.value = message;
   errorMessage.value = "";
   showToast("success", message);
+}
+
+function setConnectionErrorMessage(message: string) {
+  setConnectionFeedback("error", message);
+  setErrorMessage(message);
+}
+
+function setConnectionSuccessMessage(message: string) {
+  setConnectionFeedback("success", message);
+  setSuccessMessage(message);
 }
 
 interface VrcConfirmActionOptions {
@@ -2345,6 +3507,28 @@ function pushActivity(
     },
     ...activityEntries.value,
   ].slice(0, 200);
+}
+
+function handleConsoleUploadResult(result: ConsoleUploadResultEvent) {
+  const target = result.vmIp ? `${result.vmName} / ${result.vmIp}` : result.vmName;
+  const fileText = result.files.length ? `文件：${result.files.join("，")}` : "";
+  const pathText = result.remotePaths.length ? `位置：${result.remotePaths.join("，")}` : "";
+  const detail = [fileText, pathText, result.message].filter(Boolean).join("；");
+  if (result.status === "success") {
+    showToast("success", result.message);
+    pushActivity("控制台上传完成", {
+      target,
+      detail,
+      status: "success",
+    });
+    return;
+  }
+  showToast("error", result.message);
+  pushActivity("控制台上传失败", {
+    target,
+    detail,
+    status: "error",
+  });
 }
 
 function provisionTaskActivityTitle(status: "pending" | "running" | "success" | "failed") {
@@ -2534,11 +3718,17 @@ function defaultPortForProvider(value: ProviderType) {
   if (value === "proxmox") return 8006;
   return value === "vmware" ? 443 : 22;
 }
+
+function normalizePort(value: unknown, providerType: ProviderType) {
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : defaultPortForProvider(providerType);
+}
 </script>
 
 <template>
-  <main class="app-shell">
+  <main class="app-shell" :class="{ 'electron-shell': isElectron, 'electron-mac-shell': isMacElectron, 'electron-windows-shell': isWindowsElectron }">
     <aside class="sidebar">
+      <div v-if="isMacElectron" class="electron-titlebar-drag" aria-hidden="true"></div>
       <div class="sidebar-head">
         <div class="brand-lockup">
           <span class="brand-mark sidebar-logo" aria-hidden="true">
@@ -2553,7 +3743,7 @@ function defaultPortForProvider(value: ProviderType) {
             <p>{{ storedConnections.length }} 个连接</p>
           </div>
         </div>
-        <button class="icon-button" :class="{ active: isSettingsNavActive }" title="设置 / 外观" @click="openSettingsWorkspace">
+        <button class="icon-button settings-entry-button" :class="{ active: isSettingsNavActive }" title="设置" aria-label="设置" @click="openSettingsWorkspace">
           <el-icon><Setting /></el-icon>
         </button>
       </div>
@@ -2634,7 +3824,14 @@ function defaultPortForProvider(value: ProviderType) {
       </button>
     </aside>
 
-    <section class="workspace">
+    <section
+      class="workspace"
+      :class="{
+        'is-settings-mode': workspaceMode === 'settings',
+        'has-custom-background': uiPreferences.backgroundMode !== 'default',
+      }"
+      :style="workspaceAppearanceStyle"
+    >
 
       <section v-if="workspaceMode === 'connection' && loadingHosts && !inventory && !hostOverviewRows.length && !loadingHostOverview" class="panel loading-panel">
         <div class="resource-loading-card" :class="`platform-${selectedConnectionBrand.type}`">
@@ -2671,8 +3868,8 @@ function defaultPortForProvider(value: ProviderType) {
           :vms-total="vms?.total ?? 0"
           :selected-vm-ids="selectedVmIds"
           :vm-action-states="vmActionStates"
-          :vm-load-status-text="vmLoadStatusText"
           :loading-vms="loadingVms"
+          variant="page"
           table-height="100%"
           table-panel-class="single-table-panel"
           @search-change="loadVms"
@@ -2836,7 +4033,7 @@ function defaultPortForProvider(value: ProviderType) {
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="CPU 余量" min-width="140" align="right">
+          <el-table-column label="CPU 运行情况" min-width="140" align="right">
             <template #default="{ row }">
               <span class="overview-resource-cell" :class="{ warning: overviewResourceMeterWarning(row, 'cpu') }">
                 <strong>{{ overviewCpuMain(row) }}</strong>
@@ -2950,6 +4147,122 @@ function defaultPortForProvider(value: ProviderType) {
               </div>
             </section>
 
+            <section class="settings-card appearance-custom-settings">
+              <div class="settings-card-head appearance-custom-head">
+                <div>
+                  <strong>自定义主题</strong>
+                  <span>在基础主题上覆盖语义色和工作区背景，未修改的组件继续使用系统样式变量。</span>
+                </div>
+                <div class="appearance-head-actions">
+                  <el-button size="small" :icon="Upload" @click="selectAppearanceJson">载入</el-button>
+                  <el-button size="small" :icon="Download" @click="exportAppearanceConfig">导出</el-button>
+                  <el-button size="small" :icon="RefreshLeft" @click="resetAppearancePreferences">重置</el-button>
+                </div>
+              </div>
+
+              <div class="appearance-custom-grid">
+                <section class="appearance-setting-group">
+                  <div class="appearance-group-title">
+                    <strong>颜色</strong>
+                    <span>基于语义变量覆盖，不逐个组件写死颜色。</span>
+                  </div>
+                  <div class="appearance-setting-row">
+                    <div><strong>界面明暗</strong><span>浅色、深色或跟随系统。</span></div>
+                    <el-segmented
+                      v-model="uiPreferences.toneMode"
+                      class="appearance-tone-segmented"
+                      :options="[{ label: '跟随系统', value: 'system' }, { label: '浅色', value: 'light' }, { label: '深色', value: 'dark' }]"
+                      size="small"
+                      @change="persistAppearancePreference('toneMode')"
+                    />
+                  </div>
+                  <div class="appearance-setting-row">
+                    <div><strong>强调色</strong><span>按钮、选中态、链接和图表主色。</span></div>
+                    <div class="appearance-color-control">
+                      <button
+                        v-for="color in accentColorPresets"
+                        :key="color"
+                        class="appearance-color-chip"
+                        :class="{ active: uiPreferences.accentColor === color }"
+                        type="button"
+                        :style="{ '--appearance-chip-color': color }"
+                        :aria-label="`使用强调色 ${color}`"
+                        @click="setAppearanceAccentColor(color)"
+                      ></button>
+                      <el-color-picker
+                        v-model="uiPreferences.accentColor"
+                        size="small"
+                        @change="updateAppearanceColor('accentColor', $event)"
+                      />
+                    </div>
+                  </div>
+                  <div class="appearance-setting-row">
+                    <div><strong>状态色</strong><span>成功、警告、危险保持独立语义。</span></div>
+                    <div class="appearance-semantic-colors">
+                      <label><span>成功</span><el-color-picker v-model="uiPreferences.successColor" size="small" @change="updateAppearanceColor('successColor', $event)" /></label>
+                      <label><span>警告</span><el-color-picker v-model="uiPreferences.warningColor" size="small" @change="updateAppearanceColor('warningColor', $event)" /></label>
+                      <label><span>危险</span><el-color-picker v-model="uiPreferences.dangerColor" size="small" @change="updateAppearanceColor('dangerColor', $event)" /></label>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="appearance-setting-group appearance-background-group">
+                  <div class="appearance-group-title">
+                    <strong>工作区背景</strong>
+                    <span>背景只作用于内容画布，不覆盖侧栏和组件 surface。</span>
+                  </div>
+                  <div class="appearance-setting-row">
+                    <div><strong>背景类型</strong><span>默认、纯色或本地图片。</span></div>
+                    <el-radio-group v-model="uiPreferences.backgroundMode" size="small" @change="persistAppearancePreference('backgroundMode')">
+                      <el-radio-button value="default">默认</el-radio-button>
+                      <el-radio-button value="solid">纯色</el-radio-button>
+                      <el-radio-button value="image">图片</el-radio-button>
+                    </el-radio-group>
+                  </div>
+                  <div v-if="uiPreferences.backgroundMode === 'solid'" class="appearance-setting-row">
+                    <div><strong>背景颜色</strong><span>{{ uiPreferences.backgroundColor }}</span></div>
+                    <el-color-picker
+                      v-model="uiPreferences.backgroundColor"
+                      size="small"
+                      @change="updateAppearanceColor('backgroundColor', $event)"
+                    />
+                  </div>
+                  <div v-if="uiPreferences.backgroundMode === 'image'" class="appearance-setting-row">
+                    <div><strong>背景图片</strong><span>支持 JPG、PNG 和 WebP，最大 16MB。</span></div>
+                    <div class="appearance-image-control">
+                      <span
+                        class="appearance-image-preview"
+                        :class="{ empty: !appearanceBackgroundImageUrl }"
+                        :style="appearanceBackgroundPreviewStyle"
+                        aria-hidden="true"
+                      ></span>
+                      <span class="appearance-image-name" :title="uiPreferences.backgroundImageName || '未选择图片'">
+                        {{ uiPreferences.backgroundImageName || "未选择图片" }}
+                      </span>
+                      <el-button size="small" :icon="Picture" :loading="appearanceImageUploading" @click="selectAppearanceImage">
+                        {{ uiPreferences.backgroundImageUpdatedAt ? "更换图片" : "选择图片" }}
+                      </el-button>
+                    </div>
+                  </div>
+                  <div v-if="uiPreferences.backgroundMode === 'image'" class="appearance-slider-row">
+                    <span>透明度</span>
+                    <el-slider v-model="uiPreferences.backgroundOpacity" :min="5" :max="60" :show-tooltip="false" @change="persistAppearanceNumber('backgroundOpacity')" />
+                    <strong>{{ uiPreferences.backgroundOpacity }}%</strong>
+                  </div>
+                  <div v-if="uiPreferences.backgroundMode === 'image'" class="appearance-slider-row">
+                    <span>模糊</span>
+                    <el-slider v-model="uiPreferences.backgroundBlur" :min="0" :max="16" :show-tooltip="false" @change="persistAppearanceNumber('backgroundBlur')" />
+                    <strong>{{ uiPreferences.backgroundBlur }}px</strong>
+                  </div>
+                  <div v-if="uiPreferences.backgroundMode !== 'default'" class="appearance-slider-row">
+                    <span>遮罩</span>
+                    <el-slider v-model="uiPreferences.backgroundOverlay" :min="0" :max="35" :show-tooltip="false" @change="persistAppearanceNumber('backgroundOverlay')" />
+                    <strong>{{ uiPreferences.backgroundOverlay }}%</strong>
+                  </div>
+                </section>
+              </div>
+            </section>
+
             <section class="settings-tile-grid" aria-label="外观偏好">
               <article class="settings-tile">
                 <div class="settings-row">
@@ -2958,7 +4271,15 @@ function defaultPortForProvider(value: ProviderType) {
                 </div>
                 <div class="settings-row">
                   <span>图标按钮显示 tooltip</span>
-                  <span class="settings-switch active"><i></i></span>
+                  <button
+                    type="button"
+                    class="settings-switch"
+                    :class="{ active: uiPreferences.showIconTooltips }"
+                    :aria-pressed="uiPreferences.showIconTooltips"
+                    @click="updateUiPreference('showIconTooltips', !uiPreferences.showIconTooltips)"
+                  >
+                    <i></i>
+                  </button>
                 </div>
               </article>
               <article class="settings-tile">
@@ -2968,7 +4289,15 @@ function defaultPortForProvider(value: ProviderType) {
                 </div>
                 <div class="settings-row">
                   <span>长名称单行省略</span>
-                  <span class="settings-switch active"><i></i></span>
+                  <button
+                    type="button"
+                    class="settings-switch"
+                    :class="{ active: uiPreferences.truncateLongNames }"
+                    :aria-pressed="uiPreferences.truncateLongNames"
+                    @click="updateUiPreference('truncateLongNames', !uiPreferences.truncateLongNames)"
+                  >
+                    <i></i>
+                  </button>
                 </div>
               </article>
               <article class="settings-tile">
@@ -2989,7 +4318,15 @@ function defaultPortForProvider(value: ProviderType) {
                 </div>
                 <div class="settings-row">
                   <span>拖拽中节流刷新</span>
-                  <span class="settings-switch active"><i></i></span>
+                  <button
+                    type="button"
+                    class="settings-switch"
+                    :class="{ active: uiPreferences.throttleConsoleResize }"
+                    :aria-pressed="uiPreferences.throttleConsoleResize"
+                    @click="updateUiPreference('throttleConsoleResize', !uiPreferences.throttleConsoleResize)"
+                  >
+                    <i></i>
+                  </button>
                 </div>
               </article>
             </section>
@@ -3045,6 +4382,7 @@ function defaultPortForProvider(value: ProviderType) {
               <div class="settings-actions connection-settings-actions">
                 <el-button :icon="Plus" @click="startNewConnection">新连接</el-button>
                 <el-button :icon="Connection" :loading="testing" @click="testConnection">{{ testing ? "测试中" : "测试" }}</el-button>
+                <el-button :icon="Upload" @click="openAccountImportDialog">导入账号</el-button>
                 <el-tooltip content="加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单" placement="top">
                   <el-button :icon="Refresh" :loading="loadingHosts" :disabled="!selectedConnectionId" @click="loadSelectedConnectionResources">
                     {{ loadingHosts ? "加载中" : "加载资源" }}
@@ -3144,8 +4482,8 @@ function defaultPortForProvider(value: ProviderType) {
           :vms-total="vms?.total ?? 0"
           :selected-vm-ids="selectedVmIds"
           :vm-action-states="vmActionStates"
-          :vm-load-status-text="vmLoadStatusText"
           :loading-vms="loadingVms"
+          variant="dialog"
           table-height="100%"
           metric-grid-class="dialog-metric-grid"
           table-panel-class="dialog-table-panel"
@@ -3163,7 +4501,14 @@ function defaultPortForProvider(value: ProviderType) {
         />
       </el-dialog>
 
-      <ConsoleDialog v-model:visible="consoleDialogVisible" :target="consoleTarget" />
+      <ConsoleDialog
+        v-model:visible="consoleDialogVisible"
+        :target="consoleTarget"
+        :provision-task="activeConsoleProvisionTask"
+        :provision-targets="provisionConsoleTargets"
+        @select-provision-target="handleSelectProvisionConsoleTarget"
+        @upload-result="handleConsoleUploadResult"
+      />
 
       <el-dialog v-model="activityLogVisible" title="操作记录" width="820px" class="activity-log-dialog" top="7vh" :close-on-click-modal="false">
         <div class="activity-log-tools">
@@ -3288,6 +4633,7 @@ function defaultPortForProvider(value: ProviderType) {
               <div class="settings-actions connection-settings-actions">
                 <el-button :icon="Plus" @click="startNewConnection">新连接</el-button>
                 <el-button :icon="Connection" :loading="testing" @click="testConnection">{{ testing ? "测试中" : "测试" }}</el-button>
+                <el-button :icon="Upload" @click="openAccountImportDialog">导入账号</el-button>
                 <el-tooltip content="加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单" placement="top">
                   <el-button :icon="Refresh" :loading="loadingHosts" :disabled="!selectedConnectionId" @click="loadSelectedConnectionResources">
                     {{ loadingHosts ? "加载中" : "加载资源" }}
@@ -3312,6 +4658,109 @@ function defaultPortForProvider(value: ProviderType) {
         </form>
       </el-dialog>
 
+      <el-dialog v-model="accountImportVisible" width="980px" class="account-import-dialog" top="8vh" :close-on-click-modal="false">
+        <template #header>
+          <div class="account-import-dialog-title">
+            <div>
+              <strong>服务器账号导入</strong>
+              <span>Excel / JSON / 固定格式，先测试连接，通过后再保存</span>
+            </div>
+          </div>
+        </template>
+        <section class="settings-card account-import-card">
+          <div class="account-import-layout">
+            <section class="import-drop-panel">
+              <div class="import-mode-tabs" role="tablist" aria-label="导入方式">
+                <button type="button" :class="{ active: accountImportMode === 'excel' }" @click="switchAccountImportMode('excel')">Excel 文件</button>
+                <button type="button" :class="{ active: accountImportMode === 'json' }" @click="switchAccountImportMode('json')">JSON 串</button>
+                <button type="button" :class="{ active: accountImportMode === 'fixed' }" @click="switchAccountImportMode('fixed')">固定格式</button>
+              </div>
+
+              <input ref="accountImportFileInput" class="account-import-file-input" type="file" accept=".xlsx,.xls,.csv" @change="handleAccountImportFileChange" />
+
+              <div v-if="accountImportMode === 'excel'" class="import-drop-zone" @click="triggerAccountImportFile" @dragover.prevent @drop.prevent="handleAccountImportDrop">
+                <div>
+                  <strong>{{ accountImportFileName || "拖入 .xlsx / .csv，或点击选择文件" }}</strong>
+                  <span>表头：平台、主机、服务器名称、登录账号、登录密码、端口；端口和账号可为空。</span>
+                </div>
+              </div>
+
+              <textarea
+                v-else
+                v-model="accountImportText"
+                class="import-textarea"
+                :placeholder="accountImportPlaceholder"
+              ></textarea>
+
+              <div class="format-sample">
+                <span>固定格式示例：</span>
+                <span>XenServer 192.0.2.77 xenserver-1 root change-me</span>
+                <span>XenServer 192.0.2.6 xenserver-3 change-me</span>
+              </div>
+              <span class="format-rule">固定格式按空格 / Tab 拆列；4 列时账号默认 root，5 列时第 4 列为账号。密码包含空格时请用 Excel 或 JSON。</span>
+              <div v-if="accountImportError" class="import-error-note">{{ accountImportError }}</div>
+              <div class="button-row account-import-buttons">
+                <button type="button" class="btn" @click="downloadAccountImportTemplate">
+                  <el-icon><Download /></el-icon>
+                  下载模板
+                </button>
+                <button type="button" class="btn primary" :disabled="parsingAccountImport" @click="parseAccountImport">
+                  {{ parsingAccountImport ? "解析中" : "解析预览" }}
+                </button>
+              </div>
+            </section>
+
+            <section class="import-preview-panel">
+              <div class="import-summary-row">
+                <span class="import-summary-tile"><span>总行数</span><strong>{{ accountImportSummary.total }}</strong></span>
+                <span class="import-summary-tile"><span>可导入</span><strong>{{ accountImportSummary.importable }}</strong></span>
+                <span class="import-summary-tile"><span>覆盖更新</span><strong>{{ accountImportSummary.update }}</strong></span>
+                <span class="import-summary-tile"><span>错误</span><strong>{{ accountImportSummary.error }}</strong></span>
+              </div>
+
+              <div class="import-preview-table">
+                <div class="import-preview-row header">
+                  <span>平台</span>
+                  <span>服务器名称</span>
+                  <span>主机</span>
+                  <span>账号</span>
+                  <span>结果</span>
+                </div>
+                <div
+                  v-for="row in accountImportDrafts"
+                  :key="`${row.rowNo}:${row.host}:${row.name}`"
+                  class="import-preview-row"
+                  :class="{ update: row.status === 'update', error: row.status === 'error' }"
+                  :title="row.statusDetail"
+                >
+                  <span>{{ row.providerType ? providerLabel(row.providerType) : "-" }}</span>
+                  <span>{{ row.name || "-" }}</span>
+                  <span>{{ row.host || "-" }}{{ row.port ? `:${row.port}` : "" }}</span>
+                  <span>{{ row.username || "-" }}</span>
+                  <span class="pill" :class="row.status === 'error' ? 'danger' : row.status === 'update' ? 'warn' : 'good'">{{ row.statusText }}</span>
+                </div>
+                <div v-if="!accountImportDrafts.length" class="import-preview-empty">解析后在这里预览导入结果</div>
+              </div>
+
+              <div v-if="accountImportUpdateNotes.length" class="import-preview-alert">
+                <strong>已存在相同 IP/端口</strong>
+                <span v-for="row in accountImportUpdateNotes" :key="`${row.rowNo}:${row.host}:note`">{{ row.statusDetail }}</span>
+                <span v-if="accountImportSummary.update > accountImportUpdateNotes.length">还有 {{ accountImportSummary.update - accountImportUpdateNotes.length }} 条相同 IP/端口记录会覆盖更新。</span>
+              </div>
+
+              <span class="import-preview-note">预览只展示掩码后的密码；点击导入后会先逐条测试连接，全部通过才保存；保存时按“平台 + 主机 + 端口”识别重复连接，重复项默认更新名称、账号和密码，不自动加载资源。</span>
+              <div class="button-row account-import-buttons">
+                <button type="button" class="btn" @click="accountImportVisible = false">取消</button>
+                <button type="button" class="btn" :disabled="!accountImportCanConfirm || accountImportSummary.update === accountImportSummary.importable" @click="accountImportDrafts = accountImportDrafts.filter((row) => row.status === 'new')">只导入新增</button>
+                <button type="button" class="btn primary" :disabled="!accountImportCanConfirm" @click="confirmAccountImport">
+                  {{ importingAccounts ? "测试中" : `测试并导入 ${accountImportSummary.importable} 条` }}
+                </button>
+              </div>
+            </section>
+          </div>
+        </section>
+      </el-dialog>
+
       <el-dialog v-model="hostDetailVisible" title="物理机详情" width="760px" :close-on-click-modal="false">
         <div v-if="selectedHost" class="dialog-summary host-detail-summary">
           <span>基础信息</span>
@@ -3320,7 +4769,7 @@ function defaultPortForProvider(value: ProviderType) {
         </div>
         <div class="dialog-section-title">
           <strong>网络接口</strong>
-          <span>管理网卡和 PIF 连接状态</span>
+          <span>查看当前平台网络接口连接状态</span>
         </div>
         <el-table :data="selectedHostNetworks" height="280" row-key="device" stripe>
           <el-table-column prop="device" label="Device" width="86" align="center" />
@@ -3448,10 +4897,28 @@ function defaultPortForProvider(value: ProviderType) {
         :submitting="provisioningSubmitting"
         :progress="provisioningProgress"
         :provision-task="activeProvisionTask"
+        :console-available="activeProvisionConsoleAvailable"
+        :console-target="provisionInlineConsoleTarget"
+        :provision-console-targets="activeProvisionConsoleTargets"
         @activity="pushActivity($event.title, { target: $event.target, detail: $event.detail, status: $event.status })"
         @open-iso-detail="openIsoDetail"
+        @select-console-target="handleSelectProvisionInlineConsoleTarget"
         @submit="handleProvisioningSubmit"
       />
     </section>
+    <input
+      ref="appearanceImageFileInput"
+      class="appearance-hidden-input"
+      type="file"
+      accept="image/jpeg,image/png,image/webp"
+      @change="handleAppearanceImageChange"
+    />
+    <input
+      ref="appearanceJsonFileInput"
+      class="appearance-hidden-input"
+      type="file"
+      accept="application/json,.json"
+      @change="handleAppearanceJsonChange"
+    />
   </main>
 </template>

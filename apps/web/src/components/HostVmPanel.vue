@@ -28,6 +28,7 @@ interface VmTotals {
   running: number;
   halted: number;
   vcpu: number;
+  runningVcpu: number;
   memoryBytes: number;
   diskBytes: number | null;
 }
@@ -38,6 +39,7 @@ type VmActionState = {
   message?: string;
 };
 type VmPowerFilter = "all" | "running" | "stopped";
+type HostVmPanelVariant = "page" | "dialog";
 
 const powerFilterOptions: Array<{ label: string; value: VmPowerFilter }> = [
   { label: "全部", value: "all" },
@@ -68,12 +70,12 @@ const props = withDefaults(
     vmActionStates: Record<string, VmActionState>;
     search: string;
     powerFilter: VmPowerFilter;
-    vmLoadStatusText: string;
     loadingVms: boolean;
     tableHeight?: string | number | null;
     tableMaxHeight?: string | number;
     metricGridClass?: string;
     tablePanelClass?: string;
+    variant?: HostVmPanelVariant;
   }>(),
   {
     vmActionStates: () => ({}),
@@ -81,6 +83,7 @@ const props = withDefaults(
     tableMaxHeight: undefined,
     metricGridClass: "",
     tablePanelClass: "",
+    variant: "page",
   },
 );
 
@@ -108,6 +111,9 @@ const powerFilterModel = computed({
   get: () => props.powerFilter,
   set: (value: VmPowerFilter) => emit("update:powerFilter", value),
 });
+const variantClass = computed(() => `host-vm-panel--${props.variant}`);
+const providerName = computed(() => providerLabel(props.connection.providerType));
+const networkCountLabel = computed(() => formatNetworkCount(props.connection.providerType, props.networkCount));
 
 const cpuSummary = computed(() => props.resourceSummary[0]);
 const memorySummary = computed(() => props.resourceSummary[1]);
@@ -168,6 +174,20 @@ function formatNumber(value: number) {
 
 function formatCpuCount(value: number) {
   return value > 0 ? `${value} 核` : "未读到";
+}
+
+function providerLabel(value: ProviderType) {
+  if (value === "xenserver") return "XenServer";
+  if (value === "vmware") return "VMware";
+  if (value === "proxmox") return "Proxmox VE";
+  return "KVM/libvirt";
+}
+
+function formatNetworkCount(providerType: ProviderType, count: number) {
+  if (providerType === "xenserver") return `${count} 个 PIF`;
+  if (providerType === "vmware") return `${count} 个 VMkernel 网卡`;
+  if (providerType === "proxmox") return `${count} 个网络接口`;
+  return `${count} 个网络接口`;
 }
 
 function powerStateLabel(value: VmNode["powerState"]) {
@@ -282,14 +302,21 @@ function openVmConsoleByRow(vm: VmNode) {
 </script>
 
 <template>
-  <section class="metric-grid" :class="metricGridClass">
+  <header v-if="variant === 'page'" class="host-vm-page-header overview-header">
+    <div class="overview-title-group">
+      <h3>物理机虚拟机</h3>
+      <span>{{ host.name }} · {{ host.address }} · {{ providerName }} · {{ networkCountLabel }}</span>
+    </div>
+  </header>
+
+  <section class="metric-grid host-vm-panel-metrics" :class="[metricGridClass, variantClass]">
     <article class="metric-card host-card">
       <div class="metric-label-row">
         <span class="metric-label">物理机</span>
         <button class="metric-link" @click="emit('host-detail')">详情</button>
       </div>
       <strong>{{ host.name }}</strong>
-      <small>{{ host.address }} · {{ host.vendor }} {{ host.version }} · {{ networkCount }} 个 PIF</small>
+      <small>{{ host.address }} · {{ host.vendor }} {{ host.version }} · {{ networkCountLabel }}</small>
     </article>
     <article class="metric-card">
       <span class="metric-label">CPU</span>
@@ -297,11 +324,10 @@ function openVmConsoleByRow(vm: VmNode) {
         <strong>{{ formatCpuCount(host.cpuCores) }}</strong>
         <span>{{ cpuSummary.percent }}%</span>
       </div>
-      <small>{{ vmTotals.vcpu }} vCPU 已分配 · {{ cpuSummary.subline }}</small>
-      <div class="mini-meter" :class="{ warning: cpuSummary.over > 0 }">
+      <small>{{ vmTotals.runningVcpu }} 运行 vCPU · 共配置 {{ vmTotals.vcpu }} vCPU</small>
+      <div class="mini-meter">
         <span class="used" :style="{ width: barWidth(cpuSummary, 'used') }"></span>
         <span class="free" :style="{ width: barWidth(cpuSummary, 'free') }"></span>
-        <span v-if="cpuSummary.over > 0" class="over" :style="{ width: barWidth(cpuSummary, 'over') }"></span>
       </div>
     </article>
     <article class="metric-card">
@@ -348,7 +374,7 @@ function openVmConsoleByRow(vm: VmNode) {
     </article>
   </section>
 
-  <section class="panel table-panel" :class="tablePanelClass">
+  <section class="panel table-panel host-vm-panel-table" :class="[tablePanelClass, variantClass]">
     <div class="table-toolbar vm-table-toolbar">
       <div class="vm-table-toolbar-main">
         <div class="table-heading">
@@ -361,7 +387,6 @@ function openVmConsoleByRow(vm: VmNode) {
         <div class="table-query-group">
           <el-input v-model="searchModel" class="search-input" :prefix-icon="Search" placeholder="搜索名称 / UUID / IP" clearable @change="emit('search-change')" />
           <el-segmented v-model="powerFilterModel" class="vm-power-filter" :options="powerFilterOptions" aria-label="虚拟机状态筛选" />
-          <span class="load-status-text">{{ vmLoadStatusText }}</span>
         </div>
       </div>
       <div v-if="selectedVmCount" class="vm-batch-actions" aria-label="批量虚拟机操作">

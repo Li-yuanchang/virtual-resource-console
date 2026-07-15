@@ -109,7 +109,9 @@ export interface VmInventorySummary {
   running: number;
   halted: number;
   vcpu: number;
+  runningVcpu?: number;
   memoryBytes: number;
+  runningMemoryBytes?: number;
   diskBytes?: number;
 }
 
@@ -159,6 +161,10 @@ export interface IsoImage {
 export interface VmMetricSnapshot {
   uuid: string;
   cpuUsage: number | null;
+  memoryUsedBytes?: number | null;
+  memoryTotalBytes?: number | null;
+  diskUsedBytes?: number | null;
+  diskTotalBytes?: number | null;
   diskReadRate: number | null;
   diskWriteRate: number | null;
   networkRxRate: number | null;
@@ -304,6 +310,7 @@ export interface VmCreateRequest {
   scopeKey?: string;
   environmentTemplateId?: string;
   sourceType: "iso" | "template";
+  installStrategy?: "template-clone" | "kickstart" | "manual-iso";
   isoId?: string;
   isoName?: string;
   templateName?: string;
@@ -399,6 +406,10 @@ export interface ProvisionTaskVm {
   ip?: string;
   powerState?: PowerState;
   status: ProvisionTaskStatus;
+  currentStep?: ProvisionTaskStepKey;
+  progressPercent?: number;
+  installPackageTotal?: number;
+  installPackageDone?: number;
   message?: string;
 }
 
@@ -411,6 +422,8 @@ export interface ProvisionTask {
   title: string;
   status: ProvisionTaskStatus;
   currentStep: ProvisionTaskStepKey;
+  progressPercent: number;
+  eventSeq: number;
   message: string;
   createdAt: string;
   updatedAt: string;

@@ -13,6 +13,9 @@ export interface NoVncVmConsoleTarget {
   hostName?: string;
   hostAddress?: string;
   powerStateLabel?: string;
+  cpuCount?: number;
+  memoryBytes?: number;
+  diskBytes?: number;
   cpuText?: string;
   memoryText?: string;
   diskText?: string;
@@ -29,14 +32,45 @@ export interface VmConsoleContext {
   hostAddress?: string;
 }
 
+export type ConsoleMetricKey = "cpu" | "memory" | "network" | "disk";
+
+export interface ConsoleMetricsLoadingStrategy {
+  readonly placeholderMetrics: readonly ConsoleMetricKey[];
+  readonly pollIntervalMs: number;
+  readonly memoryUsageLabel?: string;
+  readonly memoryPressureTone: boolean;
+}
+
 interface VmConsoleStrategy {
   readonly type: ProviderType;
+  readonly metrics?: ConsoleMetricsLoadingStrategy;
   resolve(context: VmConsoleContext): VmConsoleTarget | null;
 }
+
+const xenServerConsoleMetrics: ConsoleMetricsLoadingStrategy = {
+  placeholderMetrics: ["cpu", "memory", "network", "disk"],
+  pollIntervalMs: 2000,
+  memoryPressureTone: true,
+};
+
+const proxmoxConsoleMetrics: ConsoleMetricsLoadingStrategy = {
+  placeholderMetrics: ["cpu", "memory", "network", "disk"],
+  pollIntervalMs: 2000,
+  memoryUsageLabel: "平台占用",
+  memoryPressureTone: false,
+};
+
+const vmwareConsoleMetrics: ConsoleMetricsLoadingStrategy = {
+  placeholderMetrics: ["cpu", "memory", "network", "disk"],
+  pollIntervalMs: 5000,
+  memoryUsageLabel: "宿主占用",
+  memoryPressureTone: false,
+};
 
 const strategies: VmConsoleStrategy[] = [
   {
     type: "vmware",
+    metrics: vmwareConsoleMetrics,
     resolve({ connection, vm }) {
       const managedObjectId = getMetadataString(vm, "managedObjectId");
       if (!connection.id || !managedObjectId || vm.powerState !== "running") return null;
@@ -57,6 +91,7 @@ const strategies: VmConsoleStrategy[] = [
   },
   {
     type: "proxmox",
+    metrics: proxmoxConsoleMetrics,
     resolve({ connection, vm }) {
       const [node, vmid] = parseProxmoxVmId(vm.providerId);
       if (!connection.id || !node || !vmid || vm.powerState !== "running") return null;
@@ -77,6 +112,7 @@ const strategies: VmConsoleStrategy[] = [
   },
   {
     type: "xenserver",
+    metrics: xenServerConsoleMetrics,
     resolve({ connection, vm }) {
       if (!connection.id || vm.powerState !== "running") return null;
       return {
@@ -112,12 +148,19 @@ export function resolveVmConsoleTarget(context: VmConsoleContext): VmConsoleTarg
   };
 }
 
+export function resolveConsoleMetricsLoadingStrategy(providerType: ProviderType): ConsoleMetricsLoadingStrategy | null {
+  return strategies.find((strategy) => strategy.type === providerType)?.metrics ?? null;
+}
+
 function buildConsoleSummary(context: Pick<VmConsoleContext, "vm" | "hostName" | "hostAddress">) {
   return {
     vmIp: context.vm.ipAddresses[0] || "-",
     hostName: context.hostName || context.hostAddress || "-",
     hostAddress: context.hostAddress,
     powerStateLabel: powerStateLabel(context.vm.powerState),
+    cpuCount: context.vm.cpuCount,
+    memoryBytes: context.vm.memoryBytes,
+    diskBytes: context.vm.diskVirtualBytes ?? 0,
     cpuText: context.vm.cpuCount > 0 ? `${context.vm.cpuCount}C` : "-",
     memoryText: formatBytes(context.vm.memoryBytes),
     diskText: formatBytes(context.vm.diskVirtualBytes ?? 0),

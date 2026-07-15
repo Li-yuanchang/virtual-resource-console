@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch } from "vue";
 import { Loading } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
+import ConsoleDialog from "./ConsoleDialog.vue";
 import type {
   HostNode,
   IpLease,
@@ -16,6 +17,7 @@ import type {
   ProviderType,
   ProvisionTask,
   ProvisionTaskStep,
+  ProvisionTaskVm,
   ProvisioningConfig,
   ProvisioningConfigResponse,
   ProvisioningSpecTemplate,
@@ -25,6 +27,7 @@ import type {
   VmNode,
   VmCreateRequest,
 } from "../types";
+import type { NoVncVmConsoleTarget } from "../domain/consoleStrategies";
 import { resolveProvisioningStrategy } from "../domain/provisioningStrategies";
 
 interface StorageTotals {
@@ -63,6 +66,34 @@ interface ProvisioningProgressStep {
   status: ProvisionTaskStep["status"];
   message?: string;
 }
+
+interface ProvisionConsoleTargetItem {
+  key: string;
+  name: string;
+  ip?: string;
+  status: ProvisionTaskVm["status"];
+  message?: string;
+  progressPercent?: number;
+  currentStep?: ProvisionTaskVm["currentStep"];
+  installPackageDone?: number;
+  installPackageTotal?: number;
+  target: NoVncVmConsoleTarget | null;
+}
+
+const PROVISION_FOOTER_STEPS = [
+  { key: "submit", name: "提交任务" },
+  { key: "plan", name: "生成计划" },
+  { key: "publish-source", name: "发布安装源" },
+  { key: "create-vm", name: "创建 VM" },
+  { key: "boot", name: "启动系统" },
+  { key: "fetch-source", name: "拉取安装源" },
+  { key: "install-guest", name: "安装系统" },
+  { key: "wait-network", name: "等待网络" },
+  { key: "verify-login", name: "验证登录" },
+  { key: "finalize", name: "启动收尾" },
+  { key: "guest-tools", name: "监控工具" },
+  { key: "complete", name: "完成" },
+] satisfies Array<{ key: string; name: string }>;
 
 const IP_CANDIDATE_PREVIEW_LIMIT = 48;
 const VRC_TOAST_DURATION_MS = 3000;
@@ -104,12 +135,16 @@ const props = defineProps<{
   submitting: boolean;
   progress: ProvisioningProgressState | null;
   provisionTask: ProvisionTask | null;
+  consoleAvailable?: boolean;
+  consoleTarget?: NoVncVmConsoleTarget | null;
+  provisionConsoleTargets?: ProvisionConsoleTargetItem[];
 }>();
 
 const emit = defineEmits<{
   "update:visible": [value: boolean];
   activity: [payload: ActivityPayload];
   "open-iso-detail": [];
+  "select-console-target": [value: ProvisionConsoleTargetItem];
   submit: [payload: VmCreateRequest];
 }>();
 
@@ -228,11 +263,9 @@ const effectiveProvisioningSpec = computed<ProvisioningSpecTemplate>(() => {
   };
 });
 const storageFreeGiB = computed(() => Math.max(props.storageTotals.physicalGiB - props.storageTotals.usedGiB, 0));
-const cpuFreeForCreate = computed(() => {
-  const cpuAllocated = props.vms.reduce((sum, vm) => sum + vm.cpuCount, 0);
-  const cpuCapacity = Math.max(props.host?.cpuCores ?? 0, 0) * 4;
-  return Math.max(cpuCapacity - cpuAllocated, 0);
-});
+const runningVcpuForCreate = computed(() =>
+  props.vms.filter((vm) => vm.powerState === "running").reduce((sum, vm) => sum + vm.cpuCount, 0),
+);
 const provisioningPlan = computed(() => buildProvisioningPlan());
 const provisioningWarnings = computed(() => categorizeProvisioningWarnings(provisioningPlan.value?.warnings ?? []));
 const blockingProvisioningWarnings = computed(() => provisioningWarnings.value.filter((warning) => warning.severity === "blocking"));
@@ -244,22 +277,49 @@ const canSubmit = computed(
     !probingIps.value &&
     blockingProvisioningWarnings.value.length === 0,
 );
-const activeProgressSteps = computed(() => {
+const activeProgressSteps = computed<ProvisioningProgressStep[]>(() => {
   const task = props.provisionTask;
   if (!task) {
-    return [
-      {
-        key: "preflight",
-        name: props.progress?.title ?? "等待创建",
-        status: props.progress?.status === "error" ? "failed" : props.progress?.status === "success" ? "success" : "running",
-        message: props.progress?.message,
-      },
-    ] satisfies ProvisioningProgressStep[];
+    return PROVISION_FOOTER_STEPS.map((step, index) => ({
+      key: step.key,
+      name: index === 0 ? props.progress?.title ?? step.name : step.name,
+      status:
+        index === 0
+          ? props.progress?.status === "error"
+            ? "failed"
+            : props.progress?.status === "success"
+              ? "success"
+              : "running"
+          : "pending",
+      message: index === 0 ? props.progress?.message : undefined,
+    }));
   }
-  const importantKeys = new Set(["plan", "publish-source", "create-vm", "boot", "install-guest", "wait-network", "verify-login", "complete"]);
-  return task.steps.filter((step) => importantKeys.has(step.key));
+  const stepMap = new Map(task.steps.map((step) => [step.key, step]));
+  const submitStep: ProvisioningProgressStep = {
+    key: "submit",
+    name: "提交任务",
+    status: task.steps.some((step) => step.status === "running") || task.status === "success" ? "success" : task.status === "failed" ? "failed" : "running",
+    message: task.message,
+  };
+  const steps = PROVISION_FOOTER_STEPS.map((step) => {
+    if (step.key === "submit") return submitStep;
+    const taskStep = stepMap.get(step.key as ProvisionTaskStep["key"]);
+    return {
+      key: step.key,
+      name: taskStep?.name ?? step.name,
+      status: taskStep?.status ?? "pending",
+      message: taskStep?.message,
+    };
+  });
+  const createdWithoutAutoStart = task.status === "success" && task.steps.some((step) => step.key === "boot" && step.status === "skipped");
+  if (createdWithoutAutoStart) {
+    return steps.map((step) => (["boot", "fetch-source", "install-guest", "wait-network", "verify-login", "finalize", "guest-tools"].includes(step.key) ? { ...step, status: "skipped" } : step));
+  }
+  return steps;
 });
 const activeProgressPercent = computed(() => {
+  const explicitPercent = Number((props.provisionTask as (ProvisionTask & { progressPercent?: number }) | null)?.progressPercent);
+  if (Number.isFinite(explicitPercent)) return Math.min(100, Math.max(0, Math.round(explicitPercent)));
   const steps = activeProgressSteps.value;
   if (!steps.length) return 0;
   const finished = steps.filter((step) => step.status === "success" || step.status === "skipped").length;
@@ -267,8 +327,14 @@ const activeProgressPercent = computed(() => {
   return Math.min(100, Math.round(((finished + runningBonus) / steps.length) * 100));
 });
 const activeProgressVisible = computed(() => props.submitting || !!props.progress || !!props.provisionTask);
-const activeProgressTitle = computed(() => props.progress?.title || props.provisionTask?.title || "创建任务");
+const provisioningFormLocked = computed(() => activeProgressVisible.value);
 const activeProgressMessage = computed(() => props.progress?.message || props.provisionTask?.message || "等待任务状态");
+const isProvisionTaskMode = computed(() => !!props.provisionTask);
+const provisionPlanAsideText = computed(() => {
+  if (isProvisionTaskMode.value) return activeProgressMessage.value;
+  if (!canSubmit.value) return `阻断项 ${blockingProvisioningWarnings.value.length} 个`;
+  return "控制台窗口只在用户打开后出现";
+});
 const targetHostSummary = computed(() => {
   if (!props.host) return "未选择目标物理机";
   return `${props.host.name} · ${props.host.address || props.connection.host} · ${providerLabel(props.connection.providerType)}`;
@@ -597,6 +663,7 @@ function applyEnvironmentTemplate() {
 }
 
 function applyProvisioningPool() {
+  if (provisioningFormLocked.value) return;
   const pool = selectedProvisioningPool.value;
   if (!pool) return;
   applyProvisioningPoolDraft(pool);
@@ -617,6 +684,7 @@ function applyProvisioningPoolDraft(pool: IpPoolConfig) {
 }
 
 async function saveCurrentIpPool() {
+  if (provisioningFormLocked.value) return;
   const draft = currentProvisioningPoolDraft();
   const validation = validateIpPool(draft);
   if (validation) {
@@ -673,9 +741,8 @@ function buildProvisioningPlan(): ProvisioningPlanResult | null {
   if (!props.vms.length) {
     warnings.push("当前 VM 清单未完整加载，IP 占用判断可能不完整。");
   }
-  warnings.push(...resourcePlanWarnings(spec, count));
-  if (provisioningForm.sourceType === "iso" && props.connection.providerType !== "xenserver") {
-    warnings.push("ISO 安装介质会随虚拟机挂载，系统安装需在控制台内完成。");
+  if (provisioningForm.sourceType === "iso" && selectedEnvironmentTemplate.value?.installStrategy === "manual-iso") {
+    warnings.push("PVE ISO 安装介质会随虚拟机挂载，系统安装需在控制台内完成。");
   }
   const items = Array.from({ length: count }, (_, index) => {
     const override = vmDraftOverrides[index] ?? {};
@@ -706,6 +773,7 @@ function buildProvisioningPlan(): ProvisioningPlanResult | null {
     const status = item.ip ? ipProbeResults.value[item.ip]?.status : undefined;
     if (!item.ip || status !== "available") warnings.push(`第 ${index + 1} 台 IP 未确认可用。`);
   }
+  warnings.push(...resourcePlanWarnings(items));
   const readyItems = items.filter((item) => item.ip && ipProbeResults.value[item.ip]?.status === "available");
 
   return {
@@ -743,6 +811,7 @@ function installStrategyLabel(template: EnvironmentProvisioningTemplate | null) 
 }
 
 function setVmDraftOverride(index: number, field: keyof VmDraftOverride, value: string | number | undefined) {
+  if (provisioningFormLocked.value) return;
   if (!vmDraftOverrides[index]) vmDraftOverrides[index] = {};
   if (typeof value === "string") {
     vmDraftOverrides[index][field] = value as never;
@@ -754,6 +823,7 @@ function setVmDraftOverride(index: number, field: keyof VmDraftOverride, value: 
 }
 
 function setVmDraftText(index: number, field: "name" | "ip" | "rootPassword" | "loginUsername", value: string | number) {
+  if (provisioningFormLocked.value) return;
   setVmDraftOverride(index, field, String(value));
   if (field === "ip") {
     const name = vmDraftOverrides[index]?.name?.trim();
@@ -762,6 +832,7 @@ function setVmDraftText(index: number, field: "name" | "ip" | "rootPassword" | "
 }
 
 function setVmDraftNumber(index: number, field: "cpu" | "memoryGiB" | "diskGiB", value: number | undefined) {
+  if (provisioningFormLocked.value) return;
   setVmDraftOverride(index, field, value);
 }
 
@@ -777,6 +848,58 @@ function progressStepText(status: ProvisionTaskStep["status"]) {
   return "等待";
 }
 
+function workflowStepClass(status: ProvisionTaskStep["status"]) {
+  if (status === "success") return "step-success";
+  if (status === "running") return "step-running";
+  if (status === "failed") return "step-failed";
+  if (status === "skipped") return "step-skipped";
+  return "step-pending";
+}
+
+function workflowStepProgress(step: ProvisioningProgressStep) {
+  if (step.status === "success" || step.status === "skipped") return 100;
+  if (step.status === "failed") return Math.max(12, activeProgressPercent.value);
+  if (step.status !== "running") return 0;
+  const taskPercent = Number(props.provisionTask?.progressPercent);
+  if (props.provisionTask?.currentStep === step.key && Number.isFinite(taskPercent)) {
+    return Math.min(92, Math.max(12, Math.round(taskPercent)));
+  }
+  return 46;
+}
+
+function provisionVmStatusText(status: ProvisionTaskVm["status"]) {
+  if (status === "success") return "完成";
+  if (status === "running") return "执行中";
+  if (status === "failed") return "失败";
+  return "等待";
+}
+
+function vmTaskStatusClass(status: ProvisionTaskVm["status"]) {
+  if (status === "running") return ["vm-action-state-running", "vm-action-type-shutdown", "is-action-busy"];
+  if (status === "success") return ["vm-action-state-success", "vm-action-type-start"];
+  if (status === "failed") return ["vm-action-state-error", "vm-action-type-delete"];
+  return ["vm-action-state-pending"];
+}
+
+function provisionVmProgressText(vm: ProvisionTaskVm) {
+  const packageDone = Number(vm.installPackageDone);
+  const packageTotal = Number(vm.installPackageTotal);
+  if (Number.isFinite(packageDone) && packageDone > 0 && Number.isFinite(packageTotal) && packageTotal > 0) {
+    return `安装包 ${packageDone}/${packageTotal} · ${Math.round(vm.progressPercent ?? 0)}%`;
+  }
+  return vm.message || progressStepText(vm.status === "failed" ? "failed" : vm.status === "success" ? "success" : vm.status === "running" ? "running" : "pending");
+}
+
+function provisionPlanItemStatusText(item: ProvisioningPlanItem) {
+  if (!item.ip) return "待分配";
+  const status = ipProbeResults.value[item.ip]?.status;
+  if (status === "available") return "可提交创建";
+  if (status === "reachable") return "IP 有响应";
+  if (status === "occupied") return "IP 已占用";
+  if (status === "reserved") return "IP 已预留";
+  return probingIps.value ? "探测中" : "待探测";
+}
+
 function submitProvisioning() {
   if (props.submitting) return;
   const spec = effectiveProvisioningSpec.value;
@@ -789,9 +912,10 @@ function submitProvisioning() {
     showMessage(blockingWarningSummary.value || "存在阻断项，处理后才能创建。", "warning");
     return;
   }
-  if (advisoryProvisioningWarnings.value.length && !advisoryWarningsAcknowledged.value) {
+  const acknowledgementWarnings = advisoryProvisioningWarnings.value;
+  if (acknowledgementWarnings.length && !advisoryWarningsAcknowledged.value) {
     advisoryWarningsAcknowledged.value = true;
-    showMessage(summarizeProvisioningWarnings(advisoryProvisioningWarnings.value), "info");
+    showMessage(summarizeProvisioningWarnings(acknowledgementWarnings), "info");
     return;
   }
   emit("submit", {
@@ -801,6 +925,7 @@ function submitProvisioning() {
     scopeKey: currentScopeKey.value,
     environmentTemplateId: provisioningForm.environmentTemplateId || undefined,
     sourceType: provisioningForm.sourceType,
+    installStrategy: selectedEnvironmentTemplate.value?.installStrategy,
     isoId: provisioningForm.sourceType === "iso" ? provisioningForm.isoId || selectedIsoImage.value?.id || undefined : undefined,
     isoName: provisioningForm.sourceType === "iso" ? selectedIsoImage.value?.name : undefined,
     templateName: provisioningForm.sourceType === "template" ? provisioningForm.templateName.trim() : undefined,
@@ -827,19 +952,16 @@ function submitProvisioning() {
   });
 }
 
-function resourcePlanWarnings(spec: ProvisioningSpecTemplate, count: number) {
+function resourcePlanWarnings(items: ProvisioningPlanItem[]) {
   const warnings: string[] = [];
   const host = props.host;
   if (!host) return ["未选择目标物理机。"];
-  const cpuFree = cpuFreeForCreate.value;
   const memoryFree = Math.max(host.memoryFreeBytes ?? 0, 0);
   const freeStorageGiB = storageFreeGiB.value;
-  const newCpu = spec.cpu * count;
-  const newMemoryBytes = spec.memoryGiB * count * 1024 ** 3;
-  const newDiskGiB = (spec.systemDiskGiB + spec.dataDiskGiB) * count;
+  const newMemoryBytes = items.reduce((sum, item) => sum + item.memoryGiB, 0) * 1024 ** 3;
+  const newDiskGiB = items.reduce((sum, item) => sum + item.systemDiskGiB + item.dataDiskGiB, 0);
 
-  if (cpuFree < newCpu) warnings.push(`CPU 余量不足：按 4x 超配剩余 ${formatNumber(cpuFree)} vCPU，计划新增 ${newCpu} vCPU。`);
-  if (memoryFree < newMemoryBytes) warnings.push(`内存建议核对：剩余 ${formatBytes(memoryFree)}，计划新增 ${formatBytes(newMemoryBytes)}，当前不作为硬拦截。`);
+  if (memoryFree < newMemoryBytes) warnings.push(`内存余量不足：剩余 ${formatBytes(memoryFree)}，计划新增 ${formatBytes(newMemoryBytes)}。`);
   if (freeStorageGiB < newDiskGiB) warnings.push(`存储余量不足：剩余 ${formatNumber(freeStorageGiB)} GiB，计划新增 ${formatNumber(newDiskGiB)} GiB。`);
   return warnings;
 }
@@ -858,7 +980,7 @@ function summarizeProvisioningWarnings(warnings: ProvisioningWarning[]) {
 }
 
 function isBlockingProvisioningWarning(message: string) {
-  if (message.startsWith("内存建议核对") || message.startsWith("当前 VM 清单未完整加载")) return false;
+  if (message.startsWith("当前 VM 清单未完整加载")) return false;
   return /不足|未选择|未读取|探测中|未确认|不能|请填写|请改用|格式不正确|起始地址不能|范围过大|未选择目标物理机/.test(message);
 }
 
@@ -941,6 +1063,7 @@ function scheduleIpProbe(delay = 350) {
 }
 
 async function probeProvisioningIps() {
+  if (provisioningFormLocked.value) return;
   const ips = Array.from(new Set([...visibleIpCandidates.value, provisioningForm.preferredIp].filter(isIpv4)));
   if (!ips.length) {
     ipProbeResults.value = {};
@@ -992,6 +1115,7 @@ function ipCandidateStatusText(ip: string) {
 }
 
 function selectIpCandidate(ip: string) {
+  if (provisioningFormLocked.value) return;
   const status = ipProbeResults.value[ip]?.status;
   if (status !== "available") {
     showMessage(`${ip} ${ipCandidateStatusText(ip)}，不能分配给新环境。`, "warning");
@@ -1139,11 +1263,18 @@ type ProvisioningSourceType = "iso" | "template";
       </div>
     </template>
 
-    <section class="quick-provision" :class="{ 'is-single-draft': isSingleDraftMode }">
+    <section
+      class="quick-provision vrc-scroll-container"
+      :class="{
+        'is-single-draft': isSingleDraftMode,
+        'has-task-footer': activeProgressVisible,
+        'is-form-locked': provisioningFormLocked,
+      }"
+    >
       <div class="resource-check-grid compact provision-resource-checks">
         <span class="resource-check">
-          <span>CPU 可用</span>
-          <strong>{{ formatNumber(cpuFreeForCreate) }} vCPU · 本次 {{ provisioningPlan?.items.reduce((sum, item) => sum + item.cpu, 0) ?? 0 }} vCPU</strong>
+          <span>CPU</span>
+          <strong>{{ host ? `${formatNumber(host.cpuCores)} 个物理核心` : "-" }} · 运行 {{ formatNumber(runningVcpuForCreate) }} vCPU · 本次 {{ provisioningPlan?.items.reduce((sum, item) => sum + item.cpu, 0) ?? 0 }} vCPU</strong>
         </span>
         <span class="resource-check">
           <span>内存可用</span>
@@ -1168,7 +1299,15 @@ type ProvisioningSourceType = "iso" | "template";
             </div>
             <label class="form-field source-field">
               <span>创建来源</span>
-              <el-select v-model="provisioningForm.environmentTemplateId" placeholder="选择本系统模板" popper-class="vrc-provision-select-dropdown">
+              <el-select
+                v-model="provisioningForm.environmentTemplateId"
+                placeholder="选择本系统模板"
+                popper-class="vrc-provision-select-dropdown"
+                fit-input-width
+                placement="bottom-start"
+                :fallback-placements="['bottom-start', 'top-start']"
+                :disabled="provisioningFormLocked"
+              >
                 <el-option v-for="template in environmentTemplateOptions" :key="template.id" :label="template.name" :value="template.id">
                   <span>{{ template.name }}</span>
                   <small class="option-subtitle">{{ installStrategyLabel(template) }} · {{ template.description || "按模板生成创建参数" }}</small>
@@ -1186,7 +1325,11 @@ type ProvisioningSourceType = "iso" | "template";
                 placeholder="选择 ISO"
                 filterable
                 :loading="loadingIsoImages"
-                popper-class="vrc-provision-select-dropdown"
+                :disabled="provisioningFormLocked"
+                popper-class="vrc-provision-select-dropdown vrc-provision-iso-dropdown"
+                fit-input-width
+                placement="bottom-start"
+                :fallback-placements="['bottom-start', 'top-start']"
                 loading-text="正在读取镜像资源"
                 no-data-text="当前平台未读到 ISO"
                 @visible-change="handleIsoSelectVisibleChange"
@@ -1199,46 +1342,45 @@ type ProvisioningSourceType = "iso" | "template";
             </label>
             <label v-else class="form-field iso-field">
               <span>克隆源</span>
-              <el-input v-model="provisioningForm.templateName" placeholder="用于克隆的基础虚拟机名称" />
+              <el-input v-model="provisioningForm.templateName" placeholder="用于克隆的基础虚拟机名称" :disabled="provisioningFormLocked" />
             </label>
 
             <label class="form-field compact">
               <span>CPU</span>
-              <el-input-number v-model="provisioningForm.cpu" :min="1" :max="256" controls-position="right" />
+              <el-input-number v-model="provisioningForm.cpu" :min="1" :max="256" controls-position="right" :disabled="provisioningFormLocked" />
             </label>
             <label class="form-field compact">
               <span>内存 GiB</span>
-              <el-input-number v-model="provisioningForm.memoryGiB" :min="1" :max="2048" controls-position="right" />
+              <el-input-number v-model="provisioningForm.memoryGiB" :min="1" :max="2048" controls-position="right" :disabled="provisioningFormLocked" />
             </label>
             <label class="form-field compact">
               <span>虚拟硬盘 GiB</span>
-              <el-input-number v-model="provisioningForm.systemDiskGiB" :min="1" :max="65535" controls-position="right" />
+              <el-input-number v-model="provisioningForm.systemDiskGiB" :min="1" :max="65535" controls-position="right" :disabled="provisioningFormLocked" />
             </label>
             <label class="form-field compact">
               <span>创建台数</span>
-              <el-input-number v-model="provisioningForm.count" class="provision-count-input" :min="1" :max="20" controls-position="right" />
+              <el-input-number v-model="provisioningForm.count" class="provision-count-input" :min="1" :max="20" controls-position="right" :disabled="provisioningFormLocked" />
             </label>
 
             <label class="form-field">
               <span>名称备注</span>
-              <el-input v-model="provisioningForm.vmNamePrefix" placeholder="无 IP 时兜底，例如 test" />
+              <el-input v-model="provisioningForm.vmNamePrefix" placeholder="无 IP 时兜底，例如 test" :disabled="provisioningFormLocked" />
             </label>
             <label class="form-field">
               <span>{{ provisioningAccountPolicy.label }}</span>
-              <el-input v-if="provisioningAccountPolicy.requiresUsername" v-model="provisioningForm.loginUsername" placeholder="例如 ubuntu" />
-              <el-input v-else :model-value="provisioningAccountPolicy.defaultUsername" readonly />
+              <el-input v-if="provisioningAccountPolicy.requiresUsername" v-model="provisioningForm.loginUsername" placeholder="例如 ubuntu" :disabled="provisioningFormLocked" />
+              <el-input v-else :model-value="provisioningAccountPolicy.defaultUsername" readonly :disabled="provisioningFormLocked" />
             </label>
-            <el-checkbox v-model="provisioningForm.autoStart" class="provision-auto-start">创建后启动并打开控制台</el-checkbox>
+            <el-checkbox v-model="provisioningForm.autoStart" class="provision-auto-start" :disabled="provisioningFormLocked">创建后启动并打开控制台</el-checkbox>
           </section>
         </div>
 
         <aside class="provision-side-stack">
           <section class="provision-side-panel is-collapsible" :class="{ 'is-expanded': isProvisionSectionExpanded('network') }">
-            <button
+            <div
               class="provision-panel-toggle"
-              type="button"
-              :aria-expanded="isProvisionSectionExpanded('network')"
-              @click="toggleProvisionSection('network')"
+              role="group"
+              aria-label="网络配置与 IP 池"
             >
               <span class="provision-panel-title">
                 <strong>网络配置 / IP 池</strong>
@@ -1247,25 +1389,36 @@ type ProvisioningSourceType = "iso" | "template";
               <span class="provision-panel-meta">
                 {{ provisioningForm.startIp && provisioningForm.endIp ? `${provisioningForm.startIp} - ${provisioningForm.endIp}` : "未配置地址范围" }}
               </span>
-              <span class="provision-panel-indicator">{{ isProvisionSectionExpanded("network") ? "收起" : "展开" }}</span>
-            </button>
+              <button class="provision-network-action" type="button" :disabled="probingIps || provisioningFormLocked" @click.stop="probeProvisioningIps">
+                <el-icon v-if="probingIps" class="inline-loading"><Loading /></el-icon>
+                <span>探测 IP</span>
+              </button>
+              <button
+                class="provision-network-action"
+                type="button"
+                :aria-expanded="isProvisionSectionExpanded('network')"
+                @click="toggleProvisionSection('network')"
+              >
+                {{ isProvisionSectionExpanded("network") ? "收起" : "展开" }}
+              </button>
+            </div>
 
             <div v-if="isProvisionSectionExpanded('network')" class="provision-panel-body">
               <div class="provision-inline-actions">
-                <button class="cache-refresh-link" :disabled="savingProvisioningConfig" @click="saveCurrentIpPool">
+                <button class="cache-refresh-link" :disabled="savingProvisioningConfig || provisioningFormLocked" @click="saveCurrentIpPool">
                   <el-icon v-if="savingProvisioningConfig" class="inline-loading"><Loading /></el-icon>
                   <span>保存 IP 池</span>
-                </button>
-                <button class="cache-refresh-link" type="button" :disabled="probingIps" @click="probeProvisioningIps">
-                  <el-icon v-if="probingIps" class="inline-loading"><Loading /></el-icon>
-                  <span>探测 IP</span>
                 </button>
               </div>
               <el-select
                 v-model="provisioningForm.ipPoolId"
                 placeholder="选择已保存 IP 池"
                 clearable
+                :disabled="provisioningFormLocked"
                 popper-class="vrc-provision-select-dropdown"
+                fit-input-width
+                placement="bottom-start"
+                :fallback-placements="['bottom-start', 'top-start']"
                 @change="applyProvisioningPool"
               >
                 <el-option v-for="pool in provisioningPoolOptions" :key="pool.id" :label="pool.name" :value="pool.id">
@@ -1274,14 +1427,14 @@ type ProvisioningSourceType = "iso" | "template";
                 </el-option>
               </el-select>
               <div class="ip-pool-grid compact">
-                <el-input v-model="provisioningForm.poolName" placeholder="IP 池名称" />
-                <el-input v-model="provisioningForm.cidr" placeholder="CIDR，例如 192.0.2.0/24" />
-                <el-input v-model="provisioningForm.startIp" placeholder="扫描起始 IP" />
-                <el-input v-model="provisioningForm.endIp" placeholder="扫描结束 IP" />
-                <el-input v-model="provisioningForm.gateway" placeholder="网关" />
-                <el-input v-model="provisioningForm.dnsText" placeholder="DNS，逗号分隔" />
-                <el-input v-model="provisioningForm.networkName" placeholder="网络 / VLAN / PortGroup" />
-                <el-input v-model="provisioningForm.reservedIpsText" placeholder="保留 IP，逗号或换行分隔" />
+                <el-input v-model="provisioningForm.poolName" placeholder="IP 池名称" :disabled="provisioningFormLocked" />
+                <el-input v-model="provisioningForm.cidr" placeholder="CIDR，例如 192.0.2.0/24" :disabled="provisioningFormLocked" />
+                <el-input v-model="provisioningForm.startIp" placeholder="扫描起始 IP" :disabled="provisioningFormLocked" />
+                <el-input v-model="provisioningForm.endIp" placeholder="扫描结束 IP" :disabled="provisioningFormLocked" />
+                <el-input v-model="provisioningForm.gateway" placeholder="网关" :disabled="provisioningFormLocked" />
+                <el-input v-model="provisioningForm.dnsText" placeholder="DNS，逗号分隔" :disabled="provisioningFormLocked" />
+                <el-input v-model="provisioningForm.networkName" placeholder="网络 / VLAN / PortGroup" :disabled="provisioningFormLocked" />
+                <el-input v-model="provisioningForm.reservedIpsText" placeholder="保留 IP，逗号或换行分隔" :disabled="provisioningFormLocked" />
               </div>
               <div class="provision-actions">
                 <span>可用 {{ provisioningAvailableIps.length }} 个 · 已占用 {{ provisioningOccupiedIps.size }} 个 · 关机 VM 也计入占用</span>
@@ -1292,7 +1445,7 @@ type ProvisioningSourceType = "iso" | "template";
                   <span>{{ provisioningForm.preferredIp ? `首选 ${ provisioningForm.preferredIp }` : loadingIpLeases ? "读取 IP 池文件中" : `本地预留 ${ provisioningLeasedIps.size } 个` }}</span>
                 </div>
                 <div v-if="visibleIpCandidates.length" class="ip-candidate-list">
-                  <button v-for="ip in visibleIpCandidates" :key="ip" type="button" class="ip-candidate" :class="ipCandidateClass(ip)" @click="selectIpCandidate(ip)">
+                  <button v-for="ip in visibleIpCandidates" :key="ip" type="button" class="ip-candidate" :class="ipCandidateClass(ip)" :disabled="provisioningFormLocked" @click="selectIpCandidate(ip)">
                     <strong>{{ ip }}</strong>
                     <small>{{ ipCandidateStatusText(ip) }}</small>
                   </button>
@@ -1307,61 +1460,109 @@ type ProvisioningSourceType = "iso" | "template";
         <section class="vm-draft-panel provision-draft-full">
           <div class="provision-plan-head vm-plan-head">
             <div>
-              <h3>生成创建预案</h3>
-              <span>{{ provisioningPlan?.summary ?? "请先完成目标、来源、规格和 IP 池配置" }}</span>
+              <h3>{{ isProvisionTaskMode ? "VM 创建明细" : "生成创建预案" }}</h3>
+              <span>{{ isProvisionTaskMode ? "VM 创建后表单锁定，只保留对象状态和验收进度" : provisioningPlan?.summary ?? "请先完成目标、来源、规格和 IP 池配置" }}</span>
             </div>
-            <span class="provision-plan-status">{{ canSubmit ? "阻断项已清除" : `阻断项 ${blockingProvisioningWarnings.length} 个` }}</span>
+            <span class="provision-plan-status">{{ provisionPlanAsideText }}</span>
           </div>
-          <div class="vm-draft-table">
-            <div class="vm-draft-row vm-draft-header">
-              <span>#</span>
+          <div v-if="isProvisionTaskMode" class="vm-task-table">
+            <div class="vm-task-row vm-task-header">
+              <span>序号</span>
+              <span>名称</span>
+              <span>IP</span>
+              <span>状态</span>
+              <span>当前进度</span>
+            </div>
+            <div class="vm-task-body vrc-scroll-container">
+              <div v-for="(vm, index) in provisionTask?.vms ?? []" :key="`${vm.name}:${vm.ip ?? index}`" class="vm-task-row">
+                <span class="vm-draft-index">{{ index + 1 }}</span>
+                <strong>{{ vm.name }}</strong>
+                <span>{{ vm.ip || "-" }}</span>
+                <span class="vm-task-status vm-state-inline" :class="vmTaskStatusClass(vm.status)">
+                  <template v-if="vm.status === 'running'">
+                    <span class="vm-action-stage-copy">{{ provisionVmStatusText(vm.status) }}</span>
+                    <span class="vm-action-stage-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                  </template>
+                  <template v-else>
+                    <span class="state-text">{{ provisionVmStatusText(vm.status) }}</span>
+                  </template>
+                </span>
+                <span>{{ provisionVmProgressText(vm) }}</span>
+              </div>
+            </div>
+          </div>
+          <section v-if="isProvisionTaskMode" class="provision-inline-console-panel">
+            <ConsoleDialog
+              v-if="consoleTarget"
+              embedded
+              :visible="true"
+              :target="consoleTarget"
+              :provision-task="provisionTask"
+              :provision-targets="provisionConsoleTargets ?? []"
+              @select-provision-target="emit('select-console-target', $event)"
+            />
+            <div v-else class="provision-inline-console-empty">
+              <strong>控制台准备中</strong>
+              <span>{{ consoleAvailable ? "正在选择可用控制台目标" : "等待 VM 网络和控制台入口就绪" }}</span>
+            </div>
+          </section>
+          <div
+            v-else
+            class="vm-plan-list-table"
+            :style="{ height: `${Math.min(158, 32 + (provisioningPlan?.items.length ?? 0) * 42)}px` }"
+          >
+            <div class="vm-plan-list-row vm-plan-list-header">
+              <span>序号</span>
               <span>名称</span>
               <span>IP</span>
               <span>CPU</span>
               <span>内存</span>
-              <span>硬盘</span>
+              <span>磁盘</span>
               <span>密码</span>
-              <span></span>
             </div>
-            <div v-for="(item, index) in provisioningPlan?.items ?? []" :key="index" class="vm-draft-row">
-              <span class="vm-draft-index">{{ index + 1 }}</span>
-              <el-input :model-value="item.name" @update:model-value="setVmDraftText(index, 'name', $event)" />
-              <el-input :model-value="item.ip" placeholder="待分配" @update:model-value="setVmDraftText(index, 'ip', $event)" />
-              <el-input-number :model-value="item.cpu" :min="1" :max="256" controls-position="right" @update:model-value="setVmDraftNumber(index, 'cpu', $event)" />
-              <el-input-number :model-value="item.memoryGiB" :min="1" :max="2048" controls-position="right" @update:model-value="setVmDraftNumber(index, 'memoryGiB', $event)" />
-              <el-input-number :model-value="item.systemDiskGiB + item.dataDiskGiB" :min="1" :max="65535" controls-position="right" @update:model-value="setVmDraftNumber(index, 'diskGiB', $event)" />
-              <el-input :model-value="item.rootPassword" show-password @update:model-value="setVmDraftText(index, 'rootPassword', $event)" />
-              <button class="table-link" type="button" @click="resetVmDraftOverride(index)">重置</button>
+            <div class="vm-plan-list-body vrc-scroll-container">
+              <div v-for="(item, index) in provisioningPlan?.items ?? []" :key="index" class="vm-plan-list-row">
+                <span class="vm-draft-index">{{ index + 1 }}</span>
+                <el-input class="vm-plan-inline-input" :model-value="item.name" :disabled="provisioningFormLocked" @update:model-value="setVmDraftText(index, 'name', $event)" />
+                <el-input class="vm-plan-inline-input" :model-value="item.ip" placeholder="待分配" :disabled="provisioningFormLocked" @update:model-value="setVmDraftText(index, 'ip', $event)" />
+                <el-input-number class="vm-plan-inline-number" :model-value="item.cpu" :min="1" :max="256" controls-position="right" :disabled="provisioningFormLocked" @update:model-value="setVmDraftNumber(index, 'cpu', $event)" />
+                <el-input-number class="vm-plan-inline-number" :model-value="item.memoryGiB" :min="1" :max="2048" controls-position="right" :disabled="provisioningFormLocked" @update:model-value="setVmDraftNumber(index, 'memoryGiB', $event)" />
+                <el-input-number class="vm-plan-inline-number" :model-value="item.systemDiskGiB + item.dataDiskGiB" :min="1" :max="65535" controls-position="right" :disabled="provisioningFormLocked" @update:model-value="setVmDraftNumber(index, 'diskGiB', $event)" />
+                <el-input class="vm-plan-inline-input" :model-value="item.rootPassword" show-password :disabled="provisioningFormLocked" @update:model-value="setVmDraftText(index, 'rootPassword', $event)" />
+              </div>
             </div>
           </div>
         </section>
       </div>
     </section>
     <template #footer>
-      <div class="provision-dialog-footer">
-        <section v-if="activeProgressVisible" class="provision-task-progress" :class="`status-${progress?.status ?? provisionTask?.status ?? 'running'}`">
-          <div class="provision-task-progress-head">
-            <strong>{{ activeProgressTitle }}</strong>
-            <span>{{ activeProgressMessage }}</span>
-          </div>
-          <div class="provision-task-progress-track" aria-hidden="true">
-            <span :style="{ width: `${activeProgressPercent}%` }"></span>
-          </div>
-          <div class="provision-task-steps">
-            <span v-for="step in activeProgressSteps" :key="step.key" class="provision-task-step" :class="`step-${step.status}`" :title="step.message || step.name">
-              <i aria-hidden="true"></i>
-              <b>{{ step.name }}</b>
-              <small>{{ progressStepText(step.status) }}</small>
+      <div class="provision-dialog-footer" :class="{ 'has-task-bar': activeProgressVisible }">
+        <section v-if="activeProgressVisible" class="footer-workflow" :class="`status-${progress?.status ?? provisionTask?.status ?? 'running'}`">
+          <div class="footer-workflow-strip">
+            <span
+              v-for="step in activeProgressSteps"
+              :key="step.key"
+              class="footer-workflow-step"
+              :class="workflowStepClass(step.status)"
+              :style="{ '--step-progress': `${workflowStepProgress(step)}%` }"
+              :title="step.message || step.name"
+            >
+              <span class="footer-workflow-step-name">{{ step.name }}</span>
+              <span class="footer-workflow-step-state">
+                <template v-if="step.status === 'running'">
+                  <span>{{ progressStepText(step.status) }}</span>
+                  <span class="vm-action-stage-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                </template>
+                <template v-else>{{ progressStepText(step.status) }}</template>
+              </span>
+              <span class="footer-workflow-meter" aria-hidden="true"><i></i></span>
             </span>
           </div>
-          <div v-if="provisionTask?.vms.length" class="provision-task-vms">
-            <span v-for="vm in provisionTask.vms.slice(0, 3)" :key="`${vm.name}:${vm.ip}`">{{ vm.name }} {{ vm.ip ? `· ${vm.ip}` : "" }} · {{ vm.message || progressStepText(vm.status === 'failed' ? 'failed' : vm.status === 'success' ? 'success' : vm.status === 'running' ? 'running' : 'pending') }}</span>
-          </div>
         </section>
-        <div class="provision-footer-actions">
+        <div v-if="!activeProgressVisible" class="provision-footer-actions">
           <el-button :disabled="submitting" @click="visibleModel = false">取消</el-button>
           <el-button class="quick-install-button" type="primary" :loading="submitting" :disabled="submitting" @click="submitProvisioning">
-            {{ submitting ? "处理中" : "创建虚拟机" }}
+            创建虚拟机
           </el-button>
         </div>
       </div>
