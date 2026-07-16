@@ -1,5 +1,9 @@
 <script setup lang="ts">
-export type VrcToolbarIconName = "create-vm" | "export" | "refresh";
+export type VrcToolbarIconName =
+  | "create-vm"
+  | "export"
+  | "refresh"
+  | "schedule";
 
 defineProps<{
   name: VrcToolbarIconName;
@@ -20,11 +24,17 @@ defineProps<{
       <path d="M8.55 10.95 12 14.4l3.45-3.45" />
       <path d="M6.15 16.35v1.45c0 .78.62 1.4 1.4 1.4h8.9c.78 0 1.4-.62 1.4-1.4v-1.45" />
     </template>
-    <template v-else>
+    <template v-else-if="name === 'refresh'">
       <path d="M17.85 7.35A7.05 7.05 0 0 0 5.35 9.9" />
       <path d="M17.85 4.85v2.5h-2.55" />
       <path d="M6.15 16.65a7.05 7.05 0 0 0 12.5-2.55" />
       <path d="M6.15 19.15v-2.5H8.7" />
+    </template>
+    <template v-else-if="name === 'schedule'">
+      <path d="M9.1 4.5h5.8M12 4.5v2.2" />
+      <path d="M17.35 7.35 18.7 6" />
+      <circle cx="12" cy="13.4" r="6.25" />
+      <path d="M12 9.8v3.6l2.55 1.45" />
     </template>
   </svg>
 </template>

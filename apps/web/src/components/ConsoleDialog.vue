@@ -2,10 +2,15 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import RFB from "@novnc/novnc";
 import { ElDialog } from "element-plus";
-import { CopyDocument, FullScreen, Monitor, Refresh } from "@element-plus/icons-vue";
+import { Close, CopyDocument, FullScreen, Monitor, Refresh } from "@element-plus/icons-vue";
 import ConsoleVmMetrics from "./ConsoleVmMetrics.vue";
+import VrcLogoMark from "./VrcLogoMark.vue";
 import type { NoVncVmConsoleTarget } from "../domain/consoleStrategies";
 import { resolveConsoleMetricsLoadingStrategy } from "../domain/consoleStrategies";
+import {
+  normalizeConsoleClipboardText,
+  normalizeConsoleTextInput,
+} from "../domain/consoleTextInput";
 import { getProviderBrand } from "../domain/providerBrand";
 import type { ProvisionTask, ProvisionTaskStep, ProvisionTaskVm, VmMetricSnapshot } from "../types";
 
@@ -46,11 +51,13 @@ const emit = defineEmits<{
 }>();
 
 const screenRef = ref<HTMLElement | null>(null);
+const consoleFrameRef = ref<HTMLElement | null>(null);
 const clipboardCaptureRef = ref<HTMLTextAreaElement | null>(null);
 const dialogRef = ref<{ $el?: Element } | null>(null);
 const statusText = ref("等待连接");
 const connected = ref(false);
 const consoleNoticeText = ref("");
+const consolePasteSending = ref(false);
 const uploadDragActive = ref(false);
 const uploadStatusText = ref("");
 const uploadStatusLevel = ref<"info" | "success" | "error">("info");
@@ -98,46 +105,9 @@ const CONSOLE_FRAME_REVEAL_RETRY_LIMIT = 80;
 const CONSOLE_FRAME_REVEAL_RETRY_DELAY_MS = 180;
 const CONSOLE_FRAME_RECONNECT_TIMEOUT_MS = 8000;
 const CONSOLE_MODIFIER_RELEASE_DELAY_MS = 90;
+const CONSOLE_NATIVE_PASTE_FALLBACK_MS = 350;
+const CONSOLE_MAX_PASTE_CHARACTERS = 5000;
 const CONSOLE_ASPECT_RATIO_CACHE_KEY = "virtual-resource-console:console-aspect-ratio";
-const CONSOLE_TEXT_NORMALIZATION_MAP: Record<string, string> = {
-  "。": ".",
-  "．": ".",
-  "｡": ".",
-  "，": ",",
-  "、": "\\",
-  "；": ";",
-  "：": ":",
-  "？": "?",
-  "！": "!",
-  "（": "(",
-  "）": ")",
-  "【": "[",
-  "】": "]",
-  "［": "[",
-  "］": "]",
-  "｛": "{",
-  "｝": "}",
-  "＠": "@",
-  "＿": "_",
-  "－": "-",
-  "＝": "=",
-  "＋": "+",
-  "／": "/",
-  "＼": "\\",
-  "｜": "|",
-  "＂": "\"",
-  "＇": "'",
-  "｀": "`",
-  "～": "~",
-  "＜": "<",
-  "＞": ">",
-  "＃": "#",
-  "＄": "$",
-  "％": "%",
-  "＾": "^",
-  "＆": "&",
-  "＊": "*",
-};
 const CONSOLE_TEXT_SEND_INTERVAL_MS = 12;
 const CONSOLE_KEY_STROKE_MAP: Record<string, { keysym: number; code: string; shift?: boolean }> = {
   " ": { keysym: 0x20, code: "Space" },
@@ -201,8 +171,11 @@ let suppressedLocalShortcutKey = "";
 let viewportRefreshFrame: number | null = null;
 let shouldFocusAfterViewportRefresh = false;
 let nativePasteFallbackTimer: number | null = null;
-let consoleTextSendQueue: Promise<number> = Promise.resolve(0);
+let nativePasteRequestSeq = 0;
+let activeNativePasteRequestId = 0;
+let consoleTextSendQueue: Promise<ConsoleTextSendResult> = Promise.resolve({ sentCount: 0, status: "cancelled" });
 let consoleTextSendToken = 0;
+let consolePasteTaskSeq = 0;
 let resizeStart:
   | {
       x: number;
@@ -261,6 +234,15 @@ interface ConsoleUploadProgressResponse {
 
 interface ConsoleMetricsResponse {
   metrics?: VmMetricSnapshot[];
+}
+
+interface ConsoleTextSendResult {
+  sentCount: number;
+  status: "completed" | "cancelled" | "disconnected";
+}
+
+interface ConsoleTextSendOptions {
+  onProgress?: (sentCount: number) => void;
 }
 
 const consoleLoadingBrand = computed(() => {
@@ -357,6 +339,18 @@ const canCollectConsoleMetrics = computed(() => {
 });
 const consoleMetricView = computed(() => {
   const snapshot = consoleMetricSnapshot.value;
+  const guestTelemetry = snapshot?.guestTelemetry;
+  const telemetryLabel =
+    guestTelemetry?.status === "available"
+      ? "Guest 已增强"
+      : guestTelemetry?.status === "probing"
+        ? "Guest 探测中"
+        : "宿主机采集";
+  const memorySourceLabel =
+    snapshot?.metricSources?.memory === "guest-agent" || snapshot?.metricSources?.memory === "guest-tools"
+      ? "Guest 已用"
+      : consoleMetricsStrategy.value?.memoryUsageLabel || "宿主占用";
+  const diskHasGuestUsage = snapshot?.metricSources?.disk === "guest-agent" || snapshot?.metricSources?.disk === "guest-tools";
   const cpuRatio = finiteMetric(snapshot?.cpuUsage);
   const rawCpuPercent = cpuRatio == null ? null : clamp(cpuRatio * 100, 0, 100);
   const cpuPercent = rawCpuPercent == null ? null : Number(rawCpuPercent.toFixed(rawCpuPercent < 1 ? 2 : 1));
@@ -379,27 +373,28 @@ const consoleMetricView = computed(() => {
   return {
     cpuPercent,
     cpuValue: cpuPercent == null ? (cpuCount > 0 ? `${cpuCount} vCPU` : "--") : `${cpuPercent}%`,
-    cpuDetail: cpuPercent == null ? "实时利用率不可用" : cpuCount > 0 ? `${cpuCount} vCPU · 平均` : "vCPU -",
+    cpuDetail: cpuPercent == null ? "宿主机实时利用率不可用" : cpuCount > 0 ? `宿主机 · ${cpuCount} vCPU 平均` : "宿主机计数器",
     memoryPercent,
     memoryValue: memoryPercent == null ? (memoryTotal == null ? "--" : formatMetricCapacity(memoryTotal)) : `${memoryPercent}%`,
     memoryDetail:
       memoryPercent == null
         ? memoryTotal == null ? "实时用量不可用" : "分配容量"
-        : [consoleMetricsStrategy.value?.memoryUsageLabel, `${formatMetricCapacity(memoryUsed)} / ${formatMetricCapacity(memoryTotal)}`]
+        : [memorySourceLabel, `${formatMetricCapacity(memoryUsed)} / ${formatMetricCapacity(memoryTotal)}`]
             .filter(Boolean)
             .join(" "),
     networkRate: networkTotal == null ? "--" : formatMetricRate(networkTotal),
-    networkDetail: networkTotal == null ? "等待实时采样" : `↑${formatMetricRate(networkTx ?? 0)} ↓${formatMetricRate(networkRx ?? 0)}`,
+    networkDetail: networkTotal == null ? "等待宿主机实时采样" : `宿主机 · ↑${formatMetricRate(networkTx ?? 0)} ↓${formatMetricRate(networkRx ?? 0)}`,
     networkBarPercent,
     diskPercent,
     diskValue: diskPercent == null ? (diskTotal == null ? "--" : formatMetricCapacity(diskTotal)) : `${diskPercent}%`,
     diskDetail:
       diskPercent == null
         ? diskActivity == null
-          ? diskTotal == null ? "实时数据不可用" : "配置容量 · I/O 待采样"
-          : `读${formatMetricRate(diskRead ?? 0)} · 写${formatMetricRate(diskWrite ?? 0)}`
-        : `${formatMetricCapacity(diskUsed)} / ${formatMetricCapacity(diskTotal)}`,
+          ? diskTotal == null ? "实时数据不可用" : "虚拟磁盘配置容量 · I/O 待采样"
+          : `宿主机 I/O · 读${formatMetricRate(diskRead ?? 0)} 写${formatMetricRate(diskWrite ?? 0)}`
+        : `${diskHasGuestUsage ? "Guest 文件系统" : "宿主机存储"} · ${formatMetricCapacity(diskUsed)} / ${formatMetricCapacity(diskTotal)}`,
     diskActivityPercent,
+    telemetryLabel,
     sampledAt: snapshot?.sampledAt ?? "",
   };
 });
@@ -656,7 +651,9 @@ function disconnectConsole() {
   clearConsoleWakeTimer();
   clearConsoleReconnectTimer();
   clearConsoleFrameWatchTimer();
-  consoleTextSendToken += 1;
+  clearNativePasteFallbackTimer();
+  activeNativePasteRequestId = 0;
+  cancelConsolePaste("", { clearNotice: true });
   if (!rfb) return;
   suppressNextConsoleDisconnect = true;
   rfb.disconnect();
@@ -693,12 +690,14 @@ function clearConsoleReconnectTimer() {
 }
 
 function sendCtrlAltDelete() {
+  cancelConsolePaste("已取消文本发送");
   rfb?.sendCtrlAltDel();
   focusConsole();
 }
 
 function sendRemoteCtrlC() {
   if (!rfb) return;
+  cancelConsolePaste("已取消文本发送");
   focusConsole();
   rfb.sendKey(0xffe3, "ControlLeft", true);
   rfb.sendKey(0x0063, "KeyC", true);
@@ -709,12 +708,14 @@ function sendRemoteCtrlC() {
 
 function sendRemoteCommand(command: string) {
   if (!rfb) return;
+  cancelConsolePaste("已取消文本发送");
   focusConsole();
-  sendConsoleText(`${command}\n`);
+  void sendConsoleText(`${command}\n`);
 }
 
 function sendRemoteEnter() {
   if (!rfb) return;
+  cancelConsolePaste("已取消文本发送");
   focusConsole();
   tapRemoteKey(0xff0d, "Enter");
 }
@@ -934,49 +935,57 @@ async function copyConsoleInfo() {
   }, 1400);
 }
 
-async function pasteFromClipboard() {
-  if (!rfb) return;
+async function pasteFromClipboard(nativeRequestId = 0) {
+  if (nativeRequestId && !consumeNativePasteRequest(nativeRequestId)) return;
+  if (!connected.value || !rfb) {
+    showConsoleNotice("控制台未连接，未发送文本", 1800);
+    return;
+  }
+  cancelConsolePaste("");
+  const clipboardReadTaskId = ++consolePasteTaskSeq;
   try {
     const text = await navigator.clipboard.readText();
+    if (clipboardReadTaskId !== consolePasteTaskSeq) return;
     void pasteTextToConsole(text);
   } catch {
-    consoleNoticeText.value = "浏览器未允许读取剪贴板";
-    window.setTimeout(() => {
-      consoleNoticeText.value = "";
-    }, 1800);
+    showConsoleNotice("浏览器未允许读取剪贴板", 1800);
   } finally {
     focusConsole();
   }
 }
 
 function requestNativePasteCapture() {
-  if (!rfb) return;
+  if (!connected.value || !rfb) {
+    showConsoleNotice("控制台未连接，未发送文本", 1800);
+    return;
+  }
   const textarea = clipboardCaptureRef.value;
   if (!textarea) {
     void pasteFromClipboard();
     return;
   }
+  cancelConsolePaste("");
   clearNativePasteFallbackTimer();
+  const requestId = ++nativePasteRequestSeq;
+  activeNativePasteRequestId = requestId;
   textarea.value = "";
   textarea.focus({ preventScroll: true });
   textarea.select();
   nativePasteFallbackTimer = window.setTimeout(() => {
     nativePasteFallbackTimer = null;
-    if (!textarea.value) {
-      textarea.blur();
-      void pasteFromClipboard();
-    } else {
-      focusConsole();
-    }
-  }, 160);
+    textarea.blur();
+    void pasteFromClipboard(requestId);
+  }, CONSOLE_NATIVE_PASTE_FALLBACK_MS);
 }
 
 function handleClipboardCapturePaste(event: ClipboardEvent) {
-  if (!effectiveVisible.value || !rfb) return;
+  if (!effectiveVisible.value || !connected.value || !rfb) return;
   const text = event.clipboardData?.getData("text/plain") ?? "";
   event.preventDefault();
   event.stopPropagation();
   event.stopImmediatePropagation();
+  const requestId = activeNativePasteRequestId;
+  if (!requestId || !consumeNativePasteRequest(requestId)) return;
   clearNativePasteFallbackTimer();
   clipboardCaptureRef.value?.blur();
   if (text) {
@@ -990,6 +999,12 @@ function clearNativePasteFallbackTimer() {
   if (nativePasteFallbackTimer == null) return;
   window.clearTimeout(nativePasteFallbackTimer);
   nativePasteFallbackTimer = null;
+}
+
+function consumeNativePasteRequest(requestId: number) {
+  if (!requestId || requestId !== activeNativePasteRequestId) return false;
+  activeNativePasteRequestId = 0;
+  return true;
 }
 
 function getConsoleAspectRatio() {
@@ -1535,7 +1550,18 @@ function showUploadStatus(message: string, level: "info" | "success" | "error" =
 }
 
 function handleConsoleShortcut(event: KeyboardEvent) {
-  if (!effectiveVisible.value || !rfb) return;
+  if (!effectiveVisible.value || !rfb || !isConsoleKeyboardContext(event.target)) return;
+  if (consolePasteSending.value && !isModifierKey(event.key)) {
+    cancelConsolePaste("已取消文本发送");
+  }
+  const directText = resolveDirectConsoleTextKey(event);
+  if (directText) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    void sendConsoleText(directText);
+    return;
+  }
   const shortcut = resolveLocalConsoleShortcut(event);
   if (!shortcut) return;
   event.preventDefault();
@@ -1552,13 +1578,17 @@ function handleConsoleShortcut(event: KeyboardEvent) {
 }
 
 function handleConsoleCompositionEnd(event: CompositionEvent) {
-  if (!effectiveVisible.value || !rfb) return;
+  if (!effectiveVisible.value || !rfb || !isConsoleKeyboardContext(event.target)) return;
   if (isEditableEventTarget(event.target)) return;
-  const normalizedText = normalizeConsoleTextInput(event.data || "");
-  if (!normalizedText) return;
+  const normalized = normalizeConsoleTextInput(event.data || "");
+  if (normalized.unsupportedCharacterCount > 0) {
+    showConsoleNotice(`包含 ${normalized.unsupportedCharacterCount} 个兼容模式不支持的字符，未发送`, 2400);
+    return;
+  }
+  if (!normalized.text) return;
   event.stopPropagation();
   event.stopImmediatePropagation();
-  sendConsoleText(normalizedText);
+  void sendConsoleText(normalized.text);
 }
 
 function handleConsoleShortcutKeyup(event: KeyboardEvent) {
@@ -1572,7 +1602,7 @@ function handleConsoleShortcutKeyup(event: KeyboardEvent) {
 }
 
 function handleConsoleCopy(event: ClipboardEvent) {
-  if (!effectiveVisible.value || !rfb) return;
+  if (!effectiveVisible.value || !rfb || !isConsoleKeyboardContext(event.target)) return;
   if (isEditableEventTarget(event.target)) return;
   event.preventDefault();
   event.stopPropagation();
@@ -1583,7 +1613,8 @@ function handleConsoleCopy(event: ClipboardEvent) {
 }
 
 function handleConsolePaste(event: ClipboardEvent) {
-  if (!effectiveVisible.value || !rfb) return;
+  if (event.target === clipboardCaptureRef.value) return;
+  if (!effectiveVisible.value || !connected.value || !rfb || !isConsoleKeyboardContext(event.target)) return;
   const text = event.clipboardData?.getData("text/plain") ?? "";
   if (!text) return;
   event.preventDefault();
@@ -1606,44 +1637,136 @@ function resolveLocalConsoleShortcut(event: KeyboardEvent): { action: "paste" | 
   return null;
 }
 
-async function pasteTextToConsole(text: string) {
-  const normalizedText = normalizeConsoleClipboardText(text);
-  if (!normalizedText) return;
-  consoleNoticeText.value = `正在发送 ${normalizedText.length} 个字符`;
-  const sentCount = await sendConsoleText(normalizedText);
-  if (!sentCount) return;
-  consoleNoticeText.value = `已发送 ${sentCount} 个字符`;
-  window.setTimeout(() => {
-    if (consoleNoticeText.value === `已发送 ${sentCount} 个字符`) consoleNoticeText.value = "";
-  }, 1400);
+function resolveDirectConsoleTextKey(event: KeyboardEvent) {
+  if (isEditableEventTarget(event.target)) return "";
+  if (event.metaKey || event.ctrlKey || event.altKey) return "";
+  if (event.shiftKey) return "";
+  if (event.key === "." || event.key === "。" || event.key === "．" || event.key === "｡") return ".";
+  if (event.code === "NumpadDecimal" || event.code === "Period") return ".";
+  return "";
 }
 
-function sendConsoleText(text: string): Promise<number> {
+function cancelConsolePaste(message: string, options: { clearNotice?: boolean } = {}) {
+  consoleTextSendToken += 1;
+  consolePasteTaskSeq += 1;
+  if (!consolePasteSending.value) {
+    if (options.clearNotice) consoleNoticeText.value = "";
+    return;
+  }
+
+  consolePasteSending.value = false;
+  releaseModifierKeys();
+  if (options.clearNotice) {
+    consoleNoticeText.value = "";
+  } else if (message) {
+    showConsoleNotice(message, 1600);
+  }
+}
+
+function showConsoleNotice(message: string, visibleMs: number) {
+  consoleNoticeText.value = message;
+  window.setTimeout(() => {
+    if (consoleNoticeText.value === message) consoleNoticeText.value = "";
+  }, visibleMs);
+}
+
+function isConsoleKeyboardContext(target: EventTarget | null) {
+  const frame = consoleFrameRef.value;
+  if (!frame) return false;
+  const targetNode = target instanceof Node ? target : null;
+  const activeElement = document.activeElement;
+  return (!!targetNode && frame.contains(targetNode)) || (!!activeElement && frame.contains(activeElement));
+}
+
+function isModifierKey(key: string) {
+  return ["Alt", "AltGraph", "Control", "Meta", "Shift"].includes(key);
+}
+
+async function pasteTextToConsole(text: string) {
+  if (!connected.value || !rfb) {
+    showConsoleNotice("控制台未连接，未发送文本", 1800);
+    return;
+  }
+  cancelConsolePaste("");
+  const taskId = ++consolePasteTaskSeq;
+
+  const normalized = normalizeConsoleClipboardText(text);
+  if (normalized.unsupportedCharacterCount > 0) {
+    showConsoleNotice(`包含 ${normalized.unsupportedCharacterCount} 个兼容模式不支持的字符，未发送`, 2800);
+    return;
+  }
+  if (!normalized.text) {
+    showConsoleNotice("剪贴板没有可发送文本", 1800);
+    return;
+  }
+
+  const normalizedText = normalized.text;
+  const characterCount = [...normalizedText].length;
+  if (characterCount > CONSOLE_MAX_PASTE_CHARACTERS) {
+    showConsoleNotice(`文本超过 ${CONSOLE_MAX_PASTE_CHARACTERS} 个字符，未发送`, 2800);
+    return;
+  }
+
+  if (taskId !== consolePasteTaskSeq || !connected.value || !rfb) {
+    showConsoleNotice("控制台连接已断开，未发送文本", 2200);
+    return;
+  }
+
+  consolePasteSending.value = true;
+  consoleNoticeText.value = `正在发送 0/${characterCount}`;
+  const result = await sendConsoleText(normalizedText, {
+    onProgress(sentCount) {
+      if (taskId === consolePasteTaskSeq) consoleNoticeText.value = `正在发送 ${sentCount}/${characterCount}`;
+    },
+  });
+  if (taskId !== consolePasteTaskSeq) return;
+
+  consolePasteSending.value = false;
+  if (result.status === "completed" && result.sentCount === characterCount) {
+    showConsoleNotice(`已发送到控制台 ${result.sentCount} 个字符`, 1600);
+  } else if (result.status === "disconnected") {
+    showConsoleNotice(`连接已断开，发送 ${result.sentCount}/${characterCount}`, 2600);
+  } else {
+    showConsoleNotice(`已取消，发送 ${result.sentCount}/${characterCount}`, 2000);
+  }
+}
+
+function sendConsoleText(text: string, options: ConsoleTextSendOptions = {}): Promise<ConsoleTextSendResult> {
   const token = consoleTextSendToken;
   consoleTextSendQueue = consoleTextSendQueue
-    .catch(() => 0)
-    .then(() => sendConsoleTextNow(text, token));
+    .catch(() => ({ sentCount: 0, status: "cancelled" as const }))
+    .then(() => sendConsoleTextNow(text, token, options));
   return consoleTextSendQueue;
 }
 
-async function sendConsoleTextNow(text: string, token: number) {
+async function sendConsoleTextNow(text: string, token: number, options: ConsoleTextSendOptions): Promise<ConsoleTextSendResult> {
   let sentCount = 0;
+  if (!connected.value || !rfb) return { sentCount, status: "disconnected" };
   releaseModifierKeys();
   focusConsole();
   await delay(CONSOLE_MODIFIER_RELEASE_DELAY_MS);
   for (const char of text) {
-    if (!rfb || token !== consoleTextSendToken) break;
+    if (!connected.value || !rfb) {
+      releaseModifierKeys();
+      return { sentCount, status: "disconnected" };
+    }
+    if (token !== consoleTextSendToken) {
+      releaseModifierKeys();
+      return { sentCount, status: "cancelled" };
+    }
     if (sendTextCharacter(char)) {
       sentCount += 1;
+      if (sentCount % 10 === 0 || sentCount === text.length) options.onProgress?.(sentCount);
       await delay(CONSOLE_TEXT_SEND_INTERVAL_MS);
     }
   }
   releaseModifierKeys();
   focusConsole();
-  return sentCount;
+  return { sentCount, status: "completed" };
 }
 
 function sendTextCharacter(char: string) {
+  if (!connected.value || !rfb) return false;
   const special = specialKeyForCharacter(char);
   if (special) {
     tapRemoteKey(special.keysym, special.code);
@@ -1654,9 +1777,9 @@ function sendTextCharacter(char: string) {
     tapRemoteKey(keyStroke.keysym, keyStroke.code, keyStroke.shift);
     return true;
   }
-  if (!isPrintableTextCharacter(char)) return;
+  if (!isPrintableTextCharacter(char)) return false;
   const codePoint = char.codePointAt(0);
-  if (codePoint == null) return;
+  if (codePoint == null) return false;
   const keysym = codePoint <= 0xff ? codePoint : 0x01000000 | codePoint;
   tapRemoteKey(keysym, undefined);
   return true;
@@ -1694,39 +1817,6 @@ function keyStrokeForCharacter(char: string): { keysym: number; code: string; sh
     return { keysym: char.charCodeAt(0), code: `Key${char}`, shift: true };
   }
   return null;
-}
-
-function normalizeConsoleTextInput(text: string) {
-  let normalizedText = "";
-  for (const char of text) {
-    const mappedChar = CONSOLE_TEXT_NORMALIZATION_MAP[char];
-    if (mappedChar) {
-      normalizedText += mappedChar;
-      continue;
-    }
-    const codePoint = char.codePointAt(0);
-    if (codePoint == null) continue;
-    if (codePoint >= 0xff01 && codePoint <= 0xff5e) {
-      normalizedText += String.fromCharCode(codePoint - 0xfee0);
-      continue;
-    }
-    if (codePoint >= 0x20 && codePoint <= 0x7e) {
-      normalizedText += char;
-    }
-  }
-  return normalizedText;
-}
-
-function normalizeConsoleClipboardText(text: string) {
-  let normalizedText = "";
-  for (const char of text.replace(/\r\n/g, "\n")) {
-    if (char === "\n" || char === "\r" || char === "\t" || char === "\b" || char === "\u001b") {
-      normalizedText += char === "\r" ? "\n" : char;
-      continue;
-    }
-    normalizedText += normalizeConsoleTextInput(char);
-  }
-  return normalizedText;
 }
 
 function releaseModifierKeys() {
@@ -1899,32 +1989,34 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
         </div>
 
         <div class="console-action-grid">
-          <el-dropdown trigger="click" placement="bottom-start" popper-class="console-command-menu" :disabled="!rfb" @command="handleConsoleCommand">
-            <button class="console-action-icon active" :disabled="!rfb" aria-label="常用命令" title="常用命令">
-              <svg class="console-command-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M7 8h10" />
-                <path d="M7 12h10" />
-                <path d="M7 16h6" />
-              </svg>
-            </button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="paste">粘贴文本</el-dropdown-item>
-                <el-dropdown-item command="enter">Enter</el-dropdown-item>
-                <el-dropdown-item command="ctrl-c">Ctrl + C</el-dropdown-item>
-                <el-dropdown-item command="ctrl-alt-del">Ctrl + Alt + Del</el-dropdown-item>
-                <el-dropdown-item divided command="clear">clear</el-dropdown-item>
-                <el-dropdown-item command="reboot">reboot</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
-          <el-tooltip content="重新连接控制台" placement="top" :show-after="120" :hide-after="0">
-            <button class="console-action-icon" aria-label="重新连接控制台" title="重新连接控制台" @click.stop="connectConsole">
+          <el-tooltip content="常用命令" placement="bottom" :show-after="120" :hide-after="0">
+            <el-dropdown trigger="click" placement="bottom-start" popper-class="console-command-menu" :disabled="!connected" @command="handleConsoleCommand">
+              <button class="console-action-icon active" :disabled="!connected" aria-label="常用命令">
+                <svg class="console-command-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M7 8h10" />
+                  <path d="M7 12h10" />
+                  <path d="M7 16h6" />
+                </svg>
+              </button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="paste">粘贴文本</el-dropdown-item>
+                  <el-dropdown-item command="enter">Enter</el-dropdown-item>
+                  <el-dropdown-item command="ctrl-c">Ctrl + C</el-dropdown-item>
+                  <el-dropdown-item command="ctrl-alt-del">Ctrl + Alt + Del</el-dropdown-item>
+                  <el-dropdown-item divided command="clear">clear</el-dropdown-item>
+                  <el-dropdown-item command="reboot">reboot</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </el-tooltip>
+          <el-tooltip content="重新连接控制台" placement="bottom" :show-after="120" :hide-after="0">
+            <button class="console-action-icon" aria-label="重新连接控制台" @click.stop="connectConsole">
               <el-icon><Refresh /></el-icon>
             </button>
           </el-tooltip>
-          <el-tooltip v-if="!embedded" content="放大控制台窗口" placement="top" :show-after="120" :hide-after="0">
-            <button class="console-action-icon" aria-label="放大控制台窗口" title="放大控制台窗口" @click.stop="toggleExpandedConsole">
+          <el-tooltip v-if="!embedded" content="放大控制台窗口" placement="bottom" :show-after="120" :hide-after="0">
+            <button class="console-action-icon" aria-label="放大控制台窗口" @click.stop="toggleExpandedConsole">
               <el-icon><FullScreen /></el-icon>
             </button>
           </el-tooltip>
@@ -1963,10 +2055,15 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
           </div>
           <div class="console-tools" @pointerdown.stop>
             <span v-if="consoleNoticeText" class="console-paste-status">{{ consoleNoticeText }}</span>
+            <el-tooltip v-if="consolePasteSending" content="取消文本发送" placement="bottom" :show-after="80" :hide-after="0">
+              <button class="console-paste-cancel" aria-label="取消文本发送" @click.stop="cancelConsolePaste('已取消文本发送')">
+                <el-icon><Close /></el-icon>
+              </button>
+            </el-tooltip>
             <el-tooltip
               v-if="shouldShowMetricsToggle"
               :content="metricsOverlayVisible ? '隐藏资源监控' : '显示资源监控'"
-              placement="top"
+              placement="bottom"
               :show-after="120"
               :hide-after="0"
             >
@@ -1975,46 +2072,46 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
                 :class="{ active: metricsOverlayVisible }"
                 :aria-label="metricsOverlayVisible ? '隐藏资源监控' : '显示资源监控'"
                 :aria-pressed="metricsOverlayVisible"
-                :title="metricsOverlayVisible ? '隐藏资源监控' : '显示资源监控'"
                 @click.stop="toggleMetricsOverlay"
               >
                 <el-icon><Monitor /></el-icon>
               </button>
             </el-tooltip>
-            <el-tooltip content="复制控制台信息" placement="top" :show-after="120" :hide-after="0">
-              <button class="console-tool-button" aria-label="复制控制台信息" title="复制控制台信息" @click.stop="copyConsoleInfo">
+            <el-tooltip content="复制控制台信息" placement="bottom" :show-after="120" :hide-after="0">
+              <button class="console-tool-button" aria-label="复制控制台信息" @click.stop="copyConsoleInfo">
                 <el-icon><CopyDocument /></el-icon>
               </button>
             </el-tooltip>
-            <el-dropdown trigger="click" placement="bottom-end" popper-class="console-command-menu" :disabled="!rfb" @command="handleConsoleCommand">
-              <button class="console-tool-button" :disabled="!rfb" aria-label="常用命令" title="常用命令">
-                <svg class="console-command-icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M7 8h10" />
-                  <path d="M7 12h10" />
-                  <path d="M7 16h6" />
-                </svg>
-              </button>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item command="paste">粘贴文本</el-dropdown-item>
-                  <el-dropdown-item command="enter">Enter</el-dropdown-item>
-                  <el-dropdown-item command="ctrl-c">Ctrl + C</el-dropdown-item>
-                  <el-dropdown-item command="ctrl-alt-del">Ctrl + Alt + Del</el-dropdown-item>
-                  <el-dropdown-item divided command="clear">clear</el-dropdown-item>
-                  <el-dropdown-item command="reboot">reboot</el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
-            <el-tooltip content="重新连接控制台" placement="top" :show-after="120" :hide-after="0">
-              <button class="console-tool-button" aria-label="重新连接控制台" title="重新连接控制台" @click.stop="connectConsole">
+            <el-tooltip content="常用命令" placement="bottom" :show-after="120" :hide-after="0">
+              <el-dropdown trigger="click" placement="bottom-end" popper-class="console-command-menu" :disabled="!connected" @command="handleConsoleCommand">
+                <button class="console-tool-button" :disabled="!connected" aria-label="常用命令">
+                  <svg class="console-command-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M7 8h10" />
+                    <path d="M7 12h10" />
+                    <path d="M7 16h6" />
+                  </svg>
+                </button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="paste">粘贴文本</el-dropdown-item>
+                    <el-dropdown-item command="enter">Enter</el-dropdown-item>
+                    <el-dropdown-item command="ctrl-c">Ctrl + C</el-dropdown-item>
+                    <el-dropdown-item command="ctrl-alt-del">Ctrl + Alt + Del</el-dropdown-item>
+                    <el-dropdown-item divided command="clear">clear</el-dropdown-item>
+                    <el-dropdown-item command="reboot">reboot</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </el-tooltip>
+            <el-tooltip content="重新连接控制台" placement="bottom" :show-after="120" :hide-after="0">
+              <button class="console-tool-button" aria-label="重新连接控制台" @click.stop="connectConsole">
                 <el-icon><Refresh /></el-icon>
               </button>
             </el-tooltip>
-            <el-tooltip v-if="!embedded" :content="isExpanded ? '退出放大' : '放大控制台窗口'" placement="top" :show-after="120" :hide-after="0">
+            <el-tooltip v-if="!embedded" :content="isExpanded ? '退出放大' : '放大控制台窗口'" placement="bottom" :show-after="120" :hide-after="0">
               <button
                 class="console-tool-button"
                 :aria-label="isExpanded ? '退出放大' : '放大控制台窗口'"
-                :title="isExpanded ? '退出放大' : '放大控制台窗口'"
                 @click.stop="toggleExpandedConsole"
               >
                 <svg v-if="isExpanded" class="console-command-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -2030,6 +2127,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
         </div>
 
         <section
+          ref="consoleFrameRef"
           class="console-frame"
           :class="{ pending: !consoleFrameReady }"
           tabindex="0"
@@ -2083,7 +2181,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
                 <div class="console-loading-mark">
                   <div class="resource-loader-mark console-resource-loader-mark" aria-hidden="true">
                     <span class="resource-loader-ring"></span>
-                    <strong>VRC</strong>
+                    <VrcLogoMark />
                   </div>
                 </div>
               <strong>控制台加载中</strong>

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Search } from "@element-plus/icons-vue";
+import { EditPen, Search } from "@element-plus/icons-vue";
 import { resolveVmConsoleTarget, type VmConsoleTarget } from "../domain/consoleStrategies";
 import { getProviderBrand } from "../domain/providerBrand";
 import type { HostNode, ProviderType, VmNode, VmPowerAction } from "../types";
+import VrcLogoMark from "./VrcLogoMark.vue";
 import VrcToolbarIcon from "./VrcToolbarIcon.vue";
 import VrcVmActionIcon from "./VrcVmActionIcon.vue";
 
@@ -76,6 +77,7 @@ const props = withDefaults(
     metricGridClass?: string;
     tablePanelClass?: string;
     variant?: HostVmPanelVariant;
+    allowVmRename?: boolean;
   }>(),
   {
     vmActionStates: () => ({}),
@@ -84,6 +86,7 @@ const props = withDefaults(
     metricGridClass: "",
     tablePanelClass: "",
     variant: "page",
+    allowVmRename: false,
   },
 );
 
@@ -101,6 +104,8 @@ const emit = defineEmits<{
   "open-console": [target: VmConsoleTarget, vm: VmNode];
   "vm-action": [action: VmPowerAction, vm: VmNode];
   "batch-vm-action": [action: VmPowerAction, rows: VmNode[]];
+  "schedule-vms": [rows: VmNode[]];
+  "rename-vm": [vm: VmNode];
 }>();
 
 const searchModel = computed({
@@ -412,6 +417,13 @@ function openVmConsoleByRow(vm: VmNode) {
             </button>
           </span>
         </el-tooltip>
+        <el-tooltip :content="`为所选 ${selectedVmCount} 台 VM 创建定时任务`" placement="top">
+          <span class="toolbar-tooltip-target">
+            <button type="button" class="vm-batch-action schedule-batch-action" aria-label="创建定时任务" @click="emit('schedule-vms', selectedVmRows)">
+              <VrcToolbarIcon name="schedule" />
+            </button>
+          </span>
+        </el-tooltip>
       </div>
       <div class="toolbar-action-buttons" aria-label="虚拟机表格操作">
         <el-tooltip content="创建虚拟机：按当前物理机资源打开创建向导" placement="top">
@@ -453,10 +465,21 @@ function openVmConsoleByRow(vm: VmNode) {
         <el-table-column type="index" label="序号" width="50" align="center" />
         <el-table-column prop="name" label="名称" min-width="240" align="left" show-overflow-tooltip>
           <template #default="{ row }">
-            <button v-if="vmConsoleTarget(row)" class="vm-console-link drilldown-link" :title="`${vmConsoleTarget(row)?.title}，点击打开控制台`" @click.stop="openVmConsoleByRow(row)">
-              {{ row.name }}
-            </button>
-            <span v-else class="vm-name-cell">{{ row.name }}</span>
+            <div class="vm-name-entry">
+              <button v-if="vmConsoleTarget(row)" class="vm-console-link drilldown-link" :title="`${vmConsoleTarget(row)?.title}，点击打开控制台`" @click.stop="openVmConsoleByRow(row)">
+                {{ row.name }}
+              </button>
+              <span v-else class="vm-name-cell">{{ row.name }}</span>
+              <button
+                v-if="allowVmRename"
+                type="button"
+                class="vm-rename-entry"
+                :aria-label="`修改虚拟机名称：${row.name}`"
+                @click.stop="emit('rename-vm', row)"
+              >
+                <el-icon><EditPen /></el-icon>
+              </button>
+            </div>
           </template>
         </el-table-column>
         <el-table-column prop="powerState" label="状态" width="96" align="center" class-name="vm-state-column" label-class-name="vm-state-column">
@@ -472,7 +495,7 @@ function openVmConsoleByRow(vm: VmNode) {
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="系统" min-width="170" align="left" show-overflow-tooltip>
+        <el-table-column label="系统" min-width="170" align="left" show-overflow-tooltip class-name="vm-os-column" label-class-name="vm-os-column">
           <template #default="{ row }">{{ displayGuestOs(row) }}</template>
         </el-table-column>
         <el-table-column label="vCPU" width="64" align="center">
@@ -509,7 +532,7 @@ function openVmConsoleByRow(vm: VmNode) {
       <div v-if="loadingVms" class="resource-table-loading" :class="`platform-${loadingBrand.type}`">
         <div class="resource-loader-mark" aria-hidden="true">
           <span class="resource-loader-ring"></span>
-          <strong>VRC</strong>
+          <VrcLogoMark :grid="false" />
         </div>
         <div class="resource-loader-copy">
           <strong>正在读取虚拟机清单</strong>

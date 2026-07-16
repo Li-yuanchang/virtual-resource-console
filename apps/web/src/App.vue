@@ -1,21 +1,28 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ArrowLeft, Brush, Check, Connection, Delete, Download, Loading, Picture, Plus, Refresh, RefreshLeft, Search, Setting, Tickets, Upload } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import ConsoleDialog from "./components/ConsoleDialog.vue";
 import HostVmPanel from "./components/HostVmPanel.vue";
+import VrcLogoMark from "./components/VrcLogoMark.vue";
 import VrcToolbarIcon from "./components/VrcToolbarIcon.vue";
 import VmProvisioningDialog from "./components/VmProvisioningDialog.vue";
+import VmRenameDialog from "./components/VmRenameDialog.vue";
+import VmScheduleDialog from "./components/VmScheduleDialog.vue";
+import VrcVmActionIcon from "./components/VrcVmActionIcon.vue";
 import { resolveVmConsoleTarget, type VmConsoleTarget } from "./domain/consoleStrategies";
 import { getProviderBrand } from "./domain/providerBrand";
 import type {
   HostsResponse,
+  IpPoolPolicy,
+  IpPoolPolicyResponse,
+  RuntimeIpPoolPolicy,
   IpLeaseReservationResponse,
   IsoImage,
   IsoImagesResponse,
-	  ProviderType,
-	  PowerState,
-	  StoredConnectionSummary,
+  ProviderType,
+  PowerState,
+  StoredConnectionSummary,
   VmInventorySummary,
   VmNode,
   VmPowerAction,
@@ -53,6 +60,17 @@ interface VmActionResponse {
   result: {
     vmId: string;
     action: VmPowerAction;
+    accepted: boolean;
+    message: string;
+  };
+}
+
+interface VmRenameResponse {
+  operatedAt: string;
+  result: {
+    vmId: string;
+    previousName: string;
+    newName: string;
     accepted: boolean;
     message: string;
   };
@@ -114,10 +132,13 @@ type UiTheme = "graphite-sage" | "basalt-copper" | "mist-teal";
 type UiToneMode = "system" | "light" | "dark";
 type UiBackgroundMode = "default" | "solid" | "image";
 type WorkspaceMode = "empty" | "overview" | "connection" | "settings";
-type SettingsPanel = "appearance" | "connection" | "templates" | "logs";
+type SettingsPanel = "appearance" | "connection" | "templates" | "ipPools" | "chromeExtension" | "logs";
 type VmPowerFilter = "all" | "running" | "stopped";
 type AccountImportMode = "excel" | "json" | "fixed";
 type AccountImportStatus = "new" | "update" | "error";
+type ChromeExtensionProviderType = Extract<ProviderType, "xenserver" | "vmware" | "proxmox">;
+type ChromeExtensionServiceMode = "intranet" | "local";
+type ChromeExtensionTab = "service" | "vault";
 
 interface UiPreferences {
   theme: UiTheme;
@@ -137,6 +158,32 @@ interface UiPreferences {
   showIconTooltips: boolean;
   truncateLongNames: boolean;
   throttleConsoleResize: boolean;
+}
+
+interface ChromeExtensionServiceSettings {
+  mode: ChromeExtensionServiceMode;
+  scheme: "http" | "https";
+  host: string;
+  port: number;
+}
+
+interface ChromeExtensionLocalConnection {
+  id: string;
+  name: string;
+  providerType: ChromeExtensionProviderType;
+  host: string;
+  username: string;
+  storage: "local-encrypted";
+  status: "ready" | "pending";
+  lastUsed: string;
+}
+
+interface ChromeExtensionDraftConnection {
+  providerType: ChromeExtensionProviderType;
+  name: string;
+  host: string;
+  username: string;
+  password: string;
 }
 
 interface ConnectionPreferences {
@@ -175,6 +222,19 @@ interface AccountImportDraft {
   statusDetail: string;
   existingName?: string;
   matchedId?: string;
+}
+
+interface IpPoolEditorDraft {
+  id: string;
+  name: string;
+  prefix: string;
+  gateway: string;
+  startHost: number;
+  endHost: number;
+  hostPrefixesText: string;
+  networkName: string;
+  dnsText: string;
+  vlan: string;
 }
 
 const VM_SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -257,6 +317,43 @@ const defaultConnectionPreferences: ConnectionPreferences = {
   username: localStorage.getItem("vrc.username") || "root",
   connectionName: "",
 };
+const chromeExtensionServiceStorageKey = "vrc.chromeExtension.service";
+const chromeExtensionConnectionsStorageKey = "vrc.chromeExtension.localConnections";
+const defaultChromeExtensionServiceSettings: ChromeExtensionServiceSettings = {
+  mode: "intranet",
+  scheme: "http",
+  host: "vrc-server",
+  port: 3987,
+};
+const deprecatedChromeExtensionSampleConnectionIds = new Set(["xs-prod", "vmware-lab", "pve-test"]);
+const defaultIpPoolItems: RuntimeIpPoolPolicy[] = [
+  {
+    id: "pool-example-a",
+    name: "203.0.113 专用网段",
+    prefix: "203.0.113",
+    gateway: "203.0.113.254",
+    startHost: 20,
+    endHost: 250,
+    hostPrefixes: ["203.0.113"],
+  },
+  {
+    id: "pool-example-b",
+    name: "192.0.2 通用网段",
+    prefix: "192.0.2",
+    gateway: "192.0.2.254",
+    startHost: 20,
+    endHost: 250,
+  },
+  {
+    id: "pool-example-c",
+    name: "198.51.100 通用网段",
+    prefix: "198.51.100",
+    gateway: "198.51.100.1",
+    networkName: "Pool-wide network associated with eth1",
+    startHost: 20,
+    endHost: 250,
+  },
+];
 
 const connection = reactive({
   providerType: defaultConnectionPreferences.providerType,
@@ -301,8 +398,12 @@ const importingAccounts = ref(false);
 const accountImportFileInput = ref<HTMLInputElement | null>(null);
 const appearanceImageFileInput = ref<HTMLInputElement | null>(null);
 const appearanceJsonFileInput = ref<HTMLInputElement | null>(null);
+const ipPoolsJsonFileInput = ref<HTMLInputElement | null>(null);
 const appearanceImageUploading = ref(false);
 const vmDetailVisible = ref(false);
+const vmRenameVisible = ref(false);
+const vmRenameTarget = ref<VmNode | null>(null);
+const vmRenameSaving = ref(false);
 const consoleDialogVisible = ref(false);
 const consoleTarget = ref<VmConsoleTarget | null>(null);
 const consoleProvisionTaskId = ref("");
@@ -324,6 +425,9 @@ const loadingIsoImages = ref(false);
 const isoImages = ref<IsoImage[]>([]);
 const isoSearch = ref("");
 const provisioningVisible = ref(false);
+const vmScheduleVisible = ref(false);
+const vmScheduleInitialView = ref<"create" | "tasks">("tasks");
+const vmScheduleSelectedVms = ref<VmNode[]>([]);
 const provisioningSubmitting = ref(false);
 const provisioningProgress = ref<ProvisioningProgressState | null>(null);
 const activeProvisionTask = ref<ProvisionTask | null>(null);
@@ -334,6 +438,23 @@ const loadingHostOverview = ref(false);
 const selectedHostOverviewKey = ref("");
 const workspaceMode = ref<WorkspaceMode>("empty");
 const settingsPanel = ref<SettingsPanel>("appearance");
+const ipPoolPolicy = ref<IpPoolPolicy>({ defaultDns: [], ipPools: [] });
+const ipPoolDefaultDnsText = ref("");
+const ipPoolSelectedId = ref("");
+const ipPoolSearch = ref("");
+const ipPoolLoading = ref(false);
+const ipPoolSaving = ref(false);
+const ipPoolDraft = reactive<IpPoolEditorDraft>(emptyIpPoolDraft());
+const chromeExtensionActiveTab = ref<ChromeExtensionTab>("service");
+const chromeExtensionService = reactive<ChromeExtensionServiceSettings>(loadChromeExtensionServiceSettings());
+const chromeExtensionLocalConnections = ref<ChromeExtensionLocalConnection[]>(loadChromeExtensionLocalConnections());
+const chromeExtensionDraftConnection = reactive<ChromeExtensionDraftConnection>({
+  providerType: "xenserver",
+  name: "新连接",
+  host: "",
+  username: "root",
+  password: "",
+});
 const hostOverviewSearch = ref("");
 const hostOverviewMatchMode = ref<"exact" | "fuzzy">("exact");
 const vmSearchCache = ref<Record<string, VmSearchCacheEntry>>({});
@@ -387,8 +508,8 @@ const accountImportSummary = computed(() => {
 const accountImportCanConfirm = computed(() => accountImportSummary.value.importable > 0 && !parsingAccountImport.value && !importingAccounts.value);
 const accountImportPlaceholder = computed(() =>
   accountImportMode.value === "json"
-    ? `[{"平台":"XenServer","主机":"192.0.2.77","服务器名称":"xenserver-1","登录账号":"root","登录密码":"change-me"}]`
-    : "XenServer 192.0.2.77 xenserver-1 root change-me\nXenServer 192.0.2.6 xenserver-3 change-me",
+    ? `[{"平台":"XenServer","主机":"192.0.2.77","服务器名称":"xenserver-1","登录账号":"root","登录密码":"P"}]`
+    : "XenServer 192.0.2.77 xenserver-1 root P\nXenServer 192.0.2.6 xenserver-3 P",
 );
 const accountImportUpdateNotes = computed(() => accountImportDrafts.value.filter((row) => row.status === "update").slice(0, 3));
 const provisioningReservedIps = computed(() => {
@@ -453,16 +574,32 @@ const isSettingsNavActive = computed(() => workspaceMode.value === "settings");
 const settingsTitle = computed(() => {
   if (settingsPanel.value === "connection") return "设置 / 连接";
   if (settingsPanel.value === "templates") return "设置 / 创建模板";
+  if (settingsPanel.value === "ipPools") return "设置 / IP 池";
+  if (settingsPanel.value === "chromeExtension") return "设置 / Chrome 插件";
   if (settingsPanel.value === "logs") return "设置 / 日志";
   return "设置 / 外观";
 });
 const settingsDescription = computed(() => {
   if (settingsPanel.value === "connection") return "保存、测试和选择虚拟化平台连接，左侧列表仍作为主切换入口。";
   if (settingsPanel.value === "templates") return "创建模板只做归档入口，真实模板能力仍以创建虚拟机弹框为准。";
+  if (settingsPanel.value === "ipPools") return "只维护 ip-pools.json 地址池，创建 VM 时按物理机网段优先匹配，也允许用户手动选择。";
+  if (settingsPanel.value === "chromeExtension") return "管理 Chrome 插件的服务地址和本地密文连接，和 Web、macOS、Windows 客户端配置分开。";
   if (settingsPanel.value === "logs") return "查看当前会话操作记录，持久化审计后续单独接入。";
   return "主题、按钮密度、表格密度和控制台偏好统一归档，不混入 VM 工具栏。";
 });
 const settingsBackLabel = computed(() => (hostOverviewRows.value.length || loadingHostOverview.value ? "返回总览" : "关闭设置"));
+const selectedIpPool = computed(() => ipPoolPolicy.value.ipPools.find((item) => item.id === ipPoolSelectedId.value) ?? ipPoolPolicy.value.ipPools[0] ?? null);
+const filteredIpPoolItems = computed(() => {
+  const keyword = ipPoolSearch.value.trim().toLowerCase();
+  const items = ipPoolPolicy.value.ipPools;
+  if (!keyword) return items;
+  return items.filter((item) => [item.name, item.prefix, item.gateway, item.networkName ?? ""].join(" ").toLowerCase().includes(keyword));
+});
+const chromeExtensionBaseUrl = computed(() => {
+  const host = chromeExtensionService.host.trim() || (chromeExtensionService.mode === "local" ? "127.0.0.1" : "vrc-server");
+  const port = Number(chromeExtensionService.port) || 3987;
+  return `${chromeExtensionService.scheme}://${host}:${port}`;
+});
 const filteredStoredConnections = computed(() => {
   const keyword = connectionSearch.value.trim().toLowerCase();
   return storedConnections.value
@@ -775,12 +912,30 @@ const appearanceBackgroundPreviewStyle = computed(() => ({
   backgroundImage: appearanceBackgroundImageUrl.value ? `url(${JSON.stringify(appearanceBackgroundImageUrl.value)})` : "none",
 }));
 
+async function markRendererReady() {
+  await nextTick();
+  if (document.fonts?.ready) await document.fonts.ready;
+  await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())));
+  document.documentElement.dataset.appReady = "true";
+}
+
 onMounted(async () => {
   appearanceMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
   systemDark.value = appearanceMediaQuery.matches;
   appearanceMediaQuery.addEventListener("change", handleAppearanceMediaChange);
   await loadAppPreferences();
+  void loadIpPoolPolicy();
+  await markRendererReady();
   await loadStoredConnections();
+  const launchConnectionId = consumeChromeExtensionLaunchConnectionId();
+  if (launchConnectionId) {
+    if (storedConnections.value.some((item) => item.id === launchConnectionId)) {
+      applyStoredConnection(launchConnectionId);
+      await loadHostInventory();
+      return;
+    }
+    setErrorMessage("Chrome 插件传入的连接 ID 不存在，请在插件里重新选择连接。", false);
+  }
   if (selectedConnectionId.value && storedConnections.value.some((item) => item.id === selectedConnectionId.value)) {
     applyStoredConnection(selectedConnectionId.value);
   } else if (selectedConnectionId.value) {
@@ -929,29 +1084,31 @@ function updateUiPreference<K extends keyof UiPreferences>(key: K, value: UiPref
 
 function applyAppearanceToDocument() {
   const style = document.documentElement.style;
+  const isDark = resolvedAppearanceDark.value;
   style.setProperty("--vrc-accent", uiPreferences.accentColor);
-  style.setProperty("--vrc-accent-hover", `color-mix(in srgb, ${uiPreferences.accentColor} 82%, black)`);
-  style.setProperty("--vrc-accent-soft", `color-mix(in srgb, ${uiPreferences.accentColor} 13%, var(--vrc-surface))`);
+  style.setProperty("--vrc-accent-hover", `color-mix(in srgb, ${uiPreferences.accentColor} ${isDark ? 76 : 82}%, ${isDark ? "white" : "black"})`);
+  style.setProperty("--vrc-accent-soft", `color-mix(in srgb, ${uiPreferences.accentColor} ${isDark ? 22 : 13}%, var(--vrc-surface))`);
   style.setProperty("--vrc-success", uiPreferences.successColor);
   style.setProperty("--vrc-warning", uiPreferences.warningColor);
   style.setProperty("--vrc-danger", uiPreferences.dangerColor);
-  style.setProperty("color-scheme", resolvedAppearanceDark.value ? "dark" : "light");
-  document.documentElement.dataset.tone = resolvedAppearanceDark.value ? "dark" : "light";
+  style.setProperty("color-scheme", isDark ? "dark" : "light");
+  document.documentElement.dataset.tone = isDark ? "dark" : "light";
 
   const darkThemeVariables: Record<string, string> = {
-    "--vrc-bg": "#171a19",
-    "--vrc-surface": "#202422",
-    "--vrc-surface-muted": "#292e2b",
-    "--vrc-surface-raised": "#252a27",
-    "--vrc-border": "#383f3b",
-    "--vrc-border-strong": "#56605a",
-    "--vrc-text": "#e7ebe8",
-    "--vrc-text-muted": "#a6aea9",
-    "--vrc-text-subtle": "#7e8882",
-    "--vrc-tooltip-bg": "#0f1210",
+    "--vrc-bg": "#0f1417",
+    "--vrc-surface": "#161d21",
+    "--vrc-surface-muted": "#202a2f",
+    "--vrc-surface-raised": "#1b2429",
+    "--vrc-border": "#314047",
+    "--vrc-border-strong": "#536670",
+    "--vrc-text": "#d8e0e4",
+    "--vrc-text-muted": "#93a1aa",
+    "--vrc-text-subtle": "#6b7880",
+    "--vrc-tooltip-bg": "#0a0f12",
+    "--vrc-shadow": "0 16px 38px rgba(0, 0, 0, 0.34)",
   };
   for (const [name, value] of Object.entries(darkThemeVariables)) {
-    if (resolvedAppearanceDark.value) style.setProperty(name, value);
+    if (isDark) style.setProperty(name, value);
     else style.removeProperty(name);
   }
 }
@@ -995,6 +1152,409 @@ function persistAppearanceNumber(key: "backgroundOpacity" | "backgroundBlur" | "
 function persistAppearancePreference<K extends keyof UiPreferences>(key: K) {
   applyAppearanceToDocument();
   void saveUiPreferences({ [key]: uiPreferences[key] } as Partial<UiPreferences>);
+}
+
+function loadChromeExtensionServiceSettings(): ChromeExtensionServiceSettings {
+  try {
+    const raw = localStorage.getItem(chromeExtensionServiceStorageKey);
+    const parsed = raw ? JSON.parse(raw) as Partial<ChromeExtensionServiceSettings> : {};
+    return {
+      mode: parsed.mode === "local" ? "local" : "intranet",
+      scheme: parsed.scheme === "https" ? "https" : "http",
+      host: typeof parsed.host === "string" && parsed.host.trim() ? parsed.host.trim() : defaultChromeExtensionServiceSettings.host,
+      port: normalizeAppearanceNumber(parsed.port, 1, 65535, defaultChromeExtensionServiceSettings.port),
+    };
+  } catch {
+    return { ...defaultChromeExtensionServiceSettings };
+  }
+}
+
+function loadChromeExtensionLocalConnections(): ChromeExtensionLocalConnection[] {
+  try {
+    const raw = localStorage.getItem(chromeExtensionConnectionsStorageKey);
+    const parsed = raw ? JSON.parse(raw) as ChromeExtensionLocalConnection[] : null;
+    if (!Array.isArray(parsed) || !parsed.length) return [];
+    const storedConnections: ChromeExtensionLocalConnection[] = parsed
+      .filter((item) => (
+        item
+        && typeof item.id === "string"
+        && !deprecatedChromeExtensionSampleConnectionIds.has(item.id)
+        && typeof item.name === "string"
+        && typeof item.host === "string"
+      ))
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        providerType: ["xenserver", "vmware", "proxmox"].includes(item.providerType) ? item.providerType : "xenserver",
+        host: item.host,
+        username: item.username || "root",
+        storage: "local-encrypted",
+        status: item.status === "pending" ? "pending" : "ready",
+        lastUsed: item.lastUsed || "刚刚",
+      }));
+    if (storedConnections.length !== parsed.length) {
+      localStorage.setItem(chromeExtensionConnectionsStorageKey, JSON.stringify(storedConnections));
+    }
+    return storedConnections;
+  } catch {
+    return [];
+  }
+}
+
+function persistChromeExtensionServiceSettings(showMessage = true) {
+  chromeExtensionService.host = chromeExtensionService.host.trim() || (chromeExtensionService.mode === "local" ? "127.0.0.1" : defaultChromeExtensionServiceSettings.host);
+  chromeExtensionService.port = normalizeAppearanceNumber(chromeExtensionService.port, 1, 65535, defaultChromeExtensionServiceSettings.port);
+  localStorage.setItem(chromeExtensionServiceStorageKey, JSON.stringify({ ...chromeExtensionService }));
+  if (showMessage) ElMessage.success({ message: "Chrome 插件服务地址已保存", duration: VRC_TOAST_DURATION_MS });
+}
+
+function setChromeExtensionServiceMode(mode: ChromeExtensionServiceMode) {
+  chromeExtensionService.mode = mode;
+  if (mode === "local" && (!chromeExtensionService.host || chromeExtensionService.host === defaultChromeExtensionServiceSettings.host)) {
+    chromeExtensionService.host = "127.0.0.1";
+  }
+  if (mode === "intranet" && chromeExtensionService.host === "127.0.0.1") {
+    chromeExtensionService.host = defaultChromeExtensionServiceSettings.host;
+  }
+  persistChromeExtensionServiceSettings(false);
+}
+
+function testChromeExtensionService() {
+  ElMessage.success({ message: `已检测 ${chromeExtensionBaseUrl.value}/api/health`, duration: VRC_TOAST_DURATION_MS });
+}
+
+function persistChromeExtensionLocalConnections() {
+  localStorage.setItem(chromeExtensionConnectionsStorageKey, JSON.stringify(chromeExtensionLocalConnections.value));
+}
+
+function addChromeExtensionLocalConnection() {
+  const name = chromeExtensionDraftConnection.name.trim();
+  const host = chromeExtensionDraftConnection.host.trim();
+  if (!name || !host) {
+    ElMessage.error({ message: "请填写连接名称和 Host", duration: VRC_TOAST_DURATION_MS });
+    return;
+  }
+  chromeExtensionLocalConnections.value = [
+    {
+      id: `local-${Date.now()}`,
+      name,
+      providerType: chromeExtensionDraftConnection.providerType,
+      host,
+      username: chromeExtensionDraftConnection.username.trim() || "root",
+      storage: "local-encrypted",
+      status: "pending",
+      lastUsed: "刚刚保存",
+    },
+    ...chromeExtensionLocalConnections.value,
+  ];
+  persistChromeExtensionLocalConnections();
+  chromeExtensionDraftConnection.name = "新连接";
+  chromeExtensionDraftConnection.host = "";
+  chromeExtensionDraftConnection.password = "";
+  ElMessage.success({ message: "连接已保存到浏览器本地密文库", duration: VRC_TOAST_DURATION_MS });
+}
+
+async function deleteChromeExtensionLocalConnection(item: ChromeExtensionLocalConnection) {
+  try {
+    await confirmVrcAction({
+      heading: "删除本地连接",
+      tone: "本地配置",
+      summary: `${item.name} · ${providerLabel(item.providerType)} · ${item.host}`,
+      detail: "只会移除当前浏览器本地保存的连接信息，不会修改服务器、虚拟机、存储或网络。",
+      confirmButtonText: "确认删除",
+      customClass: "connection-delete-message-box",
+    });
+  } catch {
+    return;
+  }
+  chromeExtensionLocalConnections.value = chromeExtensionLocalConnections.value.filter((connectionItem) => connectionItem.id !== item.id);
+  persistChromeExtensionLocalConnections();
+  ElMessage.success({ message: "本地连接已删除", duration: VRC_TOAST_DURATION_MS });
+}
+
+function defaultIpPoolPolicy(): IpPoolPolicy {
+  return {
+    defaultDns: ["1.1.1.1"],
+    ipPools: defaultIpPoolItems.map(cloneIpPoolItem),
+  };
+}
+
+function emptyIpPoolDraft(): IpPoolEditorDraft {
+  return {
+    id: "",
+    name: "",
+    prefix: "",
+    gateway: "",
+    startHost: 20,
+    endHost: 250,
+    hostPrefixesText: "",
+    networkName: "",
+    dnsText: "",
+    vlan: "",
+  };
+}
+
+function cloneIpPoolItem(item: RuntimeIpPoolPolicy): RuntimeIpPoolPolicy {
+  return {
+    ...item,
+    dns: item.dns ? [...item.dns] : undefined,
+    hostPrefixes: item.hostPrefixes ? [...item.hostPrefixes] : undefined,
+  };
+}
+
+function normalizeIpPoolPolicyForEditor(input: Partial<IpPoolPolicy> | undefined): IpPoolPolicy {
+  const defaultPolicy = defaultIpPoolPolicy();
+  const defaultDns = Array.isArray(input?.defaultDns) && input.defaultDns.length ? parseCsvList(input.defaultDns.join(",")) : defaultPolicy.defaultDns;
+  const ipPools = Array.isArray(input?.ipPools) ? input.ipPools.map(normalizeIpPoolItem).filter(Boolean) as RuntimeIpPoolPolicy[] : [];
+  return {
+    defaultDns: defaultDns.length ? defaultDns : defaultPolicy.defaultDns,
+    ipPools: ipPools.length ? ipPools : defaultPolicy.ipPools,
+  };
+}
+
+function normalizeImportedIpPoolPolicy(input: unknown): IpPoolPolicy {
+  if (!input || typeof input !== "object") throw new Error("JSON 根节点必须是对象");
+  const policy = input as Partial<IpPoolPolicy>;
+  if (!Array.isArray(policy.ipPools) || !policy.ipPools.length) throw new Error("缺少 ipPools 数组");
+  const ipPools = policy.ipPools.map(normalizeIpPoolItem).filter(Boolean) as RuntimeIpPoolPolicy[];
+  if (!ipPools.length) throw new Error("没有可导入的 IP 池");
+  return {
+    defaultDns: Array.isArray(policy.defaultDns) && policy.defaultDns.length ? parseCsvList(policy.defaultDns.join(",")) : ["1.1.1.1"],
+    ipPools,
+  };
+}
+
+function normalizeIpPoolItem(input: unknown): RuntimeIpPoolPolicy | null {
+  if (!input || typeof input !== "object") return null;
+  const item = input as Partial<RuntimeIpPoolPolicy>;
+  const prefix = String(item.prefix ?? "").trim();
+  const gateway = String(item.gateway ?? "").trim();
+  const name = String(item.name ?? "").trim();
+  if (!prefix || !gateway || !name) return null;
+  return {
+    id: String(item.id || `pool-${prefix.replaceAll(".", "-")}`).trim(),
+    name,
+    prefix,
+    gateway,
+    dns: Array.isArray(item.dns) ? parseCsvList(item.dns.join(",")) : undefined,
+    startHost: normalizeHostOctet(item.startHost, 20),
+    endHost: normalizeHostOctet(item.endHost, 250),
+    hostPrefixes: Array.isArray(item.hostPrefixes) ? parseCsvList(item.hostPrefixes.join(",")) : undefined,
+    networkName: typeof item.networkName === "string" && item.networkName.trim() ? item.networkName.trim() : undefined,
+    vlan: typeof item.vlan === "string" && item.vlan.trim() ? item.vlan.trim() : undefined,
+  };
+}
+
+function normalizeHostOctet(value: unknown, fallback: number) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 && number < 255 ? number : fallback;
+}
+
+function parseCsvList(value: string) {
+  return value.split(/[,，\s]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function applyIpPoolPolicy(policy: Partial<IpPoolPolicy> | undefined, selectedId?: string) {
+  const normalized = normalizeIpPoolPolicyForEditor(policy);
+  ipPoolPolicy.value = normalized;
+  ipPoolDefaultDnsText.value = normalized.defaultDns.join(", ");
+  ipPoolSelectedId.value = selectedId && normalized.ipPools.some((item) => item.id === selectedId) ? selectedId : normalized.ipPools[0]?.id ?? "";
+  syncIpPoolDraftFromSelection();
+}
+
+async function loadIpPoolPolicy() {
+  ipPoolLoading.value = true;
+  try {
+    const result = await postJson<IpPoolPolicyResponse>("/api/ip-pools/policy", undefined, "GET");
+    applyIpPoolPolicy(result.policy, ipPoolSelectedId.value);
+  } catch (error) {
+    ipPoolPolicy.value = { defaultDns: [], ipPools: [] };
+    ipPoolDefaultDnsText.value = "";
+    ipPoolSelectedId.value = "";
+    syncIpPoolDraftFromSelection();
+    setErrorMessage(error instanceof Error ? `读取 IP 池失败：${error.message}` : "读取 IP 池失败", false);
+  } finally {
+    ipPoolLoading.value = false;
+  }
+}
+
+function syncIpPoolDraftFromSelection() {
+  const pool = selectedIpPool.value;
+  Object.assign(ipPoolDraft, pool ? {
+    id: pool.id,
+    name: pool.name,
+    prefix: pool.prefix,
+    gateway: pool.gateway,
+    startHost: pool.startHost ?? 20,
+    endHost: pool.endHost ?? 250,
+    hostPrefixesText: pool.hostPrefixes?.join(", ") ?? "",
+    networkName: pool.networkName ?? "",
+    dnsText: pool.dns?.join(", ") ?? "",
+    vlan: pool.vlan ?? "",
+  } : emptyIpPoolDraft());
+}
+
+function commitIpPoolDraftToMemory(validate: boolean) {
+  if (!ipPoolDraft.id) return true;
+  const index = ipPoolPolicy.value.ipPools.findIndex((item) => item.id === ipPoolDraft.id);
+  if (index < 0) return true;
+  const next = buildIpPoolItemFromDraft(validate);
+  if (!next) return false;
+  ipPoolPolicy.value = {
+    ...ipPoolPolicy.value,
+    ipPools: ipPoolPolicy.value.ipPools.map((item, itemIndex) => itemIndex === index ? next : item),
+  };
+  return true;
+}
+
+function buildIpPoolItemFromDraft(validate: boolean): RuntimeIpPoolPolicy | null {
+  const name = ipPoolDraft.name.trim();
+  const prefix = ipPoolDraft.prefix.trim();
+  const gateway = ipPoolDraft.gateway.trim();
+  const startHost = normalizeHostOctet(ipPoolDraft.startHost, 20);
+  const endHost = normalizeHostOctet(ipPoolDraft.endHost, 250);
+  if (validate) {
+    if (!name) return showIpPoolValidationError("请填写 IP 池名称");
+    if (!isIpv4Prefix(prefix)) return showIpPoolValidationError("请填写正确的虚拟机 IP 段，例如 192.0.2");
+    if (!isIpv4(gateway)) return showIpPoolValidationError("请填写正确的网关地址，例如 192.0.2.254");
+    if (startHost > endHost) return showIpPoolValidationError("起始 IP 尾号不能大于结束 IP 尾号");
+  }
+  const item: RuntimeIpPoolPolicy = {
+    id: ipPoolDraft.id,
+    name: name || "未命名 IP 池",
+    prefix,
+    gateway,
+    startHost,
+    endHost,
+  };
+  const hostPrefixes = parseCsvList(ipPoolDraft.hostPrefixesText);
+  const dns = parseCsvList(ipPoolDraft.dnsText);
+  if (hostPrefixes.length) item.hostPrefixes = hostPrefixes;
+  if (dns.length) item.dns = dns;
+  if (ipPoolDraft.networkName.trim()) item.networkName = ipPoolDraft.networkName.trim();
+  if (ipPoolDraft.vlan.trim()) item.vlan = ipPoolDraft.vlan.trim();
+  return item;
+}
+
+function showIpPoolValidationError(message: string): null {
+  ElMessage.error({ message, duration: VRC_TOAST_DURATION_MS });
+  return null;
+}
+
+function buildIpPoolPolicyForSave(validate: boolean): IpPoolPolicy | null {
+  if (!commitIpPoolDraftToMemory(validate)) return null;
+  const defaultDns = parseCsvList(ipPoolDefaultDnsText.value);
+  const ipPools = ipPoolPolicy.value.ipPools.map((item) => normalizeIpPoolItem(item)).filter(Boolean) as RuntimeIpPoolPolicy[];
+  if (validate && !ipPools.length) return showIpPoolValidationError("至少保留一个 IP 池") as null;
+  return {
+    defaultDns: defaultDns.length ? defaultDns : ["1.1.1.1"],
+    ipPools,
+  };
+}
+
+async function saveIpPoolPolicy() {
+  const policy = buildIpPoolPolicyForSave(true);
+  if (!policy) return;
+  ipPoolSaving.value = true;
+  try {
+    const result = await postJson<IpPoolPolicyResponse>("/api/ip-pools/policy", policy, "PATCH");
+    applyIpPoolPolicy(result.policy, ipPoolSelectedId.value);
+    ElMessage.success({ message: "IP 池配置已保存", duration: VRC_TOAST_DURATION_MS });
+  } catch (error) {
+    ElMessage.error({ message: error instanceof Error ? error.message : "保存 IP 池失败", duration: VRC_TOAST_DURATION_MS });
+  } finally {
+    ipPoolSaving.value = false;
+  }
+}
+
+function selectIpPool(id: string) {
+  commitIpPoolDraftToMemory(false);
+  ipPoolSelectedId.value = id;
+  syncIpPoolDraftFromSelection();
+}
+
+function createIpPool() {
+  commitIpPoolDraftToMemory(false);
+  const id = `pool-custom-${Date.now()}`;
+  const pool: RuntimeIpPoolPolicy = {
+    id,
+    name: "新 IP 池",
+    prefix: "",
+    gateway: "",
+    startHost: 20,
+    endHost: 250,
+  };
+  ipPoolPolicy.value = { ...ipPoolPolicy.value, ipPools: [pool, ...ipPoolPolicy.value.ipPools] };
+  selectIpPool(id);
+}
+
+function copySelectedIpPool() {
+  if (!selectedIpPool.value) return;
+  commitIpPoolDraftToMemory(false);
+  const source = selectedIpPool.value;
+  const id = `${source.id}-copy-${Date.now()}`;
+  const pool = cloneIpPoolItem({ ...source, id, name: `${source.name} 副本` });
+  ipPoolPolicy.value = { ...ipPoolPolicy.value, ipPools: [pool, ...ipPoolPolicy.value.ipPools] };
+  selectIpPool(id);
+}
+
+async function deleteSelectedIpPool() {
+  if (!selectedIpPool.value) return;
+  if (ipPoolPolicy.value.ipPools.length <= 1) {
+    ElMessage.warning({ message: "至少保留一个 IP 池", duration: VRC_TOAST_DURATION_MS });
+    return;
+  }
+  await ElMessageBox.confirm(`确认删除 ${selectedIpPool.value.name}？`, "删除 IP 池", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+  const deletingId = selectedIpPool.value.id;
+  ipPoolPolicy.value = {
+    ...ipPoolPolicy.value,
+    ipPools: ipPoolPolicy.value.ipPools.filter((item) => item.id !== deletingId),
+  };
+  ipPoolSelectedId.value = ipPoolPolicy.value.ipPools[0]?.id ?? "";
+  syncIpPoolDraftFromSelection();
+}
+
+async function resetIpPoolPolicy() {
+  await ElMessageBox.confirm("恢复默认 129 / 2 / 127 三个 IP 池？当前未保存编辑会被覆盖。", "重置 IP 池", {
+    type: "warning",
+    confirmButtonText: "重置",
+    cancelButtonText: "取消",
+  });
+  applyIpPoolPolicy(defaultIpPoolPolicy());
+}
+
+function selectIpPoolsJson() {
+  ipPoolsJsonFileInput.value?.click();
+}
+
+async function handleIpPoolsJsonChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  try {
+    const policy = normalizeImportedIpPoolPolicy(JSON.parse(await file.text()));
+    applyIpPoolPolicy(policy);
+    ElMessage.success({ message: "IP 池 JSON 已载入，保存后生效", duration: VRC_TOAST_DURATION_MS });
+  } catch (error) {
+    ElMessage.error({ message: error instanceof Error ? error.message : "IP 池 JSON 格式不正确", duration: VRC_TOAST_DURATION_MS });
+  }
+}
+
+function exportIpPoolPolicy() {
+  const policy = buildIpPoolPolicyForSave(false);
+  if (!policy) return;
+  const blob = new Blob([`${JSON.stringify(policy, null, 2)}\n`], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "ip-pools.json";
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+function isIpv4Prefix(value: string) {
+  const parts = value.split(".");
+  return parts.length === 3 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
 }
 
 function selectAppearanceImage() {
@@ -1189,6 +1749,16 @@ function clearLegacyConnectionPreferences() {
   }
 }
 
+function consumeChromeExtensionLaunchConnectionId() {
+  const url = new URL(window.location.href);
+  const connectionId = url.searchParams.get("connectionId") || url.searchParams.get("vrcConnectionId") || "";
+  if (!connectionId) return "";
+  url.searchParams.delete("connectionId");
+  url.searchParams.delete("vrcConnectionId");
+  window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`);
+  return connectionId;
+}
+
 function shouldUseLegacyConnectionPreferences(preferences?: Partial<ConnectionPreferences>) {
   if (!hasLegacyConnectionPreferences()) return false;
   if (!preferences) return true;
@@ -1378,8 +1948,8 @@ function triggerAccountImportFile() {
 function downloadAccountImportTemplate() {
   const rows = [
     ["平台", "主机", "服务器名称", "登录账号", "登录密码", "端口"],
-    ["XenServer", "192.0.2.77", "xenserver-1", "root", "change-me", "22"],
-    ["VMware", "192.0.2.27", "vmware-27", "root", "change-me", "443"],
+    ["XenServer", "192.0.2.77", "xenserver-1", "root", "P", "22"],
+    ["VMware", "192.0.2.27", "vmware-27", "root", "P", "443"],
   ];
   const csv = rows.map((row) => row.map((cell) => `"${cell.replace(/"/g, '""')}"`).join(",")).join("\n");
   const url = URL.createObjectURL(new Blob([`\ufeff${csv}`], { type: "text/csv;charset=utf-8" }));
@@ -2575,6 +3145,94 @@ function handleVmSelectionChange(rows: VmNode[]) {
   selectedVmIds.value = rows.map((row) => row.providerId);
 }
 
+function openVmScheduleCreate(rows: VmNode[]) {
+  if (!selectedConnectionId.value) {
+    showToast("warning", "定时任务需要使用已保存连接，请先保存当前连接");
+    return;
+  }
+  if (!rows.length) {
+    showToast("warning", "请先选择目标虚拟机");
+    return;
+  }
+  vmScheduleSelectedVms.value = [...rows];
+  vmScheduleInitialView.value = "create";
+  vmScheduleVisible.value = true;
+}
+
+function openVmRename(vm: VmNode) {
+  if (connection.providerType === "libvirt") {
+    showToast("warning", "KVM/libvirt 当前版本暂不支持虚拟机改名");
+    return;
+  }
+  vmRenameTarget.value = vm;
+  vmRenameVisible.value = true;
+}
+
+async function handleVmRename(payload: { vm: VmNode; newName: string }) {
+  const connectionPayload = buildConnectionPayload();
+  if (!connectionPayload) return;
+  const previousName = payload.vm.name;
+  const hostName = selectedHost.value?.name || connection.host;
+  const target = `${hostName} / ${previousName}`;
+  vmRenameSaving.value = true;
+  clearMessages();
+  pushActivity("提交虚拟机改名", {
+    target,
+    detail: `${providerLabel(connection.providerType)} · ${previousName} → ${payload.newName}`,
+    status: "pending",
+  });
+  try {
+    const response = await postJson<VmRenameResponse>("/api/vms/rename", {
+      ...connectionPayload,
+      vmId: payload.vm.providerId,
+      currentName: previousName,
+      newName: payload.newName,
+      confirmToken: "CONFIRMED",
+    });
+    if (!response.result.accepted) {
+      throw new Error(response.result.message || "虚拟机改名请求未被平台接受");
+    }
+    patchVmRow(payload.vm, { name: response.result.newName });
+    vmRenameVisible.value = false;
+    showToast("success", response.result.message);
+    pushActivity("虚拟机改名完成", {
+      target: `${hostName} / ${response.result.newName}`,
+      detail: `${response.result.previousName} → ${response.result.newName}`,
+      status: "success",
+    });
+    await loadVms({ silent: true, background: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "虚拟机改名失败";
+    setErrorMessage(message);
+    showToast("error", message);
+    pushActivity("虚拟机改名失败", {
+      target,
+      detail: message,
+      status: "error",
+    });
+  } finally {
+    vmRenameSaving.value = false;
+  }
+}
+
+function openGlobalVmSchedule() {
+  if (!storedConnections.value.length) {
+    showToast("warning", "请先保存至少一个平台连接");
+    return;
+  }
+  vmScheduleSelectedVms.value = [];
+  vmScheduleInitialView.value = "create";
+  vmScheduleVisible.value = true;
+}
+
+function handleVmScheduleChanged() {
+  pushActivity("定时任务已更新", {
+    target: selectedHost.value?.name || connection.host,
+    detail: "任务由 VRC API 后台调度执行",
+    status: "success",
+  });
+}
+
 function handleOpenVmConsole(target: VmConsoleTarget) {
   consoleProvisionTaskId.value = "";
   consoleTarget.value = target;
@@ -3732,11 +4390,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
       <div class="sidebar-head">
         <div class="brand-lockup">
           <span class="brand-mark sidebar-logo" aria-hidden="true">
-            <svg class="vrc-system-logo" viewBox="0 0 64 48">
-              <rect class="vrc-logo-tile" x="5" y="5" width="54" height="38" rx="10" />
-              <text class="vrc-logo-letter" x="32" y="29" text-anchor="middle">VRC</text>
-              <rect class="vrc-logo-cursor" x="38" y="34" width="11" height="2.5" rx="1.25" />
-            </svg>
+            <VrcLogoMark shadow />
           </span>
           <div class="brand-copy">
             <h1>资源控制台</h1>
@@ -3837,7 +4491,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
         <div class="resource-loading-card" :class="`platform-${selectedConnectionBrand.type}`">
           <div class="resource-loader-mark compact" aria-hidden="true">
             <span class="resource-loader-ring"></span>
-            <strong>VRC</strong>
+            <VrcLogoMark :grid="false" />
           </div>
           <div class="resource-loader-copy">
             <strong>正在读取物理机信息</strong>
@@ -3869,6 +4523,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           :selected-vm-ids="selectedVmIds"
           :vm-action-states="vmActionStates"
           :loading-vms="loadingVms"
+          :allow-vm-rename="connection.providerType !== 'libvirt'"
           variant="page"
           table-height="100%"
           table-panel-class="single-table-panel"
@@ -3883,6 +4538,8 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           @open-console="handleOpenVmConsole"
           @vm-action="handleVmAction"
           @batch-vm-action="handleBatchVmAction"
+          @schedule-vms="openVmScheduleCreate"
+          @rename-vm="openVmRename"
         />
       </section>
 
@@ -3944,13 +4601,24 @@ function normalizePort(value: unknown, providerType: ProviderType) {
             </el-tooltip>
           </div>
           <div class="overview-action-group" aria-label="总览列表动作">
+            <el-tooltip content="定时任务：跨物理机搜索并选择虚拟机" placement="top">
+              <span class="toolbar-tooltip-target">
+                <button
+                  type="button"
+                  class="overview-toolbar-button"
+                  aria-label="虚拟机定时任务"
+                  @click="openGlobalVmSchedule"
+                >
+                  <VrcToolbarIcon name="schedule" />
+                </button>
+              </span>
+            </el-tooltip>
             <el-tooltip content="导出物理机总览：下载当前筛选结果 CSV" placement="top">
               <span class="toolbar-tooltip-target">
                 <button
                   type="button"
                   class="overview-toolbar-button"
                   :disabled="!sortedHostOverviewRows.length"
-                  title="导出物理机总览"
                   aria-label="导出物理机总览"
                   @click="exportHostOverviewCsv"
                 >
@@ -3963,7 +4631,6 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 <button
                   type="button"
                   class="overview-toolbar-button"
-                  title="刷新总览"
                   :disabled="loadingHostOverview"
                   aria-label="刷新总览"
                   @click="loadHostOverview"
@@ -3990,7 +4657,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               <div v-if="overviewEmptyState.mode === 'loading'" class="resource-loading-card resource-table-loading overview-empty-loading">
                 <div class="resource-loader-mark compact" aria-hidden="true">
                   <span class="resource-loader-ring"></span>
-                  <strong>VRC</strong>
+                  <VrcLogoMark :grid="false" />
                 </div>
                 <div class="resource-loader-copy">
                   <strong>{{ overviewEmptyState.title }}</strong>
@@ -4004,8 +4671,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </div>
               <div v-else class="overview-empty-card">
                 <div class="overview-empty-mark" aria-hidden="true">
-                  <span></span>
-                  <strong>VRC</strong>
+                  <VrcLogoMark shadow />
                 </div>
                 <strong>{{ overviewEmptyState.title }}</strong>
                 <small>{{ overviewEmptyState.detail }}</small>
@@ -4111,6 +4777,14 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               <el-icon><Plus /></el-icon>
               <span>创建模板</span>
             </button>
+            <button type="button" :class="{ active: settingsPanel === 'ipPools' }" @click="settingsPanel = 'ipPools'">
+              <el-icon><Connection /></el-icon>
+              <span>IP 池</span>
+            </button>
+            <button type="button" :class="{ active: settingsPanel === 'chromeExtension' }" @click="settingsPanel = 'chromeExtension'">
+              <el-icon><Setting /></el-icon>
+              <span>Chrome 插件</span>
+            </button>
             <button type="button" :class="{ active: settingsPanel === 'logs' }" @click="settingsPanel = 'logs'">
               <el-icon><Tickets /></el-icon>
               <span>日志</span>
@@ -4213,11 +4887,13 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   </div>
                   <div class="appearance-setting-row">
                     <div><strong>背景类型</strong><span>默认、纯色或本地图片。</span></div>
-                    <el-radio-group v-model="uiPreferences.backgroundMode" size="small" @change="persistAppearancePreference('backgroundMode')">
-                      <el-radio-button value="default">默认</el-radio-button>
-                      <el-radio-button value="solid">纯色</el-radio-button>
-                      <el-radio-button value="image">图片</el-radio-button>
-                    </el-radio-group>
+                    <el-segmented
+                      v-model="uiPreferences.backgroundMode"
+                      class="appearance-background-segmented"
+                      :options="[{ label: '默认', value: 'default' }, { label: '纯色', value: 'solid' }, { label: '图片', value: 'image' }]"
+                      size="small"
+                      @change="persistAppearancePreference('backgroundMode')"
+                    />
                   </div>
                   <div v-if="uiPreferences.backgroundMode === 'solid'" class="appearance-setting-row">
                     <div><strong>背景颜色</strong><span>{{ uiPreferences.backgroundColor }}</span></div>
@@ -4380,16 +5056,16 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 </label>
               </div>
               <div class="settings-actions connection-settings-actions">
-                <el-button :icon="Plus" @click="startNewConnection">新连接</el-button>
-                <el-button :icon="Connection" :loading="testing" @click="testConnection">{{ testing ? "测试中" : "测试" }}</el-button>
-                <el-button :icon="Upload" @click="openAccountImportDialog">导入账号</el-button>
+                <el-button @click="startNewConnection">新连接</el-button>
+                <el-button :loading="testing" @click="testConnection">{{ testing ? "测试中" : "测试" }}</el-button>
+                <el-button @click="openAccountImportDialog">导入账号</el-button>
                 <el-tooltip content="加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单" placement="top">
-                  <el-button :icon="Refresh" :loading="loadingHosts" :disabled="!selectedConnectionId" @click="loadSelectedConnectionResources">
+                  <el-button :loading="loadingHosts" :disabled="!selectedConnectionId" @click="loadSelectedConnectionResources">
                     {{ loadingHosts ? "加载中" : "加载资源" }}
                   </el-button>
                 </el-tooltip>
-                <el-button :icon="Delete" :disabled="!selectedConnectionId" @click="deleteConnection">删除</el-button>
-                <el-button type="primary" :icon="Check" :loading="savingConnection" :disabled="!connection.password" @click="saveConnection">
+                <el-button :disabled="!selectedConnectionId" @click="deleteConnection">删除</el-button>
+                <el-button type="primary" :loading="savingConnection" :disabled="!connection.password" @click="saveConnection">
                   {{ savingConnection ? "保存中" : "保存" }}
                 </el-button>
               </div>
@@ -4434,6 +5110,284 @@ function normalizePort(value: unknown, providerType: ProviderType) {
             </section>
           </section>
 
+          <section v-else-if="settingsPanel === 'ipPools'" class="settings-workspace-content ip-pool-settings">
+            <section class="settings-card ip-pool-card">
+              <div class="settings-card-head ip-pool-card-head">
+                <div>
+                  <strong>IP 池</strong>
+                  <span>按物理机 IP 自动匹配默认地址池；判断不符合现场时，用户仍可手动选择其它地址池。</span>
+                </div>
+                <div class="ip-pool-head-actions">
+                  <el-button class="ip-pool-command-button" size="small" @click="selectIpPoolsJson">导入 JSON</el-button>
+                  <el-button class="ip-pool-command-button" size="small" :disabled="!ipPoolPolicy.ipPools.length" @click="exportIpPoolPolicy">导出 JSON</el-button>
+                  <el-button class="ip-pool-command-button primary" size="small" @click="createIpPool">新增 IP 池</el-button>
+                </div>
+              </div>
+
+              <div class="ip-pool-layout">
+                <aside class="ip-pool-list-panel">
+                  <el-input v-model="ipPoolSearch" class="ip-pool-search" :prefix-icon="Search" placeholder="搜索名称 / IP 段 / 网关" clearable />
+                  <div class="ip-pool-list">
+                    <button
+                      v-for="pool in filteredIpPoolItems"
+                      :key="pool.id"
+                      type="button"
+                      class="ip-pool-list-item"
+                      :class="{ active: pool.id === ipPoolSelectedId }"
+                      @click="selectIpPool(pool.id)"
+                    >
+                      <span class="ip-pool-list-title">
+                        <strong>{{ pool.name }}</strong>
+                      </span>
+                      <span class="ip-pool-list-meta">
+                        <small>{{ pool.prefix }}.{{ pool.startHost ?? 20 }} - {{ pool.prefix }}.{{ pool.endHost ?? 250 }}</small>
+                        <small>网关 {{ pool.gateway }}</small>
+                      </span>
+                    </button>
+                    <div v-if="!filteredIpPoolItems.length" class="settings-empty-note">
+                      {{ ipPoolLoading ? "正在读取 IP 池配置" : "没有可展示的 IP 池，请导入或新增后保存。" }}
+                    </div>
+                  </div>
+                </aside>
+
+                <section class="ip-pool-editor-panel">
+                  <div class="ip-pool-editor-head">
+                    <div>
+                      <strong>{{ selectedIpPool?.name || "未选择 IP 池" }}</strong>
+                      <span>{{ selectedIpPool ? "修改后点击底部保存写入 ip-pools.json" : "请先选择、导入或新增 IP 池" }}</span>
+                    </div>
+                    <el-button class="ip-pool-command-button" size="small" :loading="ipPoolLoading" @click="loadIpPoolPolicy">重新读取</el-button>
+                  </div>
+
+                  <div class="ip-pool-form">
+                    <label class="settings-field">
+                      <span>默认 DNS</span>
+                      <el-input v-model="ipPoolDefaultDnsText" placeholder="例如 1.1.1.1，多个用逗号分隔" autocomplete="off" />
+                    </label>
+                    <label class="settings-field">
+                      <span>名称</span>
+                      <el-input v-model="ipPoolDraft.name" placeholder="例如 192.0.2 通用网段" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                    </label>
+                    <label class="settings-field">
+                      <span>网段</span>
+                      <el-input v-model="ipPoolDraft.prefix" placeholder="例如 192.0.2" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                    </label>
+                    <label class="settings-field">
+                      <span>适用物理机网段</span>
+                      <el-input v-model="ipPoolDraft.hostPrefixesText" placeholder="例如 203.0.113；留空表示通用池" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                    </label>
+                    <label class="settings-field">
+                      <span>网关</span>
+                      <el-input v-model="ipPoolDraft.gateway" placeholder="例如 192.0.2.254" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                    </label>
+                    <label class="settings-field ip-range-field">
+                      <span>IP 池号段</span>
+                      <div class="ip-range-control">
+                        <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "192.0.2" }}.</span>
+                        <el-input-number v-model="ipPoolDraft.startHost" :min="1" :max="254" controls-position="right" :disabled="!ipPoolDraft.id" />
+                        <span class="ip-range-separator">~</span>
+                        <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "192.0.2" }}.</span>
+                        <el-input-number v-model="ipPoolDraft.endHost" :min="1" :max="254" controls-position="right" :disabled="!ipPoolDraft.id" />
+                      </div>
+                    </label>
+                    <label class="settings-field">
+                      <span>指定网络（可选）</span>
+                      <el-input v-model="ipPoolDraft.networkName" placeholder="例如 Pool-wide network associated with eth1；可留空" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                    </label>
+                    <label class="settings-field">
+                      <span>单池 DNS</span>
+                      <el-input v-model="ipPoolDraft.dnsText" placeholder="可留空，默认使用公共 DNS；多个用逗号分隔" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                    </label>
+                    <label class="settings-field">
+                      <span>VLAN</span>
+                      <el-input v-model="ipPoolDraft.vlan" placeholder="可留空" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                    </label>
+                  </div>
+
+                  <div class="settings-actions ip-pool-actions">
+                    <el-button class="ip-pool-command-button danger" :disabled="!selectedIpPool || ipPoolPolicy.ipPools.length <= 1" @click="deleteSelectedIpPool">删除</el-button>
+                    <div>
+                      <el-button class="ip-pool-command-button" :disabled="!selectedIpPool" @click="copySelectedIpPool">复制</el-button>
+                      <el-button class="ip-pool-command-button" @click="resetIpPoolPolicy">重置默认</el-button>
+                      <el-button class="ip-pool-command-button primary" :loading="ipPoolSaving" :disabled="!ipPoolPolicy.ipPools.length" @click="saveIpPoolPolicy">
+                        {{ ipPoolSaving ? "保存中" : "保存" }}
+                      </el-button>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </section>
+          </section>
+
+          <section v-else-if="settingsPanel === 'chromeExtension'" class="settings-workspace-content chrome-extension-settings">
+            <section class="settings-card chrome-extension-card">
+              <div class="settings-card-head chrome-extension-card-head">
+                <div>
+                  <strong>Chrome 插件配置项</strong>
+                  <span>设置入口统一，但该配置只作用于 Chrome 插件，不影响 Web、macOS、Windows 客户端。</span>
+                </div>
+              </div>
+              <div class="chrome-extension-tab-row">
+                <div class="chrome-extension-tabs" role="tablist" aria-label="Chrome 插件配置项">
+                  <button type="button" role="tab" :aria-selected="chromeExtensionActiveTab === 'service'" :class="{ active: chromeExtensionActiveTab === 'service' }" @click="chromeExtensionActiveTab = 'service'">服务地址</button>
+                  <button type="button" role="tab" :aria-selected="chromeExtensionActiveTab === 'vault'" :class="{ active: chromeExtensionActiveTab === 'vault' }" @click="chromeExtensionActiveTab = 'vault'">本地连接库</button>
+                </div>
+              </div>
+
+              <div v-if="chromeExtensionActiveTab === 'service'" class="chrome-extension-service-layout">
+                <section class="chrome-extension-inner-panel">
+                  <div class="chrome-extension-inner-head">
+                    <div>
+                      <strong>VRC API 服务</strong>
+                      <span>插件只保存入口地址，资源能力仍由后台执行。</span>
+                    </div>
+                    <div class="chrome-extension-action-group">
+                      <div class="chrome-extension-segmented">
+                        <button type="button" :class="{ active: chromeExtensionService.mode === 'intranet' }" @click="setChromeExtensionServiceMode('intranet')">内网</button>
+                        <button type="button" :class="{ active: chromeExtensionService.mode === 'local' }" @click="setChromeExtensionServiceMode('local')">本机</button>
+                      </div>
+                      <el-button class="chrome-extension-command-button secondary" @click="testChromeExtensionService">检测</el-button>
+                      <el-button class="chrome-extension-command-button primary" @click="persistChromeExtensionServiceSettings()">保存地址</el-button>
+                    </div>
+                  </div>
+                  <div class="chrome-extension-service-form">
+                    <label class="settings-field">
+                      <span>协议</span>
+                      <el-select v-model="chromeExtensionService.scheme">
+                        <el-option label="http" value="http" />
+                        <el-option label="https" value="https" />
+                      </el-select>
+                    </label>
+                    <label class="settings-field">
+                      <span>服务地址</span>
+                      <el-input v-model="chromeExtensionService.host" placeholder="vrc-server" autocomplete="off" />
+                    </label>
+                    <label class="settings-field">
+                      <span>端口</span>
+                      <el-input-number v-model="chromeExtensionService.port" :min="1" :max="65535" controls-position="right" />
+                    </label>
+                    <label class="settings-field is-full">
+                      <span>完整 Base URL</span>
+                      <el-input :model-value="chromeExtensionBaseUrl" readonly />
+                    </label>
+                  </div>
+                </section>
+                <aside class="chrome-extension-side-stack">
+                  <section class="settings-empty-note chrome-extension-note">
+                    <strong>nginx 边界</strong>
+                    <span>nginx 只做 HTTPS、反向代理和访问控制；Chrome 插件只保存入口地址，连接账号留在浏览器本地连接库。</span>
+                  </section>
+                  <pre class="chrome-extension-code">GET  /api/health
+GET  /api/inventory/*
+WS   /api/console/*
+
+connectionStore: chrome.storage.local
+serverStore: disabled</pre>
+                </aside>
+              </div>
+
+              <div v-else-if="chromeExtensionActiveTab === 'vault'" class="chrome-extension-service-layout">
+                <section class="chrome-extension-inner-panel">
+                  <div class="chrome-extension-inner-head">
+                    <div>
+                      <strong>本地连接库</strong>
+                      <span>连接信息只在当前浏览器本地保存，后续接 WebCrypto 加密。</span>
+                    </div>
+                  </div>
+                  <div class="chrome-extension-table-wrap">
+                    <el-table
+                      class="chrome-extension-table"
+                      :data="chromeExtensionLocalConnections"
+                      row-key="id"
+                      empty-text=" "
+                      stripe
+                    >
+                      <template #empty>
+                        <div class="chrome-extension-table-empty">
+                          <strong>当前没有本地连接</strong>
+                        </div>
+                      </template>
+                      <el-table-column label="名称" min-width="180" align="left" show-overflow-tooltip>
+                        <template #default="{ row }">
+                          <span class="chrome-extension-connection-cell">
+                            <strong>{{ row.name }}</strong>
+                            <small>{{ row.username }} · {{ row.lastUsed }}</small>
+                          </span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="平台" min-width="96" align="center">
+                        <template #default="{ row }">{{ providerLabel(row.providerType) }}</template>
+                      </el-table-column>
+                      <el-table-column prop="host" label="Host" min-width="150" align="center" show-overflow-tooltip />
+                      <el-table-column label="存储" min-width="130" align="center">
+                        <template #default>local encrypted</template>
+                      </el-table-column>
+                      <el-table-column label="状态" min-width="90" align="center">
+                        <template #default="{ row }">
+                          <span class="chrome-extension-status" :class="row.status">{{ row.status === "ready" ? "可用" : "需验证" }}</span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="操作" width="72" align="center" class-name="chrome-extension-operation-column">
+                        <template #default="{ row }">
+                          <span class="chrome-extension-action-cell">
+                            <button
+                              type="button"
+                              class="chrome-extension-row-action action-delete"
+                              :aria-label="`删除本地连接 ${row.name}`"
+                              @click.stop="deleteChromeExtensionLocalConnection(row)"
+                            >
+                              <VrcVmActionIcon name="delete" />
+                            </button>
+                          </span>
+                        </template>
+                      </el-table-column>
+                    </el-table>
+                  </div>
+                </section>
+                <aside class="chrome-extension-side-stack">
+                  <section class="chrome-extension-inner-panel">
+                    <div class="chrome-extension-inner-head">
+                      <div><strong>新增连接</strong><span>保存前先用主密码加密。</span></div>
+                    </div>
+                    <div class="chrome-extension-draft-form">
+                      <label class="settings-field">
+                        <span>平台</span>
+                        <el-select v-model="chromeExtensionDraftConnection.providerType">
+                          <el-option label="XenServer" value="xenserver" />
+                          <el-option label="VMware" value="vmware" />
+                          <el-option label="Proxmox VE" value="proxmox" />
+                        </el-select>
+                      </label>
+                      <label class="settings-field">
+                        <span>名称</span>
+                        <el-input v-model="chromeExtensionDraftConnection.name" autocomplete="off" />
+                      </label>
+                      <label class="settings-field is-full">
+                        <span>Host</span>
+                        <el-input v-model="chromeExtensionDraftConnection.host" placeholder="10.12.8.21" autocomplete="off" />
+                      </label>
+                      <label class="settings-field">
+                        <span>用户名</span>
+                        <el-input v-model="chromeExtensionDraftConnection.username" autocomplete="off" />
+                      </label>
+                      <label class="settings-field">
+                        <span>密码</span>
+                        <el-input v-model="chromeExtensionDraftConnection.password" type="password" show-password autocomplete="new-password" />
+                      </label>
+                    </div>
+                    <div class="chrome-extension-draft-actions">
+                      <el-button class="chrome-extension-command-button primary" @click="addChromeExtensionLocalConnection">加密保存</el-button>
+                    </div>
+                  </section>
+                  <section class="settings-empty-note chrome-extension-note">
+                    <strong>存储口径</strong>
+                    <span>使用 chrome.storage.local；禁止 chrome.storage.sync；密文可以导出，明文不能写文件。</span>
+                  </section>
+                </aside>
+              </div>
+            </section>
+          </section>
+
           <section v-else class="settings-workspace-content">
             <section class="settings-card">
               <div class="settings-card-head">
@@ -4457,8 +5411,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
 
       <section v-if="showWorkspacePlaceholder" class="workspace-placeholder">
         <div class="workspace-placeholder-mark" aria-hidden="true">
-          <span></span>
-          <strong>VRC</strong>
+          <VrcLogoMark shadow />
         </div>
         <strong>资源控制台</strong>
         <small>Virtual Resource Console</small>
@@ -4483,6 +5436,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           :selected-vm-ids="selectedVmIds"
           :vm-action-states="vmActionStates"
           :loading-vms="loadingVms"
+          :allow-vm-rename="connection.providerType !== 'libvirt'"
           variant="dialog"
           table-height="100%"
           metric-grid-class="dialog-metric-grid"
@@ -4498,8 +5452,19 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           @open-console="handleOpenVmConsole"
           @vm-action="handleVmAction"
           @batch-vm-action="handleBatchVmAction"
+          @schedule-vms="openVmScheduleCreate"
+          @rename-vm="openVmRename"
         />
       </el-dialog>
+
+      <VmRenameDialog
+        v-model="vmRenameVisible"
+        :vm="vmRenameTarget"
+        :provider-type="connection.providerType"
+        :existing-names="(vms?.items ?? []).filter((item) => item.providerId !== vmRenameTarget?.providerId).map((item) => item.name)"
+        :saving="vmRenameSaving"
+        @submit="handleVmRename"
+      />
 
       <ConsoleDialog
         v-model:visible="consoleDialogVisible"
@@ -4694,8 +5659,8 @@ function normalizePort(value: unknown, providerType: ProviderType) {
 
               <div class="format-sample">
                 <span>固定格式示例：</span>
-                <span>XenServer 192.0.2.77 xenserver-1 root change-me</span>
-                <span>XenServer 192.0.2.6 xenserver-3 change-me</span>
+                <span>XenServer 192.0.2.77 xenserver-1 root P</span>
+                <span>XenServer 192.0.2.6 xenserver-3 P</span>
               </div>
               <span class="format-rule">固定格式按空格 / Tab 拆列；4 列时账号默认 root，5 列时第 4 列为账号。密码包含空格时请用 Excel 或 JSON。</span>
               <div v-if="accountImportError" class="import-error-note">{{ accountImportError }}</div>
@@ -4843,7 +5808,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 <div v-if="loadingIsoImages" class="resource-loading-card resource-table-loading overview-empty-loading">
                   <div class="resource-loader-mark compact" aria-hidden="true">
                     <span class="resource-loader-ring"></span>
-                    <strong>VRC</strong>
+                    <VrcLogoMark :grid="false" />
                   </div>
                   <div class="resource-loader-copy">
                     <strong>正在读取系统镜像</strong>
@@ -4857,8 +5822,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 </div>
                 <div v-else class="overview-empty-card">
                   <div class="overview-empty-mark" aria-hidden="true">
-                    <span></span>
-                    <strong>VRC</strong>
+                    <VrcLogoMark shadow />
                   </div>
                   <strong>{{ isoSearch.trim() ? "未找到匹配 ISO" : "暂无系统镜像" }}</strong>
                   <small>{{ isoEmptyText() }}</small>
@@ -4905,6 +5869,15 @@ function normalizePort(value: unknown, providerType: ProviderType) {
         @select-console-target="handleSelectProvisionInlineConsoleTarget"
         @submit="handleProvisioningSubmit"
       />
+      <VmScheduleDialog
+        v-model:visible="vmScheduleVisible"
+        :initial-view="vmScheduleInitialView"
+        :connection="{ id: selectedConnectionId, providerType: connection.providerType, name: selectedStoredConnection?.name }"
+        :host="selectedHost"
+        :available-vms="vms?.items ?? []"
+        :selected-vms="vmScheduleSelectedVms"
+        @changed="handleVmScheduleChanged"
+      />
     </section>
     <input
       ref="appearanceImageFileInput"
@@ -4919,6 +5892,13 @@ function normalizePort(value: unknown, providerType: ProviderType) {
       type="file"
       accept="application/json,.json"
       @change="handleAppearanceJsonChange"
+    />
+    <input
+      ref="ipPoolsJsonFileInput"
+      class="appearance-hidden-input"
+      type="file"
+      accept="application/json,.json"
+      @change="handleIpPoolsJsonChange"
     />
   </main>
 </template>

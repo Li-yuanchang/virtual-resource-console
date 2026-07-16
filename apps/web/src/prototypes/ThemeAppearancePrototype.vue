@@ -14,6 +14,7 @@ import {
 } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import VrcLogoMark from "../components/VrcLogoMark.vue";
 
 type ThemeName = "graphite-sage" | "basalt-copper" | "mist-teal";
 type ToneMode = "system" | "light" | "dark";
@@ -271,11 +272,7 @@ onBeforeUnmount(() => {
       <div class="sidebar-head">
         <div class="brand-lockup">
           <span class="brand-mark sidebar-logo" aria-hidden="true">
-            <svg class="vrc-system-logo" viewBox="0 0 64 48">
-              <rect class="vrc-logo-tile" x="5" y="5" width="54" height="38" rx="10" />
-              <text class="vrc-logo-letter" x="32" y="29" text-anchor="middle">VRC</text>
-              <rect class="vrc-logo-cursor" x="38" y="34" width="11" height="2.5" rx="1.25" />
-            </svg>
+            <VrcLogoMark shadow />
           </span>
           <div class="brand-copy">
             <h1>资源控制台</h1>

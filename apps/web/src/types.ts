@@ -4,19 +4,13 @@ export type PowerState = "running" | "halted" | "stopped" | "suspended" | "unkno
 
 export type VmPowerAction = "start" | "shutdown" | "delete";
 
-export type ReclaimLevel = "P0" | "P1" | "P2" | "P3" | "KEEP";
+export type VmScheduleAction = Exclude<VmPowerAction, "delete">;
+export type VmScheduleCycle = "once" | "daily" | "weekly";
+export type VmScheduleFallback = "force" | "fail";
+export type VmScheduleConflictPolicy = "block" | "skip" | "replace";
+export type VmScheduleRunStatus = "running" | "success" | "partial" | "failed" | "skipped";
 
-export interface RuntimeIpPoolPolicy {
-  id: string;
-  name: string;
-  prefix: string;
-  gateway: string;
-  dns?: string[];
-  startHost?: number;
-  endHost?: number;
-  networkName?: string;
-  vlan?: string;
-}
+export type ReclaimLevel = "P0" | "P1" | "P2" | "P3" | "KEEP";
 
 export interface RuntimePolicy {
   managedIpPattern?: string;
@@ -27,9 +21,7 @@ export interface RuntimePolicy {
     hostOnlyPrefix?: string;
   };
   provisioning: {
-    defaultDns: string[];
     rootPasswordTemplate: string;
-    providerIpPools: Partial<Record<ProviderType, RuntimeIpPoolPolicy[]>>;
   };
   xenserver: {
     networkDeviceRules: Array<{
@@ -41,6 +33,28 @@ export interface RuntimePolicy {
 
 export interface RuntimePolicyResponse {
   policy: RuntimePolicy;
+}
+
+export interface RuntimeIpPoolPolicy {
+  id: string;
+  name: string;
+  prefix: string;
+  gateway: string;
+  dns?: string[];
+  startHost?: number;
+  endHost?: number;
+  hostPrefixes?: string[];
+  networkName?: string;
+  vlan?: string;
+}
+
+export interface IpPoolPolicy {
+  defaultDns: string[];
+  ipPools: RuntimeIpPoolPolicy[];
+}
+
+export interface IpPoolPolicyResponse {
+  policy: IpPoolPolicy;
 }
 
 export interface HostNode {
@@ -102,6 +116,76 @@ export interface VmNode {
   reclaimLevel: ReclaimLevel;
   reclaimReason: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface VmScheduleTarget {
+  vmId: string;
+  name: string;
+  connectionId?: string;
+  providerType?: ProviderType;
+  connectionName?: string;
+  hostId?: string;
+  hostName?: string;
+  ip?: string;
+  guestOs?: string;
+  powerState?: PowerState;
+}
+
+export interface VmScheduleTargetCatalogResponse {
+  targets: VmScheduleTarget[];
+  errors: Array<{
+    connectionId: string;
+    connectionName?: string;
+    message: string;
+  }>;
+}
+
+export interface VmScheduleLastRun {
+  status: VmScheduleRunStatus;
+  startedAt: string;
+  finishedAt?: string;
+  successCount: number;
+  failedCount: number;
+  skippedCount: number;
+  message: string;
+}
+
+export interface VmSchedule {
+  id: string;
+  name: string;
+  connectionId: string;
+  providerType: ProviderType;
+  connectionName?: string;
+  hostId?: string;
+  hostName?: string;
+  action: VmScheduleAction;
+  cycle: VmScheduleCycle;
+  onceAt?: string;
+  executeTime?: string;
+  weekdays?: number[];
+  timezone: string;
+  skipMatchingState: boolean;
+  shutdownTimeoutMinutes: number;
+  shutdownFallback: VmScheduleFallback;
+  conflictPolicy: VmScheduleConflictPolicy;
+  targets: VmScheduleTarget[];
+  enabled: boolean;
+  nextRunAt?: string;
+  lastRun?: VmScheduleLastRun;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VmScheduleRunnerStatus {
+  mode: "web" | "electron" | "chrome-native";
+  owner: boolean;
+  instanceId?: string;
+  heartbeatAt?: string;
+}
+
+export interface VmSchedulesResponse {
+  tasks: VmSchedule[];
+  runner: VmScheduleRunnerStatus;
 }
 
 export interface VmInventorySummary {
@@ -169,6 +253,17 @@ export interface VmMetricSnapshot {
   diskWriteRate: number | null;
   networkRxRate: number | null;
   networkTxRate: number | null;
+  metricSources?: {
+    cpu?: "hypervisor" | "guest-agent" | "guest-tools";
+    memory?: "hypervisor" | "guest-agent" | "guest-tools";
+    disk?: "hypervisor" | "guest-agent" | "guest-tools";
+    network?: "hypervisor" | "guest-agent" | "guest-tools";
+  };
+  guestTelemetry?: {
+    status: "available" | "probing" | "unavailable" | "unknown";
+    method: "qemu-guest-agent" | "vmware-tools" | "xenserver-tools" | "unknown";
+    message: string;
+  };
   sampledAt: string;
 }
 

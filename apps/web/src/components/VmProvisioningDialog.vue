@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
-import { Loading } from "@element-plus/icons-vue";
+import { ArrowDown, ArrowUp, Loading } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import ConsoleDialog from "./ConsoleDialog.vue";
 import type {
@@ -8,6 +8,8 @@ import type {
   IpLease,
   IpLeasesResponse,
   EnvironmentProvisioningTemplate,
+  IpPoolPolicy,
+  IpPoolPolicyResponse,
   NetworkInterface,
   IpPoolConfig,
   IpProbeResponse,
@@ -108,13 +110,18 @@ function defaultRuntimePolicy(): RuntimePolicy {
       hostOnlyPrefix: "",
     },
     provisioning: {
-      defaultDns: ["1.1.1.1"],
       rootPasswordTemplate: "",
-      providerIpPools: {},
     },
     xenserver: {
       networkDeviceRules: [],
     },
+  };
+}
+
+function defaultIpPoolPolicy(): IpPoolPolicy {
+  return {
+    defaultDns: ["1.1.1.1"],
+    ipPools: [],
   };
 }
 
@@ -155,12 +162,14 @@ const visibleModel = computed({
 
 const provisioningConfig = ref<ProvisioningConfig>({ environmentTemplates: [], specTemplates: [], ipPools: [] });
 const runtimePolicy = ref<RuntimePolicy>(defaultRuntimePolicy());
+const ipPoolPolicy = ref<IpPoolPolicy>(defaultIpPoolPolicy());
 const isoImages = ref<IsoImage[]>([]);
 const loadingProvisioningConfig = ref(false);
 const loadingIsoImages = ref(false);
 const savingProvisioningConfig = ref(false);
 const loadingIpLeases = ref(false);
 const probingIps = ref(false);
+const ipCandidateFilter = ref<"available" | "all">("available");
 const ipLeases = ref<IpLease[]>([]);
 const ipProbeResults = ref<Record<string, IpProbeResult>>({});
 let ipProbeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -173,7 +182,7 @@ const environmentTemplateOptions = computed(() =>
 const selectedEnvironmentTemplate = computed(
   () => environmentTemplateOptions.value.find((item) => item.id === provisioningForm.environmentTemplateId) ?? environmentTemplateOptions.value[0] ?? null,
 );
-const strategyIpPools = computed(() => provisioningStrategy.value.defaultIpPools(props.connection, props.host, runtimePolicy.value));
+const strategyIpPools = computed(() => provisioningStrategy.value.defaultIpPools(props.connection, props.host, ipPoolPolicy.value));
 const provisioningPoolOptions = computed(() => {
   const pools = new Map<string, IpPoolConfig>();
   for (const pool of strategyIpPools.value) pools.set(pool.id, pool);
@@ -242,11 +251,13 @@ const provisioningAvailableIps = computed(() => {
   const probedAvailable = rawProvisioningAvailableIps.value.filter((ip) => ipProbeResults.value[ip]?.status === "available");
   return orderAvailableIps(probedAvailable);
 });
-const visibleIpCandidates = computed(() =>
-  enumerateIpRange(currentProvisioningPoolDraft().startIp, currentProvisioningPoolDraft().endIp).slice(
-    0,
-    IP_CANDIDATE_PREVIEW_LIMIT,
-  ),
+const allIpCandidates = computed(() => enumerateIpRange(currentProvisioningPoolDraft().startIp, currentProvisioningPoolDraft().endIp));
+const visibleIpCandidates = computed(() => {
+  const source = ipCandidateFilter.value === "available" ? provisioningAvailableIps.value : allIpCandidates.value;
+  return source.slice(0, IP_CANDIDATE_PREVIEW_LIMIT);
+});
+const ipCandidateEmptyText = computed(() =>
+  ipCandidateFilter.value === "available" ? "暂无可用 IP，可切换全部查看占用情况。" : "当前 IP 池没有可展示的候选地址。",
 );
 const isSingleDraftMode = computed(() => (provisioningPlan.value?.items.length ?? Math.max(Math.floor(provisioningForm.count), 1)) <= 1);
 const preferredIpProbeResult = computed(() => (isIpv4(provisioningForm.preferredIp) ? ipProbeResults.value[provisioningForm.preferredIp] : undefined));
@@ -440,6 +451,7 @@ function resetProvisioningSession() {
   advisoryWarningsAcknowledged.value = false;
   expandedProvisionSections.value = [];
   ipProbeResults.value = {};
+  ipCandidateFilter.value = "available";
   isoImages.value = [];
   ipLeases.value = [];
   for (const key of Object.keys(vmDraftOverrides)) {
@@ -484,9 +496,15 @@ function toggleProvisionSection(section: "network") {
     : [...expandedProvisionSections.value, section];
 }
 
+function handleProvisionPanelDoubleClick(event: MouseEvent) {
+  const target = event.target;
+  if (target instanceof Element && target.closest("button")) return;
+  toggleProvisionSection("network");
+}
+
 async function openDialog(sessionId: number) {
   resetProvisioningSession();
-  await Promise.all([loadRuntimePolicy(sessionId), loadProvisioningConfig(sessionId), loadIsoImages(sessionId), loadIpLeases(sessionId)]);
+  await Promise.all([loadRuntimePolicy(sessionId), loadIpPoolPolicy(sessionId), loadProvisioningConfig(sessionId), loadIsoImages(sessionId), loadIpLeases(sessionId)]);
   if (!props.visible || sessionId !== dialogSessionId) return;
   initializeProvisioningForm();
   scheduleIpProbe(0);
@@ -499,6 +517,16 @@ async function loadRuntimePolicy(sessionId?: number) {
     runtimePolicy.value = result.policy;
   } catch {
     runtimePolicy.value = defaultRuntimePolicy();
+  }
+}
+
+async function loadIpPoolPolicy(sessionId?: number) {
+  try {
+    const result = await postJson<IpPoolPolicyResponse>("/api/ip-pools/policy", undefined, "GET");
+    if (!props.visible || (sessionId !== undefined && sessionId !== dialogSessionId)) return;
+    ipPoolPolicy.value = result.policy;
+  } catch {
+    ipPoolPolicy.value = defaultIpPoolPolicy();
   }
 }
 
@@ -677,7 +705,7 @@ function applyProvisioningPoolDraft(pool: IpPoolConfig) {
   provisioningForm.dnsText = pool.dns.join(", ");
   provisioningForm.startIp = pool.startIp;
   provisioningForm.endIp = pool.endIp;
-  provisioningForm.reservedIpsText = pool.reservedIps.join("\n");
+  provisioningForm.reservedIpsText = pool.reservedIps.join(", ");
   provisioningForm.networkName = pool.networkName ?? "";
   provisioningForm.vlan = pool.vlan ?? "";
   provisioningForm.preferredIp = "";
@@ -1064,7 +1092,7 @@ function scheduleIpProbe(delay = 350) {
 
 async function probeProvisioningIps() {
   if (provisioningFormLocked.value) return;
-  const ips = Array.from(new Set([...visibleIpCandidates.value, provisioningForm.preferredIp].filter(isIpv4)));
+  const ips = Array.from(new Set([...rawProvisioningAvailableIps.value.slice(0, IP_CANDIDATE_PREVIEW_LIMIT), provisioningForm.preferredIp].filter(isIpv4)));
   if (!ips.length) {
     ipProbeResults.value = {};
     return;
@@ -1381,6 +1409,8 @@ type ProvisioningSourceType = "iso" | "template";
               class="provision-panel-toggle"
               role="group"
               aria-label="网络配置与 IP 池"
+              title="双击展开或收起"
+              @dblclick="handleProvisionPanelDoubleClick"
             >
               <span class="provision-panel-title">
                 <strong>网络配置 / IP 池</strong>
@@ -1391,21 +1421,30 @@ type ProvisioningSourceType = "iso" | "template";
               </span>
               <button class="provision-network-action" type="button" :disabled="probingIps || provisioningFormLocked" @click.stop="probeProvisioningIps">
                 <el-icon v-if="probingIps" class="inline-loading"><Loading /></el-icon>
-                <span>探测 IP</span>
+                <span>PING IP</span>
               </button>
               <button
-                class="provision-network-action"
+                class="provision-collapse-action"
                 type="button"
+                :aria-label="isProvisionSectionExpanded('network') ? '收起网络配置' : '展开网络配置'"
                 :aria-expanded="isProvisionSectionExpanded('network')"
+                :title="isProvisionSectionExpanded('network') ? '收起' : '展开'"
                 @click="toggleProvisionSection('network')"
               >
-                {{ isProvisionSectionExpanded("network") ? "收起" : "展开" }}
+                <el-icon>
+                  <ArrowUp v-if="isProvisionSectionExpanded('network')" />
+                  <ArrowDown v-else />
+                </el-icon>
               </button>
             </div>
 
             <div v-if="isProvisionSectionExpanded('network')" class="provision-panel-body">
               <div class="provision-inline-actions">
-                <button class="cache-refresh-link" :disabled="savingProvisioningConfig || provisioningFormLocked" @click="saveCurrentIpPool">
+                <div class="ip-candidate-filter" role="group" aria-label="候选 IP 筛选">
+                  <button type="button" :class="{ active: ipCandidateFilter === 'available' }" @click="ipCandidateFilter = 'available'">可用</button>
+                  <button type="button" :class="{ active: ipCandidateFilter === 'all' }" @click="ipCandidateFilter = 'all'">全部</button>
+                </div>
+                <button class="provision-save-button" type="button" :disabled="savingProvisioningConfig || provisioningFormLocked" @click="saveCurrentIpPool">
                   <el-icon v-if="savingProvisioningConfig" class="inline-loading"><Loading /></el-icon>
                   <span>保存 IP 池</span>
                 </button>
@@ -1427,13 +1466,9 @@ type ProvisioningSourceType = "iso" | "template";
                 </el-option>
               </el-select>
               <div class="ip-pool-grid compact">
-                <el-input v-model="provisioningForm.poolName" placeholder="IP 池名称" :disabled="provisioningFormLocked" />
                 <el-input v-model="provisioningForm.cidr" placeholder="CIDR，例如 192.0.2.0/24" :disabled="provisioningFormLocked" />
-                <el-input v-model="provisioningForm.startIp" placeholder="扫描起始 IP" :disabled="provisioningFormLocked" />
-                <el-input v-model="provisioningForm.endIp" placeholder="扫描结束 IP" :disabled="provisioningFormLocked" />
                 <el-input v-model="provisioningForm.gateway" placeholder="网关" :disabled="provisioningFormLocked" />
                 <el-input v-model="provisioningForm.dnsText" placeholder="DNS，逗号分隔" :disabled="provisioningFormLocked" />
-                <el-input v-model="provisioningForm.networkName" placeholder="网络 / VLAN / PortGroup" :disabled="provisioningFormLocked" />
                 <el-input v-model="provisioningForm.reservedIpsText" placeholder="保留 IP，逗号或换行分隔" :disabled="provisioningFormLocked" />
               </div>
               <div class="provision-actions">
@@ -1450,7 +1485,7 @@ type ProvisioningSourceType = "iso" | "template";
                     <small>{{ ipCandidateStatusText(ip) }}</small>
                   </button>
                 </div>
-                <small v-else>当前 IP 池没有可展示的候选地址。</small>
+                <small v-else>{{ ipCandidateEmptyText }}</small>
               </div>
             </div>
           </section>

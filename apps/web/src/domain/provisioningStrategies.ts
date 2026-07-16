@@ -1,4 +1,4 @@
-import type { HostNode, IpPoolConfig, IsoImage, ProviderType, RuntimePolicy } from "../types";
+import type { HostNode, IpPoolConfig, IpPoolPolicy, IsoImage, ProviderType, RuntimePolicy } from "../types";
 
 export interface ProvisioningConnectionScope {
   id: string;
@@ -16,7 +16,7 @@ export interface ProvisioningStrategy {
   defaultIsoId(images: IsoImage[]): string;
   defaultSpecId(specs: Array<{ id: string; name: string }>): string;
   defaultVmNamePrefix(connection: ProvisioningConnectionScope, host: HostNode | null): string;
-  defaultIpPools(connection: ProvisioningConnectionScope, host: HostNode | null, policy: RuntimePolicy): IpPoolConfig[];
+  defaultIpPools(connection: ProvisioningConnectionScope, host: HostNode | null, policy: IpPoolPolicy): IpPoolConfig[];
   deriveRootPassword(ip: string, policy: RuntimePolicy): string;
   accountPolicy(source: ProvisioningInstallStepSource): ProvisioningAccountPolicy;
   installSteps(source: ProvisioningInstallStepSource): ProvisioningInstallStep[];
@@ -61,7 +61,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return `${host?.name || connection.host}-centos7`;
     },
     defaultIpPools(connection, host, policy) {
-      return defaultPolicyIpPools("xenserver", "XenServer", connection, host, policy);
+      return defaultPolicyIpPools(connection, host, policy);
     },
     deriveRootPassword(ip, policy) {
       return derivePasswordFromTemplate(ip, policy);
@@ -118,7 +118,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return `${host?.name || connection.host}-vm`;
     },
     defaultIpPools(connection, host, policy) {
-      return defaultPolicyIpPools("vmware", "VMware", connection, host, policy);
+      return defaultPolicyIpPools(connection, host, policy);
     },
     deriveRootPassword(ip, policy) {
       return derivePasswordFromTemplate(ip, policy);
@@ -149,7 +149,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return `${host?.name || connection.host}-vm`;
     },
     defaultIpPools(connection, host, policy) {
-      return defaultPolicyIpPools("proxmox", "PVE", connection, host, policy);
+      return defaultPolicyIpPools(connection, host, policy);
     },
     deriveRootPassword(ip, policy) {
       return derivePasswordFromTemplate(ip, policy);
@@ -180,7 +180,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return `${host?.name || connection.host}-vm`;
     },
     defaultIpPools(connection, host, policy) {
-      return defaultPolicyIpPools("libvirt", "KVM", connection, host, policy);
+      return defaultPolicyIpPools(connection, host, policy);
     },
     deriveRootPassword(ip, policy) {
       return derivePasswordFromTemplate(ip, policy);
@@ -249,31 +249,19 @@ function buildStaticIpPool(id: string, name: string, prefix: string, gateway: st
   };
 }
 
-function defaultPolicyIpPools(
-  providerType: ProviderType,
-  label: string,
-  connection: ProvisioningConnectionScope,
-  host: HostNode | null,
-  policy: RuntimePolicy,
-): IpPoolConfig[] {
+function defaultPolicyIpPools(connection: ProvisioningConnectionScope, host: HostNode | null, policy: IpPoolPolicy): IpPoolConfig[] {
   const hostIp = host?.address || connection.host;
-  const pools = policy.provisioning.providerIpPools[providerType]?.length
-    ? policy.provisioning.providerIpPools[providerType] ?? []
-    : [
-        {
-          id: `${providerType}-default`,
-          name: `${label} 默认网段`,
-          prefix: ipPrefix(hostIp),
-          gateway: `${ipPrefix(hostIp)}.254`,
-        },
-      ];
+  const hostPrefix = ipPrefix(hostIp);
+  const pools = policy.ipPools.length
+    ? [...policy.ipPools].sort((left, right) => ipPoolMatchRank(left.hostPrefixes, hostPrefix) - ipPoolMatchRank(right.hostPrefixes, hostPrefix))
+    : [];
   return pools.map((item) => ({
     ...buildStaticIpPool(
       item.id,
       item.name,
       item.prefix,
       item.gateway,
-      item.dns?.length ? item.dns : policy.provisioning.defaultDns,
+      item.dns?.length ? item.dns : policy.defaultDns,
       item.startHost,
       item.endHost,
     ),
@@ -281,8 +269,14 @@ function defaultPolicyIpPools(
     vlan: item.vlan,
   })).map((pool) => ({
     ...pool,
-    reservedIps: Array.from(new Set([...pool.reservedIps, ...(ipPrefix(hostIp) === ipPrefix(pool.startIp) ? [hostIp] : [])].filter(isIpv4))),
+    reservedIps: Array.from(new Set([...pool.reservedIps, ...(hostPrefix === ipPrefix(pool.startIp) ? [hostIp] : [])].filter(isIpv4))),
   }));
+}
+
+function ipPoolMatchRank(hostPrefixes: string[] | undefined, hostPrefix: string) {
+  if (hostPrefixes?.includes(hostPrefix)) return 0;
+  if (!hostPrefixes?.length) return 1;
+  return 2;
 }
 
 function derivePasswordFromTemplate(ip: string, policy: RuntimePolicy) {

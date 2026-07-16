@@ -7,5 +7,6 @@ import App from "./App.vue";
 
 const savedTheme = localStorage.getItem("vrc.theme") || "graphite-sage";
 document.documentElement.dataset.theme = ["graphite-sage", "basalt-copper", "mist-teal"].includes(savedTheme) ? savedTheme : "graphite-sage";
+delete document.documentElement.dataset.appReady;
 
 createApp(App).use(ElementPlus).mount("#app");

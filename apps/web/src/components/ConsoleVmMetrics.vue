@@ -21,6 +21,7 @@ const props = defineProps<{
   diskValue: string;
   diskDetail: string;
   diskActivityPercent: number;
+  telemetryLabel: string;
   sampledAt: string;
 }>();
 
@@ -141,7 +142,10 @@ function clamp(value: number, min: number, max: number) {
   >
     <header class="console-vm-metrics-head">
       <strong>{{ mode === "overlay" ? "VM 资源监控" : "实时资源" }}</strong>
-      <span>{{ sampledAtLabel }}</span>
+      <div>
+        <em>{{ telemetryLabel }}</em>
+        <span>{{ sampledAtLabel }}</span>
+      </div>
     </header>
     <div class="console-vm-metrics-grid">
       <template v-if="loading">
