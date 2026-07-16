@@ -1,6 +1,6 @@
 {
   "name": "@vrc/chrome-extension",
-  "version": "0.1.4",
+  "version": "0.1.7",
   "private": true,
   "scripts": {
     "build": "node ../../scripts/build-chrome-extension.mjs"

@@ -5,7 +5,9 @@ const net = require("node:net");
 const path = require("node:path");
 
 const APP_DISPLAY_NAME = "VRC";
-const MIN_STARTUP_VISIBLE_MS = 1800;
+const MIN_STARTUP_VISIBLE_MS = 650;
+const STARTUP_READY_STATUS_MS = 60;
+const STARTUP_EXIT_ANIMATION_MS = 260;
 const RENDERER_READY_TIMEOUT_MS = 15000;
 
 if (app && app.setName) {
@@ -29,6 +31,9 @@ let logStreamsClosing = false;
 async function createWindow() {
   const startupAppearance = readStartupAppearance();
   startupOverlayReady = false;
+  const shouldStartBundledApi = app.isPackaged && !process.env.VRC_WEB_URL;
+  const bundledApiPromise = shouldStartBundledApi ? startBundledApi() : Promise.resolve(apiBaseUrl);
+  bundledApiPromise.catch(() => undefined);
   const macWindowOptions =
     process.platform === "darwin"
       ? {
@@ -73,14 +78,13 @@ async function createWindow() {
   mainWindow.show();
 
   try {
-    if (app.isPackaged && !process.env.VRC_WEB_URL) {
-      apiBaseUrl = await startBundledApi();
-    }
     await setStartupStatus("正在载入资源配置");
+    apiBaseUrl = await bundledApiPromise;
+    const rendererLoadStartedAt = Date.now();
     await mainWindow.loadURL(apiBaseUrl);
     await setStartupStatus("正在准备工作区");
     const rendererReady = await waitForRendererReady(mainWindow.webContents);
-    appendMainLog("renderer startup readiness resolved", { rendererReady });
+    appendMainLog("renderer startup readiness resolved", { rendererReady, elapsedMs: Date.now() - rendererLoadStartedAt });
     await finishStartupView();
   } catch (error) {
     appendMainLog("desktop startup failed", { message: error instanceof Error ? error.message : String(error) });
@@ -170,13 +174,13 @@ async function finishStartupView() {
   const remaining = Math.max(MIN_STARTUP_VISIBLE_MS - (Date.now() - startupStartedAt), 0);
   if (remaining) await delay(remaining);
   await setStartupStatus("资源控制台已就绪");
-  await delay(100);
+  await delay(STARTUP_READY_STATUS_MS);
   try {
     await startupView.webContents.executeJavaScript("window.vrcStartup?.complete()");
   } catch {
     // 覆盖层仍会在下方统一释放。
   }
-  await delay(480);
+  await delay(STARTUP_EXIT_ANIMATION_MS);
   appendMainLog("releasing startup overlay", { visibleBefore: mainWindow?.isVisible() });
   disposeStartupView();
   mainWindow?.show();
@@ -256,10 +260,11 @@ function delay(milliseconds) {
 }
 
 async function startBundledApi() {
+  const apiStartupStartedAt = Date.now();
   const preferredPort = Number(process.env.PORT || 3987);
   const preferredBaseUrl = `http://127.0.0.1:${preferredPort}`;
-  if (await isVrcApiHealthy(preferredBaseUrl)) {
-    appendMainLog("reusing existing vrc api", { baseUrl: preferredBaseUrl });
+  if (process.env.VRC_REUSE_EXISTING_API === "1" && await isVrcApiHealthy(preferredBaseUrl)) {
+    appendMainLog("reusing existing vrc api", { baseUrl: preferredBaseUrl, elapsedMs: Date.now() - apiStartupStartedAt });
     return preferredBaseUrl;
   }
   const port = await resolveApiPort(preferredPort);
@@ -270,9 +275,10 @@ async function startBundledApi() {
   const nodeRuntime = resolveNodeRuntimePath(resourcesPath);
   const useElectronAsNode = nodeRuntime === process.execPath;
   const logsPath = getLogDir();
-  ensureBundledIpPoolsConfig(resourcesPath);
+  const dataDir = getVrcDataDir();
+  ensureBundledIpPoolsConfig(resourcesPath, dataDir);
   apiLogStream = createLogStream("api.log");
-  appendMainLog("starting bundled api", { port, apiEntry, webDistDir, nodeModulesDir, logsPath, nodeRuntime, useElectronAsNode });
+  appendMainLog("starting bundled api", { port, apiEntry, webDistDir, nodeModulesDir, logsPath, nodeRuntime, useElectronAsNode, dataDir });
 
   apiProcess = spawn(nodeRuntime, [apiEntry], {
     env: {
@@ -283,7 +289,7 @@ async function startBundledApi() {
       NODE_PATH: nodeModulesDir,
       VRC_WEB_DIST_DIR: webDistDir,
       VRC_LOG_DIR: logsPath,
-      VRC_IP_POOLS_FILE: path.join(app.getPath("home"), ".virtual-resource-console", "ip-pools.json"),
+      VRC_DATA_DIR: dataDir,
       VRC_RUNTIME_MODE: "electron",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -300,16 +306,19 @@ async function startBundledApi() {
   apiProcess.unref();
   const baseUrl = `http://127.0.0.1:${port}`;
   await waitForHealth(baseUrl);
-  appendMainLog("bundled api ready", { baseUrl });
+  appendMainLog("bundled api ready", { baseUrl, elapsedMs: Date.now() - apiStartupStartedAt });
   return baseUrl;
 }
 
-function ensureBundledIpPoolsConfig(resourcesPath) {
-  const targetDir = path.join(app.getPath("home"), ".virtual-resource-console");
-  const targetFile = path.join(targetDir, "ip-pools.json");
+function getVrcDataDir() {
+  return process.env.VRC_DATA_DIR?.trim() || path.join(app.getPath("home"), ".virtual-resource-console");
+}
+
+function ensureBundledIpPoolsConfig(resourcesPath, dataDir = getVrcDataDir()) {
+  const targetFile = path.join(dataDir, "ip-pools.json");
   if (fs.existsSync(targetFile)) return;
   const sourceFile = path.join(resourcesPath, "config", "ip-pools.json");
-  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   fs.copyFileSync(sourceFile, targetFile);
   try {
     fs.chmodSync(targetFile, 0o600);
