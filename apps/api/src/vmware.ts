@@ -17,6 +17,7 @@ import type {
   ResourcePool,
   StorageRepository,
   VirtualDisk,
+  VmActionOptions,
   VmActionResult,
   VmDisk,
   VmInventorySummary,
@@ -26,9 +27,11 @@ import type {
   VmProvisionRequest,
   VmProvisionResult,
   VmQuery,
+  VmRenameResult,
   VmSnapshot,
   XenConnectionInput,
 } from "./types.js";
+import { assertVmRenameCurrentName, assertVmRenameNameAvailable, normalizeVmRenameInput } from "./vmRename.js";
 
 type XmlValue = any;
 
@@ -331,7 +334,7 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
     return [];
   }
 
-  async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction): Promise<VmActionResult> {
+  async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction, options?: VmActionOptions): Promise<VmActionResult> {
     const session = await VmwareSoapSession.login(input);
     try {
       const vm = (await this.listVms(input, { page: 1, pageSize: 500 })).items.find((item) => item.providerId === vmId || item.id === vmId);
@@ -342,17 +345,20 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
         await session.powerOnVm(vmMoid);
       } else if (action === "shutdown") {
         if (vm.powerState !== "running") throw new Error("虚拟机未运行，无需关机。");
+        const forceOnFailure = options?.forceOnShutdownFailure ?? true;
         try {
           if (vm.toolsStatus === "missing") {
             throw new Error("VMware Tools unavailable before guest shutdown");
           }
           await session.shutdownGuest(vmMoid);
-          const gracefullyPoweredOff = await session.waitForVmPowerState(vmMoid, "halted", 18_000);
+          const gracefullyPoweredOff = await session.waitForVmPowerState(vmMoid, "halted", options?.shutdownTimeoutMs ?? 18_000);
           if (!gracefullyPoweredOff) {
+            if (!forceOnFailure) throw new Error("VMware 客户机关机超时，当前策略不允许强制关机。");
             await session.powerOffVm(vmMoid);
           }
         } catch (error) {
           if (!isVmwareGuestShutdownUnavailable(error)) throw error;
+          if (!forceOnFailure) throw new Error("VMware Tools 不可用，当前策略不允许强制关机。");
           await session.powerOffVm(vmMoid);
         }
         return {
@@ -370,6 +376,38 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
         action,
         accepted: true,
         message: `${vmwareActionLabel(action)}完成：${vm.name}`,
+      };
+    } finally {
+      await session.logout();
+    }
+  }
+
+  async renameVm(input: XenConnectionInput, vmId: string, currentName: string, newName: string): Promise<VmRenameResult> {
+    const normalized = normalizeVmRenameInput(this.type, currentName, newName);
+    const session = await VmwareSoapSession.login(input);
+    try {
+      const vmObjects = await session.retrieveContainerProperties("VirtualMachine", ["name", "config.uuid", "config.instanceUuid", "parent"]);
+      const vmObject = vmObjects.find((item) => vmwareProviderId(item) === vmId || item.ref.value === vmId);
+      if (!vmObject) throw new Error(`未找到 VMware 虚拟机：${vmId}`);
+      const actualName = textOf(vmObject.props.get("name"));
+      assertVmRenameCurrentName(actualName, normalized.currentName);
+      const parent = readOptionalManagedRef(vmObject.props.get("parent"));
+      const duplicateFound = vmObjects.some((item) => {
+        if (
+          item.ref.value === vmObject.ref.value ||
+          textOf(item.props.get("name")).toLocaleLowerCase("en-US") !== normalized.newName.toLocaleLowerCase("en-US")
+        ) return false;
+        const itemParent = readOptionalManagedRef(item.props.get("parent"));
+        return parent?.value ? itemParent?.value === parent.value : true;
+      });
+      assertVmRenameNameAvailable(duplicateFound, "当前 VM 文件夹", normalized.newName);
+      await session.renameVm(vmObject.ref.value, normalized.newName);
+      return {
+        vmId,
+        previousName: actualName,
+        newName: normalized.newName,
+        accepted: true,
+        message: `虚拟机名称已修改：${actualName} → ${normalized.newName}`,
       };
     } finally {
       await session.logout();
@@ -512,6 +550,7 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
         "summary.storage.committed",
         "summary.storage.uncommitted",
         "guest.disk",
+        "guest.toolsStatus",
       ]);
       const matchedVms = vmObjects.flatMap((item) => {
         const providerId = vmwareProviderId(item);
@@ -979,6 +1018,16 @@ export class VmwareSoapSession {
       <PowerOnVM_Task xmlns="${SOAP_NS}">
         ${managedRefXml("_this", { type: "VirtualMachine", value: vmMoid })}
       </PowerOnVM_Task>
+    `);
+    await this.waitForTaskResult({ ...readManagedRef(response?.returnval), type: "Task" });
+  }
+
+  async renameVm(vmMoid: string, newName: string): Promise<void> {
+    const response = await this.call("Rename_Task", `
+      <Rename_Task xmlns="${SOAP_NS}">
+        ${managedRefXml("_this", { type: "VirtualMachine", value: vmMoid })}
+        <newName>${escapeXml(newName)}</newName>
+      </Rename_Task>
     `);
     await this.waitForTaskResult({ ...readManagedRef(response?.returnval), type: "Task" });
   }
@@ -1651,7 +1700,23 @@ function toVmwareMetricSamples(
   networkRates?: VmwareNetworkRates,
 ): MetricSample[] {
   const samples: MetricSample[] = [];
-  const pushSample = (metric: MetricSample["metric"], value: number | null, unit: MetricSample["unit"]) => {
+  const toolsStatus = normalizeToolsStatus(textOf(item.props.get("guest.toolsStatus")));
+  const guestTelemetry: NonNullable<MetricSample["guestTelemetry"]> = {
+    status: toolsStatus === "installed" ? "available" : toolsStatus === "missing" ? "unavailable" : "unknown",
+    method: "vmware-tools",
+    message:
+      toolsStatus === "installed"
+        ? "VMware Tools 可读取 Guest 指标"
+        : toolsStatus === "missing"
+          ? "VMware Tools 未运行，使用宿主机指标"
+          : "VMware Tools 状态未知",
+  };
+  const pushSample = (
+    metric: MetricSample["metric"],
+    value: number | null,
+    unit: MetricSample["unit"],
+    source: MetricSample["source"],
+  ) => {
     if (value == null) return;
     samples.push({
       id: `${context.connectionId}:${context.targetId}:${metric}:${context.sampledAtMs}`,
@@ -1661,6 +1726,8 @@ function toVmwareMetricSamples(
       metric,
       value,
       unit,
+      source,
+      guestTelemetry,
       sampledAt: context.sampledAt,
     });
   };
@@ -1681,13 +1748,23 @@ function toVmwareMetricSamples(
   const diskUsedBytes = guestDiskUsage?.usedBytes ?? null;
   const diskTotalBytes = guestDiskUsage?.totalBytes ?? (configuredDiskBytes > 0 ? configuredDiskBytes : storageProvisionedBytes);
 
-  pushSample("cpu_usage", cpuUsageMhz != null && cpuCapacityMhz != null ? Math.min(cpuUsageMhz / cpuCapacityMhz, 1) : null, "ratio");
-  pushSample("memory_used", memoryUsedMb == null ? null : Math.min(memoryUsedMb, memoryTotalMb ?? memoryUsedMb) * 1024 * 1024, "bytes");
-  pushSample("memory_total", memoryTotalMb == null ? null : memoryTotalMb * 1024 * 1024, "bytes");
-  pushSample("disk_used", diskUsedBytes == null ? null : Math.min(diskUsedBytes, diskTotalBytes ?? diskUsedBytes), "bytes");
-  pushSample("disk_total", diskTotalBytes, "bytes");
-  pushSample("net_rx", networkRates?.receivedBytesPerSecond ?? null, "bytes_per_sec");
-  pushSample("net_tx", networkRates?.transmittedBytesPerSecond ?? null, "bytes_per_sec");
+  pushSample("cpu_usage", cpuUsageMhz != null && cpuCapacityMhz != null ? Math.min(cpuUsageMhz / cpuCapacityMhz, 1) : null, "ratio", "hypervisor");
+  pushSample(
+    "memory_used",
+    memoryUsedMb == null ? null : Math.min(memoryUsedMb, memoryTotalMb ?? memoryUsedMb) * 1024 * 1024,
+    "bytes",
+    hostMemoryMb != null ? "hypervisor" : "guest-tools",
+  );
+  pushSample("memory_total", memoryTotalMb == null ? null : memoryTotalMb * 1024 * 1024, "bytes", "hypervisor");
+  pushSample(
+    "disk_used",
+    diskUsedBytes == null ? null : Math.min(diskUsedBytes, diskTotalBytes ?? diskUsedBytes),
+    "bytes",
+    "guest-tools",
+  );
+  pushSample("disk_total", diskTotalBytes, "bytes", guestDiskUsage ? "guest-tools" : "hypervisor");
+  pushSample("net_rx", networkRates?.receivedBytesPerSecond ?? null, "bytes_per_sec", "hypervisor");
+  pushSample("net_tx", networkRates?.transmittedBytesPerSecond ?? null, "bytes_per_sec", "hypervisor");
   return samples;
 }
 

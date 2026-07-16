@@ -20,6 +20,7 @@ import type {
   ResourcePool,
   StorageRepository,
   VirtualDisk,
+  VmActionOptions,
   VmActionResult,
   VmDisk,
   VmInventorySummary,
@@ -29,9 +30,11 @@ import type {
   VmProvisionRequest,
   VmProvisionResult,
   VmQuery,
+  VmRenameResult,
   VmSnapshot,
   XenConnectionInput,
 } from "./types.js";
+import { assertVmRenameCurrentName, assertVmRenameNameAvailable, normalizeVmRenameInput } from "./vmRename.js";
 
 interface ProxmoxLogin {
   ticket: string;
@@ -164,6 +167,11 @@ interface ProxmoxGuestFsCacheEntry {
   expiresAtMs: number;
   retryAfterMs: number;
   pending?: Promise<void>;
+}
+
+interface ProxmoxGuestFsLookup {
+  value?: ProxmoxGuestAgentFsInfoResponse;
+  status: "available" | "probing" | "unavailable" | "unknown";
 }
 
 const proxmoxMetricCounters = new Map<string, ProxmoxMetricCounters>();
@@ -336,7 +344,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     return [];
   }
 
-  async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction): Promise<VmActionResult> {
+  async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction, options?: VmActionOptions): Promise<VmActionResult> {
     const [node, id] = parseVmProviderId(vmId);
     if (!node || !id) {
       throw new Error(`Proxmox VE VM ID 不完整：${vmId}`);
@@ -351,8 +359,9 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
       if (status.status !== "running") throw new Error("虚拟机未运行，无需关机。");
       try {
         const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/shutdown`);
-        await client.waitForTask(node, upid);
-      } catch {
+        await client.waitForTask(node, upid, options?.shutdownTimeoutMs);
+      } catch (error) {
+        if (options?.forceOnShutdownFailure === false) throw error;
         const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/stop`);
         await client.waitForTask(node, upid);
         return {
@@ -372,6 +381,43 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
       action,
       accepted: true,
       message: `${proxmoxActionLabel(action)}完成：${vmId}`,
+    };
+  }
+
+  async renameVm(input: XenConnectionInput, vmId: string, currentName: string, newName: string): Promise<VmRenameResult> {
+    const normalized = normalizeVmRenameInput(this.type, currentName, newName);
+    const [node, id] = parseVmProviderId(vmId);
+    if (!node || !id) throw new Error(`Proxmox VE VM ID 不完整：${vmId}`);
+    const client = await ProxmoxClient.login(input);
+    const [vms, config] = await Promise.all([
+      client.get<ProxmoxVm[]>(`/nodes/${encodeURIComponent(node)}/qemu`),
+      client.get<ProxmoxVmConfig>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/config`),
+    ]);
+    const target = vms.find((item) => String(item.vmid) === id);
+    if (!target) throw new Error(`未找到 Proxmox VE 虚拟机：${vmId}`);
+    const actualName = String(config.name ?? target.name ?? target.vmid);
+    assertVmRenameCurrentName(actualName, normalized.currentName);
+    assertVmRenameNameAvailable(
+      vms.some(
+        (item) =>
+          String(item.vmid) !== id &&
+          item.name?.toLocaleLowerCase("en-US") === normalized.newName.toLocaleLowerCase("en-US"),
+      ),
+      "当前 PVE 节点",
+      normalized.newName,
+    );
+    await client.put(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/config`, new URLSearchParams({ name: normalized.newName }));
+    const updatedConfig = await client.get<ProxmoxVmConfig>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/config`);
+    const updatedName = String(updatedConfig.name ?? "");
+    if (updatedName !== normalized.newName) {
+      throw new Error("Proxmox VE 已接受改名请求，但名称校验未通过。");
+    }
+    return {
+      vmId,
+      previousName: actualName,
+      newName: updatedName,
+      accepted: true,
+      message: `虚拟机名称已修改：${actualName} → ${updatedName}`,
     };
   }
 
@@ -656,10 +702,10 @@ class ProxmoxClient {
     return proxmoxRequest<T>(this.input, "DELETE", path, undefined, this.login);
   }
 
-  async waitForTask(node: string, upid: string): Promise<void> {
+  async waitForTask(node: string, upid: string, timeoutMs = 120_000): Promise<void> {
     if (!upid) return;
     const startedAt = Date.now();
-    while (Date.now() - startedAt < 120_000) {
+    while (Date.now() - startedAt < timeoutMs) {
       const status = await this.get<{ status?: string; exitstatus?: string }>(
         `/nodes/${encodeURIComponent(node)}/tasks/${encodeURIComponent(upid)}/status`,
       );
@@ -1045,10 +1091,27 @@ function parseVmProviderId(value: string): [string, string] {
 function toProxmoxMetricSamples(
   status: ProxmoxVmStatus,
   context: { connectionId: string; targetId: string; sampledAt: string; sampledAtMs: number },
-  guestFsInfo?: ProxmoxGuestAgentFsInfoResponse,
+  guestFsLookup: ProxmoxGuestFsLookup,
 ): MetricSample[] {
   const samples: MetricSample[] = [];
-  const pushSample = (metric: MetricSample["metric"], value: number | null, unit: MetricSample["unit"]) => {
+  const guestTelemetry: NonNullable<MetricSample["guestTelemetry"]> = {
+    status: guestFsLookup.status,
+    method: "qemu-guest-agent",
+    message:
+      guestFsLookup.status === "available"
+        ? "QEMU Guest Agent 可读取文件系统"
+        : guestFsLookup.status === "probing"
+          ? "正在探测 QEMU Guest Agent"
+          : guestFsLookup.status === "unavailable"
+            ? "QEMU Guest Agent 不可用，使用宿主机指标"
+            : "QEMU Guest Agent 状态未知",
+  };
+  const pushSample = (
+    metric: MetricSample["metric"],
+    value: number | null,
+    unit: MetricSample["unit"],
+    source: MetricSample["source"],
+  ) => {
     if (value == null) return;
     samples.push({
       id: `${context.connectionId}:${context.targetId}:${metric}:${context.sampledAtMs}`,
@@ -1058,6 +1121,8 @@ function toProxmoxMetricSamples(
       metric,
       value,
       unit,
+      source,
+      guestTelemetry,
       sampledAt: context.sampledAt,
     });
   };
@@ -1065,16 +1130,16 @@ function toProxmoxMetricSamples(
   const cpuUsage = finiteNonNegative(status.cpu);
   const memoryTotal = finitePositive(status.maxmem);
   const memoryUsed = clampToTotal(finiteNonNegative(status.mem), memoryTotal);
-  const guestDiskUsage = summarizeProxmoxGuestDiskUsage(guestFsInfo);
+  const guestDiskUsage = summarizeProxmoxGuestDiskUsage(guestFsLookup.value);
   const diskTotal = guestDiskUsage?.totalBytes ?? finitePositive(status.maxdisk);
   // PVE reports status.disk as zero when guest filesystem usage is unavailable.
   // Only Guest Agent fsinfo has the semantics required for a utilisation ratio.
   const diskUsed = guestDiskUsage?.usedBytes ?? null;
-  pushSample("cpu_usage", cpuUsage == null ? null : Math.min(cpuUsage, 1), "ratio");
-  pushSample("memory_used", memoryUsed, "bytes");
-  pushSample("memory_total", memoryTotal, "bytes");
-  pushSample("disk_used", diskUsed, "bytes");
-  pushSample("disk_total", diskTotal, "bytes");
+  pushSample("cpu_usage", cpuUsage == null ? null : Math.min(cpuUsage, 1), "ratio", "hypervisor");
+  pushSample("memory_used", memoryUsed, "bytes", "hypervisor");
+  pushSample("memory_total", memoryTotal, "bytes", "hypervisor");
+  pushSample("disk_used", diskUsed, "bytes", "guest-agent");
+  pushSample("disk_total", diskTotal, "bytes", guestDiskUsage ? "guest-agent" : "hypervisor");
 
   const counterKey = `${context.connectionId}:${context.targetId}`;
   const currentCounters: ProxmoxMetricCounters = {
@@ -1087,10 +1152,10 @@ function toProxmoxMetricSamples(
   const previousCounters = proxmoxMetricCounters.get(counterKey);
   const elapsedSeconds = previousCounters ? (context.sampledAtMs - previousCounters.sampledAtMs) / 1000 : 0;
   if (previousCounters && elapsedSeconds > 0) {
-    pushSample("disk_read", counterRate(currentCounters.diskReadBytes, previousCounters.diskReadBytes, elapsedSeconds), "bytes_per_sec");
-    pushSample("disk_write", counterRate(currentCounters.diskWriteBytes, previousCounters.diskWriteBytes, elapsedSeconds), "bytes_per_sec");
-    pushSample("net_rx", counterRate(currentCounters.networkRxBytes, previousCounters.networkRxBytes, elapsedSeconds), "bytes_per_sec");
-    pushSample("net_tx", counterRate(currentCounters.networkTxBytes, previousCounters.networkTxBytes, elapsedSeconds), "bytes_per_sec");
+    pushSample("disk_read", counterRate(currentCounters.diskReadBytes, previousCounters.diskReadBytes, elapsedSeconds), "bytes_per_sec", "hypervisor");
+    pushSample("disk_write", counterRate(currentCounters.diskWriteBytes, previousCounters.diskWriteBytes, elapsedSeconds), "bytes_per_sec", "hypervisor");
+    pushSample("net_rx", counterRate(currentCounters.networkRxBytes, previousCounters.networkRxBytes, elapsedSeconds), "bytes_per_sec", "hypervisor");
+    pushSample("net_tx", counterRate(currentCounters.networkTxBytes, previousCounters.networkTxBytes, elapsedSeconds), "bytes_per_sec", "hypervisor");
   }
   proxmoxMetricCounters.set(counterKey, currentCounters);
   return samples;
@@ -1143,10 +1208,11 @@ function getCachedProxmoxGuestFsInfo(
   vmPath: string,
   cacheKey: string,
   now: number,
-): ProxmoxGuestAgentFsInfoResponse | undefined {
+): ProxmoxGuestFsLookup {
   const cached = proxmoxGuestFsCache.get(cacheKey);
-  if (cached?.value && now < cached.expiresAtMs) return cached.value;
-  if (cached?.pending || (cached && now < cached.retryAfterMs)) return cached?.value;
+  if (cached?.value && now < cached.expiresAtMs) return { value: cached.value, status: "available" };
+  if (cached?.pending) return cached.value ? { value: cached.value, status: "available" } : { status: "probing" };
+  if (cached && now < cached.retryAfterMs) return { status: "unavailable" };
 
   const entry = cached ?? { expiresAtMs: 0, retryAfterMs: 0 };
   entry.pending = client
@@ -1165,7 +1231,7 @@ function getCachedProxmoxGuestFsInfo(
       entry.pending = undefined;
     });
   proxmoxGuestFsCache.set(cacheKey, entry);
-  return entry.value;
+  return entry.value ? { value: entry.value, status: "available" } : { status: "probing" };
 }
 
 function parseDiskSize(value: string): number {

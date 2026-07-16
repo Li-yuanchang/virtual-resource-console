@@ -209,6 +209,81 @@ export interface VmActionResult {
   message: string;
 }
 
+export interface VmRenameResult {
+  vmId: string;
+  previousName: string;
+  newName: string;
+  accepted: boolean;
+  message: string;
+}
+
+export interface VmActionOptions {
+  shutdownTimeoutMs?: number;
+  forceOnShutdownFailure?: boolean;
+}
+
+export type VmScheduleAction = Exclude<VmPowerAction, "delete">;
+export type VmScheduleCycle = "once" | "daily" | "weekly";
+export type VmScheduleFallback = "force" | "fail";
+export type VmScheduleConflictPolicy = "block" | "skip" | "replace";
+export type VmScheduleRunStatus = "running" | "success" | "partial" | "failed" | "skipped";
+
+export interface VmScheduleTarget {
+  vmId: string;
+  name: string;
+  connectionId?: string;
+  providerType?: ProviderType;
+  connectionName?: string;
+  hostId?: string;
+  hostName?: string;
+  ip?: string;
+  guestOs?: string;
+  powerState?: PowerState;
+}
+
+export interface VmScheduleLastRun {
+  status: VmScheduleRunStatus;
+  startedAt: string;
+  finishedAt?: string;
+  successCount: number;
+  failedCount: number;
+  skippedCount: number;
+  message: string;
+}
+
+export interface VmSchedule {
+  id: string;
+  name: string;
+  connectionId: string;
+  providerType: ProviderType;
+  connectionName?: string;
+  hostId?: string;
+  hostName?: string;
+  action: VmScheduleAction;
+  cycle: VmScheduleCycle;
+  onceAt?: string;
+  executeTime?: string;
+  weekdays?: number[];
+  timezone: string;
+  skipMatchingState: boolean;
+  shutdownTimeoutMinutes: number;
+  shutdownFallback: VmScheduleFallback;
+  conflictPolicy: VmScheduleConflictPolicy;
+  targets: VmScheduleTarget[];
+  enabled: boolean;
+  nextRunAt?: string;
+  lastRun?: VmScheduleLastRun;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VmScheduleRunnerStatus {
+  mode: "web" | "electron" | "chrome-native";
+  owner: boolean;
+  instanceId?: string;
+  heartbeatAt?: string;
+}
+
 export type VmProvisionSourceType = "iso" | "template";
 
 export interface VmProvisionPlanItem {
@@ -341,6 +416,21 @@ export interface MetricQuery {
   targetIds: string[];
 }
 
+export type VmMetricSource = "hypervisor" | "guest-agent" | "guest-tools";
+
+export interface GuestTelemetryState {
+  status: "available" | "probing" | "unavailable" | "unknown";
+  method: "qemu-guest-agent" | "vmware-tools" | "xenserver-tools" | "unknown";
+  message: string;
+}
+
+export interface VmMetricSourceMap {
+  cpu?: VmMetricSource;
+  memory?: VmMetricSource;
+  disk?: VmMetricSource;
+  network?: VmMetricSource;
+}
+
 export interface MetricSample {
   id: string;
   connectionId: string;
@@ -359,6 +449,8 @@ export interface MetricSample {
     | "net_tx";
   value: number;
   unit: "ratio" | "bytes" | "bytes_per_sec";
+  source: VmMetricSource;
+  guestTelemetry?: GuestTelemetryState;
   sampledAt: string;
 }
 
@@ -437,6 +529,8 @@ export interface VmMetricSnapshot {
   diskWriteRate: number | null;
   networkRxRate: number | null;
   networkTxRate: number | null;
+  metricSources: VmMetricSourceMap;
+  guestTelemetry: GuestTelemetryState;
   sampledAt: string;
 }
 

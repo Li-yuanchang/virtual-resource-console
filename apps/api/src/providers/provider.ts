@@ -8,6 +8,7 @@ import type {
   ProviderType,
   ResourcePool,
   VirtualDisk,
+  VmActionOptions,
   VmActionResult,
   VmDisk,
   VmInventorySummary,
@@ -16,6 +17,7 @@ import type {
   VmProvisionRequest,
   VmProvisionResult,
   VmQuery,
+  VmRenameResult,
   VmSnapshot,
   XenConnectionInput,
   ProvisionTaskStepKey,
@@ -48,7 +50,8 @@ export interface VirtualizationProvider<C> {
   listVirtualDisks(connection: C, scope?: ProviderScope): Promise<VirtualDisk[]>;
   listIsoImages?(connection: C, scope?: ProviderScope): Promise<IsoImage[]>;
   listVmSnapshots(connection: C, vmId: string): Promise<VmSnapshot[]>;
-  performVmAction?(connection: C, vmId: string, action: VmPowerAction): Promise<VmActionResult>;
+  performVmAction?(connection: C, vmId: string, action: VmPowerAction, options?: VmActionOptions): Promise<VmActionResult>;
+  renameVm?(connection: C, vmId: string, currentName: string, newName: string): Promise<VmRenameResult>;
   createVms?(connection: C, request: VmProvisionRequest, reporter?: ProvisionProgressReporter): Promise<VmProvisionResult>;
   collectMetrics(connection: C, query: MetricQuery): Promise<MetricSample[]>;
 }

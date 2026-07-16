@@ -14,6 +14,7 @@ import type {
   ResourcePool,
   StorageRepository,
   VirtualDisk,
+  VmActionOptions,
   VmActionResult,
   VmDisk,
   VmInventorySummary,
@@ -25,10 +26,12 @@ import type {
   VmProvisionRequest,
   VmProvisionResult,
   VmQuery,
+  VmRenameResult,
   VmSnapshot,
   XenConnectionInput,
   XenOverview,
 } from "./types.js";
+import { assertVmRenameCurrentName, normalizeVmRenameInput, VmRenameConflictError } from "./vmRename.js";
 import { cleanupRegisteredXenGeneratedIso, prepareXenCentosUnattendedIso, resolveXenInstallMediaMode } from "./xenserverUnattendedIso.js";
 
 const HOST_INVENTORY_SCRIPT = String.raw`
@@ -437,9 +440,24 @@ case "$VRC_VM_ACTION" in
       exit 4
     fi
     forced="false"
-    if ! xe vm-shutdown uuid="$VRC_VM_UUID"; then
-      xe vm-shutdown uuid="$VRC_VM_UUID" force=true
-      forced="true"
+    shutdown_timeout="$VRC_VM_SHUTDOWN_TIMEOUT_SECONDS"
+    case "$shutdown_timeout" in
+      ''|*[!0-9]*) shutdown_timeout="600" ;;
+    esac
+    graceful_shutdown=""
+    if command -v timeout >/dev/null 2>&1; then
+      timeout "$shutdown_timeout"s xe vm-shutdown uuid="$VRC_VM_UUID" || graceful_shutdown="failed"
+    else
+      xe vm-shutdown uuid="$VRC_VM_UUID" || graceful_shutdown="failed"
+    fi
+    if [ "$graceful_shutdown" = "failed" ]; then
+      if [ "$VRC_VM_FORCE_ON_SHUTDOWN_FAILURE" != "false" ]; then
+        xe vm-shutdown uuid="$VRC_VM_UUID" force=true
+        forced="true"
+      else
+        echo "虚拟机关机超时或失败，当前策略不允许强制关机：$name" >&2
+        exit 5
+      fi
     fi
     ;;
   delete)
@@ -458,6 +476,39 @@ if [ -z "$forced" ]; then
   forced="false"
 fi
 printf 'OK\t%s\t%s\t%s\t%s\n' "$VRC_VM_ACTION" "$VRC_VM_UUID" "$name" "$forced"
+`;
+
+const VM_RENAME_SCRIPT = String.raw`
+clean_one_line() {
+  tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+if [ -z "$VRC_VM_UUID" ] || [ -z "$VRC_VM_CURRENT_NAME" ] || [ -z "$VRC_VM_NEW_NAME" ]; then
+  echo "缺少虚拟机改名参数" >&2
+  exit 2
+fi
+actual_name="$(xe vm-param-get uuid="$VRC_VM_UUID" param-name=name-label 2>/dev/null | clean_one_line)"
+if [ -z "$actual_name" ]; then
+  echo "未找到虚拟机：$VRC_VM_UUID" >&2
+  exit 3
+fi
+if [ "$actual_name" != "$VRC_VM_CURRENT_NAME" ]; then
+  echo "虚拟机名称已变更为“$actual_name”，请刷新列表后重试。" >&2
+  exit 4
+fi
+duplicate_ids="$(xe vm-list name-label="$VRC_VM_NEW_NAME" params=uuid --minimal 2>/dev/null || true)"
+for duplicate_id in $(printf '%s' "$duplicate_ids" | tr ',' ' '); do
+  if [ -n "$duplicate_id" ] && [ "$duplicate_id" != "$VRC_VM_UUID" ]; then
+    echo "当前资源池内已存在名为“$VRC_VM_NEW_NAME”的虚拟机。" >&2
+    exit 5
+  fi
+done
+xe vm-param-set uuid="$VRC_VM_UUID" name-label="$VRC_VM_NEW_NAME" >/dev/null
+updated_name="$(xe vm-param-get uuid="$VRC_VM_UUID" param-name=name-label 2>/dev/null | clean_one_line)"
+if [ "$updated_name" != "$VRC_VM_NEW_NAME" ]; then
+  echo "XenServer 已接受改名请求，但名称校验未通过。" >&2
+  exit 6
+fi
+printf 'OK\t%s\t%s\n' "$actual_name" "$updated_name"
 `;
 
 const VM_CREATE_SCRIPT = String.raw`
@@ -971,7 +1022,7 @@ fi
 for vm in $vm_list; do
   power="$(xe vm-param-get uuid="$vm" param-name=power-state 2>/dev/null || true)"
   if [ "$power" != "running" ]; then
-    printf 'METRIC\t%s\t\t\t\t\t\t\t\t\t\n' "$vm"
+    printf 'METRIC\t%s\t\t\t\t\t\t\t\t\t\tunavailable\n' "$vm"
     continue
   fi
   vcpu_max="$(xe vm-param-get uuid="$vm" param-name=VCPUs-max 2>/dev/null || true)"
@@ -994,10 +1045,23 @@ for vm in $vm_list; do
   fi
   memory_total="$(xe vm-param-get uuid="$vm" param-name=memory-actual 2>/dev/null || true)"
   memory_free_kib="$(sum_metric_family "$vm" '^memory_internal_free$')"
+  guest_tools_status="unknown"
+  guest_metrics="$(xe vm-param-get uuid="$vm" param-name=guest-metrics 2>/dev/null | tr -d '\r\n' || true)"
+  if [ -z "$guest_metrics" ] || [ "$guest_metrics" = "<not in database>" ]; then
+    guest_tools_status="unavailable"
+  else
+    pv_drivers="$(xe vm-guest-metrics-param-get uuid="$guest_metrics" param-name=PV-drivers-detected 2>/dev/null | tr -d '\r\n' || true)"
+    if [ "$pv_drivers" = "true" ]; then
+      guest_tools_status="available"
+    elif [ "$pv_drivers" = "false" ]; then
+      guest_tools_status="unavailable"
+    fi
+  fi
   memory_used=""
   if is_number "$memory_total" && is_number "$memory_free_kib" && awk -v total="$memory_total" -v free="$memory_free_kib" 'BEGIN { exit !(total>0 && free>=0) }'; then
     memory_used="$(awk -v total="$memory_total" -v free="$memory_free_kib" 'BEGIN { used=total-(free*1024); if (used<0) used=0; if (used>total) used=total; printf "%.0f", used }')"
-  else
+    guest_tools_status="available"
+  elif ! is_number "$memory_total"; then
     memory_total=""
   fi
   disk_total="0"
@@ -1021,7 +1085,7 @@ for vm in $vm_list; do
   disk_write="$(sum_metric_family "$vm" '^vbd_.*_write$')"
   net_rx="$(sum_metric_family "$vm" '^vif_.*_rx$')"
   net_tx="$(sum_metric_family "$vm" '^vif_.*_tx$')"
-  printf 'METRIC\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vm" "$cpu_usage" "$memory_used" "$memory_total" "$disk_used" "$disk_total" "$disk_read" "$disk_write" "$net_rx" "$net_tx"
+  printf 'METRIC\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vm" "$cpu_usage" "$memory_used" "$memory_total" "$disk_used" "$disk_total" "$disk_read" "$disk_write" "$net_rx" "$net_tx" "$guest_tools_status"
 done
 `;
 
@@ -1158,11 +1222,13 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     return [];
   }
 
-  async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction): Promise<VmActionResult> {
+  async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction, options?: VmActionOptions): Promise<VmActionResult> {
     const output = await runRemoteScript(input, VM_ACTION_SCRIPT, {
       env: {
         VRC_VM_UUID: vmId,
         VRC_VM_ACTION: action,
+        VRC_VM_SHUTDOWN_TIMEOUT_SECONDS: String(Math.max(Math.round((options?.shutdownTimeoutMs ?? 600_000) / 1_000), 1)),
+        VRC_VM_FORCE_ON_SHUTDOWN_FAILURE: options?.forceOnShutdownFailure === false ? "false" : "true",
       },
     });
     const [, , , name = vmId, forced = "false"] = output
@@ -1180,6 +1246,37 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
           : action === "start" && forced === "true"
             ? `开机完成：${name}`
             : `${xenActionLabel(action)}完成：${name}`,
+    };
+  }
+
+  async renameVm(input: XenConnectionInput, vmId: string, currentName: string, newName: string): Promise<VmRenameResult> {
+    const normalized = normalizeVmRenameInput(this.type, currentName, newName);
+    let output = "";
+    try {
+      output = await runRemoteScript(input, VM_RENAME_SCRIPT, {
+        env: {
+          VRC_VM_UUID: sanitizeUuid(vmId),
+          VRC_VM_CURRENT_NAME: normalized.currentName,
+          VRC_VM_NEW_NAME: normalized.newName,
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/名称已变更|已存在名为/.test(message)) throw new VmRenameConflictError(message);
+      throw error;
+    }
+    const [, previousName = normalized.currentName, updatedName = normalized.newName] = output
+      .trim()
+      .split("\n")
+      .find((line) => line.startsWith("OK\t"))
+      ?.split("\t") ?? [];
+    assertVmRenameCurrentName(previousName, normalized.currentName);
+    return {
+      vmId,
+      previousName,
+      newName: updatedName,
+      accepted: true,
+      message: `虚拟机名称已修改：${previousName} → ${updatedName}`,
     };
   }
 
@@ -1695,6 +1792,17 @@ function parseMetricSamples(output: string, connectionId: string): MetricSample[
     if (!line.startsWith("METRIC\t")) continue;
     const cols = line.split("\t");
     const vmId = cols[1] ?? "";
+    const guestStatus = cols[11] === "available" || cols[11] === "unavailable" ? cols[11] : "unknown";
+    const guestTelemetry: NonNullable<MetricSample["guestTelemetry"]> = {
+      status: guestStatus,
+      method: "xenserver-tools",
+      message:
+        guestStatus === "available"
+          ? "XenServer Tools 可读取 Guest 指标"
+          : guestStatus === "unavailable"
+            ? "XenServer Tools 不可用，使用宿主机指标"
+            : "XenServer Tools 状态未知",
+    };
     const values: Array<[MetricSample["metric"], number | null]> = [
       ["cpu_usage", parseNullableNumber(cols[2])],
       ["memory_used", parseNullableNumber(cols[3])],
@@ -1721,6 +1829,8 @@ function parseMetricSamples(output: string, connectionId: string): MetricSample[
             : metric === "memory_used" || metric === "memory_total" || metric === "disk_used" || metric === "disk_total"
               ? "bytes"
               : "bytes_per_sec",
+        source: metric === "memory_used" ? "guest-tools" : "hypervisor",
+        guestTelemetry,
         sampledAt,
       });
     }
@@ -1782,6 +1892,12 @@ export function metricSamplesToVmSnapshots(samples: MetricSample[]): VmMetricSna
         diskWriteRate: null,
         networkRxRate: null,
         networkTxRate: null,
+        metricSources: {},
+        guestTelemetry: {
+          status: "unknown",
+          method: "unknown",
+          message: "Guest 遥测状态未知",
+        },
         sampledAt: sample.sampledAt,
       } satisfies VmMetricSnapshot);
     if (sample.metric === "cpu_usage") snapshot.cpuUsage = sample.value;
@@ -1793,9 +1909,36 @@ export function metricSamplesToVmSnapshots(samples: MetricSample[]): VmMetricSna
     if (sample.metric === "disk_write") snapshot.diskWriteRate = sample.value;
     if (sample.metric === "net_rx") snapshot.networkRxRate = sample.value;
     if (sample.metric === "net_tx") snapshot.networkTxRate = sample.value;
+    const metricGroup = metricGroupForSample(sample.metric);
+    if (metricGroup) snapshot.metricSources[metricGroup] = preferMetricSource(snapshot.metricSources[metricGroup], sample.source);
+    if (sample.guestTelemetry) snapshot.guestTelemetry = preferGuestTelemetry(snapshot.guestTelemetry, sample.guestTelemetry);
     byVm.set(sample.targetId, snapshot);
   }
   return Array.from(byVm.values());
+}
+
+function metricGroupForSample(metric: MetricSample["metric"]): keyof VmMetricSnapshot["metricSources"] | null {
+  if (metric === "cpu_usage") return "cpu";
+  if (metric === "memory_usage" || metric === "memory_used" || metric === "memory_total") return "memory";
+  if (metric === "disk_used" || metric === "disk_total" || metric === "disk_read" || metric === "disk_write") return "disk";
+  if (metric === "net_rx" || metric === "net_tx") return "network";
+  return null;
+}
+
+function preferMetricSource(
+  current: VmMetricSnapshot["metricSources"][keyof VmMetricSnapshot["metricSources"]],
+  candidate: MetricSample["source"],
+): MetricSample["source"] {
+  const priority = { hypervisor: 0, "guest-agent": 1, "guest-tools": 1 } as const;
+  return current == null || priority[candidate] >= priority[current] ? candidate : current;
+}
+
+function preferGuestTelemetry(
+  current: VmMetricSnapshot["guestTelemetry"],
+  candidate: NonNullable<MetricSample["guestTelemetry"]>,
+): VmMetricSnapshot["guestTelemetry"] {
+  const priority = { unknown: 0, unavailable: 1, probing: 2, available: 3 } as const;
+  return priority[candidate.status] >= priority[current.status] ? candidate : current;
 }
 
 export async function getXenConsoleLocation(input: XenConnectionInput, vmId: string): Promise<string> {

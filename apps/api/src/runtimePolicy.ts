@@ -1,19 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ProviderType } from "./types.js";
-
-export interface RuntimeIpPoolPolicy {
-  id: string;
-  name: string;
-  prefix: string;
-  gateway: string;
-  dns?: string[];
-  startHost?: number;
-  endHost?: number;
-  networkName?: string;
-  vlan?: string;
-}
 
 export interface RuntimePolicy {
   managedIpPattern?: string;
@@ -24,9 +11,7 @@ export interface RuntimePolicy {
     hostOnlyPrefix?: string;
   };
   provisioning: {
-    defaultDns: string[];
     rootPasswordTemplate: string;
-    providerIpPools: Partial<Record<ProviderType, RuntimeIpPoolPolicy[]>>;
   };
   xenserver: {
     networkDeviceRules: Array<{
@@ -40,9 +25,7 @@ type RuntimePolicyInput = Partial<{
   managedIpPattern: string;
   ipInference: Partial<RuntimePolicy["ipInference"]>;
   provisioning: Partial<{
-    defaultDns: string[];
     rootPasswordTemplate: string;
-    providerIpPools: Partial<Record<ProviderType, RuntimeIpPoolPolicy[]>>;
   }>;
   xenserver: Partial<RuntimePolicy["xenserver"]>;
 }>;
@@ -56,66 +39,7 @@ const defaultRuntimePolicy: RuntimePolicy = {
     hostOnlyPrefix: "",
   },
   provisioning: {
-    defaultDns: ["1.1.1.1"],
     rootPasswordTemplate: "",
-    providerIpPools: {
-      xenserver: [
-        {
-          id: "xenserver-example-a",
-          name: "XenServer 示例网段 A",
-          prefix: "192.0.2",
-          gateway: "192.0.2.254",
-        },
-        {
-          id: "xenserver-example-b",
-          name: "XenServer 示例网段 B",
-          prefix: "198.51.100",
-          gateway: "198.51.100.254",
-        },
-      ],
-      vmware: [
-        {
-          id: "vmware-example-a",
-          name: "VMware 示例网段 A",
-          prefix: "192.0.2",
-          gateway: "192.0.2.254",
-        },
-        {
-          id: "vmware-example-b",
-          name: "VMware 示例网段 B",
-          prefix: "198.51.100",
-          gateway: "198.51.100.254",
-        },
-      ],
-      proxmox: [
-        {
-          id: "proxmox-example-a",
-          name: "PVE 示例网段 A",
-          prefix: "192.0.2",
-          gateway: "192.0.2.254",
-        },
-        {
-          id: "proxmox-example-b",
-          name: "PVE 示例网段 B",
-          prefix: "198.51.100",
-          gateway: "198.51.100.254",
-        },
-      ],
-      libvirt: [
-        {
-          id: "libvirt-example-a",
-          name: "KVM 示例网段 A",
-          prefix: "192.0.2",
-          gateway: "192.0.2.254",
-        },
-        {
-          id: "libvirt-example-b",
-          name: "KVM 示例网段 B",
-          prefix: "198.51.100",
-          gateway: "198.51.100.254",
-        },
-      ],
-    },
   },
   xenserver: {
     networkDeviceRules: [],
@@ -201,17 +125,10 @@ function normalizeRuntimePolicy(input: RuntimePolicyInput): RuntimePolicy {
       hostOnlyPrefix: input.ipInference?.hostOnlyPrefix?.trim() ?? defaultRuntimePolicy.ipInference.hostOnlyPrefix,
     },
     provisioning: {
-      defaultDns: input.provisioning?.defaultDns?.length
-        ? input.provisioning.defaultDns.map(String).map((item) => item.trim()).filter(Boolean)
-        : defaultRuntimePolicy.provisioning.defaultDns,
       rootPasswordTemplate:
         typeof input.provisioning?.rootPasswordTemplate === "string"
           ? input.provisioning.rootPasswordTemplate
           : defaultRuntimePolicy.provisioning.rootPasswordTemplate,
-      providerIpPools: {
-        ...defaultRuntimePolicy.provisioning.providerIpPools,
-        ...normalizeProviderIpPools(input.provisioning?.providerIpPools),
-      },
     },
     xenserver: {
       networkDeviceRules: Array.isArray(input.xenserver?.networkDeviceRules)
@@ -224,34 +141,6 @@ function normalizeRuntimePolicy(input: RuntimePolicyInput): RuntimePolicy {
         : defaultRuntimePolicy.xenserver.networkDeviceRules,
     },
   };
-}
-
-function normalizeProviderIpPools(input: Partial<Record<ProviderType, RuntimeIpPoolPolicy[]>> | undefined) {
-  if (!input || typeof input !== "object") return {};
-  const result: Partial<Record<ProviderType, RuntimeIpPoolPolicy[]>> = {};
-  for (const providerType of ["xenserver", "vmware", "proxmox", "libvirt"] as const) {
-    const pools = input[providerType];
-    if (!Array.isArray(pools)) continue;
-    result[providerType] = pools
-      .map((item) => ({
-        id: String(item.id ?? "").trim(),
-        name: String(item.name ?? "").trim(),
-        prefix: String(item.prefix ?? "").trim(),
-        gateway: String(item.gateway ?? "").trim(),
-        dns: Array.isArray(item.dns) ? item.dns.map(String).map((dns) => dns.trim()).filter(Boolean) : undefined,
-        startHost: toHostOctet(item.startHost, 20),
-        endHost: toHostOctet(item.endHost, 250),
-        networkName: item.networkName?.trim(),
-        vlan: item.vlan?.trim(),
-      }))
-      .filter((item) => item.id && item.name && item.prefix && item.gateway);
-  }
-  return result;
-}
-
-function toHostOctet(value: unknown, fallback: number): number {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 && parsed < 255 ? parsed : fallback;
 }
 
 function isIpv4(value: string): boolean {

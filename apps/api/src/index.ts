@@ -20,8 +20,16 @@ import {
   resolveStoredConnection,
   saveStoredConnection,
 } from "./connectionStore.js";
+import {
+  createEphemeralConnection,
+  deleteEphemeralConnection,
+  listEphemeralConnections,
+  markEphemeralConnectionUsed,
+  resolveEphemeralConnection,
+} from "./ephemeralConnectionStore.js";
 import { cleanupXenInstallSources, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
 import { listIpLeases, releaseIpLeases, reserveIpLeases } from "./ipLeaseStore.js";
+import { getIpPoolPolicy, saveIpPoolPolicy } from "./ipPoolPolicy.js";
 import { buildIsoImageCacheKey, getIsoImageCache, saveIsoImageCache } from "./isoImageStore.js";
 import { getGeneratedIso } from "./generatedIsoStore.js";
 import { getProvisioningConfig, saveProvisioningConfig } from "./provisioningStore.js";
@@ -62,9 +70,21 @@ import type {
   VmInventorySummary,
   VmNode,
   VmProvisionRequest,
+  VmScheduleTarget,
   XenConnectionInput,
 } from "./types.js";
+import { VmRenameConflictError, VmRenameValidationError } from "./vmRename.js";
 import { cleanupRegisteredVmwareGeneratedIso, VmwareProvider } from "./vmware.js";
+import { VmScheduleRunner } from "./vmScheduleRunner.js";
+import {
+  createVmSchedule,
+  deleteVmSchedule,
+  listVmSchedules,
+  setVmScheduleEnabled,
+  updateVmSchedule,
+  VmScheduleConflictError,
+} from "./vmScheduleStore.js";
+import type { UpsertVmScheduleInput } from "./vmScheduleStore.js";
 import { metricSamplesToVmSnapshots, XenServerProvider } from "./xenserver.js";
 
 const server = Fastify({
@@ -92,7 +112,13 @@ const providers = new ProviderRegistry();
 providers.register(new XenServerProvider());
 providers.register(new VmwareProvider());
 providers.register(new ProxmoxProvider());
+const vmScheduleRunner = new VmScheduleRunner(providers, server.log);
 const isoRefreshJobs = new Set<string>();
+const vmScheduleTargetCacheTtlMs = 5 * 60_000;
+let vmScheduleTargetCache: Awaited<ReturnType<typeof loadVmScheduleTargets>> | undefined;
+let vmScheduleTargetCacheUpdatedAt = 0;
+let vmScheduleTargetRefreshJob: Promise<Awaited<ReturnType<typeof loadVmScheduleTargets>>> | undefined;
+let vmScheduleTargetCacheVersion = 0;
 
 await registerXenServerConsoleRoutes(server);
 await registerProxmoxConsoleRoutes(server);
@@ -171,6 +197,11 @@ const directConnectionSchema = z.object({
   password: z.string().min(1),
 });
 
+const ephemeralConnectionSchema = directConnectionSchema.extend({
+  name: z.string().optional(),
+  ttlMinutes: z.coerce.number().int().positive().max(240).optional(),
+});
+
 const hostsSchema = connectionSchema.extend({
   poolId: z.string().optional(),
 });
@@ -192,6 +223,71 @@ const vmActionSchema = connectionSchema.extend({
   action: z.enum(["start", "shutdown", "delete"]),
   confirmToken: z.literal("CONFIRMED"),
 });
+
+const vmRenameSchema = connectionSchema.extend({
+  vmId: z.string().min(1),
+  currentName: z.string().min(1).max(128),
+  newName: z.string().min(1).max(128),
+  confirmToken: z.literal("CONFIRMED"),
+});
+
+const vmScheduleTargetSchema = z.object({
+  vmId: z.string().min(1),
+  name: z.string().min(1),
+  connectionId: z.string().optional(),
+  providerType: providerTypeSchema.optional(),
+  connectionName: z.string().optional(),
+  hostId: z.string().optional(),
+  hostName: z.string().optional(),
+  ip: z.string().optional(),
+  guestOs: z.string().optional(),
+  powerState: z.enum(["running", "halted", "stopped", "suspended", "unknown"]).optional(),
+});
+
+const vmScheduleSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80),
+    connectionId: z.string().min(1),
+    providerType: providerTypeSchema,
+    connectionName: z.string().optional(),
+    hostId: z.string().optional(),
+    hostName: z.string().optional(),
+    action: z.enum(["start", "shutdown"]),
+    cycle: z.enum(["once", "daily", "weekly"]),
+    onceAt: z.string().optional(),
+    executeTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    weekdays: z.array(z.coerce.number().int().min(1).max(7)).max(7).optional(),
+    timezone: z.string().min(1).refine((value) => {
+      try {
+        new Intl.DateTimeFormat("en", { timeZone: value }).format();
+        return true;
+      } catch {
+        return false;
+      }
+    }, "时区无效"),
+    skipMatchingState: z.boolean().default(true),
+    shutdownTimeoutMinutes: z.coerce.number().int().min(2).max(60).default(10),
+    shutdownFallback: z.enum(["force", "fail"]).default("force"),
+    conflictPolicy: z.enum(["block", "skip", "replace"]).default("block"),
+    targets: z.array(vmScheduleTargetSchema).min(1).max(500),
+    enabled: z.boolean().optional(),
+    confirmToken: z.literal("CONFIRMED"),
+  })
+  .superRefine((value, context) => {
+    if (value.cycle === "once" && !value.onceAt) {
+      context.addIssue({ code: "custom", path: ["onceAt"], message: "单次任务必须填写执行时间" });
+    }
+    if (value.cycle !== "once" && !value.executeTime) {
+      context.addIssue({ code: "custom", path: ["executeTime"], message: "循环任务必须填写执行时间" });
+    }
+    if (value.cycle === "weekly" && !value.weekdays?.length) {
+      context.addIssue({ code: "custom", path: ["weekdays"], message: "每周任务至少选择一天" });
+    }
+  });
+
+const vmScheduleIdSchema = z.object({ id: z.string().uuid() });
+const vmScheduleEnabledSchema = z.object({ enabled: z.boolean() });
+const vmScheduleQuerySchema = z.object({ connectionId: z.string().optional() });
 
 const virtualDisksSchema = connectionSchema.extend({
   poolId: z.string().optional(),
@@ -230,6 +326,24 @@ const ipPoolSchema = z.object({
   reservedIps: z.array(z.string()).default([]),
   networkName: z.string().optional(),
   vlan: z.string().optional(),
+});
+
+const runtimeIpPoolPolicySchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  prefix: z.string().min(1),
+  gateway: z.string().min(1),
+  dns: z.array(z.string()).optional(),
+  startHost: z.coerce.number().int().min(1).max(254).optional(),
+  endHost: z.coerce.number().int().min(1).max(254).optional(),
+  hostPrefixes: z.array(z.string()).optional(),
+  networkName: z.string().optional(),
+  vlan: z.string().optional(),
+});
+
+const ipPoolPolicySchema = z.object({
+  defaultDns: z.array(z.string()).default([]),
+  ipPools: z.array(runtimeIpPoolPolicySchema).default([]),
 });
 
 const environmentTemplateSchema = z.object({
@@ -329,10 +443,15 @@ server.get("/api/health", async () => ({
   ok: true,
   service: "virtual-resource-console-api",
   now: new Date().toISOString(),
+  scheduleRunner: vmScheduleRunner.status(),
 }));
 
 server.get("/api/connections", async () => ({
-  connections: listStoredConnections(),
+  connections: [...listStoredConnections(), ...listEphemeralConnections()],
+}));
+
+server.get("/api/ephemeral-connections", async () => ({
+  connections: listEphemeralConnections(),
 }));
 
 server.get("/api/preferences/ui", async () => ({
@@ -444,6 +563,37 @@ server.get("/api/provisioning/config", async () => ({
 server.get("/api/runtime-policy", async () => ({
   policy: getRuntimePolicy(),
 }));
+
+server.get("/api/ip-pools/policy", async (_request, reply) => {
+  try {
+    return {
+      policy: getIpPoolPolicy(),
+    };
+  } catch (error) {
+    return reply.status(500).send({
+      message: error instanceof Error ? error.message : "读取 IP 池配置失败",
+    });
+  }
+});
+
+server.patch("/api/ip-pools/policy", async (request, reply) => {
+  const parsed = ipPoolPolicySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "IP 池配置格式不正确",
+      issues: parsed.error.issues,
+    });
+  }
+  try {
+    return {
+      policy: saveIpPoolPolicy(parsed.data),
+    };
+  } catch (error) {
+    return reply.status(400).send({
+      message: error instanceof Error ? error.message : "IP 池配置格式不正确",
+    });
+  }
+});
 
 server.post("/api/provisioning/config", async (request, reply) => {
   const parsed = provisioningConfigSchema.safeParse(request.body);
@@ -598,7 +748,7 @@ server.post("/api/provisioning/preflight", async (request, reply) => {
     const provider = providers.get(resolved.providerType);
     const requestData = buildProvisionRequestData(parsed.data, resolved.providerType, resolved.connectionId, resolved.connection.host);
     const checks = await runProvisionPreflight(provider, resolved.connection, resolved.providerType, requestData, parsed.data);
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return {
       checkedAt: new Date().toISOString(),
       ok: !checks.some((check) => check.status === "error"),
@@ -629,7 +779,7 @@ server.post("/api/provisioning/vms", async (request, reply) => {
         message: `当前平台暂不支持一键创建虚拟机：${resolved.providerType}`,
       });
     }
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     const requestData = buildProvisionRequestData(parsed.data, resolved.providerType, resolved.connectionId, resolved.connection.host);
     const validationErrors = validateProvisionPlan(resolved.providerType, requestData, parsed.data);
     if (validationErrors.length) {
@@ -816,9 +966,25 @@ server.post("/api/connections", async (request, reply) => {
     ...parsed.data,
     port: normalizeProviderPort(parsed.data.providerType, parsed.data.port),
   };
-  return {
-    connection: saveStoredConnection(data),
-  };
+  const saved = saveStoredConnection(data);
+  invalidateVmScheduleTargetCache();
+  return { connection: saved };
+});
+
+server.post("/api/ephemeral-connections", async (request, reply) => {
+  const parsed = ephemeralConnectionSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "请填写临时连接名称、平台、Host、端口、用户名和密码",
+      issues: parsed.error.issues,
+    });
+  }
+
+  const connection = createEphemeralConnection({
+    ...parsed.data,
+    port: normalizeProviderPort(parsed.data.providerType, parsed.data.port),
+  });
+  return { connection };
 });
 
 server.delete("/api/connections/:id", async (request, reply) => {
@@ -829,8 +995,22 @@ server.delete("/api/connections/:id", async (request, reply) => {
       issues: parsed.error.issues,
     });
   }
+  const deletedEphemeral = deleteEphemeralConnection(parsed.data.id);
+  const deletedStored = deletedEphemeral ? false : deleteStoredConnection(parsed.data.id);
+  if (deletedStored) invalidateVmScheduleTargetCache();
+  return { deleted: deletedEphemeral || deletedStored };
+});
+
+server.delete("/api/ephemeral-connections/:id", async (request, reply) => {
+  const parsed = deleteConnectionSchema.safeParse(request.params);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "临时连接 ID 不完整",
+      issues: parsed.error.issues,
+    });
+  }
   return {
-    deleted: deleteStoredConnection(parsed.data.id),
+    deleted: deleteEphemeralConnection(parsed.data.id),
   };
 });
 
@@ -847,7 +1027,7 @@ server.post("/api/connections/test", async (request, reply) => {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
     const result = await provider.testConnection(resolved.connection);
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return result;
   } catch (error) {
     request.log.error({ error }, "failed to test virtualization connection");
@@ -869,7 +1049,7 @@ server.post("/api/inventory/pools", async (request, reply) => {
   try {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return {
       collectedAt: new Date().toISOString(),
       pools: await provider.listPools(resolved.connection),
@@ -896,7 +1076,7 @@ server.post("/api/inventory/hosts", async (request, reply) => {
     const provider = providers.get(resolved.providerType);
     const connection = resolved.connection;
     const inventory = hasHostInventory(provider) ? await provider.collectHostInventory(connection) : undefined;
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return {
       collectedAt: new Date().toISOString(),
       hosts: inventory?.hosts ?? (await provider.listHosts(connection, { poolId: parsed.data.poolId })),
@@ -923,7 +1103,7 @@ server.post("/api/inventory/vms", async (request, reply) => {
   try {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return {
       collectedAt: new Date().toISOString(),
       ...(await provider.listVms(resolved.connection, {
@@ -954,7 +1134,7 @@ server.post("/api/inventory/vm-summary", async (request, reply) => {
   try {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     const query = {
       poolId: parsed.data.poolId,
       hostId: parsed.data.hostId,
@@ -996,7 +1176,7 @@ server.post("/api/inventory/vm-disks", async (request, reply) => {
   try {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return {
       collectedAt: new Date().toISOString(),
       disks: await provider.listVmDisks(resolved.connection, parsed.data.vmId),
@@ -1021,7 +1201,7 @@ server.post("/api/inventory/virtual-disks", async (request, reply) => {
   try {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return {
       collectedAt: new Date().toISOString(),
       disks: await provider.listVirtualDisks(resolved.connection, {
@@ -1057,7 +1237,7 @@ server.post("/api/inventory/iso-images", async (request, reply) => {
         refreshing: false,
       };
     }
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     const cacheKey = buildIsoImageCacheKey({
       providerType: resolved.providerType,
       connectionId: resolved.connectionId,
@@ -1114,7 +1294,7 @@ server.post("/api/vms/action", async (request, reply) => {
         message: `当前平台暂不支持 VM ${vmActionLabel(parsed.data.action)}操作。`,
       });
     }
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     let vmNameForLeaseRelease = "";
     let vmIpsForLeaseRelease: string[] = [];
     if (parsed.data.action === "delete") {
@@ -1149,6 +1329,121 @@ server.post("/api/vms/action", async (request, reply) => {
   }
 });
 
+server.post("/api/vms/rename", async (request, reply) => {
+  const parsed = vmRenameSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "VM 改名参数不完整，或未完成确认。",
+      issues: parsed.error.issues,
+    });
+  }
+
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    const provider = providers.get(resolved.providerType);
+    if (!provider.renameVm) {
+      return reply.status(501).send({
+        message: "当前平台暂不支持虚拟机改名。",
+      });
+    }
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const result = await provider.renameVm(
+      resolved.connection,
+      parsed.data.vmId,
+      parsed.data.currentName,
+      parsed.data.newName,
+    );
+    return {
+      operatedAt: new Date().toISOString(),
+      result,
+    };
+  } catch (error) {
+    request.log.error({ error }, "failed to rename vm");
+    const statusCode = error instanceof VmRenameValidationError ? 400 : error instanceof VmRenameConflictError ? 409 : 502;
+    return reply.status(statusCode).send({
+      message: toClientErrorMessage(error, "虚拟机改名失败"),
+    });
+  }
+});
+
+server.get("/api/vm-schedules", async (request, reply) => {
+  const parsed = vmScheduleQuerySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return reply.status(400).send({ message: "定时任务查询参数无效。", issues: parsed.error.issues });
+  }
+  return {
+    tasks: listVmSchedules(parsed.data.connectionId),
+    runner: vmScheduleRunner.status(),
+  };
+});
+
+server.get("/api/vm-schedule-targets", async () => listVmScheduleTargets());
+
+server.post("/api/vm-schedules", async (request, reply) => {
+  const parsed = vmScheduleSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ message: "定时任务参数不完整。", issues: parsed.error.issues });
+  }
+  try {
+    const { confirmToken: _confirmToken, ...rawInput } = parsed.data;
+    const input = validateVmScheduleConnections(rawInput);
+    const task = createVmSchedule(input);
+    return reply.status(201).send({ task, runner: vmScheduleRunner.status() });
+  } catch (error) {
+    if (error instanceof VmScheduleConflictError) {
+      return reply.status(409).send({ message: error.message, conflicts: error.conflicts });
+    }
+    request.log.error({ error }, "failed to create vm schedule");
+    return reply.status(400).send({ message: toClientErrorMessage(error, "创建定时任务失败") });
+  }
+});
+
+server.put("/api/vm-schedules/:id", async (request, reply) => {
+  const params = vmScheduleIdSchema.safeParse(request.params);
+  const parsed = vmScheduleSchema.safeParse(request.body);
+  if (!params.success || !parsed.success) {
+    return reply.status(400).send({
+      message: "定时任务参数不完整。",
+      issues: [...(params.success ? [] : params.error.issues), ...(parsed.success ? [] : parsed.error.issues)],
+    });
+  }
+  try {
+    const { confirmToken: _confirmToken, ...rawInput } = parsed.data;
+    const input = validateVmScheduleConnections(rawInput);
+    const task = updateVmSchedule(params.data.id, input);
+    if (!task) return reply.status(404).send({ message: "未找到定时任务。" });
+    return { task, runner: vmScheduleRunner.status() };
+  } catch (error) {
+    if (error instanceof VmScheduleConflictError) {
+      return reply.status(409).send({ message: error.message, conflicts: error.conflicts });
+    }
+    request.log.error({ error }, "failed to update vm schedule");
+    return reply.status(400).send({ message: toClientErrorMessage(error, "更新定时任务失败") });
+  }
+});
+
+server.patch("/api/vm-schedules/:id/enabled", async (request, reply) => {
+  const params = vmScheduleIdSchema.safeParse(request.params);
+  const parsed = vmScheduleEnabledSchema.safeParse(request.body);
+  if (!params.success || !parsed.success) {
+    return reply.status(400).send({ message: "任务启停参数无效。" });
+  }
+  try {
+    const task = setVmScheduleEnabled(params.data.id, parsed.data.enabled);
+    if (!task) return reply.status(404).send({ message: "未找到定时任务。" });
+    return { task, runner: vmScheduleRunner.status() };
+  } catch (error) {
+    return reply.status(400).send({ message: toClientErrorMessage(error, "更新任务状态失败") });
+  }
+});
+
+server.delete("/api/vm-schedules/:id", async (request, reply) => {
+  const params = vmScheduleIdSchema.safeParse(request.params);
+  if (!params.success) return reply.status(400).send({ message: "任务 ID 无效。" });
+  if (!deleteVmSchedule(params.data.id)) return reply.status(404).send({ message: "未找到定时任务。" });
+  return { deleted: true, id: params.data.id };
+});
+
 server.post("/api/metrics/snapshot", async (request, reply) => {
   const parsed = metricsSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -1166,7 +1461,7 @@ server.post("/api/metrics/snapshot", async (request, reply) => {
       targetType: parsed.data.targetType,
       targetIds: parsed.data.targetIds,
     });
-    if (resolved.connectionId) markConnectionUsed(resolved.connectionId);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return {
       collectedAt: new Date().toISOString(),
       samples,
@@ -1185,7 +1480,12 @@ registerWebStaticRoutes();
 const port = Number(process.env.PORT ?? 3987);
 const host = process.env.HOST ?? "0.0.0.0";
 
+server.addHook("onClose", async () => {
+  vmScheduleRunner.stop();
+});
 await server.listen({ host, port });
+vmScheduleRunner.start();
+void refreshVmScheduleTargetCache().catch((error) => server.log.warn({ error }, "vm schedule target cache warmup failed"));
 
 function registerWebStaticRoutes() {
   const webDistDir = resolveWebDistDir();
@@ -1290,6 +1590,7 @@ function contentTypeForFile(filePath: string) {
   const ext = path.extname(filePath).toLowerCase();
   const contentTypes: Record<string, string> = {
     ".css": "text/css; charset=utf-8",
+    ".crx": "application/x-chrome-extension",
     ".html": "text/html; charset=utf-8",
     ".ico": "image/x-icon",
     ".js": "text/javascript; charset=utf-8",
@@ -1301,6 +1602,7 @@ function contentTypeForFile(filePath: string) {
     ".webp": "image/webp",
     ".woff": "font/woff",
     ".woff2": "font/woff2",
+    ".xml": "application/xml; charset=utf-8",
   };
   return contentTypes[ext] ?? "application/octet-stream";
 }
@@ -1352,7 +1654,7 @@ function resolveConnectionRequest(input: z.infer<typeof connectionSchema>): {
   connection: XenConnectionInput;
 } {
   if (input.connectionId) {
-    const stored = resolveStoredConnection(input.connectionId);
+    const stored = resolveEphemeralConnection(input.connectionId) ?? resolveStoredConnection(input.connectionId);
     return {
       connectionId: input.connectionId,
       providerType: stored.providerType,
@@ -1368,6 +1670,157 @@ function resolveConnectionRequest(input: z.infer<typeof connectionSchema>): {
     providerType: input.providerType,
     connection: toConnection(input),
   };
+}
+
+async function listVmScheduleTargets(): Promise<{
+  targets: VmScheduleTarget[];
+  errors: Array<{ connectionId: string; connectionName?: string; message: string }>;
+}> {
+  const cacheAge = Date.now() - vmScheduleTargetCacheUpdatedAt;
+  if (vmScheduleTargetCache && cacheAge < vmScheduleTargetCacheTtlMs) return vmScheduleTargetCache;
+  if (vmScheduleTargetCache) {
+    void refreshVmScheduleTargetCache().catch((error) => server.log.warn({ error }, "vm schedule target cache refresh failed"));
+    return vmScheduleTargetCache;
+  }
+  return refreshVmScheduleTargetCache();
+}
+
+function refreshVmScheduleTargetCache() {
+  if (vmScheduleTargetRefreshJob) return vmScheduleTargetRefreshJob;
+  const cacheVersion = vmScheduleTargetCacheVersion;
+  vmScheduleTargetRefreshJob = loadVmScheduleTargets()
+    .then((result) => {
+      if (cacheVersion === vmScheduleTargetCacheVersion) {
+        vmScheduleTargetCache = result;
+        vmScheduleTargetCacheUpdatedAt = Date.now();
+      }
+      return result;
+    })
+    .finally(() => {
+      vmScheduleTargetRefreshJob = undefined;
+    });
+  return vmScheduleTargetRefreshJob;
+}
+
+function invalidateVmScheduleTargetCache() {
+  vmScheduleTargetCacheVersion += 1;
+  vmScheduleTargetCache = undefined;
+  vmScheduleTargetCacheUpdatedAt = 0;
+}
+
+async function loadVmScheduleTargets(): Promise<{
+  targets: VmScheduleTarget[];
+  errors: Array<{ connectionId: string; connectionName?: string; message: string }>;
+}> {
+  const connections = listStoredConnections();
+  const results = await mapWithConcurrency(connections, 8, async (summary) => {
+    try {
+      const stored = resolveStoredConnection(summary.id);
+      const provider = providers.get(stored.providerType);
+      const connection: XenConnectionInput = {
+        host: stored.host,
+        port: stored.port,
+        username: stored.username,
+        password: stored.password,
+      };
+      const [hosts, vms] = await Promise.all([
+        provider.listHosts(connection),
+        listAllProviderVms(provider, connection),
+      ]);
+      const hostsById = new Map(hosts.flatMap((host) => [[host.id, host], [host.providerId, host]]));
+      const onlyHost = hosts.length === 1 ? hosts[0] : undefined;
+      const targets = vms.map<VmScheduleTarget>((vm) => {
+        const matchedHost = vm.hostId ? hostsById.get(vm.hostId) : undefined;
+        const host = matchedHost ?? onlyHost;
+        const hostId = host?.providerId;
+        return {
+          vmId: vm.providerId || vm.id,
+          name: vm.name,
+          connectionId: summary.id,
+          providerType: summary.providerType,
+          connectionName: summary.name,
+          hostId,
+          hostName: host?.name,
+          ip: vm.ipAddresses[0],
+          guestOs: vm.guestOs,
+          powerState: vm.powerState,
+        };
+      });
+      return { targets, errors: [] as Array<{ connectionId: string; connectionName?: string; message: string }> };
+    } catch (error) {
+      return {
+        targets: [] as VmScheduleTarget[],
+        errors: [{
+          connectionId: summary.id,
+          connectionName: summary.name,
+          message: toClientErrorMessage(error, "读取虚拟机目录失败"),
+        }],
+      };
+    }
+  });
+  return {
+    targets: results
+      .flatMap((result) => result.targets)
+      .sort((left, right) =>
+        (left.connectionName ?? "").localeCompare(right.connectionName ?? "", "zh-CN", { numeric: true, sensitivity: "base" }) ||
+        (left.hostName ?? "").localeCompare(right.hostName ?? "", "zh-CN", { numeric: true, sensitivity: "base" }) ||
+        left.name.localeCompare(right.name, "zh-CN", { numeric: true, sensitivity: "base" }),
+      ),
+    errors: results.flatMap((result) => result.errors),
+  };
+}
+
+function validateVmScheduleConnections(input: UpsertVmScheduleInput): UpsertVmScheduleInput {
+  const primaryConnection = resolveStoredConnection(input.connectionId);
+  if (primaryConnection.providerType !== input.providerType) {
+    throw new Error("任务平台与主保存连接的平台不一致，请刷新后重试。");
+  }
+  const connectionCache = new Map([[primaryConnection.id, primaryConnection]]);
+  const targets = input.targets.map((target) => {
+    const explicitConnectionId = target.connectionId?.trim();
+    const connectionId = explicitConnectionId || input.connectionId;
+    let stored = connectionCache.get(connectionId);
+    if (!stored) {
+      stored = resolveStoredConnection(connectionId);
+      connectionCache.set(connectionId, stored);
+    }
+    if (target.providerType && target.providerType !== stored.providerType) {
+      throw new Error(`虚拟机“${target.name}”的平台类型与保存连接“${stored.name}”不一致。`);
+    }
+    const usesPrimaryConnection = connectionId === input.connectionId;
+    return {
+      ...target,
+      connectionId,
+      providerType: stored.providerType,
+      connectionName: stored.name,
+      hostId: target.hostId?.trim() || (usesPrimaryConnection ? input.hostId?.trim() : undefined),
+      hostName: target.hostName?.trim() || (usesPrimaryConnection ? input.hostName?.trim() : undefined),
+    };
+  });
+  return {
+    ...input,
+    connectionName: primaryConnection.name,
+    targets,
+  };
+}
+
+async function listAllProviderVms(
+  provider: VirtualizationProvider<XenConnectionInput>,
+  connection: XenConnectionInput,
+): Promise<VmNode[]> {
+  const firstPage = await provider.listVms(connection, { page: 1, pageSize: 500 });
+  const items = [...firstPage.items];
+  const pageCount = Math.ceil(firstPage.total / firstPage.pageSize);
+  for (let page = 2; page <= pageCount; page += 1) {
+    const nextPage = await provider.listVms(connection, { page, pageSize: firstPage.pageSize });
+    items.push(...nextPage.items);
+  }
+  return items;
+}
+
+function markResolvedConnectionUsed(connectionId: string): void {
+  if (markEphemeralConnectionUsed(connectionId)) return;
+  markConnectionUsed(connectionId);
 }
 
 function toConnection(input: z.infer<typeof connectionSchema>): XenConnectionInput {
