@@ -7,6 +7,9 @@ docs/
 !docs/
 docs/*
 !docs/分发与打包策略.md
+!docs/ui-prototypes/
+docs/ui-prototypes/*
+!docs/ui-prototypes/vrc-chrome-extension-private-connections.html
 .DS_Store
 .env
 .env.*
@@ -31,4 +34,6 @@ connections*.json
 server*.json
 runtime-policy.json
 runtime-policy.local.json
+ip-pools.json
+ip-pools.local.json
 config/*.local.json

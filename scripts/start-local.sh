@@ -14,6 +14,19 @@ USER_DOMAIN="gui/$(id -u)"
 
 mkdir -p "$LOG_DIR"
 
+seed_ip_pools_config() {
+  local data_dir="$HOME/.virtual-resource-console"
+  local target_file="$data_dir/ip-pools.json"
+  local source_file="$ROOT_DIR/config/ip-pools.example.json"
+  if [[ -f "$target_file" ]]; then
+    return 0
+  fi
+  mkdir -p "$data_dir"
+  cp "$source_file" "$target_file"
+  chmod 600 "$target_file" 2>/dev/null || true
+  echo "IP 池默认配置已写入: $target_file"
+}
+
 is_running() {
   local pid_file="$1"
   [[ -f "$pid_file" ]] || return 1
@@ -92,6 +105,7 @@ is_usable_lan_ip() {
 }
 
 cd "$ROOT_DIR"
+seed_ip_pools_config
 lan_ip="$(detect_lan_ip)"
 
 write_api_launch_agent() {
@@ -104,6 +118,7 @@ plist_path, root_dir, log_dir = sys.argv[1:4]
 command = (
     f"cd {shlex.quote(root_dir)} && "
     f"HOST=0.0.0.0 PORT=3987 "
+    f"VRC_RUNTIME_MODE=web "
     "./node_modules/.bin/tsx apps/api/src/index.ts"
 )
 data = {
@@ -144,6 +159,7 @@ else
   lan_ip="$(detect_lan_ip)"
   export HOST="${HOST:-0.0.0.0}"
   export PORT="${PORT:-3987}"
+  export VRC_RUNTIME_MODE="${VRC_RUNTIME_MODE:-web}"
   nohup npm --workspace apps/api run dev:serve >"$LOG_DIR/api.log" 2>&1 &
   echo "$!" >"$API_PID_FILE"
   echo "API 已启动: $(cat "$API_PID_FILE")"

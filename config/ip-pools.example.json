@@ -1,0 +1,31 @@
+{
+  "defaultDns": ["1.1.1.1"],
+  "ipPools": [
+    {
+      "id": "pool-example-a",
+      "name": "203.0.113 专用网段",
+      "prefix": "203.0.113",
+      "gateway": "203.0.113.254",
+      "startHost": 20,
+      "endHost": 250,
+      "hostPrefixes": ["203.0.113"]
+    },
+    {
+      "id": "pool-example-b",
+      "name": "192.0.2 通用网段",
+      "prefix": "192.0.2",
+      "gateway": "192.0.2.254",
+      "startHost": 20,
+      "endHost": 250
+    },
+    {
+      "id": "pool-example-c",
+      "name": "198.51.100 通用网段",
+      "prefix": "198.51.100",
+      "gateway": "198.51.100.1",
+      "networkName": "Pool-wide network associated with eth1",
+      "startHost": 20,
+      "endHost": 250
+    }
+  ]
+}

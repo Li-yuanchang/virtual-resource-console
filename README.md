@@ -239,13 +239,14 @@ npm --workspace apps/api run build
 - `connections.json`：平台连接摘要和加密后的密码
 - `key.bin`：本机加密密钥
 - provisioning 配置、IP 租约、ISO 缓存和任务记录
-- `runtime-policy.json`：本机运行策略，例如 IP 白名单、默认 IP 池、DNS、口令模板和 XenServer 网卡映射
+- `runtime-policy.json`：本机运行识别策略，例如 IP 白名单、VM 名称转 IP、口令模板和 XenServer 网卡映射
+- `ip-pools.json`：本机 IP 池配置，例如默认 DNS、地址池、物理机网段匹配规则和可分配主机号
 
 这些文件属于本机运行数据，不应提交到 GitHub。
 
 ### 本机运行策略
 
-`runtime-policy.json` 用来放每个部署环境自己的策略。它不随仓库提交，适合保存内网网段、DNS、默认 IP 池、VM 名称转 IP 规则、root 初始口令模板、XenServer 网卡选择规则等本地口径。
+`runtime-policy.json` 只放运行识别和平台规则。它不随仓库提交，适合保存内网 IP 白名单、VM 名称转 IP 规则、root 初始口令模板、XenServer 网卡选择规则等本地口径。IP 池不放在这里，避免运行策略和地址池维护混在一起。
 
 默认读取路径：
 
@@ -267,7 +268,7 @@ chmod 600 ~/.virtual-resource-console/runtime-policy.json
 export VRC_RUNTIME_POLICY_FILE=/path/to/runtime-policy.json
 ```
 
-如果配置文件不存在或读取失败，系统会使用安全默认值继续启动，不会因为缺少该文件报错；只是不会带入你的现场网段、DNS、口令模板或网卡映射。
+如果配置文件不存在或读取失败，系统会使用安全默认值继续启动，不会因为缺少该文件报错；只是不会带入你的现场网段识别、口令模板或网卡映射。
 
 #### 配置示例
 
@@ -283,21 +284,7 @@ export VRC_RUNTIME_POLICY_FILE=/path/to/runtime-policy.json
     "hostOnlyPrefix": "192.0.2"
   },
   "provisioning": {
-    "defaultDns": ["1.1.1.1"],
-    "rootPasswordTemplate": "",
-    "providerIpPools": {
-      "xenserver": [
-        {
-          "id": "xenserver-example",
-          "name": "XenServer 示例网段",
-          "prefix": "192.0.2",
-          "gateway": "192.0.2.254",
-          "startHost": 20,
-          "endHost": 250,
-          "networkName": "VM Network"
-        }
-      ]
-    }
+    "rootPasswordTemplate": ""
   },
   "xenserver": {
     "networkDeviceRules": [
@@ -319,9 +306,7 @@ export VRC_RUNTIME_POLICY_FILE=/path/to/runtime-policy.json
 | `ipInference.shortIpBasePrefix` | 短 IP 推断的前两段，例如 `192.0` |
 | `ipInference.shortIpThirdOctets` | 允许识别的第三段，例如名称里出现 `2.111` 时可推断为 `192.0.2.111` |
 | `ipInference.hostOnlyPrefix` | 只有主机号时使用的前三段，例如名称 `111-test` 可推断为 `192.0.2.111` |
-| `provisioning.defaultDns` | 创建 VM 时 IP 池默认 DNS |
 | `provisioning.rootPasswordTemplate` | 初始 root 口令模板；为空时不自动生成 root 口令 |
-| `provisioning.providerIpPools` | 各 Provider 的默认 IP 池，key 支持 `xenserver`、`vmware`、`proxmox`、`libvirt` |
 | `xenserver.networkDeviceRules` | XenServer 创建 VM 时按 IP 前缀选择 PIF 设备 |
 
 `rootPasswordTemplate` 支持以下占位符：
@@ -334,6 +319,61 @@ export VRC_RUNTIME_POLICY_FILE=/path/to/runtime-policy.json
 | `{fourth}` | IP 第四段 |
 | `{ip}` | 完整 IP |
 
+### 本机 IP 池配置
+
+`ip-pools.json` 只放地址池。创建、安装、租约等功能可以读取它，但这个文件本身不承载那些流程。
+
+默认读取路径：
+
+```text
+~/.virtual-resource-console/ip-pools.json
+```
+
+这是强制配置。API 不再兼容旧 `providerIpPools`，也不会在文件缺失时静默使用内置兜底；缺少文件或格式不正确会直接报错。首次使用可以复制仓库里的示例文件：
+
+```bash
+mkdir -p ~/.virtual-resource-console
+cp config/ip-pools.example.json ~/.virtual-resource-console/ip-pools.json
+chmod 600 ~/.virtual-resource-console/ip-pools.json
+```
+
+Electron 桌面包会随包携带 `config/ip-pools.example.json` 并在首次启动时复制为用户目录的 `ip-pools.json`；服务器、Docker 或裸 Node 部署需要在部署步骤里显式放好这个文件。
+
+也可以通过环境变量指定其它路径：
+
+```bash
+export VRC_IP_POOLS_FILE=/path/to/ip-pools.json
+```
+
+配置示例：
+
+```json
+{
+  "defaultDns": ["1.1.1.1"],
+  "ipPools": [
+    {
+      "id": "pool-example-a",
+      "name": "203.0.113 专用网段",
+      "prefix": "203.0.113",
+      "gateway": "203.0.113.254",
+      "startHost": 20,
+      "endHost": 250,
+      "hostPrefixes": ["203.0.113"]
+    },
+    {
+      "id": "pool-example-b",
+      "name": "192.0.2 通用网段",
+      "prefix": "192.0.2",
+      "gateway": "192.0.2.254",
+      "startHost": 20,
+      "endHost": 250
+    }
+  ]
+}
+```
+
+默认选择规则很轻：当前物理机 IP 前三段命中 `hostPrefixes` 时，该 IP 池排在第一位并默认选中；没有命中的专用池不会被隐藏，用户仍可手动切换。没有 `hostPrefixes` 的池是通用池。
+
 IP 池字段说明：
 
 | 字段 | 说明 |
@@ -342,14 +382,15 @@ IP 池字段说明：
 | `name` | 页面展示名称 |
 | `prefix` | 网段前三段，例如 `192.0.2` |
 | `gateway` | 网关地址 |
-| `dns` | 可选；不填时使用 `provisioning.defaultDns` |
+| `dns` | 可选；不填时使用 `defaultDns` |
 | `startHost` / `endHost` | 可分配主机号范围 |
+| `hostPrefixes` | 可选；适用的物理机 IP 前三段，例如 `203.0.113`；不填表示通用池 |
 | `networkName` | 可选；创建 VM 时优先使用指定网络 / VLAN / PortGroup |
 | `vlan` | 可选；用于页面展示和后续扩展 |
 
 #### 配置生效方式
 
-`runtime-policy.json` 由 API 进程启动后读取。修改后建议重启本地服务：
+`runtime-policy.json` 和 `ip-pools.json` 都由 API 进程启动后读取。修改后建议重启本地服务：
 
 ```bash
 npm run local:stop
@@ -400,6 +441,8 @@ XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进�
 | 资源清单 | `POST /api/inventory/pools`, `POST /api/inventory/hosts`, `POST /api/inventory/vms` |
 | 存储与 ISO | `POST /api/inventory/virtual-disks`, `POST /api/inventory/iso-images` |
 | VM 操作 | `POST /api/vms/action` |
+| VM 改名 | `POST /api/vms/rename` |
+| VM 定时任务 | `GET /api/vm-schedules`, `POST /api/vm-schedules`, `PUT /api/vm-schedules/:id`, `PATCH /api/vm-schedules/:id/enabled`, `DELETE /api/vm-schedules/:id` |
 | 指标快照 | `POST /api/metrics/snapshot` |
 | 创建 VM | `POST /api/provisioning/preflight`, `POST /api/provisioning/vms` |
 | 创建任务 | `GET /api/provisioning/tasks`, `GET /api/provisioning/tasks/:taskId` |

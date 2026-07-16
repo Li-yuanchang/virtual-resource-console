@@ -7,50 +7,7 @@
     "hostOnlyPrefix": "192.0.2"
   },
   "provisioning": {
-    "defaultDns": ["1.1.1.1"],
-    "rootPasswordTemplate": "",
-    "providerIpPools": {
-      "xenserver": [
-        {
-          "id": "xenserver-example",
-          "name": "XenServer 示例网段",
-          "prefix": "192.0.2",
-          "gateway": "192.0.2.254",
-          "startHost": 20,
-          "endHost": 250
-        }
-      ],
-      "vmware": [
-        {
-          "id": "vmware-example",
-          "name": "VMware 示例网段",
-          "prefix": "192.0.2",
-          "gateway": "192.0.2.254",
-          "startHost": 20,
-          "endHost": 250
-        }
-      ],
-      "proxmox": [
-        {
-          "id": "proxmox-example",
-          "name": "Proxmox 示例网段",
-          "prefix": "192.0.2",
-          "gateway": "192.0.2.254",
-          "startHost": 20,
-          "endHost": 250
-        }
-      ],
-      "libvirt": [
-        {
-          "id": "libvirt-example",
-          "name": "KVM 示例网段",
-          "prefix": "192.0.2",
-          "gateway": "192.0.2.254",
-          "startHost": 20,
-          "endHost": 250
-        }
-      ]
-    }
+    "rootPasswordTemplate": ""
   },
   "xenserver": {
     "networkDeviceRules": [
