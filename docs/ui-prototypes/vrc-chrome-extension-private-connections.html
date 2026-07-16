@@ -1,0 +1,1362 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VRC Chrome 插件私密连接原型</title>
+    <style>
+      :root {
+        --vrc-bg: #eceee8;
+        --vrc-surface: #fbfbf7;
+        --vrc-surface-2: #eef1e8;
+        --vrc-surface-3: #e6eadf;
+        --vrc-border: #d9ded0;
+        --vrc-border-strong: #c5cdbb;
+        --vrc-text: #27302a;
+        --vrc-muted: #747b70;
+        --vrc-subtle: #9aa193;
+        --vrc-accent: #426b57;
+        --vrc-accent-hover: #315743;
+        --vrc-accent-soft: #e5eee6;
+        --vrc-info: #4d6f73;
+        --vrc-success: #477a45;
+        --vrc-warning: #b77935;
+        --vrc-danger: #a5483d;
+        --vrc-shadow: 0 16px 38px rgba(54, 63, 48, 0.13);
+        color: var(--vrc-text);
+        background: var(--vrc-bg);
+        font-family:
+          Aptos, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+          -apple-system, BlinkMacSystemFont, sans-serif;
+        font-size: 13px;
+        font-synthesis: none;
+        text-rendering: optimizeLegibility;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--vrc-bg);
+      }
+
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      .prototype-page {
+        display: grid;
+        gap: 18px;
+        width: min(100%, 1680px);
+        margin: 0 auto;
+        padding: clamp(14px, 2vw, 28px);
+      }
+
+      .prototype-head {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      .prototype-head h1 {
+        margin: 0;
+        color: var(--vrc-text);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: 0;
+      }
+
+      .prototype-head p {
+        max-width: 860px;
+        margin: 6px 0 0;
+        color: var(--vrc-muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .prototype-meta {
+        color: var(--vrc-muted);
+        font-size: 12px;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .board {
+        overflow: hidden;
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 12px;
+        box-shadow: var(--vrc-shadow);
+      }
+
+      .app-frame {
+        display: grid;
+        grid-template-columns: 238px minmax(0, 1fr);
+        min-height: 820px;
+      }
+
+      .sidebar {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        background: var(--vrc-surface);
+        border-right: 1px solid var(--vrc-border);
+      }
+
+      .sidebar-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        min-height: 66px;
+        padding: 14px;
+        border-bottom: 1px solid var(--vrc-border);
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 34px;
+        height: 30px;
+        color: var(--vrc-surface);
+        background: var(--vrc-accent);
+        border: 1px solid color-mix(in srgb, var(--vrc-accent-hover) 64%, var(--vrc-border));
+        border-radius: 8px;
+        box-shadow:
+          inset 0 1px 0 color-mix(in srgb, var(--vrc-surface) 24%, transparent),
+          0 6px 14px color-mix(in srgb, var(--vrc-accent) 16%, transparent);
+        font-size: 11px;
+        font-weight: 600;
+      }
+
+      .brand-title {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .brand-title strong {
+        overflow: hidden;
+        color: var(--vrc-text);
+        font-size: 13px;
+        font-weight: 500;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .brand-title span {
+        color: var(--vrc-muted);
+        font-size: 11px;
+      }
+
+      .sidebar-status {
+        display: grid;
+        gap: 8px;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--vrc-border);
+      }
+
+      .health-line {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .health-line strong {
+        overflow: hidden;
+        font-size: 12px;
+        font-weight: 400;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .health-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: var(--vrc-success);
+        box-shadow: 0 0 0 4px rgba(71, 122, 69, 0.14);
+      }
+
+      .health-text {
+        margin: 0;
+        color: var(--vrc-muted);
+        font-size: 11px;
+        line-height: 1.45;
+      }
+
+      .sidebar-section {
+        display: grid;
+        gap: 8px;
+        padding: 14px;
+      }
+
+      .sidebar-section-title {
+        color: var(--vrc-muted);
+        font-size: 11px;
+      }
+
+      .nav-list {
+        display: grid;
+        gap: 4px;
+      }
+
+      .nav-item {
+        display: grid;
+        grid-template-columns: 18px minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
+        min-height: 34px;
+        padding: 0 8px;
+        color: var(--vrc-muted);
+        background: transparent;
+        border: 0;
+        border-radius: 8px;
+        text-align: left;
+      }
+
+      .nav-item:hover,
+      .nav-item.active {
+        color: var(--vrc-accent);
+        background: var(--vrc-accent-soft);
+      }
+
+      .nav-item strong {
+        overflow: hidden;
+        color: inherit;
+        font-size: 12px;
+        font-weight: 400;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .nav-count {
+        color: var(--vrc-subtle);
+        font-size: 11px;
+      }
+
+      .svg-icon {
+        display: block;
+        width: 16px;
+        height: 16px;
+        fill: none;
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 1.7;
+      }
+
+      .icon-button,
+      .toolbar-icon {
+        display: grid;
+        place-items: center;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        color: var(--vrc-muted);
+        background: transparent;
+        border: 0;
+        border-radius: 7px;
+      }
+
+      .icon-button:hover,
+      .toolbar-icon:hover,
+      .toolbar-icon.active {
+        color: var(--vrc-accent);
+        background: var(--vrc-accent-soft);
+      }
+
+      .main {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        background: var(--vrc-bg);
+      }
+
+      .topbar {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 14px;
+        align-items: center;
+        min-height: 66px;
+        padding: 12px 16px;
+        background: var(--vrc-surface);
+        border-bottom: 1px solid var(--vrc-border);
+      }
+
+      .title-block {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
+      }
+
+      .title-block strong {
+        overflow: hidden;
+        font-size: 16px;
+        font-weight: 600;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .title-block span {
+        overflow: hidden;
+        color: var(--vrc-muted);
+        font-size: 12px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .topbar-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        height: 30px;
+        padding: 0 10px;
+        color: var(--vrc-text);
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 7px;
+        font-size: 12px;
+        font-weight: 400;
+        line-height: 30px;
+      }
+
+      .button:hover {
+        color: var(--vrc-accent);
+        border-color: var(--vrc-border-strong);
+      }
+
+      .button.primary {
+        color: var(--vrc-surface);
+        background: var(--vrc-accent);
+        border-color: var(--vrc-accent);
+      }
+
+      .button.primary:hover {
+        color: var(--vrc-surface);
+        background: var(--vrc-accent-hover);
+      }
+
+      .content {
+        display: grid;
+        gap: 12px;
+        padding: 14px;
+      }
+
+      .settings-layout {
+        display: grid;
+        grid-template-columns: 178px minmax(0, 1fr);
+        gap: 12px;
+        align-items: start;
+      }
+
+      .settings-nav {
+        display: grid;
+        gap: 6px;
+        padding: 8px;
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 9px;
+      }
+
+      .settings-nav button {
+        display: grid;
+        grid-template-columns: 18px minmax(0, 1fr);
+        gap: 8px;
+        align-items: center;
+        min-height: 34px;
+        padding: 0 9px;
+        color: var(--vrc-muted);
+        background: transparent;
+        border: 0;
+        border-radius: 8px;
+        text-align: left;
+      }
+
+      .settings-nav button:hover,
+      .settings-nav button.active {
+        color: var(--vrc-accent);
+        background: var(--vrc-accent-soft);
+      }
+
+      .settings-nav span {
+        overflow: hidden;
+        font-size: 12px;
+        font-weight: 400;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .settings-content {
+        display: grid;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .runtime-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .runtime-card {
+        display: grid;
+        gap: 6px;
+        min-width: 0;
+        padding: 10px;
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 8px;
+      }
+
+      .runtime-card.active {
+        border-color: color-mix(in srgb, var(--vrc-accent) 42%, var(--vrc-border));
+        background: color-mix(in srgb, var(--vrc-accent-soft) 54%, var(--vrc-surface));
+      }
+
+      .runtime-card strong,
+      .runtime-card span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .runtime-card strong {
+        font-size: 12px;
+        font-weight: 400;
+      }
+
+      .runtime-card span {
+        color: var(--vrc-muted);
+        font-size: 11px;
+      }
+
+      .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .metric-card {
+        display: grid;
+        gap: 5px;
+        min-width: 0;
+        padding: 12px;
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 8px;
+      }
+
+      .metric-card span {
+        color: var(--vrc-muted);
+        font-size: 11px;
+      }
+
+      .metric-card strong {
+        overflow: hidden;
+        color: var(--vrc-text);
+        font-size: 14px;
+        font-weight: 600;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .metric-card small {
+        overflow: hidden;
+        color: var(--vrc-subtle);
+        font-size: 11px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .work-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 390px;
+        gap: 12px;
+      }
+
+      .panel {
+        min-width: 0;
+        overflow: hidden;
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 9px;
+      }
+
+      .panel-head,
+      .table-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 44px;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--vrc-border);
+      }
+
+      .panel-head .topbar-actions {
+        gap: 6px;
+      }
+
+      .panel-head .topbar-actions .button {
+        height: 28px;
+        min-height: 28px;
+        min-width: 74px;
+        padding: 0 9px;
+        font-size: 12px;
+        line-height: 28px;
+      }
+
+      .panel-title {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .panel-title strong {
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .panel-title span {
+        color: var(--vrc-muted);
+        font-size: 11px;
+      }
+
+      .panel-body {
+        padding: 12px;
+      }
+
+      .segmented {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        height: 28px;
+        min-height: 28px;
+        padding: 2px;
+        background: var(--vrc-surface-2);
+        border: 1px solid var(--vrc-border);
+        border-radius: 7px;
+      }
+
+      .segmented button {
+        height: 22px;
+        min-height: 22px;
+        padding: 0 9px;
+        color: var(--vrc-muted);
+        background: transparent;
+        border: 0;
+        border-radius: 5px;
+        font-size: 12px;
+        font-weight: 400;
+        line-height: 22px;
+      }
+
+      .segmented button.active {
+        color: var(--vrc-text);
+        background: var(--vrc-surface);
+        box-shadow: 0 1px 0 rgba(44, 54, 42, 0.08);
+        font-weight: 400;
+      }
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px 10px;
+      }
+
+      .service-form {
+        grid-template-columns: 118px minmax(0, 1fr) 120px;
+      }
+
+      .field {
+        display: grid;
+        gap: 5px;
+        min-width: 0;
+      }
+
+      .field.span-2 {
+        grid-column: span 2;
+      }
+
+      .field.span-4 {
+        grid-column: 1 / -1;
+      }
+
+      label {
+        color: var(--vrc-muted);
+        font-size: 11px;
+      }
+
+      input,
+      select {
+        width: 100%;
+        min-width: 0;
+        height: 28px;
+        min-height: 28px;
+        padding: 0 9px;
+        color: var(--vrc-text);
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 7px;
+        outline: none;
+        font-size: 12px;
+        line-height: 28px;
+      }
+
+      input:focus,
+      select:focus {
+        border-color: color-mix(in srgb, var(--vrc-accent) 54%, var(--vrc-border));
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--vrc-accent) 15%, transparent);
+      }
+
+      .table-wrap {
+        overflow: hidden;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+      }
+
+      th,
+      td {
+        height: 42px;
+        padding: 0 10px;
+        border-bottom: 1px solid var(--vrc-border);
+        text-align: left;
+        vertical-align: middle;
+      }
+
+      th {
+        color: var(--vrc-muted);
+        background: var(--vrc-surface-2);
+        font-size: 11px;
+        font-weight: 500;
+      }
+
+      td {
+        overflow: hidden;
+        color: var(--vrc-text);
+        font-size: 12px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      tr:hover td {
+        background: color-mix(in srgb, var(--vrc-accent-soft) 45%, var(--vrc-surface));
+      }
+
+      .connection-name {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .connection-name strong,
+      .connection-name span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .connection-name strong {
+        font-weight: 400;
+      }
+
+      .connection-name span {
+        color: var(--vrc-muted);
+        font-size: 11px;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+        height: 22px;
+        max-width: 100%;
+        padding: 0;
+        color: var(--vrc-accent);
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+        font-size: 11px;
+        line-height: 22px;
+        white-space: nowrap;
+      }
+
+      .status-pill.warning {
+        color: var(--vrc-warning);
+        background: transparent;
+      }
+
+      .status-pill.danger {
+        color: var(--vrc-danger);
+        background: transparent;
+      }
+
+      .status-pill i {
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: currentColor;
+      }
+
+      .side-stack {
+        display: grid;
+        gap: 12px;
+      }
+
+      .popup-preview {
+        width: 350px;
+        max-width: 100%;
+        margin: 0 auto;
+        overflow: hidden;
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border-strong);
+        border-radius: 10px;
+        box-shadow: 0 18px 42px rgba(54, 63, 48, 0.16);
+      }
+
+      .popup-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        min-height: 54px;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--vrc-border);
+      }
+
+      .popup-body {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .popup-actions {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 8px;
+      }
+
+      .flow-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .flow-step {
+        display: grid;
+        grid-template-columns: 22px minmax(0, 1fr);
+        gap: 9px;
+        min-width: 0;
+        padding: 9px;
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 8px;
+      }
+
+      .flow-index {
+        display: grid;
+        place-items: center;
+        width: 22px;
+        height: 22px;
+        color: var(--vrc-surface);
+        background: var(--vrc-accent);
+        border-radius: 6px;
+        font-size: 11px;
+        font-weight: 600;
+      }
+
+      .flow-step strong {
+        display: block;
+        overflow: hidden;
+        margin-bottom: 2px;
+        font-size: 12px;
+        font-weight: 400;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .flow-step span {
+        display: block;
+        color: var(--vrc-muted);
+        font-size: 11px;
+        line-height: 1.45;
+      }
+
+      .session-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .session-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
+        padding: 9px;
+        background: var(--vrc-surface);
+        border: 1px solid var(--vrc-border);
+        border-radius: 8px;
+      }
+
+      .session-row strong,
+      .session-row span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .session-row strong {
+        display: block;
+        font-size: 12px;
+        font-weight: 400;
+      }
+
+      .session-row span {
+        display: block;
+        margin-top: 2px;
+        color: var(--vrc-muted);
+        font-size: 11px;
+      }
+
+      .notice {
+        display: grid;
+        gap: 6px;
+        padding: 10px;
+        color: #604222;
+        background: #fbf1df;
+        border: 1px solid #ead8b7;
+        border-radius: 8px;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .notice strong {
+        color: #52381f;
+        font-weight: 600;
+      }
+
+      .mini-code {
+        overflow: auto;
+        margin: 0;
+        padding: 10px;
+        color: #dbe6dd;
+        background: #26342c;
+        border-radius: 8px;
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.55;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      @media (max-width: 1160px) {
+        .app-frame,
+        .settings-layout,
+        .work-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .sidebar {
+          border-right: 0;
+          border-bottom: 1px solid var(--vrc-border);
+        }
+
+        .metric-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .runtime-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 720px) {
+        .prototype-head,
+        .topbar {
+          grid-template-columns: 1fr;
+        }
+
+        .prototype-head {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .prototype-meta {
+          text-align: left;
+        }
+
+        .form-grid,
+        .runtime-grid,
+        .metric-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .field.span-2,
+        .field.span-4 {
+          grid-column: auto;
+        }
+
+        .topbar {
+          display: flex;
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="prototype-page">
+      <header class="prototype-head">
+        <div>
+          <h1>设置 / Chrome 插件配置原型</h1>
+          <p>统一从资源控制台左侧齿轮进入设置；Chrome 插件只是设置分组之一，和 Web、macOS、Windows 客户端配置明确区分。</p>
+        </div>
+        <div class="prototype-meta">VRC · Settings / Chrome Extension · 2026-07-16</div>
+      </header>
+
+      <section class="board">
+        <div class="app-frame">
+          <aside class="sidebar">
+            <div class="sidebar-head">
+              <div class="brand">
+                <div class="brand-mark">VRC</div>
+                <div class="brand-title">
+                  <strong>资源控制台</strong>
+                  <span>16 个连接</span>
+                </div>
+              </div>
+              <button class="icon-button active" type="button" aria-label="设置">
+                <svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" /><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9a1.7 1.7 0 0 0 .6 1 1.7 1.7 0 0 0 1.1.4H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15Z" /></svg>
+              </button>
+            </div>
+
+            <div class="sidebar-section">
+              <div class="field">
+                <input value="" placeholder="输入名称、平台或地址" />
+              </div>
+            </div>
+
+            <div class="sidebar-section">
+              <div class="sidebar-section-title">资源</div>
+              <div class="nav-list">
+                <button class="nav-item" type="button">
+                  <span class="health-dot"></span>
+                  <strong>资源总览</strong>
+                  <span class="nav-count">总</span>
+                </button>
+                <button class="nav-item" type="button">
+                  <span class="health-dot"></span>
+                  <strong>xenserver-1</strong>
+                  <span class="nav-count">22</span>
+                </button>
+                <button class="nav-item" type="button">
+                  <span class="health-dot"></span>
+                  <strong>kunpeng920</strong>
+                  <span class="nav-count">8006</span>
+                </button>
+                <button class="nav-item active" type="button">
+                  <svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" /><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9a1.7 1.7 0 0 0 .6 1 1.7 1.7 0 0 0 1.1.4H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15Z" /></svg>
+                  <strong>设置</strong>
+                  <span class="nav-count">开</span>
+                </button>
+              </div>
+            </div>
+          </aside>
+
+          <section class="main">
+            <header class="topbar">
+              <div class="title-block">
+                <strong>设置 / Chrome 插件</strong>
+                <span>从左侧统一设置入口进入；该页只管理浏览器插件运行方式，不混入 Web、macOS、Windows 客户端配置。</span>
+              </div>
+              <div class="topbar-actions">
+                <button class="button" type="button">返回总览</button>
+                <button class="button" type="button">检测服务</button>
+                <button class="button primary" type="button">保存设置</button>
+              </div>
+            </header>
+
+            <div class="content">
+              <div class="settings-layout">
+                <aside class="settings-nav" aria-label="设置分组">
+                  <button type="button"><svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 3v18" /><path d="M3 12h18" /></svg><span>外观</span></button>
+                  <button type="button"><svg class="svg-icon" viewBox="0 0 24 24"><path d="M5 12h14" /><path d="M12 5v14" /></svg><span>连接</span></button>
+                  <button type="button"><svg class="svg-icon" viewBox="0 0 24 24"><path d="M4 5h16v14H4z" /><path d="M8 9h8" /></svg><span>创建模板</span></button>
+                  <button class="active" type="button"><svg class="svg-icon" viewBox="0 0 24 24"><path d="M4 5h16v14H4z" /><path d="M8 17h8" /><path d="M12 13v4" /></svg><span>Chrome 插件</span></button>
+                  <button type="button"><svg class="svg-icon" viewBox="0 0 24 24"><path d="M6 4h12v16H6z" /><path d="M9 8h6" /><path d="M9 12h6" /></svg><span>日志</span></button>
+                </aside>
+
+                <section class="settings-content">
+                  <div class="runtime-grid">
+                    <div class="runtime-card"><strong>Web</strong><span>浏览器直连 VRC API；不保存本地插件连接库</span></div>
+                    <div class="runtime-card"><strong>macOS 客户端</strong><span>Electron 内置 API / Web / Node runtime</span></div>
+                    <div class="runtime-card"><strong>Windows 客户端</strong><span>Electron 安装包；独立窗口和日志路径</span></div>
+                    <div class="runtime-card active"><strong>Chrome 插件</strong><span>只管理插件地址、本地密文连接和临时会话</span></div>
+                  </div>
+
+                  <div class="metric-grid">
+                    <div class="metric-card">
+                      <span>插件后端</span>
+                      <strong>可配置</strong>
+                      <small>host + port 写入 chrome.storage.local</small>
+                    </div>
+                    <div class="metric-card">
+                      <span>插件连接保存</span>
+                      <strong>浏览器本地</strong>
+                      <small>AES-GCM 密文；不使用 sync</small>
+                    </div>
+                    <div class="metric-card">
+                      <span>VRC API 凭据</span>
+                      <strong>不落盘</strong>
+                      <small>ephemeral connection TTL 30 分钟</small>
+                    </div>
+                    <div class="metric-card">
+                      <span>用户系统</span>
+                      <strong>暂不需要</strong>
+                      <small>除非后台保存多人连接信息</small>
+                    </div>
+                  </div>
+
+                  <div class="panel">
+                    <div class="panel-head">
+                      <div class="panel-title">
+                        <strong>Chrome 插件配置项</strong>
+                        <span>设置入口统一，但配置口径和 Web / macOS / Windows 分开</span>
+                      </div>
+                      <div class="segmented">
+                        <button class="plugin-tab active" type="button" data-tab="service">服务地址</button>
+                        <button class="plugin-tab" type="button" data-tab="vault">本地连接库</button>
+                        <button class="plugin-tab" type="button" data-tab="sessions">临时会话</button>
+                        <button class="plugin-tab" type="button" data-tab="prototype">弹窗预览</button>
+                      </div>
+                    </div>
+                    <div class="panel-body">
+                      <section id="service-tab" class="tab-panel">
+                        <div class="work-grid">
+                  <div class="panel">
+                    <div class="panel-head">
+                      <div class="panel-title">
+                        <strong>VRC API 服务</strong>
+                        <span>插件只保存入口地址，资源能力仍由后台执行</span>
+                      </div>
+                      <div class="topbar-actions">
+                        <div class="segmented">
+                          <button class="active" type="button">内网</button>
+                          <button type="button">本机</button>
+                        </div>
+                        <button class="button" type="button">检测</button>
+                        <button class="button primary" type="button">保存地址</button>
+                      </div>
+                    </div>
+                    <div class="panel-body">
+                      <div class="form-grid service-form">
+                        <div class="field">
+                          <label for="scheme">协议</label>
+                          <select id="scheme">
+                            <option>http</option>
+                            <option>https</option>
+                          </select>
+                        </div>
+                        <div class="field">
+                          <label for="host">服务地址</label>
+                          <input id="host" value="vrc-server" spellcheck="false" />
+                        </div>
+                        <div class="field">
+                          <label for="port">端口</label>
+                          <input id="port" value="3987" inputmode="numeric" />
+                        </div>
+                        <div class="field span-4">
+                          <label for="baseUrl">完整 Base URL</label>
+                          <input id="baseUrl" value="http://vrc-server:3987" spellcheck="false" />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <aside class="side-stack">
+                    <div class="panel">
+                      <div class="panel-head">
+                        <div class="panel-title">
+                          <strong>为什么不能只部署 nginx</strong>
+                          <span>nginx 不是 VRC 后端</span>
+                        </div>
+                      </div>
+                      <div class="panel-body">
+                        <div class="notice">
+                          <strong>边界：</strong>
+                          nginx 只能做 HTTPS、反向代理和访问控制；XenAPI、控制台 WebSocket、临时连接会话仍必须由 VRC API 处理。
+                        </div>
+                      </div>
+                    </div>
+                    <pre class="mini-code">POST /api/ephemeral-connections
+GET  /api/inventory/*
+WS   /api/console/*
+
+connectionStore: disabled
+sessionStore: memory ttl=30m</pre>
+                  </aside>
+                </div>
+              </section>
+
+              <section id="vault-tab" class="tab-panel hidden">
+                <div class="work-grid">
+                  <div class="panel">
+                    <div class="table-toolbar">
+                      <div class="panel-title">
+                        <strong>本地连接库</strong>
+                        <span>连接信息只在当前浏览器本地保存</span>
+                      </div>
+                      <button class="button primary" type="button" id="add-row">新增连接</button>
+                    </div>
+                    <div class="table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th style="width: 31%">名称</th>
+                            <th style="width: 14%">平台</th>
+                            <th style="width: 23%">Host</th>
+                            <th style="width: 16%">存储</th>
+                            <th style="width: 16%">状态</th>
+                          </tr>
+                        </thead>
+                        <tbody id="connection-body">
+                          <tr>
+                            <td><div class="connection-name"><strong>XenServer 生产池</strong><span>root · 最近使用 2 分钟前</span></div></td>
+                            <td>XenServer</td>
+                            <td>10.12.8.21</td>
+                            <td>local encrypted</td>
+                            <td><span class="status-pill"><i></i>可用</span></td>
+                          </tr>
+                          <tr>
+                            <td><div class="connection-name"><strong>VMware 实验集群</strong><span>administrator · vCenter</span></div></td>
+                            <td>VMware</td>
+                            <td>vcenter.lab.local</td>
+                            <td>local encrypted</td>
+                            <td><span class="status-pill warning"><i></i>需验证</span></td>
+                          </tr>
+                          <tr>
+                            <td><div class="connection-name"><strong>Proxmox 测试节点</strong><span>root@pam · 仅测试</span></div></td>
+                            <td>Proxmox</td>
+                            <td>10.12.9.44</td>
+                            <td>local encrypted</td>
+                            <td><span class="status-pill"><i></i>可用</span></td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <aside class="side-stack">
+                    <div class="panel">
+                      <div class="panel-head">
+                        <div class="panel-title">
+                          <strong>新增连接</strong>
+                          <span>保存前先用主密码加密</span>
+                        </div>
+                      </div>
+                      <div class="panel-body">
+                        <div class="form-grid" style="grid-template-columns: 1fr 1fr">
+                          <div class="field">
+                            <label>平台</label>
+                            <select id="provider"><option>XenServer</option><option>VMware</option><option>Proxmox</option></select>
+                          </div>
+                          <div class="field">
+                            <label>名称</label>
+                            <input id="conn-name" value="新连接" />
+                          </div>
+                          <div class="field span-2">
+                            <label>Host</label>
+                            <input id="conn-host" placeholder="10.12.8.21" />
+                          </div>
+                          <div class="field">
+                            <label>用户名</label>
+                            <input value="root" />
+                          </div>
+                          <div class="field">
+                            <label>密码</label>
+                            <input type="password" value="local-only" />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="notice">
+                      <strong>存储口径：</strong>
+                      使用 chrome.storage.local；禁止 chrome.storage.sync；密文可以导出，明文不能写文件。
+                    </div>
+                  </aside>
+                </div>
+              </section>
+
+              <section id="sessions-tab" class="tab-panel hidden">
+                <div class="work-grid">
+                  <div class="panel">
+                    <div class="panel-head">
+                      <div class="panel-title">
+                        <strong>临时连接会话</strong>
+                        <span>后台只保存在内存，过期立即失效</span>
+                      </div>
+                      <button class="button" type="button">清理全部</button>
+                    </div>
+                    <div class="panel-body">
+                      <div class="session-list">
+                        <div class="session-row">
+                          <div><strong>eph_xs_prod_9f21</strong><span>XenServer 生产池 · inventory / console 使用中</span></div>
+                          <span class="status-pill"><i></i>剩余 28:41</span>
+                        </div>
+                        <div class="session-row">
+                          <div><strong>eph_vmware_lab_2c80</strong><span>VMware 实验集群 · 等待健康检测</span></div>
+                          <span class="status-pill warning"><i></i>剩余 06:12</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <aside class="panel">
+                    <div class="panel-head">
+                      <div class="panel-title">
+                        <strong>执行链路</strong>
+                        <span>插件解密后只交给后台短期使用</span>
+                      </div>
+                    </div>
+                    <div class="panel-body">
+                      <div class="flow-list">
+                        <div class="flow-step"><div class="flow-index">1</div><div><strong>插件解锁本地连接库</strong><span>用户输入主密码，WebCrypto 解密连接。</span></div></div>
+                        <div class="flow-step"><div class="flow-index">2</div><div><strong>创建 ephemeral connection</strong><span>API 只生成内存 ID，不写 connectionStore。</span></div></div>
+                        <div class="flow-step"><div class="flow-index">3</div><div><strong>业务接口使用临时 ID</strong><span>资源、控制台、任务都走 connectionId。</span></div></div>
+                        <div class="flow-step"><div class="flow-index">4</div><div><strong>TTL 到期自动清除</strong><span>日志不得记录密码，只记录摘要和 ID。</span></div></div>
+                      </div>
+                    </div>
+                  </aside>
+                </div>
+              </section>
+
+              <section id="prototype-tab" class="tab-panel hidden">
+                <div class="work-grid">
+                  <div class="panel">
+                    <div class="panel-head">
+                      <div class="panel-title">
+                        <strong>插件弹窗预览</strong>
+                        <span>保持轻入口，只处理地址、健康检测和打开控制台</span>
+                      </div>
+                    </div>
+                    <div class="panel-body">
+                      <div class="popup-preview">
+                        <div class="popup-head">
+                          <div class="brand">
+                            <div class="brand-mark">VRC</div>
+                            <div class="brand-title">
+                              <strong>资源控制台</strong>
+                              <span>服务可用</span>
+                            </div>
+                          </div>
+                          <i class="health-dot"></i>
+                        </div>
+                        <div class="popup-body">
+                          <div class="field">
+                            <label>服务地址</label>
+                            <input value="http://vrc-server:3987" />
+                          </div>
+                          <div class="session-row">
+                            <div><strong>本地连接库已解锁</strong><span>3 个连接 · 2 个临时会话</span></div>
+                            <span class="status-pill"><i></i>本地</span>
+                          </div>
+                          <div class="popup-actions">
+                            <button class="button primary" type="button">打开控制台</button>
+                            <button class="button" type="button">检测</button>
+                          </div>
+                          <button class="button" type="button">管理本地连接</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <aside class="panel">
+                    <div class="panel-head">
+                      <div class="panel-title">
+                        <strong>下一步落地</strong>
+                        <span>从原型进入实现的拆分</span>
+                      </div>
+                    </div>
+                    <div class="panel-body">
+                      <div class="flow-list">
+                        <div class="flow-step"><div class="flow-index">A</div><div><strong>插件设置页扩展</strong><span>后端地址、连接库、主密码、导入导出。</span></div></div>
+                        <div class="flow-step"><div class="flow-index">B</div><div><strong>API 临时连接 store</strong><span>新增内存 sessionStore 和 resolveConnection。</span></div></div>
+                        <div class="flow-step"><div class="flow-index">C</div><div><strong>Web UI 接入临时 ID</strong><span>资源、控制台、创建 VM 不再依赖持久连接。</span></div></div>
+                      </div>
+                    </div>
+                  </aside>
+                </div>
+              </section>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      document.querySelectorAll(".plugin-tab").forEach((button) => {
+        button.addEventListener("click", () => {
+          const tab = button.dataset.tab;
+          document.querySelectorAll(".plugin-tab").forEach((item) => item.classList.toggle("active", item === button));
+          document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.add("hidden"));
+          document.querySelector(`#${tab}-tab`).classList.remove("hidden");
+        });
+      });
+
+      for (const id of ["scheme", "host", "port"]) {
+        document.querySelector(`#${id}`).addEventListener("input", syncBaseUrl);
+        document.querySelector(`#${id}`).addEventListener("change", syncBaseUrl);
+      }
+
+      document.querySelector("#add-row").addEventListener("click", () => {
+        const tbody = document.querySelector("#connection-body");
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td><div class="connection-name"><strong>新增连接</strong><span>root · 刚刚保存</span></div></td><td>XenServer</td><td>未填写</td><td>local encrypted</td><td><span class="status-pill warning"><i></i>待测试</span></td>`;
+        tbody.prepend(tr);
+      });
+
+      function syncBaseUrl() {
+        const scheme = document.querySelector("#scheme").value;
+        const host = document.querySelector("#host").value.trim();
+        const port = document.querySelector("#port").value.trim();
+        document.querySelector("#baseUrl").value = `${scheme}://${host}${port ? `:${port}` : ""}`;
+      }
+    </script>
+  </body>
+</html>

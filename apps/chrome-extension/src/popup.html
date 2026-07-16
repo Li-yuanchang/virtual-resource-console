@@ -3,37 +3,39 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Virtual Resource Console</title>
+    <title>VRC</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <main class="panel">
-      <header class="header">
-        <div>
-          <p class="eyebrow">VRC</p>
-          <h1>资源控制台</h1>
+    <main class="panel popup-panel">
+      <header class="popup-head">
+        <div class="brand-row">
+          <img class="brand-icon" src="icons/vrc-48.png" alt="" aria-hidden="true" />
+          <div>
+            <strong>资源控制台</strong>
+            <span id="healthTitle">未检测</span>
+          </div>
         </div>
         <span class="status-dot" id="statusDot"></span>
       </header>
 
-      <section class="service-box">
+      <section class="popup-body">
         <label for="apiBaseUrl">服务地址</label>
-        <div class="input-row">
-          <input id="apiBaseUrl" type="url" spellcheck="false" placeholder="http://vrc-server:3987" />
-          <button id="saveButton" type="button">保存</button>
+        <input id="apiBaseUrl" type="url" spellcheck="false" placeholder="http://vrc-server:3987" />
+        <div class="vault-summary">
+          <span>
+            <strong>本地连接库已解锁</strong>
+            <small id="vaultSummary">0 个本地连接保存在当前浏览器</small>
+          </span>
+          <i>本地</i>
         </div>
+        <span id="healthDetail" class="popup-health-detail">配置内网 VRC 服务地址后即可打开控制台。</span>
+        <div class="popup-actions">
+          <button id="openButton" type="button" class="primary">打开控制台</button>
+          <button id="checkButton" type="button">检测</button>
+        </div>
+        <button id="openOptionsButton" type="button" class="wide-action">管理本地连接</button>
       </section>
-
-      <section class="health" id="healthBox">
-        <p class="health-title" id="healthTitle">未检测</p>
-        <p class="health-detail" id="healthDetail">配置内网 VRC 服务地址后即可从插件打开控制台。</p>
-      </section>
-
-      <div class="actions">
-        <button id="openButton" type="button" class="primary">打开控制台</button>
-        <button id="checkButton" type="button" class="secondary">检测服务</button>
-      </div>
-      <button id="startButton" type="button" class="wide-action">启动本机服务</button>
     </main>
     <script src="popup.js"></script>
   </body>

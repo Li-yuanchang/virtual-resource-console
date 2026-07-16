@@ -1,13 +1,26 @@
 {
   "manifest_version": 3,
-  "name": "Virtual Resource Console",
-  "version": "0.1.0",
-  "description": "Connect to a local or intranet Virtual Resource Console service.",
+  "name": "VRC",
+  "short_name": "VRC",
+  "version": "0.1.3",
+  "description": "连接本机或内网 VRC 服务的浏览器入口。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxYQTZuNxstCujGx8Y4znS/KMsfzdf/yfzlU6gDCE3KI/Fa3258Y5qpMEV57rR8w4pPKOdYlxYHphr1U2Yywgqjm+cQZtYbaSS68QTOWUi7kN5mpp83QKfjdergytNlvtRYb8yezb4MGRuAflLR69ZUZmBuoo7YD//Z0b5YLf7Ia6mGINi2YYSYE2DBQq0vPIvvG+MOaFJzIKj8JmC1dZYk2xEH3aoXnhZppjsUOKn4Uhalvv6yYqtR1mOzBLA5g7CwpOCBQnipx6h4x08MwJ0QA+Ai2ayPN5E+7K/ZYC8Xq7W2TyQP/73RgjOM8Am7UGFDbHGk2i1VvOy3B3SVum8wIDAQAB",
   "permissions": ["storage", "tabs", "nativeMessaging"],
   "host_permissions": ["http://*/*", "https://*/*"],
+  "icons": {
+    "16": "icons/vrc-16.png",
+    "32": "icons/vrc-32.png",
+    "48": "icons/vrc-48.png",
+    "128": "icons/vrc-128.png"
+  },
   "action": {
-    "default_title": "Virtual Resource Console",
+    "default_title": "VRC",
+    "default_icon": {
+      "16": "icons/vrc-16.png",
+      "32": "icons/vrc-32.png",
+      "48": "icons/vrc-48.png",
+      "128": "icons/vrc-128.png"
+    },
     "default_popup": "popup.html"
   },
   "options_page": "options.html"

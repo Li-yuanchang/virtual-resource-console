@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="VRC">
+  <defs>
+    <linearGradient id="vrcIconBg" x1="24" y1="16" x2="104" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#527c67" />
+      <stop offset="1" stop-color="#2f5944" />
+    </linearGradient>
+    <pattern id="vrcIconGrid" width="11" height="11" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <path d="M 0 0 L 0 11" stroke="#ffffff" stroke-opacity=".075" stroke-width="1" />
+    </pattern>
+  </defs>
+  <rect x="17" y="17" width="94" height="94" rx="20" fill="url(#vrcIconBg)" />
+  <rect x="17" y="17" width="94" height="94" rx="20" fill="url(#vrcIconGrid)" />
+  <text
+    x="64"
+    y="60"
+    fill="#f7fbf2"
+    font-family="Arial Narrow, Aptos Display, DIN Condensed, Arial, sans-serif"
+    font-size="30"
+    font-weight="800"
+    text-anchor="middle"
+    dominant-baseline="middle"
+  >VRC</text>
+  <rect x="70" y="78" width="19" height="4" rx="2" fill="#f7fbf2" opacity=".94" />
+</svg>

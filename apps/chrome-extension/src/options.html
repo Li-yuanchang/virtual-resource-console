@@ -3,37 +3,147 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Virtual Resource Console 设置</title>
+    <title>VRC 插件设置</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body class="options-page">
-    <main class="panel options-panel">
-      <header class="header">
-        <div>
-          <p class="eyebrow">VRC</p>
-          <h1>插件设置</h1>
+    <main class="settings-shell">
+      <aside class="settings-sidebar">
+        <div class="brand-row">
+          <img class="brand-icon" src="icons/vrc-48.png" alt="" aria-hidden="true" />
+          <div>
+            <strong>资源控制台</strong>
+            <span>设置 / Chrome 插件</span>
+          </div>
         </div>
-        <span class="status-dot" id="statusDot"></span>
-      </header>
+        <nav class="settings-nav" aria-label="设置分组">
+          <button type="button" class="active">Chrome 插件</button>
+        </nav>
+      </aside>
 
-      <section class="service-box">
-        <label for="apiBaseUrl">服务地址</label>
-        <div class="input-row">
-          <input id="apiBaseUrl" type="url" spellcheck="false" placeholder="http://vrc-server:3987" />
-          <button id="saveButton" type="button">保存</button>
-        </div>
+      <section class="settings-main">
+        <header class="settings-head">
+          <div>
+            <h1>设置 / Chrome 插件</h1>
+            <p>该配置只作用于 Chrome 插件，不影响 Web、macOS、Windows 客户端。</p>
+          </div>
+          <div class="head-actions">
+            <button id="checkButton" type="button">检测服务</button>
+            <button id="saveButton" type="button" class="primary">保存设置</button>
+          </div>
+        </header>
+
+        <section class="settings-card">
+          <div class="card-head">
+            <div>
+              <strong>Chrome 插件配置项</strong>
+              <span>配置后端地址、本地连接库、临时会话和插件弹窗行为。</span>
+            </div>
+            <div class="tabs" role="tablist">
+              <button class="tab-button active" data-tab="service" type="button">服务地址</button>
+              <button class="tab-button" data-tab="vault" type="button">本地连接库</button>
+              <button class="tab-button" data-tab="sessions" type="button">临时会话</button>
+              <button class="tab-button" data-tab="popup" type="button">弹窗预览</button>
+            </div>
+          </div>
+
+          <div class="tab-panel active" data-panel="service">
+            <section class="inner-panel">
+              <div class="inner-head">
+                <div><strong>VRC API 服务</strong><span>插件只保存入口地址，资源能力仍由后台执行。</span></div>
+                <div class="segmented">
+                  <button class="mode-button active" data-mode="intranet" type="button">内网</button>
+                  <button class="mode-button" data-mode="local" type="button">本机</button>
+                </div>
+              </div>
+              <div class="form-grid">
+                <label><span>协议</span><select id="serviceScheme"><option value="http">http</option><option value="https">https</option></select></label>
+                <label><span>服务地址</span><input id="serviceHost" type="text" spellcheck="false" placeholder="vrc-server" /></label>
+                <label><span>端口</span><input id="servicePort" type="number" min="1" max="65535" /></label>
+                <label class="full"><span>完整 Base URL</span><input id="apiBaseUrl" type="url" readonly /></label>
+              </div>
+            </section>
+            <aside class="note-panel">
+              <strong>部署边界</strong>
+              <span>nginx 只做 HTTPS、反向代理和访问控制；XenAPI、控制台 WebSocket、临时连接仍必须由 VRC API 处理。</span>
+              <pre>POST /api/ephemeral-connections
+GET  /api/inventory/*
+WS   /api/console/*
+
+connectionStore: disabled
+sessionStore: memory ttl=30m</pre>
+            </aside>
+          </div>
+
+          <div class="tab-panel" data-panel="vault">
+            <section class="inner-panel">
+              <div class="inner-head">
+                <div><strong>本地连接库</strong><span>连接信息只在当前浏览器本地保存，保存前用主密码加密。</span></div>
+                <button id="addConnectionButton" class="primary" type="button">加密保存</button>
+              </div>
+              <label class="master-field"><span>主密码</span><input id="masterPassword" type="password" autocomplete="current-password" placeholder="用于加密/解锁当前浏览器连接库" /></label>
+              <div class="table-wrap">
+                <table id="connectionsTable">
+                  <thead><tr><th>名称</th><th>平台</th><th>Host</th><th>存储</th><th>状态</th><th>操作</th></tr></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </section>
+            <aside class="inner-panel">
+              <div class="inner-head"><div><strong>新增连接</strong><span>明文密码只用于本次加密，不写入服务器。</span></div></div>
+              <div class="draft-grid">
+                <label><span>平台</span><select id="connectionProvider"><option value="xenserver">XenServer</option><option value="vmware">VMware</option><option value="proxmox">Proxmox VE</option></select></label>
+                <label><span>名称</span><input id="connectionName" type="text" value="新连接" /></label>
+                <label><span>Host</span><input id="connectionHost" type="text" spellcheck="false" placeholder="10.12.8.21" /></label>
+                <label><span>端口</span><input id="connectionPort" type="number" min="1" max="65535" placeholder="443" /></label>
+                <label><span>用户名</span><input id="connectionUsername" type="text" value="root" autocomplete="username" /></label>
+                <label><span>密码</span><input id="connectionPassword" type="password" autocomplete="new-password" /></label>
+              </div>
+              <p class="small-note">使用 chrome.storage.local；禁止 chrome.storage.sync；密文可导出，明文不能写文件。</p>
+            </aside>
+          </div>
+
+          <div class="tab-panel" data-panel="sessions">
+            <section class="inner-panel">
+              <div class="inner-head">
+                <div><strong>临时连接会话</strong><span>后台只保存在内存，过期立即失效。</span></div>
+                <div class="head-actions"><button id="refreshSessionsButton" type="button">刷新</button><button id="clearSessionsButton" type="button">清理全部</button></div>
+              </div>
+              <div id="sessionsList" class="session-list"></div>
+            </section>
+            <aside class="inner-panel">
+              <div class="inner-head"><div><strong>执行链路</strong><span>插件解密后只交给后台短期使用。</span></div></div>
+              <div class="flow-list">
+                <span><i>1</i><strong>插件解锁本地连接库</strong><small>用户输入主密码，WebCrypto 解密连接。</small></span>
+                <span><i>2</i><strong>创建 ephemeral connection</strong><small>API 只生成内存 ID，不写 connectionStore。</small></span>
+                <span><i>3</i><strong>业务接口使用临时 ID</strong><small>资源、控制台、任务都走 connectionId。</small></span>
+                <span><i>4</i><strong>TTL 到期自动清除</strong><small>日志不得记录密码，只记录摘要和 ID。</small></span>
+              </div>
+            </aside>
+          </div>
+
+          <div class="tab-panel" data-panel="popup">
+            <section class="inner-panel">
+              <div class="inner-head"><div><strong>插件弹窗预览</strong><span>保持轻入口，只处理地址、健康检测和打开控制台。</span></div></div>
+              <div class="popup-preview">
+                <div class="popup-preview-head"><img class="brand-icon" src="icons/vrc-48.png" alt="" aria-hidden="true" /><div><strong>资源控制台</strong><span>服务可用</span></div></div>
+                <label><span>服务地址</span><input type="text" value="http://vrc-server:3987" readonly /></label>
+                <article class="session-row"><span><strong>本地连接库已解锁</strong><small>连接由当前浏览器保存</small></span><i>本地</i></article>
+                <div class="popup-actions"><button class="primary" type="button">打开控制台</button><button type="button">检测</button></div>
+                <button type="button">管理本地连接</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="health" aria-live="polite">
+          <span id="statusDot" class="status-dot"></span>
+          <div>
+            <p id="healthTitle">未检测</p>
+            <span id="healthDetail">建议填写内网部署地址，或本机客户端启动的 http://127.0.0.1:3987。</span>
+          </div>
+        </section>
       </section>
-
-      <section class="health" id="healthBox">
-        <p class="health-title" id="healthTitle">未检测</p>
-        <p class="health-detail" id="healthDetail">建议填写内网部署地址，或本机客户端启动的 http://127.0.0.1:3987。</p>
-      </section>
-
-      <div class="actions">
-        <button id="openButton" type="button" class="primary">打开控制台</button>
-        <button id="checkButton" type="button" class="secondary">检测服务</button>
-      </div>
-      <button id="startButton" type="button" class="wide-action">启动本机服务</button>
     </main>
     <script src="popup.js"></script>
   </body>
