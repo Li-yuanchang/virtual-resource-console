@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { ArrowLeft, Brush, Check, Connection, Delete, Download, Loading, Picture, Plus, Refresh, RefreshLeft, Search, Setting, Tickets, Upload } from "@element-plus/icons-vue";
+import { ArrowLeft, Brush, Check, Connection, Delete, Download, Loading, Picture, Plus, Refresh, Search, Setting, Tickets, Upload } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import ConsoleDialog from "./components/ConsoleDialog.vue";
 import HostVmPanel from "./components/HostVmPanel.vue";
@@ -75,6 +75,62 @@ interface VmRenameResponse {
     message: string;
   };
 }
+
+interface VmSummaryResponse {
+  collectedAt: string;
+  summary: VmInventorySummary;
+  source?: "cache" | "live";
+  cacheUpdatedAt?: string;
+  refreshing?: boolean;
+}
+
+type InventoryEvent =
+  | {
+      type: "vm.patch";
+      connectionId?: string;
+      providerType: ProviderType;
+      hostId?: string;
+      vmId: string;
+      patch: Partial<VmNode>;
+      eventSeq: number;
+      updatedAt: string;
+    }
+  | {
+      type: "vm.upsert";
+      connectionId?: string;
+      providerType: ProviderType;
+      hostId?: string;
+      vm: VmNode;
+      eventSeq: number;
+      updatedAt: string;
+    }
+  | {
+      type: "vm.delete";
+      connectionId?: string;
+      providerType: ProviderType;
+      hostId?: string;
+      vmId: string;
+      eventSeq: number;
+      updatedAt: string;
+    }
+  | {
+      type: "host.patch";
+      connectionId?: string;
+      providerType: ProviderType;
+      hostId?: string;
+      patch: Partial<HostNodeItem>;
+      eventSeq: number;
+      updatedAt: string;
+    }
+  | {
+      type: "summary.patch";
+      connectionId?: string;
+      providerType: ProviderType;
+      hostId?: string;
+      summary: VmInventorySummary;
+      eventSeq: number;
+      updatedAt: string;
+    };
 
 interface VmActionState {
   action: VmPowerAction;
@@ -444,6 +500,7 @@ const ipPoolSelectedId = ref("");
 const ipPoolSearch = ref("");
 const ipPoolLoading = ref(false);
 const ipPoolSaving = ref(false);
+const ipPoolPolicyRevision = ref(0);
 const ipPoolDraft = reactive<IpPoolEditorDraft>(emptyIpPoolDraft());
 const chromeExtensionActiveTab = ref<ChromeExtensionTab>("service");
 const chromeExtensionService = reactive<ChromeExtensionServiceSettings>(loadChromeExtensionServiceSettings());
@@ -473,6 +530,8 @@ let lastErrorToastAt = 0;
 let vmSearchTimer: ReturnType<typeof setTimeout> | undefined;
 let connectionPreferenceSaveTimer: ReturnType<typeof setTimeout> | undefined;
 let appearanceMediaQuery: MediaQueryList | undefined;
+let inventoryEventSource: EventSource | null = null;
+let lastInventoryEventSeq = 0;
 const provisioningPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const provisioningTaskMarks = new Map<string, string>();
 const provisioningEventSources = new Map<string, EventSource>();
@@ -925,6 +984,7 @@ onMounted(async () => {
   appearanceMediaQuery.addEventListener("change", handleAppearanceMediaChange);
   await loadAppPreferences();
   void loadIpPoolPolicy();
+  connectInventoryEvents();
   await markRendererReady();
   await loadStoredConnections();
   const launchConnectionId = consumeChromeExtensionLaunchConnectionId();
@@ -954,6 +1014,8 @@ onBeforeUnmount(() => {
   provisioningPollTimers.clear();
   for (const source of provisioningEventSources.values()) source.close();
   provisioningEventSources.clear();
+  inventoryEventSource?.close();
+  inventoryEventSource = null;
 });
 
 watch(hostOverviewSearch, (value) => {
@@ -1319,7 +1381,7 @@ function normalizeImportedIpPoolPolicy(input: unknown): IpPoolPolicy {
   const ipPools = policy.ipPools.map(normalizeIpPoolItem).filter(Boolean) as RuntimeIpPoolPolicy[];
   if (!ipPools.length) throw new Error("没有可导入的 IP 池");
   return {
-    defaultDns: Array.isArray(policy.defaultDns) && policy.defaultDns.length ? parseCsvList(policy.defaultDns.join(",")) : ["1.1.1.1"],
+    defaultDns: Array.isArray(policy.defaultDns) && policy.defaultDns.length ? parseCsvList(policy.defaultDns.join(",")) : defaultIpPoolPolicy().defaultDns,
     ipPools,
   };
 }
@@ -1359,6 +1421,7 @@ function applyIpPoolPolicy(policy: Partial<IpPoolPolicy> | undefined, selectedId
   ipPoolPolicy.value = normalized;
   ipPoolDefaultDnsText.value = normalized.defaultDns.join(", ");
   ipPoolSelectedId.value = selectedId && normalized.ipPools.some((item) => item.id === selectedId) ? selectedId : normalized.ipPools[0]?.id ?? "";
+  ipPoolPolicyRevision.value += 1;
   syncIpPoolDraftFromSelection();
 }
 
@@ -1447,7 +1510,7 @@ function buildIpPoolPolicyForSave(validate: boolean): IpPoolPolicy | null {
   const ipPools = ipPoolPolicy.value.ipPools.map((item) => normalizeIpPoolItem(item)).filter(Boolean) as RuntimeIpPoolPolicy[];
   if (validate && !ipPools.length) return showIpPoolValidationError("至少保留一个 IP 池") as null;
   return {
-    defaultDns: defaultDns.length ? defaultDns : ["1.1.1.1"],
+    defaultDns: defaultDns.length ? defaultDns : defaultIpPoolPolicy().defaultDns,
     ipPools,
   };
 }
@@ -1459,12 +1522,17 @@ async function saveIpPoolPolicy() {
   try {
     const result = await postJson<IpPoolPolicyResponse>("/api/ip-pools/policy", policy, "PATCH");
     applyIpPoolPolicy(result.policy, ipPoolSelectedId.value);
+    notifyIpPoolPolicyUpdated(result.policy);
     ElMessage.success({ message: "IP 池配置已保存", duration: VRC_TOAST_DURATION_MS });
   } catch (error) {
     ElMessage.error({ message: error instanceof Error ? error.message : "保存 IP 池失败", duration: VRC_TOAST_DURATION_MS });
   } finally {
     ipPoolSaving.value = false;
   }
+}
+
+function notifyIpPoolPolicyUpdated(policy: IpPoolPolicy) {
+  window.dispatchEvent(new CustomEvent<IpPoolPolicy>("vrc:ip-pool-policy-updated", { detail: policy }));
 }
 
 function selectIpPool(id: string) {
@@ -1532,12 +1600,17 @@ async function handleIpPoolsJsonChange(event: Event) {
   const file = input.files?.[0];
   input.value = "";
   if (!file) return;
+  ipPoolSaving.value = true;
   try {
     const policy = normalizeImportedIpPoolPolicy(JSON.parse(await file.text()));
-    applyIpPoolPolicy(policy);
-    ElMessage.success({ message: "IP 池 JSON 已载入，保存后生效", duration: VRC_TOAST_DURATION_MS });
+    const result = await postJson<IpPoolPolicyResponse>("/api/ip-pools/policy", policy, "PATCH");
+    applyIpPoolPolicy(result.policy);
+    notifyIpPoolPolicyUpdated(result.policy);
+    ElMessage.success({ message: "IP 池 JSON 已导入并保存", duration: VRC_TOAST_DURATION_MS });
   } catch (error) {
-    ElMessage.error({ message: error instanceof Error ? error.message : "IP 池 JSON 格式不正确", duration: VRC_TOAST_DURATION_MS });
+    ElMessage.error({ message: error instanceof Error ? error.message : "IP 池 JSON 导入失败", duration: VRC_TOAST_DURATION_MS });
+  } finally {
+    ipPoolSaving.value = false;
   }
 }
 
@@ -1816,6 +1889,14 @@ function applyStoredConnection(connectionId: string) {
 }
 
 async function selectConnectionAndLoad(connectionId: string) {
+  if (workspaceMode.value === "connection" && selectedConnectionId.value === connectionId && inventory.value) {
+    vmDetailVisible.value = false;
+    hostDetailVisible.value = false;
+    storageDetailVisible.value = false;
+    isoDetailVisible.value = false;
+    provisioningVisible.value = false;
+    return;
+  }
   workspaceMode.value = "connection";
   applyStoredConnection(connectionId);
   hostOverviewRequestSeq++;
@@ -1924,7 +2005,7 @@ async function loadSelectedConnectionResources() {
     return;
   }
   clearConnectionFeedback();
-  await loadHostInventory();
+  await loadHostInventory({ forceRefresh: true });
 }
 
 function openAccountImportDialog() {
@@ -2275,7 +2356,15 @@ function markAccountImportRowFailed(row: AccountImportDraft, message: string) {
   );
 }
 
-async function loadHostOverview() {
+async function loadHostOverview(options: { forceRefresh?: boolean } = {}) {
+  if (!options.forceRefresh && workspaceMode.value === "overview" && hostOverviewRows.value.length) {
+    vmDetailVisible.value = false;
+    hostDetailVisible.value = false;
+    storageDetailVisible.value = false;
+    isoDetailVisible.value = false;
+    provisioningVisible.value = false;
+    return;
+  }
   clearMessages();
   const requestId = ++hostOverviewRequestSeq;
   workspaceMode.value = "overview";
@@ -2309,6 +2398,7 @@ async function loadHostOverview() {
       const hostInventory = await postJson<HostsResponse>("/api/inventory/hosts", {
         connectionId: item.id,
         providerType: item.providerType,
+        forceRefresh: options.forceRefresh,
       });
       if (requestId !== hostOverviewRequestSeq) return;
       const rows = hostInventory.hosts.map((host, index) => ({
@@ -2321,7 +2411,7 @@ async function loadHostOverview() {
       }));
       replaceHostOverviewRows(item.id, rows.length ? rows : [createFallbackOverviewRow(item, "error", "未读取到物理机")]);
       for (const row of rows) {
-        void loadHostOverviewSummary(row, requestId);
+        void loadHostOverviewSummary(row, requestId, options.forceRefresh);
       }
     } catch (error) {
       if (requestId !== hostOverviewRequestSeq) return;
@@ -2409,15 +2499,16 @@ async function loadHostVmSearchCache(row: HostOverviewRow, force = false) {
   }
 }
 
-async function loadHostOverviewSummary(row: HostOverviewRow, requestId = hostOverviewRequestSeq) {
+async function loadHostOverviewSummary(row: HostOverviewRow, requestId = hostOverviewRequestSeq, forceRefresh = false) {
   if (!hasOverviewInventory(row)) return;
   try {
-    const result = await postJson<{ summary: VmInventorySummary }>("/api/inventory/vm-summary", {
+    const result = await postJson<VmSummaryResponse>("/api/inventory/vm-summary", {
       connectionId: row.connection.id,
       providerType: row.connection.providerType,
       hostId: row.host.providerId,
       page: 1,
       pageSize: 500,
+      forceRefresh,
     });
     if (requestId !== hostOverviewRequestSeq) return;
     updateHostOverviewRow(row.key, {
@@ -2495,7 +2586,7 @@ async function openHostOverview(row: HostOverviewRow) {
   void loadVms({ silent: true });
 }
 
-async function loadHostInventory() {
+async function loadHostInventory(options: { forceRefresh?: boolean } = {}) {
   const payload = buildConnectionPayload();
   if (!payload) return;
   workspaceMode.value = "connection";
@@ -2504,7 +2595,10 @@ async function loadHostInventory() {
   persistConnection(payload);
 
   try {
-    inventory.value = await postJson<HostsResponse>("/api/inventory/hosts", payload);
+    inventory.value = await postJson<HostsResponse>("/api/inventory/hosts", {
+      ...payload,
+      forceRefresh: options.forceRefresh,
+    });
     selectedHostId.value = inventory.value.hosts[0]?.providerId ?? "";
     resetIsoImages();
     prepareVmPanelForHostLoad(!!selectedHostId.value);
@@ -2514,8 +2608,8 @@ async function loadHostInventory() {
       status: "success",
     });
     if (selectedHostId.value) {
-      void loadVmSummary({ silent: true });
-      void loadVms({ silent: true });
+      void loadVmSummary({ silent: true, forceRefresh: options.forceRefresh });
+      void loadVms({ silent: true, forceRefresh: options.forceRefresh });
     }
   } catch (error) {
     loadingVms.value = false;
@@ -2560,18 +2654,19 @@ function resetIsoImages() {
   loadingIsoImages.value = false;
 }
 
-async function loadVmSummary(options: { silent?: boolean } = {}) {
+async function loadVmSummary(options: { silent?: boolean; forceRefresh?: boolean } = {}) {
   const payload = buildConnectionPayload();
   if (!payload || !selectedHost.value) return;
   loadingVmSummary.value = true;
   if (!options.silent) clearMessages();
 
   try {
-    const result = await postJson<{ summary: VmInventorySummary }>("/api/inventory/vm-summary", {
+    const result = await postJson<VmSummaryResponse>("/api/inventory/vm-summary", {
       ...payload,
       hostId: selectedHost.value.providerId,
       page: 1,
       pageSize: 500,
+      forceRefresh: options.forceRefresh,
     });
     vmSummary.value = result.summary;
     pushActivity("加载 VM 汇总", {
@@ -2591,7 +2686,7 @@ async function loadVmSummary(options: { silent?: boolean } = {}) {
   }
 }
 
-async function loadVms(options: { silent?: boolean; background?: boolean } = {}) {
+async function loadVms(options: { silent?: boolean; background?: boolean; forceRefresh?: boolean } = {}) {
   const payload = buildConnectionPayload();
   if (!payload || !selectedHost.value) return;
   const showLoading = !options.background || !vms.value?.items.length;
@@ -2607,6 +2702,7 @@ async function loadVms(options: { silent?: boolean; background?: boolean } = {})
       page: 1,
       pageSize: serverKeyword ? 200 : 500,
       keyword: serverKeyword,
+      forceRefresh: options.forceRefresh,
     });
     vmSummary.value = summarizeVms(vms.value.items, vms.value.total);
     if (!options.silent) {
@@ -2857,6 +2953,100 @@ function formatProvisionPreflightChecks(checks: ProvisionPreflightCheck[]) {
   return checks.map((check) => `${check.label}：${check.message}`).join("；");
 }
 
+function connectInventoryEvents() {
+  if (typeof EventSource === "undefined" || inventoryEventSource) return;
+  const source = new EventSource("/api/inventory/events");
+  inventoryEventSource = source;
+  source.addEventListener("inventory", (message) => {
+    try {
+      const parsed = JSON.parse((message as MessageEvent).data) as { event?: InventoryEvent };
+      if (!parsed.event || parsed.event.eventSeq <= lastInventoryEventSeq) return;
+      lastInventoryEventSeq = parsed.event.eventSeq;
+      applyInventoryEvent(parsed.event);
+    } catch {
+      // SSE 事件解析失败时忽略本条，下一条事件或手动刷新会重新校正状态。
+    }
+  });
+  source.onerror = () => {
+    source.close();
+    if (inventoryEventSource === source) inventoryEventSource = null;
+    window.setTimeout(connectInventoryEvents, 5000);
+  };
+}
+
+function applyInventoryEvent(event: InventoryEvent) {
+  if (event.type === "host.patch") {
+    patchHostFromInventoryEvent(event);
+    return;
+  }
+  if (event.type === "summary.patch") {
+    patchSummaryFromInventoryEvent(event);
+    return;
+  }
+  if (!inventoryEventMatchesSelectedHost(event)) return;
+  if (event.type === "vm.patch") {
+    patchVmRowById(event.vmId, event.patch);
+  } else if (event.type === "vm.upsert") {
+    upsertVmRow(event.vm);
+  } else if (event.type === "vm.delete") {
+    removeVmRowById(event.vmId);
+  }
+}
+
+function inventoryEventMatchesSelectedHost(event: InventoryEvent) {
+  if (event.connectionId && event.connectionId !== selectedConnectionId.value) return false;
+  if (event.providerType !== connection.providerType) return false;
+  const currentHostId = selectedHost.value?.providerId || selectedHost.value?.id;
+  if (event.hostId && currentHostId && event.hostId !== currentHostId) return false;
+  return true;
+}
+
+function patchHostFromInventoryEvent(event: Extract<InventoryEvent, { type: "host.patch" }>) {
+  if (inventory.value) {
+    inventory.value = {
+      ...inventory.value,
+      hosts: inventory.value.hosts.map((host) => (hostMatchesEvent(host, event) ? { ...host, ...event.patch } : host)),
+    };
+  }
+  hostOverviewRows.value = hostOverviewRows.value.map((row) => {
+    if (!overviewRowMatchesEvent(row, event)) return row;
+    const patchedHost = { ...row.host, ...event.patch };
+    return {
+      ...row,
+      host: patchedHost,
+      inventory: {
+        ...row.inventory,
+        hosts: row.inventory.hosts.map((host) => (hostMatchesEvent(host, event) ? { ...host, ...event.patch } : host)),
+      },
+    };
+  });
+}
+
+function patchSummaryFromInventoryEvent(event: Extract<InventoryEvent, { type: "summary.patch" }>) {
+  if (inventoryEventMatchesSelectedHost(event)) {
+    vmSummary.value = event.summary;
+  }
+  hostOverviewRows.value = hostOverviewRows.value.map((row) =>
+    overviewRowMatchesEvent(row, event)
+      ? {
+          ...row,
+          summary: event.summary,
+          status: "ready",
+        }
+      : row,
+  );
+}
+
+function hostMatchesEvent(host: HostNodeItem, event: Pick<InventoryEvent, "hostId">) {
+  return !!event.hostId && (host.providerId === event.hostId || host.id === event.hostId);
+}
+
+function overviewRowMatchesEvent(row: HostOverviewRow, event: Pick<InventoryEvent, "connectionId" | "providerType" | "hostId">) {
+  if (event.connectionId && row.connection.id !== event.connectionId) return false;
+  if (row.connection.providerType !== event.providerType) return false;
+  return !event.hostId || row.host.providerId === event.hostId || row.host.id === event.hostId;
+}
+
 async function pollProvisioningTask(taskId: string) {
   if (!taskId) return;
   if (provisioningPollTimers.has(taskId)) return;
@@ -2949,7 +3139,7 @@ async function applyProvisioningTaskUpdate(task: ProvisionTask) {
       await reserveProvisioningIpsAfterCreate(payload);
       provisioningTaskPayloads.delete(task.id);
     }
-    await Promise.all([loadVmSummary({ silent: true }), loadVms({ silent: true })]);
+    await loadVmSummary({ silent: true, forceRefresh: true });
     syncSelectedOverviewRowAfterVmChange();
   }
   if (task.status === "failed") {
@@ -3185,6 +3375,7 @@ async function handleVmRename(payload: { vm: VmNode; newName: string }) {
     const response = await postJson<VmRenameResponse>("/api/vms/rename", {
       ...connectionPayload,
       vmId: payload.vm.providerId,
+      hostId: selectedHost.value?.providerId,
       currentName: previousName,
       newName: payload.newName,
       confirmToken: "CONFIRMED",
@@ -3295,6 +3486,7 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
     const response = await postJson<VmActionResponse>("/api/vms/action", {
       ...payload,
       vmId: vm.providerId,
+      hostId: selectedHost.value?.providerId,
       action,
       confirmToken: "CONFIRMED",
     });
@@ -3302,11 +3494,14 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
       throw new Error(response.result.message || `VM ${meta.label}请求未被平台接受`);
     }
     if (action === "start") {
-      const runningVm = await refreshVmRow(vm, { expectedPowerState: "running" });
+      const runningVm = patchVmRow(vm, { powerState: "running" });
       setVmActionState(runningVm, { action, status: "success", message: "已开机" });
       openConsoleAfterStart(runningVm);
+    } else if (action === "forceReboot") {
+      const runningVm = patchVmRow(vm, { powerState: "running" });
+      setVmActionState(runningVm, { action, status: "success", message: "已重启" });
     } else if (action === "shutdown") {
-      const haltedVm = await refreshVmRow(vm, { expectedPowerState: "halted" });
+      const haltedVm = patchVmRow(vm, { powerState: "halted" });
       setVmActionState(haltedVm, { action, status: "success", message: "已关机" });
     } else {
       successMessage.value = response.result.message;
@@ -3418,6 +3613,7 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
       const response = await postJson<VmActionResponse>("/api/vms/action", {
         ...payload,
         vmId: vm.providerId,
+        hostId: selectedHost.value?.providerId,
         action,
         confirmToken: "CONFIRMED",
       });
@@ -3425,10 +3621,13 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
 	        throw new Error(response.result.message || `VM ${meta.label}请求未被平台接受`);
 	      }
 	      if (action === "start") {
-	        const runningVm = await refreshVmRow(vm, { expectedPowerState: "running" });
+	        const runningVm = patchVmRow(vm, { powerState: "running" });
 	        setVmActionState(runningVm, { action, status: "success", message: "已开机" });
+	      } else if (action === "forceReboot") {
+	        const runningVm = patchVmRow(vm, { powerState: "running" });
+	        setVmActionState(runningVm, { action, status: "success", message: "已重启" });
 	      } else if (action === "shutdown") {
-	        const haltedVm = await refreshVmRow(vm, { expectedPowerState: "halted" });
+	        const haltedVm = patchVmRow(vm, { powerState: "halted" });
 	        setVmActionState(haltedVm, { action, status: "success", message: "已关机" });
 	      } else {
 	        removeVmRow(vm);
@@ -3495,6 +3694,45 @@ function clearVmActionState(vm: VmNode) {
 
 function scheduleClearVmActionState(vm: VmNode, delayMs: number) {
   window.setTimeout(() => clearVmActionState(vm), delayMs);
+}
+
+function upsertVmRow(vm: VmNode): VmNode {
+  if (!vms.value) {
+    vms.value = {
+      collectedAt: new Date().toISOString(),
+      items: [vm],
+      page: 1,
+      pageSize: 500,
+      total: 1,
+    };
+    vmSummary.value = summarizeVms(vms.value.items, vms.value.total);
+    syncSelectedOverviewRowAfterVmChange();
+    return vm;
+  }
+  const existing = vms.value.items.find((item) => isSameVm(item, vm));
+  if (existing) {
+    return patchVmRow(existing, vm);
+  }
+  vms.value = {
+    ...vms.value,
+    items: [vm, ...vms.value.items],
+    total: vms.value.total + 1,
+  };
+  vmSummary.value = summarizeVms(vms.value.items, vms.value.total);
+  syncSelectedOverviewRowAfterVmChange();
+  return vm;
+}
+
+function patchVmRowById(vmId: string, patch: Partial<VmNode>): VmNode | null {
+  const target = vms.value?.items.find((item) => item.providerId === vmId || item.id === vmId);
+  if (!target) return null;
+  return patchVmRow(target, patch);
+}
+
+function removeVmRowById(vmId: string) {
+  const target = vms.value?.items.find((item) => item.providerId === vmId || item.id === vmId);
+  if (!target) return;
+  removeVmRow(target);
 }
 
 function patchVmRow(vm: VmNode, patch: Partial<VmNode>): VmNode {
@@ -3592,6 +3830,7 @@ function powerStateDoneLabel(state: PowerState) {
 function vmActionCompleteMessage(action: VmPowerAction) {
   if (action === "start") return "已开机";
   if (action === "shutdown") return "已关机";
+  if (action === "forceReboot") return "已重启";
   return "已删除";
 }
 
@@ -3679,6 +3918,9 @@ function hostResourceChangeObserved(
   if (action === "shutdown") {
     return current.running < baseline.running || current.runningVcpu < baseline.runningVcpu || current.memoryFreeBytes > baseline.memoryFreeBytes;
   }
+  if (action === "forceReboot") {
+    return true;
+  }
   return current.storageUsedGiB < baseline.storageUsedGiB;
 }
 
@@ -3693,12 +3935,16 @@ async function refreshSelectedHostResources(action: VmPowerAction, baseline: Hos
     if (attempt > 0) await sleep(action === "delete" ? 800 : 500);
     try {
       const [hostInventory, summaryResult] = await Promise.all([
-        postJson<HostsResponse>("/api/inventory/hosts", payload),
-        postJson<{ summary: VmInventorySummary }>("/api/inventory/vm-summary", {
+        postJson<HostsResponse>("/api/inventory/hosts", {
+          ...payload,
+          forceRefresh: true,
+        }),
+        postJson<VmSummaryResponse>("/api/inventory/vm-summary", {
           ...payload,
           hostId,
           page: 1,
           pageSize: 500,
+          forceRefresh: true,
         }),
       ]);
       const refreshedHost = hostInventory.hosts.find((item) => item.providerId === hostId || item.id === hostId);
@@ -4310,6 +4556,7 @@ function isVmRunning(vm: VmNode) {
 function canRunVmAction(action: VmPowerAction, vm: VmNode) {
   if (action === "start") return isVmStopped(vm);
   if (action === "shutdown") return isVmRunning(vm);
+  if (action === "forceReboot") return isVmRunning(vm);
   return isVmStopped(vm);
 }
 
@@ -4339,6 +4586,15 @@ function vmActionMeta(action: VmPowerAction) {
       customClass: "vm-shutdown-message-box",
     };
   }
+  if (action === "forceReboot") {
+    return {
+      label: "重启",
+      confirmHeading: "强制重启虚拟机",
+      confirmTone: "高风险变更",
+      confirmButtonText: "确认强制重启",
+      customClass: "vm-force-reboot-message-box",
+    };
+  }
   return {
     label: "删除",
     confirmHeading: "删除虚拟机",
@@ -4354,6 +4610,9 @@ function vmActionDescription(action: VmPowerAction, providerType: ProviderType) 
   }
   if (action === "shutdown") {
     return "影响范围：可能中断虚拟机内正在运行的业务；系统会按平台策略完成关机，完成前状态保持关机中。";
+  }
+  if (action === "forceReboot") {
+    return "影响范围：会立即中断当前运行状态并强制重启，可能导致未保存数据丢失；完成前状态保持重启中。";
   }
   return "影响范围：会移除虚拟机配置和磁盘，通常不可恢复。请确认 VM 已关机、已完成备份，并且这台 VM 确实可以回收。";
 }
@@ -4408,7 +4667,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
 
       <div class="connection-groups">
         <section v-if="filteredStoredConnections.length" class="connection-group overview-group">
-          <button class="overview-entry" :class="{ active: isOverviewNavActive }" @click="loadHostOverview">
+          <button class="overview-entry" :class="{ active: isOverviewNavActive }" @click="loadHostOverview()">
             <span class="overview-entry-icon">↗</span>
             <span class="overview-entry-main">
               <strong>资源总览</strong>
@@ -4528,7 +4787,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           table-height="100%"
           table-panel-class="single-table-panel"
           @search-change="loadVms"
-          @refresh="loadVms"
+	          @refresh="loadVms({ forceRefresh: true })"
           @export="exportCsv"
           @host-detail="hostDetailVisible = true"
           @storage-detail="storageDetailVisible = true"
@@ -4633,7 +4892,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   class="overview-toolbar-button"
                   :disabled="loadingHostOverview"
                   aria-label="刷新总览"
-                  @click="loadHostOverview"
+                  @click="loadHostOverview({ forceRefresh: true })"
                 >
                   <el-icon v-if="loadingHostOverview" class="is-loading"><Loading /></el-icon>
                   <VrcToolbarIcon v-else name="refresh" />
@@ -4828,9 +5087,9 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   <span>在基础主题上覆盖语义色和工作区背景，未修改的组件继续使用系统样式变量。</span>
                 </div>
                 <div class="appearance-head-actions">
-                  <el-button size="small" :icon="Upload" @click="selectAppearanceJson">载入</el-button>
-                  <el-button size="small" :icon="Download" @click="exportAppearanceConfig">导出</el-button>
-                  <el-button size="small" :icon="RefreshLeft" @click="resetAppearancePreferences">重置</el-button>
+                  <el-button size="small" @click="selectAppearanceJson">载入</el-button>
+                  <el-button size="small" @click="exportAppearanceConfig">导出</el-button>
+                  <el-button size="small" @click="resetAppearancePreferences">重置</el-button>
                 </div>
               </div>
 
@@ -5166,15 +5425,15 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                     </label>
                     <label class="settings-field">
                       <span>名称</span>
-                      <el-input v-model="ipPoolDraft.name" placeholder="例如 192.0.2 通用网段" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                      <el-input v-model="ipPoolDraft.name" placeholder="例如 192.168.2 通用网段" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
                     <label class="settings-field">
                       <span>网段</span>
-                      <el-input v-model="ipPoolDraft.prefix" placeholder="例如 192.0.2" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                      <el-input v-model="ipPoolDraft.prefix" placeholder="例如 192.168.2" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
                     <label class="settings-field">
                       <span>适用物理机网段</span>
-                      <el-input v-model="ipPoolDraft.hostPrefixesText" placeholder="例如 203.0.113；留空表示通用池" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                      <el-input v-model="ipPoolDraft.hostPrefixesText" placeholder="例如 192.168.129；留空表示通用池" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
                     <label class="settings-field">
                       <span>网关</span>
@@ -5183,18 +5442,18 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                     <label class="settings-field ip-range-field">
                       <span>IP 池号段</span>
                       <div class="ip-range-control">
-                        <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "192.0.2" }}.</span>
+                        <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "192.168.2" }}.</span>
                         <el-input-number v-model="ipPoolDraft.startHost" :min="1" :max="254" controls-position="right" :disabled="!ipPoolDraft.id" />
                         <span class="ip-range-separator">~</span>
-                        <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "192.0.2" }}.</span>
+                        <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "192.168.2" }}.</span>
                         <el-input-number v-model="ipPoolDraft.endHost" :min="1" :max="254" controls-position="right" :disabled="!ipPoolDraft.id" />
                       </div>
                     </label>
-                    <label class="settings-field">
+                    <label class="settings-field is-full">
                       <span>指定网络（可选）</span>
                       <el-input v-model="ipPoolDraft.networkName" placeholder="例如 Pool-wide network associated with eth1；可留空" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
-                    <label class="settings-field">
+                    <label class="settings-field is-full">
                       <span>单池 DNS</span>
                       <el-input v-model="ipPoolDraft.dnsText" placeholder="可留空，默认使用公共 DNS；多个用逗号分隔" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
@@ -5442,7 +5701,7 @@ serverStore: disabled</pre>
           metric-grid-class="dialog-metric-grid"
           table-panel-class="dialog-table-panel"
           @search-change="loadVms"
-          @refresh="loadVms"
+	          @refresh="loadVms({ forceRefresh: true })"
           @export="exportCsv"
           @host-detail="hostDetailVisible = true"
           @storage-detail="storageDetailVisible = true"
@@ -5506,7 +5765,7 @@ serverStore: disabled</pre>
       </el-dialog>
 
       <el-dialog v-model="connectionSettingsVisible" title="连接设置" width="1280px" class="connection-settings-dialog" top="5vh" :close-on-click-modal="false">
-        <form class="settings-dialog-shell" autocomplete="off" @submit.prevent="loadHostInventory">
+        <form class="settings-dialog-shell" autocomplete="off" @submit.prevent="loadHostInventory()">
           <aside class="settings-nav" aria-label="设置分组">
             <div class="settings-current">
               <span>当前连接</span>
@@ -5726,61 +5985,79 @@ serverStore: disabled</pre>
         </section>
       </el-dialog>
 
-      <el-dialog v-model="hostDetailVisible" title="物理机详情" width="760px" :close-on-click-modal="false">
-        <div v-if="selectedHost" class="dialog-summary host-detail-summary">
-          <span>基础信息</span>
-          <strong>{{ selectedHost.name }}</strong>
-          <small>{{ selectedHost.address }} · {{ formatCpuCount(selectedHost.cpuCores) }} · {{ formatBytes(selectedHost.memoryTotalBytes) }}</small>
+      <el-dialog v-model="hostDetailVisible" title="物理机详情" width="760px" class="resource-detail-dialog host-resource-detail-dialog" :close-on-click-modal="false">
+        <div v-if="selectedHost" class="resource-detail-summary">
+          <div>
+            <span>物理机</span>
+            <strong>{{ selectedHost.name }}</strong>
+          </div>
+          <div>
+            <span>管理地址</span>
+            <strong>{{ selectedHost.address }}</strong>
+          </div>
+          <div>
+            <span>资源规格</span>
+            <strong>{{ formatCpuCount(selectedHost.cpuCores) }} · {{ formatBytes(selectedHost.memoryTotalBytes) }}</strong>
+          </div>
         </div>
         <div class="dialog-section-title">
           <strong>网络接口</strong>
           <span>查看当前平台网络接口连接状态</span>
         </div>
-        <el-table :data="selectedHostNetworks" height="280" row-key="device" stripe>
-          <el-table-column prop="device" label="Device" width="86" align="center" />
+        <el-table class="resource-detail-table host-network-detail-table" :data="selectedHostNetworks" :max-height="360" row-key="device" stripe empty-text="暂无网络接口">
+          <el-table-column prop="device" label="设备" width="112" align="center" class-name="resource-detail-nowrap" show-overflow-tooltip />
           <el-table-column prop="ip" label="IP" width="132" align="left" />
-          <el-table-column prop="mac" label="MAC" width="152" align="left" show-overflow-tooltip />
-          <el-table-column prop="network" label="Network" min-width="190" align="left" show-overflow-tooltip />
-          <el-table-column label="Mgmt" width="76" align="center">
+          <el-table-column prop="mac" label="MAC" width="142" align="left" show-overflow-tooltip />
+          <el-table-column prop="network" label="网络" min-width="150" align="left" show-overflow-tooltip />
+          <el-table-column label="管理口" width="80" align="center">
             <template #default="{ row }">
-              <el-tag v-if="row.management" size="small" type="success" effect="plain">Yes</el-tag>
-              <span v-else>No</span>
+              <span :class="{ 'resource-detail-positive': row.management }">{{ row.management ? "是" : "否" }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="Attached" width="86" align="center">
-            <template #default="{ row }">{{ row.attached ? "Yes" : "No" }}</template>
+          <el-table-column label="已连接" width="86" align="center">
+            <template #default="{ row }">{{ row.attached ? "是" : "否" }}</template>
           </el-table-column>
         </el-table>
       </el-dialog>
 
-      <el-dialog v-model="storageDetailVisible" title="SR 详情" width="860px" :close-on-click-modal="false">
-        <div class="dialog-summary storage-detail-summary">
-          <span>容量摘要</span>
-          <strong>{{ storage.length }} 个 SR · 已用 {{ storageTotals.usagePercent }}%</strong>
-          <small>{{ formatNumber(storageTotals.usedGiB) }} / {{ formatNumber(storageTotals.physicalGiB) }} GiB · 虚拟分配 {{ formatNumber(storageTotals.virtualGiB) }} GiB</small>
+      <el-dialog v-model="storageDetailVisible" title="SR 详情" width="860px" class="resource-detail-dialog storage-resource-detail-dialog" :close-on-click-modal="false">
+        <div class="resource-detail-summary">
+          <div>
+            <span>SR 数量</span>
+            <strong>{{ storage.length }} 个</strong>
+          </div>
+          <div>
+            <span>已用比例</span>
+            <strong>{{ storageTotals.usagePercent }}%</strong>
+          </div>
+          <div>
+            <span>容量</span>
+            <strong>{{ formatNumber(storageTotals.usedGiB) }} / {{ formatNumber(storageTotals.physicalGiB) }} GiB</strong>
+            <small>虚拟分配 {{ formatNumber(storageTotals.virtualGiB) }} GiB</small>
+          </div>
         </div>
         <div class="dialog-section-title">
-          <strong>SR 表格</strong>
+          <strong>存储资源</strong>
           <span>区分物理容量、已用容量和虚拟分配容量</span>
         </div>
-        <el-table :data="storage" height="320" row-key="name" stripe>
-          <el-table-column prop="name" label="Name" min-width="230" align="left" show-overflow-tooltip />
-          <el-table-column prop="type" label="Type" width="96" align="center" />
-          <el-table-column label="Shared" width="82" align="center">
-            <template #default="{ row }">{{ row.shared ? "Yes" : "No" }}</template>
+        <el-table class="resource-detail-table storage-resource-detail-table" :data="storage" :max-height="360" row-key="name" stripe empty-text="暂无 SR 数据">
+          <el-table-column prop="name" label="存储名称" min-width="175" align="left" show-overflow-tooltip />
+          <el-table-column prop="type" label="类型" width="70" align="center" />
+          <el-table-column label="共享" width="64" align="center">
+            <template #default="{ row }">{{ row.shared ? "是" : "否" }}</template>
           </el-table-column>
-          <el-table-column label="Usage" width="160" align="center">
+          <el-table-column label="使用率" width="142" align="center">
             <template #default="{ row }">
-              <el-progress :percentage="percent(positive(row.usedGiB), positive(row.physicalGiB))" :stroke-width="7" />
+              <el-progress :percentage="percent(positive(row.usedGiB), positive(row.physicalGiB))" :stroke-width="4" />
             </template>
           </el-table-column>
-          <el-table-column label="Size" width="110" align="right">
+          <el-table-column label="容量" width="100" align="right">
             <template #default="{ row }">{{ formatNumber(row.physicalGiB) }} GiB</template>
           </el-table-column>
-          <el-table-column label="Used" width="110" align="right">
+          <el-table-column label="已用" width="100" align="right">
             <template #default="{ row }">{{ formatNumber(row.usedGiB) }} GiB</template>
           </el-table-column>
-          <el-table-column label="Virtual" width="120" align="right">
+          <el-table-column label="虚拟分配" width="110" align="right">
             <template #default="{ row }">{{ formatNumber(row.virtualGiB) }} GiB</template>
           </el-table-column>
         </el-table>
@@ -5851,6 +6128,7 @@ serverStore: disabled</pre>
       </el-dialog>
 
       <VmProvisioningDialog
+        :key="`provisioning-${ipPoolPolicyRevision}`"
         v-model:visible="provisioningVisible"
         :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username }"
         :host="selectedHost"

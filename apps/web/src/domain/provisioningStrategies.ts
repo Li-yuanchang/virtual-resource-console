@@ -342,7 +342,7 @@ function resolveLinuxAccountPolicy(isoName: string): ProvisioningAccountPolicy {
 function ipPrefix(ip: string) {
   const parts = ip.split(".");
   if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) {
-    return "192.0.2";
+    return "";
   }
   return `${parts[0]}.${parts[1]}.${parts[2]}`;
 }

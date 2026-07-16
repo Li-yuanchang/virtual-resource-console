@@ -132,6 +132,7 @@ const selectedVmCount = computed(() => selectedVmRows.value.length);
 const batchActionRows = computed<Record<VmPowerAction, VmNode[]>>(() => ({
   start: selectedVmRows.value.filter((vm) => canRunVmAction("start", vm)),
   shutdown: selectedVmRows.value.filter((vm) => canRunVmAction("shutdown", vm)),
+  forceReboot: selectedVmRows.value.filter((vm) => canRunVmAction("forceReboot", vm)),
   delete: selectedVmRows.value.filter((vm) => canRunVmAction("delete", vm)),
 }));
 
@@ -238,6 +239,7 @@ function vmActionStatusLabel(vm: VmNode) {
 function vmActionLabel(action: VmPowerAction) {
   if (action === "start") return "开机";
   if (action === "shutdown") return "关机";
+  if (action === "forceReboot") return "重启";
   return "删除";
 }
 
@@ -272,7 +274,21 @@ function actionDisabledReason(action: VmPowerAction, vm: VmNode) {
   if (action === "shutdown") {
     return isVmRunning(vm) ? "" : "只有运行中的虚拟机可以关机";
   }
+  if (action === "forceReboot") {
+    return isVmRunning(vm) ? "" : "只有运行中的虚拟机可以强制重启";
+  }
   return isVmStopped(vm) ? "" : "删除前需要先关机，避免删除运行中的业务 VM";
+}
+
+function actionButtonTitle(action: VmPowerAction, vm: VmNode) {
+  const labels: Record<VmPowerAction, string> = {
+    start: "开机",
+    shutdown: "关机",
+    forceReboot: "强制重启",
+    delete: "删除",
+  };
+  const reason = actionDisabledReason(action, vm);
+  return reason ? `${labels[action]}：${reason}` : labels[action];
 }
 
 function canRunVmAction(action: VmPowerAction, vm: VmNode) {
@@ -410,6 +426,13 @@ function openVmConsoleByRow(vm: VmNode) {
             </button>
           </span>
         </el-tooltip>
+        <el-tooltip :content="batchActionRows.forceReboot.length ? `批量重启 ${batchActionRows.forceReboot.length} 台运行中 VM` : '所选 VM 中没有可重启项'" placement="top">
+          <span class="toolbar-tooltip-target">
+            <button type="button" class="vm-batch-action action-force-reboot" :disabled="!batchActionRows.forceReboot.length" aria-label="批量重启" @click="emitBatchVmAction('forceReboot')">
+              <VrcVmActionIcon name="forceReboot" />
+            </button>
+          </span>
+        </el-tooltip>
         <el-tooltip :content="batchActionRows.delete.length ? `批量删除 ${batchActionRows.delete.length} 台已关机 VM` : '删除前需先关机'" placement="top">
           <span class="toolbar-tooltip-target">
             <button type="button" class="vm-batch-action action-delete" :disabled="!batchActionRows.delete.length" aria-label="批量删除" @click="emitBatchVmAction('delete')">
@@ -513,16 +536,19 @@ function openVmConsoleByRow(vm: VmNode) {
         <el-table-column label="IP" width="128" align="center">
           <template #default="{ row }">{{ displayVmIp(row, host.address) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="116" align="center" fixed="right" class-name="vm-operation-column" label-class-name="vm-operation-column">
+        <el-table-column label="操作" width="146" align="center" fixed="right" class-name="vm-operation-column" label-class-name="vm-operation-column">
           <template #default="{ row }">
             <div class="vm-action-cell">
-              <button class="vm-action-link action-start" :disabled="!canRunVmAction('start', row)" :aria-label="actionDisabledReason('start', row) || '开机'" @click.stop="emitVmAction('start', row)">
+              <button class="vm-action-link action-start" :disabled="!canRunVmAction('start', row)" :aria-label="actionButtonTitle('start', row)" :title="actionButtonTitle('start', row)" @click.stop="emitVmAction('start', row)">
                 <VrcVmActionIcon name="start" />
               </button>
-              <button class="vm-action-link action-shutdown" :disabled="!canRunVmAction('shutdown', row)" :aria-label="actionDisabledReason('shutdown', row) || '关机'" @click.stop="emitVmAction('shutdown', row)">
+              <button class="vm-action-link action-shutdown" :disabled="!canRunVmAction('shutdown', row)" :aria-label="actionButtonTitle('shutdown', row)" :title="actionButtonTitle('shutdown', row)" @click.stop="emitVmAction('shutdown', row)">
                 <VrcVmActionIcon name="shutdown" />
               </button>
-              <button class="vm-action-link action-delete" :disabled="!canRunVmAction('delete', row)" :aria-label="actionDisabledReason('delete', row) || '删除'" @click.stop="emitVmAction('delete', row)">
+              <button class="vm-action-link action-force-reboot" :disabled="!canRunVmAction('forceReboot', row)" :aria-label="actionButtonTitle('forceReboot', row)" :title="actionButtonTitle('forceReboot', row)" @click.stop="emitVmAction('forceReboot', row)">
+                <VrcVmActionIcon name="forceReboot" />
+              </button>
+              <button class="vm-action-link action-delete" :disabled="!canRunVmAction('delete', row)" :aria-label="actionButtonTitle('delete', row)" :title="actionButtonTitle('delete', row)" @click.stop="emitVmAction('delete', row)">
                 <VrcVmActionIcon name="delete" />
               </button>
             </div>

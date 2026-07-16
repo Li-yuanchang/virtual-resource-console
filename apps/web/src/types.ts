@@ -2,9 +2,9 @@ export type ProviderType = "xenserver" | "vmware" | "proxmox" | "libvirt";
 
 export type PowerState = "running" | "halted" | "stopped" | "suspended" | "unknown";
 
-export type VmPowerAction = "start" | "shutdown" | "delete";
+export type VmPowerAction = "start" | "shutdown" | "forceReboot" | "delete";
 
-export type VmScheduleAction = Exclude<VmPowerAction, "delete">;
+export type VmScheduleAction = Exclude<VmPowerAction, "forceReboot" | "delete">;
 export type VmScheduleCycle = "once" | "daily" | "weekly";
 export type VmScheduleFallback = "force" | "fail";
 export type VmScheduleConflictPolicy = "block" | "skip" | "replace";
@@ -285,6 +285,9 @@ export interface HostsResponse {
   hosts: HostNode[];
   storage: StorageRepository[];
   networks: NetworkInterface[];
+  source?: "cache" | "live";
+  cacheUpdatedAt?: string;
+  refreshing?: boolean;
 }
 
 export interface VmsResponse {
@@ -293,6 +296,9 @@ export interface VmsResponse {
   page: number;
   pageSize: number;
   total: number;
+  source?: "cache" | "live";
+  cacheUpdatedAt?: string;
+  refreshing?: boolean;
 }
 
 export interface VmDisksResponse {

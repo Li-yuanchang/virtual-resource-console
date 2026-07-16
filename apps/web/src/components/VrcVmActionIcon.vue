@@ -1,17 +1,24 @@
 <script setup lang="ts">
 defineProps<{
-  name: "start" | "shutdown" | "delete";
+  name: "start" | "shutdown" | "forceReboot" | "delete";
 }>();
 </script>
 
 <template>
   <svg class="vrc-vm-action-icon" :class="`is-${name}`" viewBox="0 0 24 24" aria-hidden="true">
     <template v-if="name === 'start'">
-      <path d="M8 5v14l11-7Z" />
+      <path d="M8.25 5.75v12.5L18 12Z" />
     </template>
     <template v-else-if="name === 'shutdown'">
       <path d="M12 4.9v6.8" />
       <path d="M7.4 7.7a6.7 6.7 0 1 0 9.2 0" />
+    </template>
+    <template v-else-if="name === 'forceReboot'">
+      <path d="M4.7 9.4A7.5 7.5 0 0 1 18.2 7.2" />
+      <path d="M18.2 4.4v3.2H15" />
+      <path d="M19.3 14.6A7.5 7.5 0 0 1 5.8 16.8" />
+      <path d="M5.8 19.6v-3.2H9" />
+      <path d="M10 8.7v6.6l5.2-3.3Z" />
     </template>
     <template v-else>
       <path d="M6.4 7.4h11.2" />

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ArrowDown, ArrowUp, Loading } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import ConsoleDialog from "./ConsoleDialog.vue";
@@ -166,7 +166,6 @@ const ipPoolPolicy = ref<IpPoolPolicy>(defaultIpPoolPolicy());
 const isoImages = ref<IsoImage[]>([]);
 const loadingProvisioningConfig = ref(false);
 const loadingIsoImages = ref(false);
-const savingProvisioningConfig = ref(false);
 const loadingIpLeases = ref(false);
 const probingIps = ref(false);
 const ipCandidateFilter = ref<"available" | "all">("available");
@@ -186,7 +185,6 @@ const strategyIpPools = computed(() => provisioningStrategy.value.defaultIpPools
 const provisioningPoolOptions = computed(() => {
   const pools = new Map<string, IpPoolConfig>();
   for (const pool of strategyIpPools.value) pools.set(pool.id, pool);
-  for (const pool of provisioningConfig.value.ipPools) pools.set(pool.id, pool);
   return Array.from(pools.values());
 });
 const provisioningForm = reactive({
@@ -525,10 +523,34 @@ async function loadIpPoolPolicy(sessionId?: number) {
     const result = await postJson<IpPoolPolicyResponse>("/api/ip-pools/policy", undefined, "GET");
     if (!props.visible || (sessionId !== undefined && sessionId !== dialogSessionId)) return;
     ipPoolPolicy.value = result.policy;
-  } catch {
+  } catch (error) {
     ipPoolPolicy.value = defaultIpPoolPolicy();
+    showMessage(error instanceof Error ? error.message : "读取 IP 池文件失败", "error");
   }
 }
+
+function handleIpPoolPolicyUpdated(event: Event) {
+  const policy = (event as CustomEvent<IpPoolPolicy>).detail;
+  if (!policy?.ipPools?.length) return;
+  ipPoolPolicy.value = policy;
+  if (!props.visible) return;
+  const selectedPool = selectedProvisioningPool.value;
+  if (selectedPool) {
+    applyProvisioningPoolDraft(selectedPool);
+    scheduleIpProbe();
+    return;
+  }
+  provisioningForm.ipPoolId = provisioningPoolOptions.value[0]?.id ?? "";
+  applyProvisioningPool();
+}
+
+onMounted(() => {
+  window.addEventListener("vrc:ip-pool-policy-updated", handleIpPoolPolicyUpdated);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("vrc:ip-pool-policy-updated", handleIpPoolPolicyUpdated);
+});
 
 async function loadProvisioningConfig(sessionId?: number) {
   loadingProvisioningConfig.value = true;
@@ -709,44 +731,6 @@ function applyProvisioningPoolDraft(pool: IpPoolConfig) {
   provisioningForm.networkName = pool.networkName ?? "";
   provisioningForm.vlan = pool.vlan ?? "";
   provisioningForm.preferredIp = "";
-}
-
-async function saveCurrentIpPool() {
-  if (provisioningFormLocked.value) return;
-  const draft = currentProvisioningPoolDraft();
-  const validation = validateIpPool(draft);
-  if (validation) {
-    showMessage(validation, "error");
-    return;
-  }
-
-  savingProvisioningConfig.value = true;
-  try {
-    const existingIndex = provisioningConfig.value.ipPools.findIndex((item) => item.id === provisioningForm.ipPoolId);
-    const nextPools =
-      existingIndex >= 0
-        ? provisioningConfig.value.ipPools.map((item, index) => (index === existingIndex ? { ...draft, id: item.id } : item))
-        : [...provisioningConfig.value.ipPools, draft];
-    const result = await postJson<ProvisioningConfigResponse>("/api/provisioning/config", {
-      environmentTemplates: provisioningConfig.value.environmentTemplates,
-      specTemplates: provisioningConfig.value.specTemplates,
-      ipPools: nextPools,
-    });
-    provisioningConfig.value = result.config;
-    const saved = result.config.ipPools.find((item) => item.name === draft.name && item.startIp === draft.startIp && item.endIp === draft.endIp);
-    provisioningForm.ipPoolId = saved?.id ?? provisioningForm.ipPoolId;
-    showMessage(`IP 池已保存：${draft.name}`, "success");
-    emit("activity", {
-      title: "保存 IP 池",
-      target: draft.name,
-      detail: `${draft.startIp} - ${draft.endIp}`,
-      status: "success",
-    });
-  } catch (error) {
-    showMessage(error instanceof Error ? error.message : "保存 IP 池失败", "error");
-  } finally {
-    savingProvisioningConfig.value = false;
-  }
 }
 
 function buildProvisioningPlan(): ProvisioningPlanResult | null {
@@ -1444,10 +1428,6 @@ type ProvisioningSourceType = "iso" | "template";
                   <button type="button" :class="{ active: ipCandidateFilter === 'available' }" @click="ipCandidateFilter = 'available'">可用</button>
                   <button type="button" :class="{ active: ipCandidateFilter === 'all' }" @click="ipCandidateFilter = 'all'">全部</button>
                 </div>
-                <button class="provision-save-button" type="button" :disabled="savingProvisioningConfig || provisioningFormLocked" @click="saveCurrentIpPool">
-                  <el-icon v-if="savingProvisioningConfig" class="inline-loading"><Loading /></el-icon>
-                  <span>保存 IP 池</span>
-                </button>
               </div>
               <el-select
                 v-model="provisioningForm.ipPoolId"
