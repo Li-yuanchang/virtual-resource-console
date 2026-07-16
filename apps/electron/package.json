@@ -1,11 +1,12 @@
 {
   "name": "@vrc/electron",
-  "version": "0.1.11",
+  "version": "0.1.19",
   "private": true,
   "description": "Desktop shell for Virtual Resource Console.",
   "main": "main.cjs",
   "scripts": {
     "dev": "electron .",
+    "prepack": "node ../../scripts/prepare-electron-runtime.mjs",
     "pack": "electron-builder --dir",
     "predist:mac": "node ../../scripts/prepare-electron-runtime.mjs darwin-arm64",
     "dist:mac": "electron-builder --mac",
@@ -23,8 +24,10 @@
     "directories": {
       "output": "dist"
     },
+    "compression": "normal",
     "files": [
       "main.cjs",
+      "startup.html",
       "assets/**",
       "package.json"
     ],
@@ -41,6 +44,10 @@
       {
         "from": "../web/dist",
         "to": "web"
+      },
+      {
+        "from": "../../config/ip-pools.example.json",
+        "to": "config/ip-pools.json"
       },
       {
         "from": "assets",
@@ -101,6 +108,12 @@
         },
         {
           "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
           "arch": [
             "x64"
           ]

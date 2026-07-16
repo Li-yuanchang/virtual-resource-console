@@ -1,24 +1,34 @@
-const { app, BrowserWindow, Menu, Tray, nativeImage, shell } = require("electron");
+const { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, nativeTheme, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 
 const APP_DISPLAY_NAME = "VRC";
+const MIN_STARTUP_VISIBLE_MS = 1800;
+const RENDERER_READY_TIMEOUT_MS = 15000;
 
 if (app && app.setName) {
   app.setName(APP_DISPLAY_NAME);
 }
 
 let mainWindow;
+let startupView;
+let startupStartedAt = 0;
+let startupResizeHandler;
+let startupOverlayReady = false;
 let apiProcess;
 let apiBaseUrl = process.env.VRC_WEB_URL || "http://127.0.0.1:5173";
 let tray;
 let logDir;
 let apiLogStream;
 let mainLogStream;
+let isQuitting = false;
+let logStreamsClosing = false;
 
 async function createWindow() {
+  const startupAppearance = readStartupAppearance();
+  startupOverlayReady = false;
   const macWindowOptions =
     process.platform === "darwin"
       ? {
@@ -28,13 +38,14 @@ async function createWindow() {
       : {};
 
   mainWindow = new BrowserWindow({
+    show: false,
     width: 1440,
     height: 920,
     minWidth: 1180,
     minHeight: 760,
     autoHideMenuBar: process.platform === "win32",
     ...macWindowOptions,
-    backgroundColor: "#f6f3ee",
+    backgroundColor: startupAppearance.bg,
     icon: resolveAssetPath(process.platform === "win32" ? "app-icon.ico" : "app-icon.icns"),
     webPreferences: {
       contextIsolation: true,
@@ -42,37 +53,216 @@ async function createWindow() {
     },
   });
 
-  if (app.isPackaged && !process.env.VRC_WEB_URL) {
-    apiBaseUrl = await startBundledApi();
+  mainWindow.on("close", (event) => {
+    appendMainLog("main window close requested", { isQuitting, startupActive: Boolean(startupView) });
+    if (isQuitting) return;
+    event.preventDefault();
+    mainWindow.hide();
+  });
+
+  startupStartedAt = Date.now();
+  try {
+    await attachStartupView(startupAppearance);
+    startupOverlayReady = true;
+  } catch (error) {
+    appendMainLog("startup overlay failed to load", { message: error instanceof Error ? error.message : String(error) });
+    disposeStartupView();
+    startupOverlayReady = true;
+  }
+  appendMainLog("startup overlay ready", { elapsedMs: Date.now() - startupStartedAt });
+  mainWindow.show();
+
+  try {
+    if (app.isPackaged && !process.env.VRC_WEB_URL) {
+      apiBaseUrl = await startBundledApi();
+    }
+    await setStartupStatus("正在载入资源配置");
+    await mainWindow.loadURL(apiBaseUrl);
+    await setStartupStatus("正在准备工作区");
+    const rendererReady = await waitForRendererReady(mainWindow.webContents);
+    appendMainLog("renderer startup readiness resolved", { rendererReady });
+    await finishStartupView();
+  } catch (error) {
+    appendMainLog("desktop startup failed", { message: error instanceof Error ? error.message : String(error) });
+    await setStartupStatus("启动失败，请查看日志");
+    throw error;
   }
 
-  mainWindow.loadURL(apiBaseUrl);
 }
 
 app.whenReady().then(async () => {
   configureApplicationMenu();
-  await createWindow();
   createTray();
+  await createWindow();
+}).catch((error) => {
+  appendMainLog("electron initialization failed", { message: error instanceof Error ? error.message : String(error) });
 });
 
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
-});
+app.on("window-all-closed", () => undefined);
 
 app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  if (BrowserWindow.getAllWindows().length === 0) {
+    void createWindow();
+    return;
+  }
+  if (!startupOverlayReady) return;
+  mainWindow?.show();
+  mainWindow?.focus();
 });
 
 app.on("before-quit", () => {
+  isQuitting = true;
+  logStreamsClosing = true;
+  disposeStartupView();
   if (apiProcess && !apiProcess.killed) {
     apiProcess.kill();
   }
-  apiLogStream?.end();
-  mainLogStream?.end();
+  closeLogStream(apiLogStream);
+  closeLogStream(mainLogStream);
+  apiLogStream = undefined;
+  mainLogStream = undefined;
 });
 
+async function attachStartupView(appearance) {
+  startupView = new WebContentsView({
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  startupView.webContents.setBackgroundThrottling(false);
+  startupView.setBackgroundColor("#00000000");
+  mainWindow.contentView.addChildView(startupView);
+  startupResizeHandler = () => layoutStartupView();
+  mainWindow.on("resize", startupResizeHandler);
+  layoutStartupView();
+  await startupView.webContents.loadFile(path.join(__dirname, "startup.html"), {
+    query: {
+      bg: appearance.bg,
+      surface: appearance.surface,
+      border: appearance.border,
+      text: appearance.text,
+      muted: appearance.muted,
+      accent: appearance.accent,
+      logoFg: appearance.logoFg,
+    },
+  });
+}
+
+function layoutStartupView() {
+  if (!mainWindow || mainWindow.isDestroyed() || !startupView) return;
+  const [width, height] = mainWindow.getContentSize();
+  startupView.setBounds({ x: 0, y: 0, width, height });
+}
+
+async function setStartupStatus(message) {
+  if (!startupView || startupView.webContents.isDestroyed()) return;
+  try {
+    await startupView.webContents.executeJavaScript(`window.vrcStartup?.setStatus(${JSON.stringify(message)})`);
+  } catch {
+    // 启动覆盖层退出期间的状态更新失败不影响主界面。
+  }
+}
+
+async function finishStartupView() {
+  if (!startupView) return;
+  const remaining = Math.max(MIN_STARTUP_VISIBLE_MS - (Date.now() - startupStartedAt), 0);
+  if (remaining) await delay(remaining);
+  await setStartupStatus("资源控制台已就绪");
+  await delay(100);
+  try {
+    await startupView.webContents.executeJavaScript("window.vrcStartup?.complete()");
+  } catch {
+    // 覆盖层仍会在下方统一释放。
+  }
+  await delay(480);
+  appendMainLog("releasing startup overlay", { visibleBefore: mainWindow?.isVisible() });
+  disposeStartupView();
+  mainWindow?.show();
+  mainWindow?.focus();
+  appendMainLog("startup overlay released", { visibleAfter: mainWindow?.isVisible() });
+}
+
+function disposeStartupView() {
+  if (mainWindow && startupResizeHandler) {
+    mainWindow.removeListener("resize", startupResizeHandler);
+  }
+  startupResizeHandler = undefined;
+  if (!startupView) return;
+  try {
+    mainWindow?.contentView.removeChildView(startupView);
+    if (!startupView.webContents.isDestroyed()) startupView.webContents.close();
+  } catch {
+    // 应用退出或窗口销毁时视图可能已被 Electron 回收。
+  }
+  startupView = undefined;
+  startupOverlayReady = true;
+}
+
+async function waitForRendererReady(webContents) {
+  const deadline = Date.now() + RENDERER_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (webContents.isDestroyed()) return false;
+    try {
+      const ready = await webContents.executeJavaScript("document.documentElement.dataset.appReady === 'true'");
+      if (ready) return true;
+    } catch {
+      // 页面导航或首轮脚本执行期间继续等待。
+    }
+    await delay(50);
+  }
+  return false;
+}
+
+function readStartupAppearance() {
+  const fallback = {
+    theme: "graphite-sage",
+    toneMode: "light",
+    accentColor: "#426b57",
+  };
+  let preferences = fallback;
+  try {
+    const file = path.join(app.getPath("home"), ".virtual-resource-console", "preferences.json");
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    preferences = { ...fallback, ...(parsed?.ui ?? {}) };
+  } catch {
+    preferences = fallback;
+  }
+
+  const theme = ["graphite-sage", "basalt-copper", "mist-teal"].includes(preferences.theme) ? preferences.theme : fallback.theme;
+  const dark = preferences.toneMode === "dark" || (preferences.toneMode === "system" && nativeTheme.shouldUseDarkColors);
+  const palettes = {
+    "graphite-sage": { bg: "#f5f6f2", surface: "#fbfbf7", border: "#d9ded0", text: "#27302a", muted: "#747b70", accent: "#426b57" },
+    "basalt-copper": { bg: "#f4f2ed", surface: "#fcfaf5", border: "#d7d0c3", text: "#2f2b24", muted: "#766f63", accent: "#9b5f35" },
+    "mist-teal": { bg: "#f3f6f4", surface: "#fbfcfa", border: "#d2dbd5", text: "#22302d", muted: "#6f7b77", accent: "#2f6f68" },
+  };
+  const palette = dark
+    ? { bg: "#0f1417", surface: "#161d21", border: "#314047", text: "#d8e0e4", muted: "#93a1aa", accent: palettes[theme].accent }
+    : palettes[theme];
+  return {
+    ...palette,
+    accent: isHexColor(preferences.accentColor) ? preferences.accentColor.toLowerCase() : palette.accent,
+    logoFg: dark ? "#edf4ef" : "#f7fbf2",
+  };
+}
+
+function isHexColor(value) {
+  return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 async function startBundledApi() {
-  const port = await resolveApiPort(Number(process.env.PORT || 3987));
+  const preferredPort = Number(process.env.PORT || 3987);
+  const preferredBaseUrl = `http://127.0.0.1:${preferredPort}`;
+  if (await isVrcApiHealthy(preferredBaseUrl)) {
+    appendMainLog("reusing existing vrc api", { baseUrl: preferredBaseUrl });
+    return preferredBaseUrl;
+  }
+  const port = await resolveApiPort(preferredPort);
   const resourcesPath = process.resourcesPath;
   const apiEntry = path.join(resourcesPath, "api", "index.js");
   const webDistDir = path.join(resourcesPath, "web");
@@ -80,6 +270,7 @@ async function startBundledApi() {
   const nodeRuntime = resolveNodeRuntimePath(resourcesPath);
   const useElectronAsNode = nodeRuntime === process.execPath;
   const logsPath = getLogDir();
+  ensureBundledIpPoolsConfig(resourcesPath);
   apiLogStream = createLogStream("api.log");
   appendMainLog("starting bundled api", { port, apiEntry, webDistDir, nodeModulesDir, logsPath, nodeRuntime, useElectronAsNode });
 
@@ -92,6 +283,8 @@ async function startBundledApi() {
       NODE_PATH: nodeModulesDir,
       VRC_WEB_DIST_DIR: webDistDir,
       VRC_LOG_DIR: logsPath,
+      VRC_IP_POOLS_FILE: path.join(app.getPath("home"), ".virtual-resource-console", "ip-pools.json"),
+      VRC_RUNTIME_MODE: "electron",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -109,6 +302,21 @@ async function startBundledApi() {
   await waitForHealth(baseUrl);
   appendMainLog("bundled api ready", { baseUrl });
   return baseUrl;
+}
+
+function ensureBundledIpPoolsConfig(resourcesPath) {
+  const targetDir = path.join(app.getPath("home"), ".virtual-resource-console");
+  const targetFile = path.join(targetDir, "ip-pools.json");
+  if (fs.existsSync(targetFile)) return;
+  const sourceFile = path.join(resourcesPath, "config", "ip-pools.json");
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  fs.copyFileSync(sourceFile, targetFile);
+  try {
+    fs.chmodSync(targetFile, 0o600);
+  } catch {
+    // Windows 不支持 POSIX mode，忽略即可。
+  }
+  appendMainLog("seeded default ip pools config", { targetFile });
 }
 
 function createTray() {
@@ -143,7 +351,10 @@ function createTray() {
       { type: "separator" },
       {
         label: "退出",
-        click: () => app.quit(),
+        click: () => {
+          isQuitting = true;
+          app.quit();
+        },
       },
     ]),
   );
@@ -336,22 +547,48 @@ function createLogStream(filename) {
 
 function appendMainLog(message, detail) {
   try {
+    if (logStreamsClosing) return;
+    if (mainLogStream && isLogStreamClosed(mainLogStream)) {
+      mainLogStream = undefined;
+    }
     if (!mainLogStream) {
       mainLogStream = createLogStream("main.log");
     }
     const suffix = detail ? ` ${JSON.stringify(detail)}` : "";
-    mainLogStream.write(`[${new Date().toISOString()}] ${message}${suffix}\n`);
+    safeWriteLogStream(mainLogStream, `[${new Date().toISOString()}] ${message}${suffix}\n`);
   } catch {
     // 日志失败不能影响桌面应用启动。
   }
 }
 
 function writeApiLog(streamName, chunk) {
-  if (!apiLogStream) return;
+  if (logStreamsClosing || !apiLogStream || isLogStreamClosed(apiLogStream)) return;
   const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
   for (const line of text.split(/\r?\n/)) {
     if (!line) continue;
-    apiLogStream.write(`[${new Date().toISOString()}] [${streamName}] ${line}\n`);
+    safeWriteLogStream(apiLogStream, `[${new Date().toISOString()}] [${streamName}] ${line}\n`);
+  }
+}
+
+function isLogStreamClosed(stream) {
+  return Boolean(stream.destroyed || stream.closed || stream.writableEnded || stream.writableFinished);
+}
+
+function safeWriteLogStream(stream, line) {
+  if (!stream || isLogStreamClosed(stream)) return;
+  try {
+    stream.write(line);
+  } catch {
+    // 退出阶段 stream 可能已结束，不能让日志写入变成主进程异常。
+  }
+}
+
+function closeLogStream(stream) {
+  if (!stream || isLogStreamClosed(stream)) return;
+  try {
+    stream.end();
+  } catch {
+    // 忽略退出阶段日志关闭异常。
   }
 }
 
@@ -410,4 +647,15 @@ async function waitForHealth(baseUrl) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw lastError || new Error("Timed out waiting for VRC API.");
+}
+
+async function isVrcApiHealthy(baseUrl) {
+  try {
+    const response = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(1500) });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    return payload?.service === "virtual-resource-console-api";
+  } catch {
+    return false;
+  }
 }

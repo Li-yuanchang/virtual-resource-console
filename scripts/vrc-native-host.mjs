@@ -65,6 +65,7 @@ async function startRepoServer(baseUrl) {
       ...process.env,
       HOST: host,
       PORT: port,
+      VRC_RUNTIME_MODE: "chrome-native",
     },
     stdio: ["ignore", logStream, logStream],
   });

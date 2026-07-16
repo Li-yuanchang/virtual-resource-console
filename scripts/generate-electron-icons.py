@@ -1,6 +1,5 @@
-from pathlib import Path
-import math
 import subprocess
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -37,10 +36,10 @@ def draw_app_icon(size: int) -> Image.Image:
 
     shadow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow)
-    margin = int(106 * scale)
-    radius = int(178 * scale)
+    margin = int(92 * scale)
+    radius = int(190 * scale)
     shadow_draw.rounded_rectangle(
-        (margin, margin + int(22 * scale), size - margin, size - margin + int(22 * scale)),
+        (margin, margin + int(24 * scale), size - margin, size - margin + int(24 * scale)),
         radius=radius,
         fill=(20, 42, 34, 90),
     )
@@ -49,49 +48,41 @@ def draw_app_icon(size: int) -> Image.Image:
 
     tile = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     mask = rounded_rect_mask(size - 2 * margin, radius)
-    base = Image.new("RGBA", (size - 2 * margin, size - 2 * margin), (47, 96, 78, 255))
+    base = Image.new("RGBA", (size - 2 * margin, size - 2 * margin), (47, 89, 68, 255))
     base_draw = ImageDraw.Draw(base)
     for y in range(base.height):
         t = y / max(1, base.height - 1)
-        r = int(57 * (1 - t) + 35 * t)
-        g = int(118 * (1 - t) + 82 * t)
-        b = int(96 * (1 - t) + 67 * t)
+        r = int(82 * (1 - t) + 47 * t)
+        g = int(124 * (1 - t) + 89 * t)
+        b = int(103 * (1 - t) + 68 * t)
         base_draw.line((0, y, base.width, y), fill=(r, g, b, 255))
 
     grid = Image.new("RGBA", base.size, (0, 0, 0, 0))
     grid_draw = ImageDraw.Draw(grid)
-    step = int(92 * scale)
+    step = int(88 * scale)
     for x in range(-base.height, base.width, step):
-        grid_draw.line((x, base.height, x + base.height, 0), fill=(255, 255, 255, 22), width=max(1, int(3 * scale)))
+        grid_draw.line((x, base.height, x + base.height, 0), fill=(255, 255, 255, 18), width=max(1, int(3 * scale)))
     base.alpha_composite(grid)
-
-    ring_draw = ImageDraw.Draw(base)
-    ring_draw.rounded_rectangle(
-        (int(34 * scale), int(34 * scale), base.width - int(34 * scale), base.height - int(34 * scale)),
-        radius=int(142 * scale),
-        outline=(232, 244, 235, 82),
-        width=max(2, int(8 * scale)),
-    )
     tile.paste(base, (margin, margin), mask)
     image.alpha_composite(tile)
 
     draw = ImageDraw.Draw(image)
     text = "VRC"
-    text_font = font(int(190 * scale))
+    text_font = font(int(238 * scale))
     bbox = draw.textbbox((0, 0), text, font=text_font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
     draw.text(
-        ((size - text_w) / 2, int(434 * scale) - text_h / 2),
+        ((size - text_w) / 2, int(444 * scale) - text_h / 2),
         text,
         font=text_font,
         fill=(246, 250, 242, 255),
     )
 
-    cursor_w = int(148 * scale)
-    cursor_h = max(4, int(18 * scale))
-    cursor_x = int(548 * scale)
-    cursor_y = int(626 * scale)
+    cursor_w = int(158 * scale)
+    cursor_h = max(4, int(32 * scale))
+    cursor_x = int(570 * scale)
+    cursor_y = int(668 * scale)
     draw.rounded_rectangle(
         (cursor_x, cursor_y, cursor_x + cursor_w, cursor_y + cursor_h),
         radius=cursor_h // 2,
@@ -102,35 +93,37 @@ def draw_app_icon(size: int) -> Image.Image:
 
 
 def draw_tray_icon(size: int) -> Image.Image:
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    scale = 6
+    canvas = size * scale
+    image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    pad = max(1, int(size * 0.08))
-    rect = (pad, pad, size - pad, size - pad)
-    radius = max(3, int(size * 0.22))
-    draw.rounded_rectangle(rect, radius=radius, fill=(47, 96, 78, 255), outline=(218, 234, 224, 150), width=max(1, size // 18))
+    pad = max(1, int(size * 0.12)) * scale
+    rect = (pad, pad, canvas - pad, canvas - pad)
+    radius = max(3, int(size * 0.2)) * scale
+    draw.rounded_rectangle(rect, radius=radius, fill=(47, 89, 68, 255))
 
     label = "VRC"
-    label_font = font(max(7, int(size * 0.34)))
+    label_font = font(max(7, int(size * 0.32)) * scale)
     bbox = draw.textbbox((0, 0), label, font=label_font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
     draw.text(
-        ((size - text_w) / 2, int(size * 0.48) - text_h / 2),
+        ((canvas - text_w) / 2, int(canvas * 0.42) - text_h / 2),
         label,
         font=label_font,
         fill=(246, 250, 242, 255),
     )
 
-    cursor_h = max(1, int(size * 0.08))
-    cursor_w = max(4, int(size * 0.28))
-    cursor_x = int(size * 0.52)
-    cursor_y = int(size * 0.68)
+    cursor_h = max(1, int(size * 0.08)) * scale
+    cursor_w = max(4, int(size * 0.22)) * scale
+    cursor_x = int(canvas * 0.58)
+    cursor_y = int(canvas * 0.72)
     draw.rounded_rectangle(
         (cursor_x, cursor_y, cursor_x + cursor_w, cursor_y + cursor_h),
         radius=max(1, cursor_h // 2),
         fill=(246, 250, 242, 235),
     )
-    return image
+    return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def save_iconset() -> None:

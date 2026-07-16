@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-start "" "%~dp0Virtual Resource Console.exe"
+start "" "%~dp0VRC.exe"

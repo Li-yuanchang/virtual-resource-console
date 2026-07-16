@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readlinkSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,7 +51,7 @@ function defaultTarget() {
 function prepareRuntime(target, spec) {
   const targetDir = path.join(runtimeRoot, `node-${target}`);
   const executable = target.startsWith("win-") ? path.join(targetDir, "node.exe") : path.join(targetDir, "bin", "node");
-  if (existsSync(executable)) {
+  if (existsSync(executable) && hasPortableRuntimeLinks(targetDir)) {
     console.log(`[electron-runtime] ${target} already prepared: ${executable}`);
     return;
   }
@@ -76,9 +76,22 @@ function prepareRuntime(target, spec) {
 
   const extractedRoot = path.join(tempDir, spec.folder);
   const sourceRoot = existsSync(extractedRoot) ? extractedRoot : path.join(tempDir, readdirSync(tempDir)[0] ?? "");
-  cpSync(sourceRoot, targetDir, { recursive: true });
+  cpSync(sourceRoot, targetDir, { recursive: true, verbatimSymlinks: true });
   rmSync(tempDir, { recursive: true, force: true });
   console.log(`[electron-runtime] prepared ${target}: ${targetDir}`);
+}
+
+function hasPortableRuntimeLinks(targetDir) {
+  const binDir = path.join(targetDir, "bin");
+  for (const name of ["corepack", "npm", "npx"]) {
+    const link = path.join(binDir, name);
+    try {
+      if (lstatSync(link).isSymbolicLink() && path.isAbsolute(readlinkSync(link))) return false;
+    } catch {
+      // Windows 运行时没有这些 Unix 符号链接。
+    }
+  }
+  return true;
 }
 
 function pruneUnrequestedRuntimes(targetsToKeep) {
