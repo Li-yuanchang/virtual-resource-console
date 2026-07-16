@@ -367,6 +367,10 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
           accepted: true,
           message: `${vmwareActionLabel(action)}完成：${vm.name}`,
         };
+      } else if (action === "forceReboot") {
+        if (vm.powerState !== "running") throw new Error("虚拟机未运行，不能强制重启。");
+        await session.powerOffVm(vmMoid);
+        await session.powerOnVm(vmMoid);
       } else {
         if (vm.powerState === "running") throw new Error("虚拟机正在运行，请先关机后再删除。");
         await session.destroyVm(vmMoid);
@@ -1257,6 +1261,7 @@ export class VmwareSoapSession {
 function vmwareActionLabel(action: VmPowerAction) {
   if (action === "start") return "开机";
   if (action === "shutdown") return "关机";
+  if (action === "forceReboot") return "强制重启";
   return "删除";
 }
 

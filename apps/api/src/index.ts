@@ -27,6 +27,9 @@ import {
   markEphemeralConnectionUsed,
   resolveEphemeralConnection,
 } from "./ephemeralConnectionStore.js";
+import { InventoryCache } from "./inventoryCache.js";
+import type { InventoryCacheScope } from "./inventoryCache.js";
+import { listInventoryEventsAfter, publishInventoryEvent, subscribeInventoryEvents } from "./inventoryEvents.js";
 import { cleanupXenInstallSources, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
 import { listIpLeases, releaseIpLeases, reserveIpLeases } from "./ipLeaseStore.js";
 import { getIpPoolPolicy, saveIpPoolPolicy } from "./ipPoolPolicy.js";
@@ -113,6 +116,7 @@ providers.register(new XenServerProvider());
 providers.register(new VmwareProvider());
 providers.register(new ProxmoxProvider());
 const vmScheduleRunner = new VmScheduleRunner(providers, server.log);
+const inventoryCache = new InventoryCache();
 const isoRefreshJobs = new Set<string>();
 const vmScheduleTargetCacheTtlMs = 5 * 60_000;
 let vmScheduleTargetCache: Awaited<ReturnType<typeof loadVmScheduleTargets>> | undefined;
@@ -204,6 +208,7 @@ const ephemeralConnectionSchema = directConnectionSchema.extend({
 
 const hostsSchema = connectionSchema.extend({
   poolId: z.string().optional(),
+  forceRefresh: z.boolean().optional(),
 });
 
 const vmsSchema = connectionSchema.extend({
@@ -212,6 +217,7 @@ const vmsSchema = connectionSchema.extend({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().default(100),
   keyword: z.string().optional(),
+  forceRefresh: z.boolean().optional(),
 });
 
 const vmDisksSchema = connectionSchema.extend({
@@ -220,12 +226,14 @@ const vmDisksSchema = connectionSchema.extend({
 
 const vmActionSchema = connectionSchema.extend({
   vmId: z.string().min(1),
-  action: z.enum(["start", "shutdown", "delete"]),
+  hostId: z.string().optional(),
+  action: z.enum(["start", "shutdown", "forceReboot", "delete"]),
   confirmToken: z.literal("CONFIRMED"),
 });
 
 const vmRenameSchema = connectionSchema.extend({
   vmId: z.string().min(1),
+  hostId: z.string().optional(),
   currentName: z.string().min(1).max(128),
   newName: z.string().min(1).max(128),
   confirmToken: z.literal("CONFIRMED"),
@@ -734,6 +742,38 @@ server.get("/api/provisioning/tasks/:taskId/events", (request, reply) => {
   request.raw.once("close", cleanup);
 });
 
+server.get("/api/inventory/events", (request, reply) => {
+  reply.hijack();
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  reply.raw.write(": connected\n\n");
+
+  const sendInventoryEvent = (event: ReturnType<typeof publishInventoryEvent>) => {
+    if (reply.raw.writableEnded || reply.raw.destroyed) return;
+    reply.raw.write(`id: ${event.eventSeq}\n`);
+    reply.raw.write("event: inventory\n");
+    reply.raw.write(`data: ${JSON.stringify({ event })}\n\n`);
+  };
+  for (const event of listInventoryEventsAfter(parseLastEventId(request.headers["last-event-id"]))) {
+    sendInventoryEvent(event);
+  }
+
+  const unsubscribe = subscribeInventoryEvents(sendInventoryEvent);
+  const heartbeat = setInterval(() => {
+    if (reply.raw.writableEnded || reply.raw.destroyed) return;
+    reply.raw.write(": keep-alive\n\n");
+  }, 15000);
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  };
+  request.raw.once("close", cleanup);
+});
+
 server.post("/api/provisioning/preflight", async (request, reply) => {
   const parsed = provisionPreflightSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -914,6 +954,24 @@ async function runProvisionTaskExecution(input: {
       };
     }),
   );
+  invalidateInventoryCache(
+    {
+      connectionId: executableRequest.connectionId,
+      providerType: executableRequest.providerType,
+      connection: input.connection,
+    },
+    executableRequest.hostId,
+  );
+  scheduleInventoryRefresh({
+    resolved: {
+      connectionId: executableRequest.connectionId,
+      providerType: executableRequest.providerType,
+      connection: input.connection,
+    },
+    hostId: executableRequest.hostId,
+    changedVmIds: result.created.map((vm) => vm.providerId || vm.id).filter(Boolean),
+    changedVmNames: result.created.map((vm) => vm.name).filter(Boolean),
+  });
   runProvisioningVerifier({
     taskId: input.taskId,
     connection: input.connection,
@@ -1073,15 +1131,19 @@ server.post("/api/inventory/hosts", async (request, reply) => {
 
   try {
     const resolved = resolveConnectionRequest(parsed.data);
-    const provider = providers.get(resolved.providerType);
-    const connection = resolved.connection;
-    const inventory = hasHostInventory(provider) ? await provider.collectHostInventory(connection) : undefined;
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const inventory = await loadHostInventoryCached(resolved, {
+      poolId: parsed.data.poolId,
+      forceRefresh: parsed.data.forceRefresh,
+    });
     return {
-      collectedAt: new Date().toISOString(),
-      hosts: inventory?.hosts ?? (await provider.listHosts(connection, { poolId: parsed.data.poolId })),
-      storage: inventory?.storage ?? [],
-      networks: inventory?.networks ?? [],
+      collectedAt: inventory.updatedAt,
+      hosts: inventory.value.hosts,
+      storage: inventory.value.storage,
+      networks: inventory.value.networks,
+      source: inventory.source,
+      cacheUpdatedAt: inventory.updatedAt,
+      refreshing: inventory.refreshing,
     };
   } catch (error) {
     request.log.error({ error }, "failed to list virtualization hosts");
@@ -1102,17 +1164,21 @@ server.post("/api/inventory/vms", async (request, reply) => {
 
   try {
     const resolved = resolveConnectionRequest(parsed.data);
-    const provider = providers.get(resolved.providerType);
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const vms = await loadVmsCached(resolved, {
+      poolId: parsed.data.poolId,
+      hostId: parsed.data.hostId,
+      page: parsed.data.page,
+      pageSize: parsed.data.pageSize,
+      keyword: parsed.data.keyword,
+      forceRefresh: parsed.data.forceRefresh,
+    });
     return {
-      collectedAt: new Date().toISOString(),
-      ...(await provider.listVms(resolved.connection, {
-        poolId: parsed.data.poolId,
-        hostId: parsed.data.hostId,
-        page: parsed.data.page,
-        pageSize: parsed.data.pageSize,
-        keyword: parsed.data.keyword,
-      })),
+      collectedAt: vms.updatedAt,
+      ...vms.value,
+      source: vms.source,
+      cacheUpdatedAt: vms.updatedAt,
+      refreshing: vms.refreshing,
     };
   } catch (error) {
     request.log.error({ error }, "failed to list virtualization vms");
@@ -1133,28 +1199,20 @@ server.post("/api/inventory/vm-summary", async (request, reply) => {
 
   try {
     const resolved = resolveConnectionRequest(parsed.data);
-    const provider = providers.get(resolved.providerType);
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
-    const query = {
+    const summary = await loadVmSummaryCached(resolved, {
       poolId: parsed.data.poolId,
       hostId: parsed.data.hostId,
       page: 1,
       pageSize: 500,
-    };
-    const summary =
-      provider.summarizeVms != null
-        ? await provider.summarizeVms(resolved.connection, query)
-        : summarizeVmItems(
-            (
-              await provider.listVms(resolved.connection, {
-                ...query,
-                keyword: undefined,
-              })
-            ).items,
-          );
+      forceRefresh: parsed.data.forceRefresh,
+    });
     return {
-      collectedAt: new Date().toISOString(),
-      summary,
+      collectedAt: summary.updatedAt,
+      summary: summary.value,
+      source: summary.source,
+      cacheUpdatedAt: summary.updatedAt,
+      refreshing: summary.refreshing,
     };
   } catch (error) {
     request.log.error({ error }, "failed to summarize virtualization vms");
@@ -1309,6 +1367,35 @@ server.post("/api/vms/action", async (request, reply) => {
       }
     }
     const result = await provider.performVmAction(resolved.connection, parsed.data.vmId, parsed.data.action);
+    invalidateInventoryCache(resolved, parsed.data.hostId);
+    if (parsed.data.hostId) {
+      if (parsed.data.action === "delete") {
+        publishInventoryEvent({
+          type: "vm.delete",
+          connectionId: resolved.connectionId,
+          providerType: resolved.providerType,
+          hostId: parsed.data.hostId,
+          vmId: parsed.data.vmId,
+        });
+      } else {
+        publishInventoryEvent({
+          type: "vm.patch",
+          connectionId: resolved.connectionId,
+          providerType: resolved.providerType,
+          hostId: parsed.data.hostId,
+          vmId: parsed.data.vmId,
+          patch: {
+            powerState: parsed.data.action === "shutdown" ? "halted" : "running",
+          },
+        });
+      }
+      scheduleInventoryRefresh({
+        resolved,
+        hostId: parsed.data.hostId,
+        changedVmIds: parsed.data.action === "delete" ? [] : [parsed.data.vmId],
+        deletedVmIds: parsed.data.action === "delete" ? [parsed.data.vmId] : [],
+      });
+    }
     const releasedLeases =
       parsed.data.action === "delete" && (vmNameForLeaseRelease || vmIpsForLeaseRelease.length)
         ? releaseIpLeases({
@@ -1353,6 +1440,25 @@ server.post("/api/vms/rename", async (request, reply) => {
       parsed.data.currentName,
       parsed.data.newName,
     );
+    invalidateInventoryCache(resolved, parsed.data.hostId);
+    if (parsed.data.hostId) {
+      publishInventoryEvent({
+        type: "vm.patch",
+        connectionId: resolved.connectionId,
+        providerType: resolved.providerType,
+        hostId: parsed.data.hostId,
+        vmId: parsed.data.vmId,
+        patch: {
+          name: result.newName,
+        },
+      });
+      scheduleInventoryRefresh({
+        resolved,
+        hostId: parsed.data.hostId,
+        changedVmIds: [parsed.data.vmId],
+        changedVmNames: [result.newName],
+      });
+    }
     return {
       operatedAt: new Date().toISOString(),
       result,
@@ -1845,6 +1951,176 @@ function hasHostInventory(provider: unknown): provider is HostInventoryCapabilit
   return typeof provider === "object" && provider !== null && "collectHostInventory" in provider;
 }
 
+function buildInventoryCacheScope(
+  resolved: ReturnType<typeof resolveConnectionRequest>,
+  scope: Pick<InventoryCacheScope, "poolId" | "hostId" | "page" | "pageSize" | "keyword"> = {},
+): InventoryCacheScope {
+  return {
+    providerType: resolved.providerType,
+    connectionId: resolved.connectionId,
+    host: resolved.connection.host,
+    port: resolved.connection.port,
+    username: resolved.connection.username,
+    ...scope,
+  };
+}
+
+function loadHostInventoryCached(
+  resolved: ReturnType<typeof resolveConnectionRequest>,
+  options: { poolId?: string; forceRefresh?: boolean } = {},
+) {
+  const provider = providers.get(resolved.providerType);
+  const connection = resolved.connection;
+  const cacheScope = buildInventoryCacheScope(resolved, { poolId: options.poolId });
+  return inventoryCache.getHosts(
+    cacheScope,
+    async () => {
+      const inventory = hasHostInventory(provider) ? await provider.collectHostInventory(connection) : undefined;
+      return {
+        hosts: inventory?.hosts ?? (await provider.listHosts(connection, { poolId: options.poolId })),
+        storage: inventory?.storage ?? [],
+        networks: inventory?.networks ?? [],
+      };
+    },
+    Boolean(options.forceRefresh),
+  );
+}
+
+function loadVmsCached(
+  resolved: ReturnType<typeof resolveConnectionRequest>,
+  options: { poolId?: string; hostId?: string; page: number; pageSize: number; keyword?: string; forceRefresh?: boolean },
+) {
+  const provider = providers.get(resolved.providerType);
+  const cacheScope = buildInventoryCacheScope(resolved, {
+    poolId: options.poolId,
+    hostId: options.hostId,
+    page: options.page,
+    pageSize: options.pageSize,
+    keyword: options.keyword,
+  });
+  return inventoryCache.getVmList(
+    cacheScope,
+    () =>
+      provider.listVms(resolved.connection, {
+        poolId: options.poolId,
+        hostId: options.hostId,
+        page: options.page,
+        pageSize: options.pageSize,
+        keyword: options.keyword,
+      }),
+    Boolean(options.forceRefresh),
+  );
+}
+
+function loadVmSummaryCached(
+  resolved: ReturnType<typeof resolveConnectionRequest>,
+  options: { poolId?: string; hostId?: string; page: number; pageSize: number; forceRefresh?: boolean },
+) {
+  const provider = providers.get(resolved.providerType);
+  const cacheScope = buildInventoryCacheScope(resolved, {
+    poolId: options.poolId,
+    hostId: options.hostId,
+    page: options.page,
+    pageSize: options.pageSize,
+  });
+  return inventoryCache.getVmSummary(
+    cacheScope,
+    async () => {
+      const query = {
+        poolId: options.poolId,
+        hostId: options.hostId,
+        page: options.page,
+        pageSize: options.pageSize,
+      };
+      return provider.summarizeVms != null
+        ? provider.summarizeVms(resolved.connection, query)
+        : summarizeVmItems((await provider.listVms(resolved.connection, { ...query, keyword: undefined })).items);
+    },
+    Boolean(options.forceRefresh),
+  );
+}
+
+function invalidateInventoryCache(resolved: ReturnType<typeof resolveConnectionRequest>, hostId?: string) {
+  inventoryCache.invalidate(buildInventoryCacheScope(resolved, { hostId }));
+}
+
+function scheduleInventoryRefresh(input: {
+  resolved: ReturnType<typeof resolveConnectionRequest>;
+  hostId?: string;
+  changedVmIds?: string[];
+  changedVmNames?: string[];
+  deletedVmIds?: string[];
+}) {
+  if (!input.hostId) return;
+  setTimeout(() => {
+    void refreshInventoryAndPublish(input).catch((error) => {
+      server.log.warn({ error, hostId: input.hostId, connectionId: input.resolved.connectionId }, "background inventory refresh failed");
+    });
+  }, 1500);
+}
+
+async function refreshInventoryAndPublish(input: {
+  resolved: ReturnType<typeof resolveConnectionRequest>;
+  hostId?: string;
+  changedVmIds?: string[];
+  changedVmNames?: string[];
+  deletedVmIds?: string[];
+}) {
+  const hostId = input.hostId;
+  if (!hostId) return;
+  const [hostsResult, summaryResult, vmsResult] = await Promise.allSettled([
+    loadHostInventoryCached(input.resolved, { forceRefresh: true }),
+    loadVmSummaryCached(input.resolved, { hostId, page: 1, pageSize: 500, forceRefresh: true }),
+    loadVmsCached(input.resolved, { hostId, page: 1, pageSize: 500, forceRefresh: true }),
+  ]);
+  if (hostsResult.status === "fulfilled") {
+    const host = hostsResult.value.value.hosts.find((item) => item.providerId === hostId || item.id === hostId);
+    if (host) {
+      publishInventoryEvent({
+        type: "host.patch",
+        connectionId: input.resolved.connectionId,
+        providerType: input.resolved.providerType,
+        hostId,
+        patch: host,
+      });
+    }
+  }
+  if (summaryResult.status === "fulfilled") {
+    publishInventoryEvent({
+      type: "summary.patch",
+      connectionId: input.resolved.connectionId,
+      providerType: input.resolved.providerType,
+      hostId,
+      summary: summaryResult.value.value,
+    });
+  }
+  if (vmsResult.status !== "fulfilled") return;
+  const changedVmIds = new Set(input.changedVmIds ?? []);
+  const changedVmNames = new Set(input.changedVmNames ?? []);
+  for (const vm of vmsResult.value.value.items) {
+    if (changedVmIds.has(vm.providerId) || changedVmIds.has(vm.id) || changedVmNames.has(vm.name)) {
+      publishInventoryEvent({
+        type: "vm.upsert",
+        connectionId: input.resolved.connectionId,
+        providerType: input.resolved.providerType,
+        hostId,
+        vm,
+      });
+    }
+  }
+  for (const vmId of input.deletedVmIds ?? []) {
+    if (!vmsResult.value.value.items.some((vm) => vm.providerId === vmId || vm.id === vmId)) {
+      publishInventoryEvent({
+        type: "vm.delete",
+        connectionId: input.resolved.connectionId,
+        providerType: input.resolved.providerType,
+        hostId,
+        vmId,
+      });
+    }
+  }
+}
+
 function summarizeVmItems(items: VmNode[]): VmInventorySummary {
   const runningItems = items.filter((vm) => vm.powerState === "running");
   return {
@@ -1859,9 +2135,10 @@ function summarizeVmItems(items: VmNode[]): VmInventorySummary {
   };
 }
 
-function vmActionLabel(action: "start" | "shutdown" | "delete") {
+function vmActionLabel(action: "start" | "shutdown" | "forceReboot" | "delete") {
   if (action === "start") return "开机";
   if (action === "shutdown") return "关机";
+  if (action === "forceReboot") return "强制重启";
   return "删除";
 }
 

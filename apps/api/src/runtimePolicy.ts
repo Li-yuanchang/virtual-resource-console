@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { getVrcDataFile } from "./appPaths.js";
 
 export interface RuntimePolicy {
   managedIpPattern?: string;
@@ -55,7 +54,7 @@ export function getRuntimePolicy(): RuntimePolicy {
 }
 
 export function getRuntimePolicyPath(): string {
-  return process.env.VRC_RUNTIME_POLICY_FILE?.trim() || join(homedir(), ".virtual-resource-console", "runtime-policy.json");
+  return process.env.VRC_RUNTIME_POLICY_FILE?.trim() || getVrcDataFile("runtime-policy.json");
 }
 
 export function isManagedIpv4(ip: string, policy = getRuntimePolicy()): boolean {

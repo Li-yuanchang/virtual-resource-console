@@ -1,11 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EnvironmentProvisioningTemplate, IpPoolConfig, ProvisioningConfig, ProvisioningSpecTemplate } from "./types.js";
+import { getVrcDataFile } from "./appPaths.js";
 
-const storeDir = join(homedir(), ".virtual-resource-console");
-const storeFile = join(storeDir, "provisioning.json");
+const storeFile = getVrcDataFile("provisioning.json");
 
 interface ProvisioningStoreFile {
   version: 1;

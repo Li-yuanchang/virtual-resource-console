@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
+import { getVrcDataFile } from "./appPaths.js";
 
 export interface RuntimeIpPoolPolicy {
   id: string;
@@ -25,12 +25,8 @@ type IpPoolPolicyInput = Partial<{
   ipPools: RuntimeIpPoolPolicy[];
 }>;
 
-let cachedPolicy: IpPoolPolicy | null = null;
-
 export function getIpPoolPolicy(): IpPoolPolicy {
-  if (cachedPolicy) return cachedPolicy;
-  cachedPolicy = loadIpPoolPolicy();
-  return cachedPolicy;
+  return loadIpPoolPolicy();
 }
 
 export function saveIpPoolPolicy(input: IpPoolPolicyInput): IpPoolPolicy {
@@ -38,12 +34,11 @@ export function saveIpPoolPolicy(input: IpPoolPolicyInput): IpPoolPolicy {
   const file = getIpPoolPolicyPath();
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   writeFileSync(file, `${JSON.stringify(policy, null, 2)}\n`, { mode: 0o600 });
-  cachedPolicy = policy;
   return policy;
 }
 
 export function getIpPoolPolicyPath(): string {
-  return process.env.VRC_IP_POOLS_FILE?.trim() || join(homedir(), ".virtual-resource-console", "ip-pools.json");
+  return process.env.VRC_IP_POOLS_FILE?.trim() || getVrcDataFile("ip-pools.json");
 }
 
 function loadIpPoolPolicy(): IpPoolPolicy {

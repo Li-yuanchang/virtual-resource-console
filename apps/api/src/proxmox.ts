@@ -371,6 +371,12 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
           message: `关机完成：${vmId}`,
         };
       }
+    } else if (action === "forceReboot") {
+      if (status.status !== "running") throw new Error("虚拟机未运行，不能强制重启。");
+      const stopUpid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/stop`);
+      await client.waitForTask(node, stopUpid);
+      const startUpid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`);
+      await client.waitForTask(node, startUpid);
     } else {
       if (status.status === "running") throw new Error("虚拟机正在运行，请先关机后再删除。");
       const upid = await client.delete<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}`);
@@ -832,6 +838,7 @@ function proxmoxRequest<T>(
 function proxmoxActionLabel(action: VmPowerAction) {
   if (action === "start") return "开机";
   if (action === "shutdown") return "关机";
+  if (action === "forceReboot") return "强制重启";
   return "删除";
 }
 

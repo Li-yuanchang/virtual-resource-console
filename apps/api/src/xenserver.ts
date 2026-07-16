@@ -460,6 +460,17 @@ case "$VRC_VM_ACTION" in
       fi
     fi
     ;;
+  forceReboot)
+    if [ "$power" != "running" ]; then
+      echo "虚拟机未运行，不能强制重启：$name" >&2
+      exit 4
+    fi
+    xe vm-shutdown uuid="$VRC_VM_UUID" force=true
+    if ! xe vm-start uuid="$VRC_VM_UUID"; then
+      xe vm-start uuid="$VRC_VM_UUID" force=true
+    fi
+    forced="true"
+    ;;
   delete)
     if [ "$power" = "running" ]; then
       echo "虚拟机正在运行，请先关机后再删除：$name" >&2
@@ -1243,6 +1254,8 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
       message:
         action === "shutdown" && forced === "true"
           ? `关机完成：${name}`
+          : action === "forceReboot"
+            ? `强制重启完成：${name}`
           : action === "start" && forced === "true"
             ? `开机完成：${name}`
             : `${xenActionLabel(action)}完成：${name}`,
@@ -1448,6 +1461,7 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
 function xenActionLabel(action: VmPowerAction) {
   if (action === "start") return "开机";
   if (action === "shutdown") return "关机";
+  if (action === "forceReboot") return "强制重启";
   return "删除";
 }
 

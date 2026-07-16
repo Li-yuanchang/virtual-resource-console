@@ -10,7 +10,7 @@ export type ProviderType = "xenserver" | "vmware" | "proxmox" | "libvirt";
 export type ResourceStatus = "online" | "offline" | "maintenance" | "unknown";
 
 export type PowerState = "running" | "halted" | "stopped" | "suspended" | "unknown";
-export type VmPowerAction = "start" | "shutdown" | "delete";
+export type VmPowerAction = "start" | "shutdown" | "forceReboot" | "delete";
 
 export type ReclaimLevel = "P0" | "P1" | "P2" | "P3" | "KEEP";
 
@@ -222,7 +222,7 @@ export interface VmActionOptions {
   forceOnShutdownFailure?: boolean;
 }
 
-export type VmScheduleAction = Exclude<VmPowerAction, "delete">;
+export type VmScheduleAction = Exclude<VmPowerAction, "forceReboot" | "delete">;
 export type VmScheduleCycle = "once" | "daily" | "weekly";
 export type VmScheduleFallback = "force" | "fail";
 export type VmScheduleConflictPolicy = "block" | "skip" | "replace";
