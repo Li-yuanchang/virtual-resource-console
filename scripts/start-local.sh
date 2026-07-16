@@ -15,7 +15,7 @@ USER_DOMAIN="gui/$(id -u)"
 mkdir -p "$LOG_DIR"
 
 seed_ip_pools_config() {
-  local data_dir="$HOME/.virtual-resource-console"
+  local data_dir="${VRC_DATA_DIR:-$HOME/.virtual-resource-console}"
   local target_file="$data_dir/ip-pools.json"
   local source_file="$ROOT_DIR/config/ip-pools.example.json"
   if [[ -f "$target_file" ]]; then

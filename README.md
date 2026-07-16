@@ -326,10 +326,10 @@ export VRC_RUNTIME_POLICY_FILE=/path/to/runtime-policy.json
 默认读取路径：
 
 ```text
-~/.virtual-resource-console/ip-pools.json
+${VRC_DATA_DIR:-~/.virtual-resource-console}/ip-pools.json
 ```
 
-这是强制配置。API 不再兼容旧 `providerIpPools`，也不会在文件缺失时静默使用内置兜底；缺少文件或格式不正确会直接报错。首次使用可以复制仓库里的示例文件：
+这是强制配置。API 不再兼容旧 `providerIpPools`，也不会在文件缺失时静默使用内置兜底；缺少文件或格式不正确会直接报错。首次使用可以复制仓库里的默认配置文件：
 
 ```bash
 mkdir -p ~/.virtual-resource-console
@@ -337,13 +337,16 @@ cp config/ip-pools.example.json ~/.virtual-resource-console/ip-pools.json
 chmod 600 ~/.virtual-resource-console/ip-pools.json
 ```
 
-Electron 桌面包会随包携带 `config/ip-pools.example.json` 并在首次启动时复制为用户目录的 `ip-pools.json`；服务器、Docker 或裸 Node 部署需要在部署步骤里显式放好这个文件。
+Electron 桌面包会随包携带 `config/ip-pools.example.json` 并在首次启动时复制为数据目录的 `ip-pools.json`；服务器、Docker 或裸 Node 部署需要在部署步骤里显式放好这个文件。
 
 也可以通过环境变量指定其它路径：
 
 ```bash
+export VRC_DATA_DIR=/path/to/vrc-data
 export VRC_IP_POOLS_FILE=/path/to/ip-pools.json
 ```
+
+`VRC_IP_POOLS_FILE` 指定的是完整文件路径，优先级最高；只想整体迁移 VRC 运行数据目录时，配置 `VRC_DATA_DIR` 即可。
 
 配置示例：
 
@@ -365,6 +368,15 @@ export VRC_IP_POOLS_FILE=/path/to/ip-pools.json
       "name": "192.0.2 通用网段",
       "prefix": "192.0.2",
       "gateway": "192.0.2.254",
+      "startHost": 20,
+      "endHost": 250
+    },
+    {
+      "id": "pool-example-c",
+      "name": "198.51.100 通用网段",
+      "prefix": "198.51.100",
+      "gateway": "198.51.100.1",
+      "networkName": "Pool-wide network associated with eth1",
       "startHost": 20,
       "endHost": 250
     }

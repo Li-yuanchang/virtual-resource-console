@@ -1,0 +1,23 @@
+[Unit]
+Description=Virtual Resource Console API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vrc/app
+Environment=HOST=0.0.0.0
+Environment=PORT=3988
+Environment=VRC_RUNTIME_MODE=web
+ExecStart=/opt/vrc/app/runtime/node/bin/node /opt/vrc/app/apps/api/dist/index.js
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vrc-api
+
+[Install]
+WantedBy=multi-user.target
