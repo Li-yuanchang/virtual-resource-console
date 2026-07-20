@@ -1,16 +1,16 @@
 {
   "name": "@vrc/electron",
-  "version": "0.1.29",
+  "version": "0.1.37",
   "private": true,
   "description": "Desktop shell for Virtual Resource Console.",
   "main": "main.cjs",
   "scripts": {
     "dev": "electron .",
-    "prepack": "node ../../scripts/prepare-electron-runtime.mjs",
+    "prepack": "node ../../scripts/prepare-electron-runtime.mjs && node ../../scripts/prepare-electron-api-runtime.mjs",
     "pack": "electron-builder --dir",
-    "predist:mac": "node ../../scripts/prepare-electron-runtime.mjs darwin-arm64",
+    "predist:mac": "node ../../scripts/prepare-electron-runtime.mjs darwin-arm64 && node ../../scripts/prepare-electron-api-runtime.mjs",
     "dist:mac": "electron-builder --mac",
-    "predist:win": "node ../../scripts/prepare-electron-runtime.mjs win-x64",
+    "predist:win": "node ../../scripts/prepare-electron-runtime.mjs win-x64 && node ../../scripts/prepare-electron-api-runtime.mjs",
     "dist:win": "electron-builder --win --x64"
   },
   "devDependencies": {
@@ -46,10 +46,6 @@
         "to": "web"
       },
       {
-        "from": "../../config/ip-pools.example.json",
-        "to": "config/ip-pools.json"
-      },
-      {
         "from": "assets",
         "to": "assets"
       },
@@ -61,21 +57,10 @@
         ]
       },
       {
-        "from": "../../node_modules",
+        "from": ".api-runtime/node_modules",
         "to": "node_modules",
         "filter": [
-          "**/*",
-          "!@vrc{,/**}",
-          "!.bin{,/**}",
-          "!electron{,/**}",
-          "!electron-builder{,/**}",
-          "!@electron{,/**}",
-          "!app-builder-bin{,/**}",
-          "!builder-util{,/**}",
-          "!builder-util-runtime{,/**}",
-          "!dmg-builder{,/**}",
-          "!electron-publish{,/**}",
-          "!*.tsbuildinfo"
+          "**/*"
         ]
       }
     ],

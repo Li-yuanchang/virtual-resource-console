@@ -15,9 +15,11 @@
     "@fastify/cors": "^11.1.0",
     "@fastify/multipart": "^10.1.0",
     "@fastify/websocket": "^11.3.0",
+    "7zip-bin-full": "^26.2.1",
     "fast-xml-parser": "^5.9.3",
     "fastify": "^5.6.1",
     "ssh2": "^1.17.0",
+    "winrm-client": "^0.0.12",
     "ws": "^8.21.0",
     "zod": "^4.1.12"
   },
