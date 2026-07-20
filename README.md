@@ -329,15 +329,15 @@ export VRC_RUNTIME_POLICY_FILE=/path/to/runtime-policy.json
 ${VRC_DATA_DIR:-~/.virtual-resource-console}/ip-pools.json
 ```
 
-这是强制配置。API 不再兼容旧 `providerIpPools`，也不会在文件缺失时静默使用内置兜底；缺少文件或格式不正确会直接报错。首次使用可以复制仓库里的默认配置文件：
+这是强制配置。API 不再兼容旧 `providerIpPools`，也不会在文件缺失时静默使用内置兜底；缺少文件或格式不正确会直接报错。首次使用可以复制仓库里的默认 IP 池配置：
 
 ```bash
 mkdir -p ~/.virtual-resource-console
-cp config/ip-pools.example.json ~/.virtual-resource-console/ip-pools.json
+cp config/ip-pools.json ~/.virtual-resource-console/ip-pools.json
 chmod 600 ~/.virtual-resource-console/ip-pools.json
 ```
 
-Electron 桌面包会随包携带 `config/ip-pools.example.json` 并在首次启动时复制为数据目录的 `ip-pools.json`；服务器、Docker 或裸 Node 部署需要在部署步骤里显式放好这个文件。
+`config/ip-pools.json` 随仓库维护默认的 129 / 2 / 127 三个网段；`config/ip-pools.example.json` 只作为脱敏示例。`scripts/start-local.sh` 会在数据目录不存在 `ip-pools.json` 时把默认文件写入一次，已有文件不会被覆盖。Electron 桌面包不在安装或升级时覆盖数据目录里的 `ip-pools.json`；用户后续通过设置页新增、导入、编辑并保存。服务器、Docker 或裸 Node 部署需要在部署步骤里显式放好这个文件。
 
 也可以通过环境变量指定其它路径：
 
