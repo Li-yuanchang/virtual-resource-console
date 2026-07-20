@@ -12,6 +12,7 @@ export interface ProvisioningStrategy {
   readonly type: ProviderType;
   readonly label: string;
   scopeKey(connection: ProvisioningConnectionScope, host: HostNode | null): string;
+  installIsoImages(images: IsoImage[]): IsoImage[];
   sortIsoImages(images: IsoImage[]): IsoImage[];
   defaultIsoId(images: IsoImage[]): string;
   defaultSpecId(specs: Array<{ id: string; name: string }>): string;
@@ -41,12 +42,20 @@ export interface ProvisioningAccountPolicy {
   hint: string;
 }
 
+export interface IsoSourceGroup {
+  label: "共享 ISO 库" | "本地 ISO 库" | "本机 DVD" | "工具盘";
+  options: IsoImage[];
+}
+
 const strategies: Record<ProviderType, ProvisioningStrategy> = {
   xenserver: {
     type: "xenserver",
     label: "XenServer",
     scopeKey(connection, host) {
       return buildProvisioningScopeKey(connection, host);
+    },
+    installIsoImages(images) {
+      return images.filter((image) => !isXenGuestToolsIso(image));
     },
     sortIsoImages(images) {
       return sortIsoImages(images, ["CentOS-7-x86_64-DVD-1511.iso"], ["xs-tools.iso"]);
@@ -105,6 +114,9 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
     scopeKey(connection, host) {
       return buildProvisioningScopeKey(connection, host);
     },
+    installIsoImages(images) {
+      return images;
+    },
     sortIsoImages(images) {
       return sortIsoImages(images);
     },
@@ -127,7 +139,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return resolveLinuxAccountPolicy(source.isoName);
     },
     installSteps(source) {
-      return genericInstallSteps(source);
+      return genericInstallSteps(source, "open-vm-tools");
     },
   },
   proxmox: {
@@ -136,6 +148,9 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
     scopeKey(connection, host) {
       return buildProvisioningScopeKey(connection, host);
     },
+    installIsoImages(images) {
+      return images;
+    },
     sortIsoImages(images) {
       return sortIsoImages(images);
     },
@@ -158,7 +173,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return resolveLinuxAccountPolicy(source.isoName);
     },
     installSteps(source) {
-      return genericInstallSteps(source);
+      return genericInstallSteps(source, "qemu-guest-agent");
     },
   },
   libvirt: {
@@ -166,6 +181,9 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
     label: "KVM/libvirt",
     scopeKey(connection, host) {
       return buildProvisioningScopeKey(connection, host);
+    },
+    installIsoImages(images) {
+      return images;
     },
     sortIsoImages(images) {
       return sortIsoImages(images);
@@ -202,6 +220,31 @@ export function buildProvisioningScopeKey(connection: ProvisioningConnectionScop
   const hostKey = host?.providerId || host?.id || connection.host;
   const connectionKey = connection.id || `${connection.providerType}:${connection.host}:${connection.port}:${connection.username}`;
   return `${connection.providerType}::${connectionKey}::${hostKey}`;
+}
+
+export function isXenGuestToolsIso(image: IsoImage): boolean {
+  const name = (image.name || image.path || "").trim().split("/").pop() ?? "";
+  return /^(?:xs-tools|guest-tools)(?:-[^/]*)?\.iso$/i.test(name);
+}
+
+export function isoSourceLabel(image: IsoImage): IsoSourceGroup["label"] {
+  if (image.sourceType === "host-dvd") return "本机 DVD";
+  if (image.sourceType === "tools") return "工具盘";
+  return image.shared ? "共享 ISO 库" : "本地 ISO 库";
+}
+
+export function groupIsoImagesBySource(images: IsoImage[]): IsoSourceGroup[] {
+  const groups = new Map<IsoSourceGroup["label"], IsoImage[]>();
+  for (const image of images) {
+    const label = isoSourceLabel(image);
+    const options = groups.get(label) ?? [];
+    options.push(image);
+    groups.set(label, options);
+  }
+  const order: IsoSourceGroup["label"][] = ["共享 ISO 库", "本地 ISO 库", "本机 DVD", "工具盘"];
+  return Array.from(groups, ([label, options]) => ({ label, options })).sort(
+    (left, right) => order.indexOf(left.label) - order.indexOf(right.label),
+  );
 }
 
 function sortIsoImages(images: IsoImage[], preferredNames: string[] = [], trailingNames: string[] = []): IsoImage[] {
@@ -292,7 +335,7 @@ function derivePasswordFromTemplate(ip: string, policy: RuntimePolicy) {
     .replaceAll("{ip}", ip);
 }
 
-function genericInstallSteps(source: ProvisioningInstallStepSource): ProvisioningInstallStep[] {
+function genericInstallSteps(source: ProvisioningInstallStepSource, monitoringTool?: string): ProvisioningInstallStep[] {
   const account = resolveLinuxAccountPolicy(source.isoName);
   return [
     {
@@ -314,11 +357,29 @@ function genericInstallSteps(source: ProvisioningInstallStepSource): Provisionin
           ? "开机后打开控制台确认账号、网络和平台监控状态。"
           : "安装时创建普通登录用户，开机后确认账号、网络和平台监控状态。",
     },
+    ...(monitoringTool
+      ? [
+          {
+            title: "安装监控工具",
+            detail: `安装并启用 ${monitoringTool}，以管理平台回读 Guest 状态作为验收结果。`,
+          },
+        ]
+      : []),
   ];
 }
 
 function resolveLinuxAccountPolicy(isoName: string): ProvisioningAccountPolicy {
   const normalized = isoName.toLowerCase();
+  if (normalized.includes("windows") || normalized.includes("winserver")) {
+    return {
+      mode: "named-user",
+      label: "登录账号",
+      defaultUsername: "Administrator",
+      requiresUsername: false,
+      passwordLabel: "Administrator 密码",
+      hint: "Windows Server 使用内置 Administrator 账号。",
+    };
+  }
   if (normalized.includes("ubuntu")) {
     return {
       mode: "named-user",

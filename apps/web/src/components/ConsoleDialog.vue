@@ -6,13 +6,14 @@ import { Close, CopyDocument, FullScreen, Monitor, Refresh } from "@element-plus
 import ConsoleVmMetrics from "./ConsoleVmMetrics.vue";
 import VrcLogoMark from "./VrcLogoMark.vue";
 import type { NoVncVmConsoleTarget } from "../domain/consoleStrategies";
-import { resolveConsoleMetricsLoadingStrategy } from "../domain/consoleStrategies";
+import { resolveConsoleDisplayStrategy, resolveConsoleMetricsLoadingStrategy } from "../domain/consoleStrategies";
 import {
   normalizeConsoleClipboardText,
   normalizeConsoleTextInput,
 } from "../domain/consoleTextInput";
 import { getProviderBrand } from "../domain/providerBrand";
-import type { ProvisionTask, ProvisionTaskStep, ProvisionTaskVm, VmMetricSnapshot } from "../types";
+import { secureJsonRequest } from "../domain/secureRequest";
+import type { ProvisionTask, ProvisionTaskStep, ProvisionTaskStepKey, ProvisionTaskVm, VmMetricSnapshot } from "../types";
 
 interface ProvisionConsoleTargetItem {
   key: string;
@@ -85,6 +86,7 @@ const normalDialogSize = reactive({
 
 const DIALOG_HORIZONTAL_MARGIN = 32;
 const DIALOG_VERTICAL_MARGIN = 64;
+const DIALOG_DRAG_VIEWPORT_MARGIN = 8;
 const MIN_DIALOG_WIDTH = 720;
 const MIN_DIALOG_HEIGHT = 480;
 const DEFAULT_DIALOG_MAX_WIDTH = 1680;
@@ -93,22 +95,35 @@ const DEFAULT_NORMAL_SCREEN_WIDTH = 980;
 const DEFAULT_NORMAL_SCREEN_HEIGHT = 620;
 const DEFAULT_EXPANDED_SCREEN_WIDTH = 1280;
 const DEFAULT_EXPANDED_SCREEN_HEIGHT = 720;
-const NORMAL_CONSOLE_SIDE_WIDTH = 360;
-const NORMAL_CONSOLE_LAYOUT_GAP = 16;
-const NORMAL_CONSOLE_LAYOUT_PADDING = 20;
+const NORMAL_CONSOLE_SIDE_WIDTH = 330;
+const NORMAL_CONSOLE_LAYOUT_GAP = 14;
+const NORMAL_CONSOLE_LAYOUT_HORIZONTAL_PADDING = 20;
+const NORMAL_CONSOLE_LAYOUT_VERTICAL_PADDING = 10;
+const NORMAL_CONSOLE_BORDER_ALLOWANCE = 4;
 const NORMAL_CONSOLE_HEADER_HEIGHT = 48;
-const CONSOLE_TITLEBAR_HEIGHT = 42;
-const CONSOLE_WAKE_ENTER_DELAY_MS = 260;
+const CONSOLE_TITLEBAR_HEIGHT = 44;
+const CONSOLE_WAKE_REFRESH_DELAY_MS = 260;
 const CONSOLE_RETRY_DELAY_MS = 2500;
-const CONSOLE_RETRY_LIMIT = 24;
+const CONSOLE_CONNECT_ATTEMPT_TIMEOUT_MS = 20_000;
 const CONSOLE_FRAME_REVEAL_RETRY_LIMIT = 80;
 const CONSOLE_FRAME_REVEAL_RETRY_DELAY_MS = 180;
 const CONSOLE_FRAME_RECONNECT_TIMEOUT_MS = 8000;
-const CONSOLE_MODIFIER_RELEASE_DELAY_MS = 90;
-const CONSOLE_NATIVE_PASTE_FALLBACK_MS = 350;
+const CONSOLE_STAGE_RECONNECT_DELAY_MS = 500;
+const CONSOLE_PROVISION_BLANK_RECONNECT_DELAY_MS = 8000;
+const CONSOLE_PROVISION_BLANK_RECONNECT_MAX_DELAY_MS = 30000;
+const CONSOLE_MODIFIER_RELEASE_DELAY_MS = 12;
+const CONSOLE_NATIVE_PASTE_CAPTURE_TIMEOUT_MS = 1200;
 const CONSOLE_MAX_PASTE_CHARACTERS = 5000;
+const CONSOLE_PASTE_SHORTCUT_LABEL = /Mac|iPhone|iPad/i.test(navigator.platform) ? "Cmd+V" : "Ctrl+V";
 const CONSOLE_ASPECT_RATIO_CACHE_KEY = "virtual-resource-console:console-aspect-ratio";
-const CONSOLE_TEXT_SEND_INTERVAL_MS = 12;
+const CONSOLE_TEXT_KEY_HOLD_MS = 10;
+const CONSOLE_TEXT_SEND_INTERVAL_MS = 2;
+const CONSOLE_TEXT_SHIFT_SETTLE_MS = 4;
+const CONSOLE_CTRL_C_MODIFIER_SETTLE_MS = 18;
+const CONSOLE_CTRL_C_KEY_HOLD_MS = 28;
+const CONSOLE_BACKSPACE_KEY_HOLD_MS = 12;
+const CONSOLE_BACKSPACE_REPEAT_DELAY_MS = 220;
+const CONSOLE_BACKSPACE_REPEAT_INTERVAL_MS = 24;
 const CONSOLE_KEY_STROKE_MAP: Record<string, { keysym: number; code: string; shift?: boolean }> = {
   " ": { keysym: 0x20, code: "Space" },
   "`": { keysym: 0x60, code: "Backquote" },
@@ -159,15 +174,20 @@ const consoleAspectRatioCache = new Map<string, number>();
 let rfb: RFB | null = null;
 let screenResizeObserver: ResizeObserver | null = null;
 let consoleLoadingStartedAt = 0;
-let consoleWakeTimer: number | null = null;
+let consoleWakeRefreshTimer: number | null = null;
 let consoleReconnectTimer: number | null = null;
+let consoleConnectAttemptTimer: number | null = null;
 let consoleFrameWatchTimer: number | null = null;
 let consoleCanvasProbeTimer: number | null = null;
+let consoleBlankReconnectTimer: number | null = null;
+let consoleStageReconnectTimer: number | null = null;
 let consoleCanvasObserver: MutationObserver | null = null;
 let consoleReconnectAttempt = 0;
+let consoleBlankReconnectAttempt = 0;
 let suppressNextConsoleDisconnect = false;
 let suppressLocalShortcutUntil = 0;
 let suppressedLocalShortcutKey = "";
+let suppressedLocalShortcutModifier: "meta" | "ctrl" | "" = "";
 let viewportRefreshFrame: number | null = null;
 let shouldFocusAfterViewportRefresh = false;
 let nativePasteFallbackTimer: number | null = null;
@@ -176,6 +196,9 @@ let activeNativePasteRequestId = 0;
 let consoleTextSendQueue: Promise<ConsoleTextSendResult> = Promise.resolve({ sentCount: 0, status: "cancelled" });
 let consoleTextSendToken = 0;
 let consolePasteTaskSeq = 0;
+let remoteCtrlCInFlight = false;
+let consoleBackspaceHeld = false;
+let consoleBackspaceRepeatToken = 0;
 let resizeStart:
   | {
       x: number;
@@ -191,6 +214,8 @@ let dragStart:
       offsetX: number;
       offsetY: number;
       element: HTMLElement;
+      handle: HTMLElement;
+      pointerId: number;
     }
   | null = null;
 let dialogOffsetX = 0;
@@ -253,12 +278,13 @@ const consoleSpecText = computed(() => {
   return parts.length ? parts.join(" / ") : "-";
 });
 const isProvisionConsole = computed(() => !!props.provisionTask && !!props.provisionTargets?.length);
+const isProvisionTaskTerminal = computed(() => isProvisionConsole.value && ["success", "warning", "failed"].includes(props.provisionTask?.status ?? ""));
 const provisionTaskPercent = computed(() => {
   const explicitPercent = Number((props.provisionTask as (ProvisionTask & { progressPercent?: number }) | null | undefined)?.progressPercent);
   if (Number.isFinite(explicitPercent)) return clamp(Math.round(explicitPercent), 0, 100);
   const steps = props.provisionTask?.steps ?? [];
   if (!steps.length) return 0;
-  const finished = steps.filter((step) => step.status === "success" || step.status === "skipped").length;
+  const finished = steps.filter((step) => step.status === "success" || step.status === "warning" || step.status === "skipped").length;
   const runningBonus = steps.some((step) => step.status === "running") ? 0.45 : 0;
   return clamp(Math.round(((finished + runningBonus) / steps.length) * 100), 0, 100);
 });
@@ -277,9 +303,51 @@ const provisionTaskStatusText = computed(() => {
   if (!step) return props.provisionTask?.message || "等待任务状态";
   return `${step.name} · ${step.message || provisionStepStatusText(step.status)}`;
 });
+const activeProvisionConsoleStep = computed<ProvisionTaskStepKey | "console">(
+  () => currentProvisionVm.value?.currentStep ?? props.provisionTask?.currentStep ?? provisionTaskCurrentStep.value?.key ?? "console",
+);
+const consolePendingCopy = computed(() => {
+  if (!isProvisionConsole.value) {
+    return {
+      title: "控制台加载中",
+      detail: statusText.value === "控制台连接中" ? "正在建立控制台会话" : statusText.value,
+    };
+  }
+  const vm = currentProvisionVm.value;
+  const step = activeProvisionConsoleStep.value;
+  const taskStatus = props.provisionTask?.status;
+  const detail = vm?.message || provisionTaskCurrentStep.value?.message || props.provisionTask?.message || statusText.value;
+  const consoleRecovering = /自动重试|暂时黑屏|重新获取当前画面|画面未就绪/.test(statusText.value);
+  if (taskStatus === "success") {
+    return { title: "环境已完成", detail: "系统启动、登录验证和后续验收已完成" };
+  }
+  if (taskStatus === "warning") {
+    return { title: "系统创建完成", detail };
+  }
+  if (taskStatus === "failed") {
+    return { title: "创建链路失败", detail };
+  }
+  if (consoleRecovering) {
+    return { title: "控制台画面恢复中", detail: statusText.value };
+  }
+  if (step === "boot" || step === "fetch-source") {
+    return { title: "等待安装器画面", detail: detail || "VM 已启动，正在拉取 Kickstart 和安装源" };
+  }
+  if (step === "install-guest") {
+    return { title: "系统安装中", detail: detail || "安装器正在安装软件包，画面恢复后自动显示" };
+  }
+  if (step === "wait-network") {
+    return { title: "等待系统启动", detail: detail || "系统可能正在重启，等待控制台和 SSH 恢复" };
+  }
+  if (step === "verify-login") {
+    return { title: "验证登录", detail: detail || "SSH 已就绪，正在校验账号密码" };
+  }
+  return { title: "控制台衔接中", detail };
+});
 const provisionTaskRunningTitle = computed(() => {
   const status = props.provisionTask?.status ?? "pending";
   if (status === "success") return "创建链路已完成";
+  if (status === "warning") return "系统已完成，存在告警";
   if (status === "failed") return "创建链路失败";
   if (status === "pending") return "创建链路等待中";
   return "创建链路执行中";
@@ -318,6 +386,7 @@ const consoleTaskStatusRows = computed(() => {
   ];
 });
 const effectiveVisible = computed(() => (props.embedded ? !!props.target : props.visible));
+const shouldAutoConnectConsole = computed(() => !!props.target);
 const consoleRootComponent = computed(() => (props.embedded ? "section" : ElDialog));
 const consoleRootClass = computed(() => [
   "console-dialog",
@@ -333,6 +402,7 @@ const shouldShowUploadProgressInFrame = computed(() => uploadProgressVisible.val
 const consoleMetricsStrategy = computed(() =>
   props.target ? resolveConsoleMetricsLoadingStrategy(props.target.providerType) : null,
 );
+const consoleDisplayStrategy = computed(() => resolveConsoleDisplayStrategy(props.target?.providerType ?? "xenserver"));
 const canCollectConsoleMetrics = computed(() => {
   const target = props.target;
   return !isProvisionConsole.value && consoleMetricsStrategy.value != null && !!target?.connectionId && !!target.vmId;
@@ -414,7 +484,11 @@ const shouldShowMetricsToggle = computed(
 );
 const consoleRootAttrs = computed(() =>
   props.embedded
-    ? {}
+    ? {
+        style: {
+          "--console-frame-aspect-ratio": String(getConsoleAspectRatio()),
+        },
+      }
     : {
         modelValue: props.visible,
         title: "控制台",
@@ -431,6 +505,7 @@ watch(
   () => [effectiveVisible.value, props.target?.wsUrl, props.target?.vmId, props.target?.connectionId, props.target?.providerType, isProvisionConsole.value] as const,
   async ([visible]) => {
     if (!visible || !props.target) {
+      stopDialogDrag();
       stopConsoleMetricsPolling();
       disconnectConsole();
       disconnectScreenResizeObserver();
@@ -438,8 +513,16 @@ watch(
       clearConsoleFrameWatchTimer();
       return;
     }
+    if (!shouldAutoConnectConsole.value) {
+      stopConsoleMetricsPolling();
+      disconnectConsole();
+      statusText.value = props.provisionTask?.status === "success" ? "任务已完成" : "任务已结束";
+      consoleFrameReady.value = false;
+      return;
+    }
     clearConsoleReconnectTimer();
     consoleReconnectAttempt = 0;
+    consoleBlankReconnectAttempt = 0;
     const cachedAspectRatio = getCachedConsoleAspectRatio(props.target);
     consoleAspectRatio.value = cachedAspectRatio || props.target.aspectRatio || 4 / 3;
     consoleLoadingStartedAt = Date.now();
@@ -456,16 +539,57 @@ watch(
   },
 );
 
+watch(
+  () => activeProvisionConsoleStep.value,
+  (step, previousStep) => {
+    if (step === previousStep || !effectiveVisible.value || !isProvisionConsole.value || isProvisionTaskTerminal.value) return;
+    consoleBlankReconnectAttempt = 0;
+    clearConsoleStageReconnectTimer();
+    if (step === "wait-network" || step === "guest-tools") {
+      consoleFrameReady.value = false;
+      statusText.value = step === "guest-tools" ? "Guest 重启，正在刷新控制台" : "系统重启，正在刷新控制台";
+      consoleStageReconnectTimer = window.setTimeout(() => {
+        consoleStageReconnectTimer = null;
+        if (!effectiveVisible.value || !props.target || isProvisionTaskTerminal.value) return;
+        void connectConsole();
+      }, CONSOLE_STAGE_RECONNECT_DELAY_MS);
+      return;
+    }
+    if (!hasNonBlankConsoleCanvas()) {
+      consoleFrameReady.value = false;
+      statusText.value = "安装阶段已切换，正在获取当前控制台画面";
+      startProvisionBlankConsoleWatch(350);
+    }
+  },
+);
+
+watch(
+  () => props.provisionTask?.status ?? "",
+  (status, previousStatus) => {
+    if (status === previousStatus || !["success", "warning"].includes(status) || !effectiveVisible.value || !isProvisionConsole.value || !props.target) return;
+    clearConsoleStageReconnectTimer();
+    consoleFrameReady.value = false;
+    statusText.value = "任务结束，正在获取最终控制台画面";
+    consoleStageReconnectTimer = window.setTimeout(() => {
+      consoleStageReconnectTimer = null;
+      if (!effectiveVisible.value || !props.target) return;
+      void connectConsole();
+    }, CONSOLE_STAGE_RECONNECT_DELAY_MS);
+  },
+);
+
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", handleConsoleShortcut, true);
   window.removeEventListener("keyup", handleConsoleShortcutKeyup, true);
   window.removeEventListener("compositionend", handleConsoleCompositionEnd, true);
-  window.removeEventListener("copy", handleConsoleCopy, true);
   window.removeEventListener("mousemove", handleResizeMove);
   window.removeEventListener("mouseup", stopResize);
   window.removeEventListener("pointermove", handleDialogDragMove);
   window.removeEventListener("pointerup", stopDialogDrag);
   window.removeEventListener("pointercancel", stopDialogDrag);
+  window.removeEventListener("blur", stopDialogDrag);
+  window.removeEventListener("blur", stopConsoleBackspaceRepeat);
+  window.removeEventListener("resize", ensureDialogWithinViewport);
   if (viewportRefreshFrame != null) window.cancelAnimationFrame(viewportRefreshFrame);
   clearNativePasteFallbackTimer();
   stopConsoleMetricsPolling();
@@ -473,6 +597,7 @@ onBeforeUnmount(() => {
   disconnectConsole();
   disconnectScreenResizeObserver();
   clearConsoleFrameWatchTimer();
+  clearConsoleStageReconnectTimer();
   stopConsoleCanvasProbe();
 });
 
@@ -480,12 +605,13 @@ onMounted(async () => {
   window.addEventListener("keydown", handleConsoleShortcut, true);
   window.addEventListener("keyup", handleConsoleShortcutKeyup, true);
   window.addEventListener("compositionend", handleConsoleCompositionEnd, true);
-  window.addEventListener("copy", handleConsoleCopy, true);
+  window.addEventListener("blur", stopConsoleBackspaceRepeat);
+  window.addEventListener("resize", ensureDialogWithinViewport);
   connectScreenResizeObserver();
   if (effectiveVisible.value && props.target) {
     startConsoleMetricsPolling();
     await nextTick();
-    void connectConsole();
+    if (shouldAutoConnectConsole.value) void connectConsole();
   }
 });
 
@@ -517,19 +643,11 @@ async function pollConsoleMetrics(requestSeq: number) {
   consoleMetricsAbortController = controller;
 
   try {
-    const response = await fetch("/api/metrics/snapshot", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        connectionId: target.connectionId,
-        providerType: target.providerType,
-        targetType: "vm",
-        targetIds: [target.vmId],
-      }),
-      signal: controller.signal,
-    });
-    const result = (await response.json()) as ConsoleMetricsResponse & { message?: string };
-    if (!response.ok) throw new Error(result.message || "读取实时指标失败");
+    const result = await secureJsonRequest<ConsoleMetricsResponse>("/api/metrics/snapshot", {
+      ...buildConsoleConnectionRequest(target),
+      targetType: "vm",
+      targetIds: [target.vmId],
+    }, "POST", { signal: controller.signal });
     if (requestSeq !== consoleMetricsRequestSeq) return;
     consoleMetricSnapshot.value = result.metrics?.find((item) => item.uuid === target.vmId) ?? null;
     consoleMetricsLoading.value = false;
@@ -577,30 +695,51 @@ async function connectConsole() {
     shared: true,
     ...(prepared.password ? { credentials: { password: prepared.password } } : {}),
   });
-  rfb.scaleViewport = true;
+  rfb.scaleViewport = consoleDisplayStrategy.value.scaleViewport;
   rfb.clipViewport = false;
-  rfb.resizeSession = true;
+  rfb.resizeSession = props.embedded || consoleDisplayStrategy.value.resizeSession;
+  const displayClient = rfb as RFB & { qualityLevel: number; compressionLevel: number };
+  displayClient.qualityLevel = consoleDisplayStrategy.value.qualityLevel;
+  displayClient.compressionLevel = consoleDisplayStrategy.value.compressionLevel;
   rfb.focusOnClick = true;
   setNoVncDotCursor(true);
   setNoVncBackground("#000");
+  const connectingRfb = rfb;
+  clearConsoleConnectAttemptTimer();
+  consoleConnectAttemptTimer = window.setTimeout(() => {
+    consoleConnectAttemptTimer = null;
+    if (!effectiveVisible.value || rfb !== connectingRfb || connected.value) return;
+    suppressNextConsoleDisconnect = true;
+    connectingRfb.disconnect();
+    rfb = null;
+    window.setTimeout(() => {
+      suppressNextConsoleDisconnect = false;
+    }, 250);
+    scheduleConsoleReconnect("控制台握手超时");
+  }, CONSOLE_CONNECT_ATTEMPT_TIMEOUT_MS);
 
   rfb.addEventListener("connect", () => {
+    clearConsoleConnectAttemptTimer();
     clearConsoleReconnectTimer();
     consoleReconnectAttempt = 0;
     connected.value = true;
     statusText.value = "已连接";
     focusConsole();
-    scheduleConsoleWakeEnter();
+    scheduleConsoleWakeRefresh();
     window.setTimeout(() => syncConsoleAspectRatio({ reveal: true }), 120);
     startConsoleFrameWatch();
     startConsoleCanvasProbe();
+    startProvisionBlankConsoleWatch();
     refreshNoVncViewport();
   });
   rfb.addEventListener("disconnect", (event) => {
+    clearConsoleConnectAttemptTimer();
+    stopConsoleBackspaceRepeat();
     connected.value = false;
     consoleFrameReady.value = false;
     clearConsoleFrameWatchTimer();
     stopConsoleCanvasProbe();
+    clearProvisionBlankConsoleWatch();
     if (suppressNextConsoleDisconnect) {
       suppressNextConsoleDisconnect = false;
       return;
@@ -609,15 +748,19 @@ async function connectConsole() {
     scheduleConsoleReconnect(clean ? "连接已断开" : "RFB 握手失败或远端控制台关闭");
   });
   rfb.addEventListener("securityfailure", () => {
+    clearConsoleConnectAttemptTimer();
     connected.value = false;
     clearConsoleFrameWatchTimer();
     stopConsoleCanvasProbe();
+    clearProvisionBlankConsoleWatch();
     scheduleConsoleReconnect("认证失败或控制台被拒绝");
   });
   rfb.addEventListener("credentialsrequired", () => {
+    clearConsoleConnectAttemptTimer();
     connected.value = false;
     clearConsoleFrameWatchTimer();
     stopConsoleCanvasProbe();
+    clearProvisionBlankConsoleWatch();
     statusText.value = "需要额外控制台认证";
   });
 }
@@ -629,28 +772,41 @@ async function prepareConsoleTarget(target: NoVncVmConsoleTarget): Promise<{ wsU
   if (!target.connectionId || !target.vmId) {
     throw new Error("控制台参数不完整");
   }
-  const response = await fetch(target.prepareUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      connectionId: target.connectionId,
-      vmId: target.vmId,
-    }),
+  const result = await secureJsonRequest<PreparedConsoleSession>(target.prepareUrl, {
+    ...buildConsoleConnectionRequest(target),
+    vmId: target.vmId,
   });
-  const result = (await response.json()) as PreparedConsoleSession & { message?: string };
-  if (!response.ok) {
-    throw new Error(result.message || "控制台会话准备失败");
-  }
   return {
     wsUrl: buildApiWebSocketUrl(result.wsPath),
     password: result.password,
   };
 }
 
+function buildConsoleConnectionRequest(target: NoVncVmConsoleTarget) {
+  if (target.connection) {
+    return {
+      providerType: target.connection.providerType,
+      host: target.connection.host,
+      port: target.connection.port,
+      username: target.connection.username,
+      password: target.connection.password,
+      connection: target.connection,
+    };
+  }
+  return {
+    connectionId: target.connectionId,
+    providerType: target.providerType,
+  };
+}
+
 function disconnectConsole() {
-  clearConsoleWakeTimer();
+  stopConsoleBackspaceRepeat();
+  clearConsoleWakeRefreshTimer();
   clearConsoleReconnectTimer();
+  clearConsoleConnectAttemptTimer();
   clearConsoleFrameWatchTimer();
+  clearConsoleStageReconnectTimer();
+  clearProvisionBlankConsoleWatch();
   clearNativePasteFallbackTimer();
   activeNativePasteRequestId = 0;
   cancelConsolePaste("", { clearNotice: true });
@@ -663,19 +819,18 @@ function disconnectConsole() {
   }, 250);
 }
 
+function clearConsoleStageReconnectTimer() {
+  if (consoleStageReconnectTimer == null) return;
+  window.clearTimeout(consoleStageReconnectTimer);
+  consoleStageReconnectTimer = null;
+}
+
 function scheduleConsoleReconnect(reason: string) {
   if (!effectiveVisible.value || !props.target) return;
   const normalizedReason = reason.trim().replace(/[，,。；;：:\s]+$/u, "") || "控制台连接失败";
-  const retryLimit = isProvisionConsole.value ? Number.POSITIVE_INFINITY : CONSOLE_RETRY_LIMIT;
-  if (consoleReconnectAttempt >= retryLimit) {
-    statusText.value = normalizedReason;
-    return;
-  }
   clearConsoleReconnectTimer();
   consoleReconnectAttempt += 1;
-  statusText.value = Number.isFinite(retryLimit)
-    ? `${normalizedReason}，自动重试 ${consoleReconnectAttempt}/${retryLimit}`
-    : `${normalizedReason}，自动重试 ${consoleReconnectAttempt}`;
+  statusText.value = `${normalizedReason}，自动重试 ${consoleReconnectAttempt}`;
   consoleReconnectTimer = window.setTimeout(() => {
     consoleReconnectTimer = null;
     if (!effectiveVisible.value || !props.target) return;
@@ -689,6 +844,12 @@ function clearConsoleReconnectTimer() {
   consoleReconnectTimer = null;
 }
 
+function clearConsoleConnectAttemptTimer() {
+  if (consoleConnectAttemptTimer == null) return;
+  window.clearTimeout(consoleConnectAttemptTimer);
+  consoleConnectAttemptTimer = null;
+}
+
 function sendCtrlAltDelete() {
   cancelConsolePaste("已取消文本发送");
   rfb?.sendCtrlAltDel();
@@ -696,14 +857,56 @@ function sendCtrlAltDelete() {
 }
 
 function sendRemoteCtrlC() {
-  if (!rfb) return;
+  if (!rfb || remoteCtrlCInFlight) return;
   cancelConsolePaste("已取消文本发送");
-  focusConsole();
-  rfb.sendKey(0xffe3, "ControlLeft", true);
-  rfb.sendKey(0x0063, "KeyC", true);
-  rfb.sendKey(0x0063, "KeyC", false);
-  rfb.sendKey(0xffe3, "ControlLeft", false);
-  releaseModifierKeys();
+  remoteCtrlCInFlight = true;
+  void sendRemoteCtrlCNow();
+}
+
+async function sendRemoteCtrlCNow() {
+  const session = rfb;
+  if (!session || !connected.value) {
+    remoteCtrlCInFlight = false;
+    return;
+  }
+  try {
+    releaseModifierKeys();
+    focusConsole();
+    await delay(CONSOLE_MODIFIER_RELEASE_DELAY_MS);
+    if (session !== rfb || !connected.value) return;
+    session.sendKey(0xffe3, "ControlLeft", true);
+    await delay(CONSOLE_CTRL_C_MODIFIER_SETTLE_MS);
+    if (session !== rfb || !connected.value) return;
+    session.sendKey(0x0063, "KeyC", true);
+    await delay(CONSOLE_CTRL_C_KEY_HOLD_MS);
+    session.sendKey(0x0063, "KeyC", false);
+    session.sendKey(0xffe3, "ControlLeft", false);
+  } finally {
+    remoteCtrlCInFlight = false;
+    releaseModifierKeys();
+    focusConsole();
+  }
+}
+
+function startConsoleBackspaceRepeat() {
+  if (consoleBackspaceHeld || !rfb || !connected.value) return;
+  consoleBackspaceHeld = true;
+  const token = ++consoleBackspaceRepeatToken;
+  void runConsoleBackspaceRepeat(token);
+}
+
+async function runConsoleBackspaceRepeat(token: number) {
+  await tapRemoteKey(0xff08, "Backspace", false, CONSOLE_BACKSPACE_KEY_HOLD_MS);
+  await delay(CONSOLE_BACKSPACE_REPEAT_DELAY_MS);
+  while (consoleBackspaceHeld && token === consoleBackspaceRepeatToken && connected.value && rfb) {
+    await tapRemoteKey(0xff08, "Backspace", false, CONSOLE_BACKSPACE_KEY_HOLD_MS);
+    await delay(CONSOLE_BACKSPACE_REPEAT_INTERVAL_MS);
+  }
+}
+
+function stopConsoleBackspaceRepeat() {
+  consoleBackspaceHeld = false;
+  consoleBackspaceRepeatToken += 1;
 }
 
 function sendRemoteCommand(command: string) {
@@ -717,7 +920,7 @@ function sendRemoteEnter() {
   if (!rfb) return;
   cancelConsolePaste("已取消文本发送");
   focusConsole();
-  tapRemoteKey(0xff0d, "Enter");
+  void tapRemoteKey(0xff0d, "Enter");
 }
 
 function handleConsoleCommand(command: string) {
@@ -751,21 +954,19 @@ function focusConsole() {
   rfb?.focus();
 }
 
-function scheduleConsoleWakeEnter() {
-  clearConsoleWakeTimer();
-  consoleWakeTimer = window.setTimeout(() => {
-    consoleWakeTimer = null;
+function scheduleConsoleWakeRefresh() {
+  clearConsoleWakeRefreshTimer();
+  consoleWakeRefreshTimer = window.setTimeout(() => {
+    consoleWakeRefreshTimer = null;
     if (!effectiveVisible.value || !connected.value || !rfb) return;
-    focusConsole();
-    rfb.sendKey(0xff0d, "Enter");
     refreshNoVncViewport();
-  }, CONSOLE_WAKE_ENTER_DELAY_MS);
+  }, CONSOLE_WAKE_REFRESH_DELAY_MS);
 }
 
-function clearConsoleWakeTimer() {
-  if (consoleWakeTimer == null) return;
-  window.clearTimeout(consoleWakeTimer);
-  consoleWakeTimer = null;
+function clearConsoleWakeRefreshTimer() {
+  if (consoleWakeRefreshTimer == null) return;
+  window.clearTimeout(consoleWakeRefreshTimer);
+  consoleWakeRefreshTimer = null;
 }
 
 function startResize(event: MouseEvent) {
@@ -802,32 +1003,57 @@ function startDialogDrag(event: PointerEvent) {
   if (props.embedded) return;
   if (event.button !== 0) return;
   const dragHandle = event.currentTarget as HTMLElement | null;
-  const dialogElement = dragHandle?.closest(".el-dialog") as HTMLElement | null;
+  if (!dragHandle) return;
+  const dialogElement = dragHandle.closest(".el-dialog") as HTMLElement | null;
   if (!dialogElement) return;
   event.preventDefault();
-  dragHandle?.setPointerCapture?.(event.pointerId);
+  try {
+    dragHandle.setPointerCapture(event.pointerId);
+  } catch {
+    // Window-level listeners still provide a safe drag fallback.
+  }
   dragStart = {
     x: event.clientX,
     y: event.clientY,
     offsetX: dialogOffsetX,
     offsetY: dialogOffsetY,
     element: dialogElement,
+    handle: dragHandle,
+    pointerId: event.pointerId,
   };
+  dragHandle.addEventListener("lostpointercapture", stopDialogDrag);
   window.addEventListener("pointermove", handleDialogDragMove);
   window.addEventListener("pointerup", stopDialogDrag);
   window.addEventListener("pointercancel", stopDialogDrag);
+  window.addEventListener("blur", stopDialogDrag);
 }
 
 function handleDialogDragMove(event: PointerEvent) {
   if (!dragStart) return;
+  if ((event.buttons & 1) === 0) {
+    stopDialogDrag();
+    return;
+  }
   applyDialogOffset(dragStart.offsetX + event.clientX - dragStart.x, dragStart.offsetY + event.clientY - dragStart.y, dragStart.element);
 }
 
 function stopDialogDrag() {
+  const activeDrag = dragStart;
   dragStart = null;
+  if (activeDrag) {
+    activeDrag.handle.removeEventListener("lostpointercapture", stopDialogDrag);
+    try {
+      if (activeDrag.handle.hasPointerCapture(activeDrag.pointerId)) {
+        activeDrag.handle.releasePointerCapture(activeDrag.pointerId);
+      }
+    } catch {
+      // Pointer capture can already be gone when the browser window loses focus.
+    }
+  }
   window.removeEventListener("pointermove", handleDialogDragMove);
   window.removeEventListener("pointerup", stopDialogDrag);
   window.removeEventListener("pointercancel", stopDialogDrag);
+  window.removeEventListener("blur", stopDialogDrag);
 }
 
 function resetDialogOffset() {
@@ -837,19 +1063,44 @@ function resetDialogOffset() {
 }
 
 function applyDialogOffset(x: number, y: number, targetElement?: HTMLElement) {
-  dialogOffsetX = x;
-  dialogOffsetY = y;
   const dialogElement = targetElement ?? dragStart?.element ?? getConsoleDialogElement();
+  if (!dialogElement) {
+    dialogOffsetX = x;
+    dialogOffsetY = y;
+    return;
+  }
+
+  const rect = dialogElement.getBoundingClientRect();
+  const nextLeft = rect.left + x - dialogOffsetX;
+  const nextTop = rect.top + y - dialogOffsetY;
+  const minLeft = DIALOG_DRAG_VIEWPORT_MARGIN;
+  const minTop = DIALOG_DRAG_VIEWPORT_MARGIN;
+  const maxLeft = Math.max(minLeft, window.innerWidth - rect.width - DIALOG_DRAG_VIEWPORT_MARGIN);
+  const maxTop = Math.max(minTop, window.innerHeight - rect.height - DIALOG_DRAG_VIEWPORT_MARGIN);
+  dialogOffsetX = x + clamp(nextLeft, minLeft, maxLeft) - nextLeft;
+  dialogOffsetY = y + clamp(nextTop, minTop, maxTop) - nextTop;
+  dialogElement.style.transform = `translate(${dialogOffsetX}px, ${dialogOffsetY}px)`;
+}
+
+function ensureDialogWithinViewport() {
+  if (!effectiveVisible.value) return;
+  if (props.embedded) return;
+  const dialogElement = getConsoleDialogElement();
   if (dialogElement) {
-    dialogElement.style.transform = `translate(${x}px, ${y}px)`;
+    applyDialogOffset(dialogOffsetX, dialogOffsetY, dialogElement);
   }
 }
 
 function getConsoleDialogElement() {
-  return dialogRef.value?.$el?.querySelector?.(".el-dialog") as HTMLElement | null | undefined;
+  const rootElement = dialogRef.value?.$el;
+  if (rootElement instanceof HTMLElement && rootElement.matches(".el-dialog.console-dialog")) {
+    return rootElement;
+  }
+  return (rootElement?.querySelector?.(".el-dialog.console-dialog") ?? document.querySelector(".el-dialog.console-dialog")) as HTMLElement | null;
 }
 
 function resetDialogSize() {
+  if (props.embedded) return;
   setDialogSizeForConsoleFit({ expanded: false });
   rememberNormalDialogSize();
 }
@@ -860,8 +1111,12 @@ function setDialogSizeForConsoleFit(options: { expanded: boolean }) {
   const minWidth = Math.min(MIN_DIALOG_WIDTH, maxWidth);
   const minHeight = Math.min(MIN_DIALOG_HEIGHT, maxHeight);
   const aspectRatio = getConsoleAspectRatio();
-  const horizontalChrome = options.expanded ? 0 : NORMAL_CONSOLE_SIDE_WIDTH + NORMAL_CONSOLE_LAYOUT_GAP + NORMAL_CONSOLE_LAYOUT_PADDING;
-  const verticalChrome = (options.expanded ? 0 : NORMAL_CONSOLE_HEADER_HEIGHT + NORMAL_CONSOLE_LAYOUT_PADDING) + CONSOLE_TITLEBAR_HEIGHT;
+  const horizontalChrome = options.expanded
+    ? 0
+    : NORMAL_CONSOLE_SIDE_WIDTH + NORMAL_CONSOLE_LAYOUT_GAP + NORMAL_CONSOLE_LAYOUT_HORIZONTAL_PADDING + NORMAL_CONSOLE_BORDER_ALLOWANCE;
+  const verticalChrome =
+    CONSOLE_TITLEBAR_HEIGHT +
+    (options.expanded ? 0 : NORMAL_CONSOLE_HEADER_HEIGHT + NORMAL_CONSOLE_LAYOUT_VERTICAL_PADDING + NORMAL_CONSOLE_BORDER_ALLOWANCE);
   const availableScreenWidth = Math.max(240, maxWidth - horizontalChrome);
   const availableScreenHeight = Math.max(180, maxHeight - verticalChrome);
   const targetScreenWidth = options.expanded ? DEFAULT_EXPANDED_SCREEN_WIDTH : DEFAULT_NORMAL_SCREEN_WIDTH;
@@ -893,7 +1148,11 @@ function rememberNormalDialogSize() {
 }
 
 function toggleExpandedConsole() {
-  if (props.embedded) return;
+  if (props.embedded) {
+    isExpanded.value = !isExpanded.value;
+    requestConsoleResize({ focus: true });
+    return;
+  }
   if (isExpanded.value) {
     isExpanded.value = false;
     if (normalDialogSize.width && normalDialogSize.height) {
@@ -907,6 +1166,7 @@ function toggleExpandedConsole() {
     metricsOverlayVisible.value = true;
     setDialogSizeForConsoleFit({ expanded: true });
   }
+  void nextTick(ensureDialogWithinViewport);
   requestConsoleResize({ focus: true });
 }
 
@@ -941,6 +1201,7 @@ async function pasteFromClipboard(nativeRequestId = 0) {
     showConsoleNotice("控制台未连接，未发送文本", 1800);
     return;
   }
+  clearConsoleWakeRefreshTimer();
   cancelConsolePaste("");
   const clipboardReadTaskId = ++consolePasteTaskSeq;
   try {
@@ -948,20 +1209,23 @@ async function pasteFromClipboard(nativeRequestId = 0) {
     if (clipboardReadTaskId !== consolePasteTaskSeq) return;
     void pasteTextToConsole(text);
   } catch {
-    showConsoleNotice("浏览器未允许读取剪贴板", 1800);
+    requestNativePasteCapture({ notice: `请按 ${CONSOLE_PASTE_SHORTCUT_LABEL} 粘贴` });
+    return;
   } finally {
-    focusConsole();
+    if (!activeNativePasteRequestId) focusConsole();
   }
 }
 
-function requestNativePasteCapture() {
+function requestNativePasteCapture(options: { notice?: string } = {}) {
   if (!connected.value || !rfb) {
     showConsoleNotice("控制台未连接，未发送文本", 1800);
     return;
   }
+  clearConsoleWakeRefreshTimer();
   const textarea = clipboardCaptureRef.value;
   if (!textarea) {
-    void pasteFromClipboard();
+    showConsoleNotice(`请点击控制台后按 ${CONSOLE_PASTE_SHORTCUT_LABEL} 粘贴`, 2200);
+    focusConsole();
     return;
   }
   cancelConsolePaste("");
@@ -971,11 +1235,13 @@ function requestNativePasteCapture() {
   textarea.value = "";
   textarea.focus({ preventScroll: true });
   textarea.select();
+  if (options.notice) showConsoleNotice(options.notice, 2400);
   nativePasteFallbackTimer = window.setTimeout(() => {
     nativePasteFallbackTimer = null;
+    consumeNativePasteRequest(requestId);
     textarea.blur();
-    void pasteFromClipboard(requestId);
-  }, CONSOLE_NATIVE_PASTE_FALLBACK_MS);
+    focusConsole();
+  }, CONSOLE_NATIVE_PASTE_CAPTURE_TIMEOUT_MS);
 }
 
 function handleClipboardCapturePaste(event: ClipboardEvent) {
@@ -1028,8 +1294,10 @@ function syncConsoleAspectRatio(options: { reveal?: boolean; attempt?: number } 
   if (target) cacheConsoleAspectRatio(target, nextAspectRatio);
   if (Math.abs(nextAspectRatio - consoleAspectRatio.value) >= 0.01) {
     consoleAspectRatio.value = nextAspectRatio;
-    setDialogSizeForConsoleFit({ expanded: isExpanded.value });
-    if (!isExpanded.value) rememberNormalDialogSize();
+    if (!props.embedded) {
+      setDialogSizeForConsoleFit({ expanded: isExpanded.value });
+      if (!isExpanded.value) rememberNormalDialogSize();
+    }
   }
   if (options.reveal) {
     revealConsoleFrame();
@@ -1128,18 +1396,68 @@ function hasRenderableConsoleCanvas(): boolean {
   const width = canvas.width || Number(canvas.getAttribute("width"));
   const height = canvas.height || Number(canvas.getAttribute("height"));
   const rect = canvas.getBoundingClientRect();
-  if ((width > 1 && height > 1) || (rect.width > 1 && rect.height > 1)) return true;
-  return hasNonBlankCanvasPixels(canvas);
+  const hasSize = (width > 1 && height > 1) || (rect.width > 1 && rect.height > 1);
+  return hasSize;
+}
+
+function hasNonBlankConsoleCanvas(): boolean {
+  const canvas = screenRef.value?.querySelector("canvas");
+  return canvas ? hasNonBlankCanvasPixels(canvas) : false;
+}
+
+function startProvisionBlankConsoleWatch(delayMs?: number) {
+  clearProvisionBlankConsoleWatch();
+  if (!isProvisionConsole.value || props.provisionTask?.status === "failed") return;
+  const nextDelay = delayMs ?? Math.min(
+    CONSOLE_PROVISION_BLANK_RECONNECT_DELAY_MS * Math.max(consoleBlankReconnectAttempt + 1, 1),
+    CONSOLE_PROVISION_BLANK_RECONNECT_MAX_DELAY_MS,
+  );
+  consoleBlankReconnectTimer = window.setTimeout(() => {
+    consoleBlankReconnectTimer = null;
+    if (!effectiveVisible.value || !props.target || !connected.value || !rfb || !isProvisionConsole.value || props.provisionTask?.status === "failed") return;
+    if (hasNonBlankConsoleCanvas()) {
+      consoleBlankReconnectAttempt = 0;
+      startProvisionBlankConsoleWatch();
+      return;
+    }
+    if (!shouldReconnectBlankProvisionConsole()) {
+      startProvisionBlankConsoleWatch();
+      return;
+    }
+    consoleBlankReconnectAttempt += 1;
+    consoleFrameReady.value = false;
+    statusText.value = `控制台暂时黑屏，正在重新获取当前画面（第 ${consoleBlankReconnectAttempt} 次）`;
+    void connectConsole();
+  }, nextDelay);
+}
+
+function clearProvisionBlankConsoleWatch() {
+  if (consoleBlankReconnectTimer == null) return;
+  window.clearTimeout(consoleBlankReconnectTimer);
+  consoleBlankReconnectTimer = null;
+}
+
+function shouldReconnectBlankProvisionConsole() {
+  if (!effectiveVisible.value || !props.target || !connected.value || !rfb || !isProvisionConsole.value) return false;
+  const stepKey = currentProvisionVm.value?.currentStep || props.provisionTask?.currentStep || provisionTaskCurrentStep.value?.key;
+  if (!["boot", "fetch-source", "install-guest", "wait-network", "verify-login", "finalize", "guest-tools"].includes(String(stepKey))) return false;
+  const canvas = screenRef.value?.querySelector("canvas");
+  if (!canvas) return true;
+  return !hasNonBlankCanvasPixels(canvas);
 }
 
 function hasNonBlankCanvasPixels(canvas: HTMLCanvasElement): boolean {
   if (!canvas.width || !canvas.height) return false;
   try {
-    const context = canvas.getContext("2d", { willReadFrequently: true });
-    if (!context) return false;
     const sampleWidth = Math.min(canvas.width, 80);
     const sampleHeight = Math.min(canvas.height, 60);
-    const image = context.getImageData(0, 0, sampleWidth, sampleHeight).data;
+    const sampleCanvas = document.createElement("canvas");
+    sampleCanvas.width = sampleWidth;
+    sampleCanvas.height = sampleHeight;
+    const sampleContext = sampleCanvas.getContext("2d", { willReadFrequently: true });
+    if (!sampleContext) return false;
+    sampleContext.drawImage(canvas, 0, 0, sampleWidth, sampleHeight);
+    const image = sampleContext.getImageData(0, 0, sampleWidth, sampleHeight).data;
     for (let index = 0; index < image.length; index += 4) {
       if (image[index] || image[index + 1] || image[index + 2]) return true;
     }
@@ -1194,7 +1512,15 @@ function isConsoleCanvasFitted() {
   const screenRect = screen.getBoundingClientRect();
   const canvasRect = canvas.getBoundingClientRect();
   if (!screenRect.width || !screenRect.height || !canvasRect.width || !canvasRect.height) return false;
-  return Math.abs(screenRect.width - canvasRect.width) <= 3 && Math.abs(screenRect.height - canvasRect.height) <= 3;
+  const sourceWidth = canvas.width || Number(canvas.getAttribute("width"));
+  const sourceHeight = canvas.height || Number(canvas.getAttribute("height"));
+  if (!sourceWidth || !sourceHeight) return false;
+  const sourceAspectRatio = sourceWidth / sourceHeight;
+  const renderedAspectRatio = canvasRect.width / canvasRect.height;
+  const fitsWithinScreen = canvasRect.width <= screenRect.width + 3 && canvasRect.height <= screenRect.height + 3;
+  const touchesScreenEdge = Math.abs(screenRect.width - canvasRect.width) <= 3 || Math.abs(screenRect.height - canvasRect.height) <= 3;
+  const preservesAspectRatio = Math.abs(sourceAspectRatio - renderedAspectRatio) <= 0.01;
+  return fitsWithinScreen && touchesScreenEdge && preservesAspectRatio;
 }
 
 function refreshNoVncViewport(options: { focus?: boolean } = {}) {
@@ -1550,9 +1876,29 @@ function showUploadStatus(message: string, level: "info" | "success" | "error" =
 }
 
 function handleConsoleShortcut(event: KeyboardEvent) {
-  if (!effectiveVisible.value || !rfb || !isConsoleKeyboardContext(event.target)) return;
+  if (!effectiveVisible.value) return;
+  if (event.key === "Escape" && isExpanded.value && !props.embedded) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    stopDialogDrag();
+    releaseModifierKeys();
+    toggleExpandedConsole();
+    return;
+  }
+  if (!rfb || !isConsoleKeyboardContext(event.target)) return;
+  clearConsoleWakeRefreshTimer();
+  if (event.key === "Backspace" && !event.metaKey && !event.ctrlKey && !event.altKey) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    if (consolePasteSending.value) cancelConsolePaste("已取消文本发送");
+    if (!event.repeat) startConsoleBackspaceRepeat();
+    return;
+  }
+  const isNativeCtrlC = event.key.toLowerCase() === "c" && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey;
   if (consolePasteSending.value && !isModifierKey(event.key)) {
-    cancelConsolePaste("已取消文本发送");
+    cancelConsolePaste("已取消文本发送", { releaseModifiers: !isNativeCtrlC });
   }
   const directText = resolveDirectConsoleTextKey(event);
   if (directText) {
@@ -1564,17 +1910,50 @@ function handleConsoleShortcut(event: KeyboardEvent) {
   }
   const shortcut = resolveLocalConsoleShortcut(event);
   if (!shortcut) return;
+  if (shortcut.action === "paste") {
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    suppressLocalShortcutUntil = Date.now() + 1000;
+    suppressedLocalShortcutKey = shortcut.key;
+    suppressedLocalShortcutModifier = event.metaKey ? "meta" : "ctrl";
+    releaseModifierKeys();
+    requestNativePasteCapture();
+    return;
+  }
   event.preventDefault();
   event.stopPropagation();
   event.stopImmediatePropagation();
   suppressLocalShortcutUntil = Date.now() + 1000;
   suppressedLocalShortcutKey = shortcut.key;
-  releaseModifierKeys();
-  if (shortcut.action === "paste") {
-    requestNativePasteCapture();
-  } else if (shortcut.action === "ctrl-c") {
-    sendRemoteCtrlC();
-  }
+  suppressedLocalShortcutModifier = event.metaKey ? "meta" : "ctrl";
+  if (!remoteCtrlCInFlight) releaseModifierKeys();
+}
+
+function handleConsoleScreenShortcut(event: KeyboardEvent) {
+  const isRemoteCtrlC =
+    event.key.toLowerCase() === "c" &&
+    (event.ctrlKey || event.metaKey) &&
+    !event.altKey &&
+    !event.shiftKey;
+  if (!isRemoteCtrlC) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
+  if (!event.repeat) sendRemoteCtrlC();
+}
+
+function handleConsoleScreenShortcutKeyup(event: KeyboardEvent) {
+  const isRemoteCtrlC =
+    event.key.toLowerCase() === "c" &&
+    (event.ctrlKey || event.metaKey) &&
+    !event.altKey &&
+    !event.shiftKey;
+  if (!isRemoteCtrlC) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
 }
 
 function handleConsoleCompositionEnd(event: CompositionEvent) {
@@ -1593,23 +1972,29 @@ function handleConsoleCompositionEnd(event: CompositionEvent) {
 
 function handleConsoleShortcutKeyup(event: KeyboardEvent) {
   if (!effectiveVisible.value || !rfb) return;
-  if (Date.now() > suppressLocalShortcutUntil || event.key.toLowerCase() !== suppressedLocalShortcutKey) return;
+  if (event.key === "Backspace" && consoleBackspaceHeld) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    stopConsoleBackspaceRepeat();
+    return;
+  }
+  const matchesSuppressedModifier =
+    (suppressedLocalShortcutModifier === "meta" && event.metaKey && !event.ctrlKey) ||
+    (suppressedLocalShortcutModifier === "ctrl" && event.ctrlKey && !event.metaKey);
+  if (
+    Date.now() > suppressLocalShortcutUntil ||
+    event.key.toLowerCase() !== suppressedLocalShortcutKey ||
+    !matchesSuppressedModifier
+  ) {
+    return;
+  }
   event.preventDefault();
   event.stopPropagation();
   event.stopImmediatePropagation();
   releaseModifierKeys();
   suppressedLocalShortcutKey = "";
-}
-
-function handleConsoleCopy(event: ClipboardEvent) {
-  if (!effectiveVisible.value || !rfb || !isConsoleKeyboardContext(event.target)) return;
-  if (isEditableEventTarget(event.target)) return;
-  event.preventDefault();
-  event.stopPropagation();
-  event.stopImmediatePropagation();
-  suppressLocalShortcutUntil = Date.now() + 1000;
-  suppressedLocalShortcutKey = "c";
-  sendRemoteCtrlC();
+  suppressedLocalShortcutModifier = "";
 }
 
 function handleConsolePaste(event: ClipboardEvent) {
@@ -1617,13 +2002,14 @@ function handleConsolePaste(event: ClipboardEvent) {
   if (!effectiveVisible.value || !connected.value || !rfb || !isConsoleKeyboardContext(event.target)) return;
   const text = event.clipboardData?.getData("text/plain") ?? "";
   if (!text) return;
+  clearConsoleWakeRefreshTimer();
   event.preventDefault();
   event.stopPropagation();
   event.stopImmediatePropagation();
   void pasteTextToConsole(text);
 }
 
-function resolveLocalConsoleShortcut(event: KeyboardEvent): { action: "paste" | "ctrl-c" | "block"; key: string } | null {
+function resolveLocalConsoleShortcut(event: KeyboardEvent): { action: "paste" | "block"; key: string } | null {
   const key = event.key.toLowerCase();
   if (key === "escape" && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey) {
     return { action: "block", key };
@@ -1632,7 +2018,6 @@ function resolveLocalConsoleShortcut(event: KeyboardEvent): { action: "paste" | 
   const isLocalModifier = event.metaKey || event.ctrlKey;
   if (!isLocalModifier) return null;
   if (key === "v") return { action: "paste", key };
-  if (key === "c") return { action: "ctrl-c", key };
   if (["x", "a"].includes(key)) return { action: "block", key };
   return null;
 }
@@ -1646,7 +2031,7 @@ function resolveDirectConsoleTextKey(event: KeyboardEvent) {
   return "";
 }
 
-function cancelConsolePaste(message: string, options: { clearNotice?: boolean } = {}) {
+function cancelConsolePaste(message: string, options: { clearNotice?: boolean; releaseModifiers?: boolean } = {}) {
   consoleTextSendToken += 1;
   consolePasteTaskSeq += 1;
   if (!consolePasteSending.value) {
@@ -1655,7 +2040,7 @@ function cancelConsolePaste(message: string, options: { clearNotice?: boolean } 
   }
 
   consolePasteSending.value = false;
-  releaseModifierKeys();
+  if (options.releaseModifiers !== false) releaseModifierKeys();
   if (options.clearNotice) {
     consoleNoticeText.value = "";
   } else if (message) {
@@ -1732,6 +2117,7 @@ async function pasteTextToConsole(text: string) {
 }
 
 function sendConsoleText(text: string, options: ConsoleTextSendOptions = {}): Promise<ConsoleTextSendResult> {
+  clearConsoleWakeRefreshTimer();
   const token = consoleTextSendToken;
   consoleTextSendQueue = consoleTextSendQueue
     .catch(() => ({ sentCount: 0, status: "cancelled" as const }))
@@ -1754,7 +2140,7 @@ async function sendConsoleTextNow(text: string, token: number, options: ConsoleT
       releaseModifierKeys();
       return { sentCount, status: "cancelled" };
     }
-    if (sendTextCharacter(char)) {
+    if (await sendTextCharacter(char)) {
       sentCount += 1;
       if (sentCount % 10 === 0 || sentCount === text.length) options.onProgress?.(sentCount);
       await delay(CONSOLE_TEXT_SEND_INTERVAL_MS);
@@ -1765,32 +2151,42 @@ async function sendConsoleTextNow(text: string, token: number, options: ConsoleT
   return { sentCount, status: "completed" };
 }
 
-function sendTextCharacter(char: string) {
+async function sendTextCharacter(char: string) {
   if (!connected.value || !rfb) return false;
   const special = specialKeyForCharacter(char);
   if (special) {
-    tapRemoteKey(special.keysym, special.code);
-    return true;
+    return tapRemoteKey(special.keysym, special.code);
   }
   const keyStroke = keyStrokeForCharacter(char);
   if (keyStroke) {
-    tapRemoteKey(keyStroke.keysym, keyStroke.code, keyStroke.shift);
-    return true;
+    return tapRemoteKey(keyStroke.keysym, keyStroke.code, keyStroke.shift);
   }
   if (!isPrintableTextCharacter(char)) return false;
   const codePoint = char.codePointAt(0);
   if (codePoint == null) return false;
   const keysym = codePoint <= 0xff ? codePoint : 0x01000000 | codePoint;
-  tapRemoteKey(keysym, undefined);
-  return true;
+  return tapRemoteKey(keysym, undefined);
 }
 
-function tapRemoteKey(keysym: number, code?: string, shift = false) {
-  if (!rfb) return;
-  if (shift) rfb.sendKey(0xffe1, "ShiftLeft", true);
-  rfb.sendKey(keysym, code, true);
-  rfb.sendKey(keysym, code, false);
-  if (shift) rfb.sendKey(0xffe1, "ShiftLeft", false);
+async function tapRemoteKey(keysym: number, code?: string, shift = false, holdMs = CONSOLE_TEXT_KEY_HOLD_MS) {
+  const session = rfb;
+  if (!session || !connected.value) return false;
+  if (shift) {
+    session.sendKey(0xffe1, "ShiftLeft", true);
+    await delay(CONSOLE_TEXT_SHIFT_SETTLE_MS);
+  }
+  if (session !== rfb || !connected.value) {
+    if (shift) session.sendKey(0xffe1, "ShiftLeft", false);
+    return false;
+  }
+  session.sendKey(keysym, code, true);
+  await delay(holdMs);
+  session.sendKey(keysym, code, false);
+  if (shift) {
+    await delay(CONSOLE_TEXT_SHIFT_SETTLE_MS);
+    session.sendKey(0xffe1, "ShiftLeft", false);
+  }
+  return session === rfb && connected.value;
 }
 
 function specialKeyForCharacter(char: string): { keysym: number; code: string } | null {
@@ -1859,6 +2255,7 @@ function clamp(value: number, min: number, max: number) {
 function provisionStepStatusText(status: ProvisionTaskStep["status"] | ProvisionTaskVm["status"]) {
   if (status === "success") return "完成";
   if (status === "running") return "执行中";
+  if (status === "warning") return "有告警";
   if (status === "failed") return "失败";
   if (status === "skipped") return "跳过";
   return "等待";
@@ -1918,7 +2315,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
               <strong>{{ provisionTask?.id || "创建任务" }}</strong>
               <p>{{ provisionTaskCurrentCopy }}</p>
             </div>
-            <span>{{ provisionStepStatusText(provisionTask?.status || "pending") }}</span>
+            <span class="console-task-state" :class="consoleTaskStatusTone">{{ provisionStepStatusText(provisionTask?.status || "pending") }}</span>
           </div>
           <div class="console-task-track" aria-hidden="true">
             <i :style="{ width: `${provisionTaskPercent}%` }"></i>
@@ -1952,7 +2349,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
               <strong>{{ item.name }}</strong>
               <span>{{ [item.ip, item.message || provisionStepStatusText(item.status)].filter(Boolean).join(" · ") }}</span>
             </span>
-            <em>{{ provisionVmProgressLabel(item) }}</em>
+            <em :class="`status-${item.status}`">{{ provisionVmProgressLabel(item) }}</em>
           </button>
         </div>
         <div v-if="shouldShowUploadProgressInSide" class="console-upload-progress is-side">
@@ -2108,7 +2505,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
                 <el-icon><Refresh /></el-icon>
               </button>
             </el-tooltip>
-            <el-tooltip v-if="!embedded" :content="isExpanded ? '退出放大' : '放大控制台窗口'" placement="bottom" :show-after="120" :hide-after="0">
+            <el-tooltip :content="isExpanded ? '退出放大' : '放大控制台窗口'" placement="bottom" :show-after="120" :hide-after="0">
               <button
                 class="console-tool-button"
                 :aria-label="isExpanded ? '退出放大' : '放大控制台窗口'"
@@ -2176,7 +2573,11 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
             spellcheck="false"
             @paste.capture="handleClipboardCapturePaste"
           ></textarea>
-          <div v-if="!consoleFrameReady" class="console-frame-pending console-terminal-overlay" :class="`platform-${consoleLoadingBrand.type}`">
+          <div
+            v-if="!consoleFrameReady"
+            class="console-frame-pending console-terminal-overlay"
+            :class="`platform-${consoleLoadingBrand.type}`"
+          >
               <div class="console-loading-card">
                 <div class="console-loading-mark">
                   <div class="resource-loader-mark console-resource-loader-mark" aria-hidden="true">
@@ -2184,8 +2585,8 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
                     <VrcLogoMark />
                   </div>
                 </div>
-              <strong>控制台加载中</strong>
-              <span v-if="statusText !== '控制台连接中'" :title="statusText">{{ statusText }}</span>
+              <strong>{{ consolePendingCopy.title }}</strong>
+              <span :title="consolePendingCopy.detail">{{ consolePendingCopy.detail }}</span>
             </div>
           </div>
           <div
@@ -2196,6 +2597,9 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
             inputmode="text"
             autocapitalize="off"
             spellcheck="false"
+            @pointerdown.capture="focusConsole"
+            @keydown.capture="handleConsoleScreenShortcut"
+            @keyup.capture="handleConsoleScreenShortcutKeyup"
           ></div>
         </section>
 

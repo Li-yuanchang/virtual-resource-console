@@ -1,11 +1,14 @@
 <script setup lang="ts">
+import VmResizeIconMark from "./VmResizeIconMark.vue";
+
 defineProps<{
-  name: "start" | "shutdown" | "forceReboot" | "delete";
+  name: "start" | "shutdown" | "forceReboot" | "resize" | "delete";
 }>();
 </script>
 
 <template>
-  <svg class="vrc-vm-action-icon" :class="`is-${name}`" viewBox="0 0 24 24" aria-hidden="true">
+  <VmResizeIconMark v-if="name === 'resize'" variant="rack-stack" :size="17" class="vrc-vm-action-icon is-resize" />
+  <svg v-else class="vrc-vm-action-icon" :class="`is-${name}`" viewBox="0 0 24 24" aria-hidden="true">
     <template v-if="name === 'start'">
       <path d="M8.25 5.75v12.5L18 12Z" />
     </template>

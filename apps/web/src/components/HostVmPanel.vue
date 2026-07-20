@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { EditPen, Search } from "@element-plus/icons-vue";
+import type { TableInstance } from "element-plus";
 import { resolveVmConsoleTarget, type VmConsoleTarget } from "../domain/consoleStrategies";
 import { getProviderBrand } from "../domain/providerBrand";
 import type { HostNode, ProviderType, VmNode, VmPowerAction } from "../types";
@@ -41,6 +42,8 @@ type VmActionState = {
 };
 type VmPowerFilter = "all" | "running" | "stopped";
 type HostVmPanelVariant = "page" | "dialog";
+type VmSortOrder = "ascending" | "descending" | null;
+type VmSortKey = "name" | "powerState" | "guestOs" | "cpuCount" | "memoryBytes" | "diskVirtualBytes" | "ip" | "lastShutdownAt";
 
 const powerFilterOptions: Array<{ label: string; value: VmPowerFilter }> = [
   { label: "全部", value: "all" },
@@ -56,6 +59,7 @@ const props = withDefaults(
       host: string;
       port: number;
       username: string;
+      password?: string;
     };
     host: HostNode;
     networkCount: number;
@@ -95,7 +99,7 @@ const emit = defineEmits<{
   "update:powerFilter": [value: VmPowerFilter];
   "search-change": [];
   refresh: [];
-  export: [];
+  export: [rows: VmNode[]];
   "host-detail": [];
   "storage-detail": [];
   "iso-detail": [];
@@ -106,6 +110,7 @@ const emit = defineEmits<{
   "batch-vm-action": [action: VmPowerAction, rows: VmNode[]];
   "schedule-vms": [rows: VmNode[]];
   "rename-vm": [vm: VmNode];
+  "resize-vm": [vm: VmNode];
 }>();
 
 const searchModel = computed({
@@ -124,6 +129,8 @@ const cpuSummary = computed(() => props.resourceSummary[0]);
 const memorySummary = computed(() => props.resourceSummary[1]);
 const storageSummary = computed(() => props.resourceSummary[2]);
 const loadingBrand = computed(() => getProviderBrand(props.connection.providerType));
+const supportsVmResize = computed(() => props.connection.providerType !== "libvirt");
+const vmOperationColumnWidth = computed(() => (supportsVmResize.value ? 176 : 144));
 const exportTooltipText = computed(() =>
   props.vms.length ? "导出虚拟机清单：下载当前筛选结果 CSV" : "无可导出的虚拟机：当前筛选结果为空",
 );
@@ -135,6 +142,105 @@ const batchActionRows = computed<Record<VmPowerAction, VmNode[]>>(() => ({
   forceReboot: selectedVmRows.value.filter((vm) => canRunVmAction("forceReboot", vm)),
   delete: selectedVmRows.value.filter((vm) => canRunVmAction("delete", vm)),
 }));
+const vmSort = ref<{ prop: VmSortKey; order: VmSortOrder }>({ prop: "ip", order: "ascending" });
+const vmSortingEnabled = computed(() => props.vms.length > 1);
+const vmColumnSortable = computed(() => (vmSortingEnabled.value ? "custom" : false));
+const defaultVmSort = computed(() => (vmSortingEnabled.value ? { prop: "ip", order: "ascending" as const } : undefined));
+const sortedVms = computed(() => {
+  if (!vmSortingEnabled.value) return props.vms;
+  const { prop, order } = vmSort.value;
+  return [...props.vms].sort((left, right) => compareVmRows(left, right, prop, order));
+});
+const vmTableRef = ref<TableInstance>();
+let syncingVmTableSelection = false;
+
+function vmSelectionKey(vm: VmNode) {
+  return vm.providerId || vm.id;
+}
+
+function handleVmSort({ prop, order }: { prop: string; order: VmSortOrder }) {
+  if (!vmSortingEnabled.value) return;
+  const supported: VmSortKey[] = ["name", "powerState", "guestOs", "cpuCount", "memoryBytes", "diskVirtualBytes", "ip", "lastShutdownAt"];
+  vmSort.value = {
+    prop: supported.includes(prop as VmSortKey) ? (prop as VmSortKey) : "ip",
+    order,
+  };
+}
+
+function compareVmRows(left: VmNode, right: VmNode, prop: VmSortKey, order: VmSortOrder) {
+  if (!order) return compareVmIp(left, right);
+  const leftValue = vmSortValue(left, prop);
+  const rightValue = vmSortValue(right, prop);
+  if (leftValue == null && rightValue == null) return compareVmIp(left, right);
+  if (leftValue == null) return 1;
+  if (rightValue == null) return -1;
+  const direction = order === "ascending" ? 1 : -1;
+  const compared =
+    typeof leftValue === "number" && typeof rightValue === "number"
+      ? leftValue - rightValue
+      : String(leftValue).localeCompare(String(rightValue), "zh-CN", { numeric: true, sensitivity: "base" });
+  return compared === 0 ? compareVmIp(left, right) : compared * direction;
+}
+
+function vmSortValue(vm: VmNode, prop: VmSortKey): string | number | null {
+  if (prop === "name") return vm.name;
+  if (prop === "powerState") return vmPowerStateRank(vm.powerState);
+  if (prop === "guestOs") return displayGuestOs(vm) === "-" ? null : displayGuestOs(vm);
+  if (prop === "cpuCount") return Number.isFinite(vm.cpuCount) ? vm.cpuCount : null;
+  if (prop === "memoryBytes") return Number.isFinite(vm.memoryBytes) ? vm.memoryBytes : null;
+  if (prop === "diskVirtualBytes") return vm.diskVirtualBytes == null || !Number.isFinite(vm.diskVirtualBytes) ? null : vm.diskVirtualBytes;
+  if (prop === "lastShutdownAt") {
+    const timestamp = vm.lastShutdownAt ? Date.parse(vm.lastShutdownAt) : Number.NaN;
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+  return vm.ipAddresses[0] || null;
+}
+
+function vmPowerStateRank(value: VmNode["powerState"]) {
+  if (value === "running") return 0;
+  if (value === "suspended") return 1;
+  if (value === "halted" || value === "stopped") return 2;
+  return 3;
+}
+
+function compareVmIp(left: VmNode, right: VmNode) {
+  const leftIp = left.ipAddresses[0] || "";
+  const rightIp = right.ipAddresses[0] || "";
+  if (!leftIp && !rightIp) return left.name.localeCompare(right.name, "zh-CN", { numeric: true, sensitivity: "base" });
+  if (!leftIp) return 1;
+  if (!rightIp) return -1;
+  const compared = leftIp.localeCompare(rightIp, "zh-CN", { numeric: true, sensitivity: "base" });
+  return compared === 0 ? left.name.localeCompare(right.name, "zh-CN", { numeric: true, sensitivity: "base" }) : compared;
+}
+
+async function syncVmTableSelection() {
+  await nextTick();
+  const table = vmTableRef.value;
+  if (!table) return;
+
+  const selectedIds = new Set(props.selectedVmIds);
+  const targetRows = props.vms.filter((vm) => selectedIds.has(vm.providerId) || selectedIds.has(vm.id));
+  const currentKeys = (table.getSelectionRows() as VmNode[]).map(vmSelectionKey).sort();
+  const targetKeys = targetRows.map(vmSelectionKey).sort();
+  if (currentKeys.length === targetKeys.length && currentKeys.every((key, index) => key === targetKeys[index])) return;
+
+  syncingVmTableSelection = true;
+  table.clearSelection();
+  for (const row of targetRows) table.toggleRowSelection(row, true);
+  await nextTick();
+  syncingVmTableSelection = false;
+}
+
+function handleVmTableSelectionChange(rows: VmNode[]) {
+  if (syncingVmTableSelection) return;
+  emit("selection-change", rows);
+}
+
+watch(
+  () => [props.selectedVmIds.join("|"), props.vms.map(vmSelectionKey).join("|")] as const,
+  () => void syncVmTableSelection(),
+  { immediate: true, flush: "post" },
+);
 
 function percent(used: number, total: number) {
   if (!total) return 0;
@@ -152,6 +258,20 @@ function displayVmIp(vm: VmNode, hostIp?: string) {
 
 function displayGuestOs(vm: VmNode) {
   return vm.guestOs?.trim() || "-";
+}
+
+function displayLastShutdownAt(vm: VmNode) {
+  if (!vm.lastShutdownAt) return "-";
+  const date = new Date(vm.lastShutdownAt);
+  if (!Number.isFinite(date.getTime())) return "-";
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date).replace(/\//g, "-");
 }
 
 function formatVmDiskSummary(vm: VmNode) {
@@ -458,7 +578,7 @@ function openVmConsoleByRow(vm: VmNode) {
         </el-tooltip>
         <el-tooltip :content="exportTooltipText" placement="top">
           <span class="toolbar-tooltip-target">
-            <button type="button" class="toolbar-action-button" :disabled="!vms.length" aria-label="导出虚拟机清单" @click="emit('export')">
+            <button type="button" class="toolbar-action-button" :disabled="!vms.length" aria-label="导出虚拟机清单" @click="emit('export', sortedVms)">
               <VrcToolbarIcon name="export" />
             </button>
           </span>
@@ -475,18 +595,22 @@ function openVmConsoleByRow(vm: VmNode) {
 
     <div class="vm-table-wrap" :class="{ loading: loadingVms }">
       <el-table
-        :data="vms"
+        ref="vmTableRef"
+        class="resource-sort-table vm-resource-table"
+        :data="sortedVms"
         :height="tableHeight || undefined"
         :max-height="tableMaxHeight"
         :empty-text="loadingVms ? ' ' : '暂无虚拟机数据'"
         row-key="providerId"
+        :default-sort="defaultVmSort"
         :row-class-name="vmRowClassName"
         stripe
-        @selection-change="emit('selection-change', $event)"
+        @sort-change="handleVmSort"
+        @selection-change="handleVmTableSelectionChange"
       >
         <el-table-column type="selection" width="40" align="center" reserve-selection />
         <el-table-column type="index" label="序号" width="50" align="center" />
-        <el-table-column prop="name" label="名称" min-width="240" align="left" show-overflow-tooltip>
+        <el-table-column prop="name" label="名称" min-width="240" align="left" :sortable="vmColumnSortable" show-overflow-tooltip>
           <template #default="{ row }">
             <div class="vm-name-entry">
               <button v-if="vmConsoleTarget(row)" class="vm-console-link drilldown-link" :title="`${vmConsoleTarget(row)?.title}，点击打开控制台`" @click.stop="openVmConsoleByRow(row)">
@@ -505,7 +629,7 @@ function openVmConsoleByRow(vm: VmNode) {
             </div>
           </template>
         </el-table-column>
-        <el-table-column prop="powerState" label="状态" width="96" align="center" class-name="vm-state-column" label-class-name="vm-state-column">
+        <el-table-column prop="powerState" label="状态" width="96" align="center" :sortable="vmColumnSortable" class-name="vm-state-column" label-class-name="vm-state-column">
           <template #default="{ row }">
             <span class="vm-state-inline" :class="[vmActionStateClass(row), vmActionTypeClass(row), { 'is-action-busy': isVmActionBusy(row) }]">
               <template v-if="isVmActionBusy(row)">
@@ -518,25 +642,28 @@ function openVmConsoleByRow(vm: VmNode) {
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="系统" min-width="170" align="left" show-overflow-tooltip class-name="vm-os-column" label-class-name="vm-os-column">
+        <el-table-column prop="guestOs" label="系统" min-width="156" align="center" :sortable="vmColumnSortable" show-overflow-tooltip class-name="vm-os-column" label-class-name="vm-os-column">
           <template #default="{ row }">{{ displayGuestOs(row) }}</template>
         </el-table-column>
-        <el-table-column label="vCPU" width="64" align="center">
+        <el-table-column prop="cpuCount" label="vCPU" width="84" align="center" :sortable="vmColumnSortable">
           <template #default="{ row }">{{ formatCpuCount(row.cpuCount) }}</template>
         </el-table-column>
-        <el-table-column label="内存" width="78" align="center">
+        <el-table-column prop="memoryBytes" label="内存" width="78" align="center" :sortable="vmColumnSortable">
           <template #default="{ row }">{{ formatBytes(row.memoryBytes) }}</template>
         </el-table-column>
-        <el-table-column label="磁盘" width="220" align="center">
+        <el-table-column prop="diskVirtualBytes" label="磁盘" width="220" align="center" :sortable="vmColumnSortable">
           <template #default="{ row }">
             <span class="disk-total" :title="formatVmDiskSummary(row)">{{ formatBytes(row.diskVirtualBytes ?? 0) }}</span>
             <small class="disk-subtitle">{{ formatVmDiskSummary(row) }}</small>
           </template>
         </el-table-column>
-        <el-table-column label="IP" width="128" align="center">
+        <el-table-column prop="ip" label="IP" width="128" align="center" :sortable="vmColumnSortable">
           <template #default="{ row }">{{ displayVmIp(row, host.address) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="146" align="center" fixed="right" class-name="vm-operation-column" label-class-name="vm-operation-column">
+        <el-table-column prop="lastShutdownAt" label="关机时间" width="150" align="center" :sortable="vmColumnSortable">
+          <template #default="{ row }">{{ displayLastShutdownAt(row) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" :width="vmOperationColumnWidth" align="center" fixed="right" class-name="vm-operation-column" label-class-name="vm-operation-column">
           <template #default="{ row }">
             <div class="vm-action-cell">
               <button class="vm-action-link action-start" :disabled="!canRunVmAction('start', row)" :aria-label="actionButtonTitle('start', row)" :title="actionButtonTitle('start', row)" @click.stop="emitVmAction('start', row)">
@@ -547,6 +674,9 @@ function openVmConsoleByRow(vm: VmNode) {
               </button>
               <button class="vm-action-link action-force-reboot" :disabled="!canRunVmAction('forceReboot', row)" :aria-label="actionButtonTitle('forceReboot', row)" :title="actionButtonTitle('forceReboot', row)" @click.stop="emitVmAction('forceReboot', row)">
                 <VrcVmActionIcon name="forceReboot" />
+              </button>
+              <button v-if="supportsVmResize" class="vm-action-link action-resize" :disabled="isVmActionBusy(row)" aria-label="资源扩容" title="资源扩容" @click.stop="emit('resize-vm', row)">
+                <VrcVmActionIcon name="resize" />
               </button>
               <button class="vm-action-link action-delete" :disabled="!canRunVmAction('delete', row)" :aria-label="actionButtonTitle('delete', row)" :title="actionButtonTitle('delete', row)" @click.stop="emitVmAction('delete', row)">
                 <VrcVmActionIcon name="delete" />

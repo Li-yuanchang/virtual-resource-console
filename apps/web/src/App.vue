@@ -8,12 +8,18 @@ import VrcLogoMark from "./components/VrcLogoMark.vue";
 import VrcToolbarIcon from "./components/VrcToolbarIcon.vue";
 import VmProvisioningDialog from "./components/VmProvisioningDialog.vue";
 import VmRenameDialog from "./components/VmRenameDialog.vue";
+import VmResizeDialog from "./components/VmResizeDialog.vue";
 import VmScheduleDialog from "./components/VmScheduleDialog.vue";
 import VrcVmActionIcon from "./components/VrcVmActionIcon.vue";
 import { resolveVmConsoleTarget, type VmConsoleTarget } from "./domain/consoleStrategies";
 import { getProviderBrand } from "./domain/providerBrand";
+import { isoSourceLabel } from "./domain/provisioningStrategies";
+import { secureJsonRequest } from "./domain/secureRequest";
+import { vmPowerActionRowPatch } from "./domain/vmPowerState";
 import type {
   HostsResponse,
+  GuestStorageInventory,
+  GuestStorageResponse,
   IpPoolPolicy,
   IpPoolPolicyResponse,
   RuntimeIpPoolPolicy,
@@ -25,7 +31,11 @@ import type {
   StoredConnectionSummary,
   VmInventorySummary,
   VmNode,
+  VmDisk,
+  VmDisksResponse,
   VmPowerAction,
+  VmResizeRequest,
+  VmResizeResult,
   VmCreateRequest,
   VmProvisionCreatedVm,
   VmProvisionResponse,
@@ -46,6 +56,21 @@ interface HostOverviewRow {
   summary: VmInventorySummary | null;
   status: "loading" | "ready" | "error";
   error?: string;
+}
+
+interface BrowserStoredConnection extends StoredConnectionSummary {
+  password: string;
+  storage: "browser-local";
+}
+
+interface ChromeExtensionLaunchConnection {
+  id: string;
+  name?: string;
+  providerType: ProviderType;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
 }
 
 interface VmSearchCacheEntry {
@@ -74,6 +99,11 @@ interface VmRenameResponse {
     accepted: boolean;
     message: string;
   };
+}
+
+interface VmResizeResponse {
+  operatedAt: string;
+  result: VmResizeResult;
 }
 
 interface VmSummaryResponse {
@@ -149,7 +179,7 @@ interface HostResourceFingerprint {
 interface ProvisioningProgressState {
   title: string;
   message: string;
-  status: "running" | "success" | "error";
+  status: "running" | "success" | "warning" | "error";
 }
 
 interface ProvisionConsoleTargetItem {
@@ -188,8 +218,10 @@ type UiTheme = "graphite-sage" | "basalt-copper" | "mist-teal";
 type UiToneMode = "system" | "light" | "dark";
 type UiBackgroundMode = "default" | "solid" | "image";
 type WorkspaceMode = "empty" | "overview" | "connection" | "settings";
-type SettingsPanel = "appearance" | "connection" | "templates" | "ipPools" | "chromeExtension" | "logs";
+type SettingsPanel = "appearance" | "connection" | "templates" | "ipPools" | "chromeExtension" | "maintenance" | "logs";
 type VmPowerFilter = "all" | "running" | "stopped";
+type TableSortOrder = "ascending" | "descending" | null;
+type HostOverviewSortKey = "hostName" | "cpuUsage" | "memoryFree" | "storageFree" | "vmTotal";
 type AccountImportMode = "excel" | "json" | "fixed";
 type AccountImportStatus = "new" | "update" | "error";
 type ChromeExtensionProviderType = Extract<ProviderType, "xenserver" | "vmware" | "proxmox">;
@@ -256,6 +288,13 @@ interface AppPreferences {
   connection: ConnectionPreferences;
 }
 
+interface ApiHealthResponse {
+  runtimeMode?: "web" | "electron" | "chrome-native";
+  connectionStore?: {
+    persistentEnabled?: boolean;
+  };
+}
+
 interface AppearanceImportConfig {
   [key: string]: unknown;
   baseTheme?: unknown;
@@ -291,6 +330,43 @@ interface IpPoolEditorDraft {
   networkName: string;
   dnsText: string;
   vlan: string;
+}
+
+type MaintenanceCleanupDecision = "eligible" | "retained" | "skipped" | "cleaned" | "failed";
+
+interface MaintenanceGeneratedIsoEntry {
+  id: string;
+  taskId: string;
+  providerType: ProviderType;
+  connectionId?: string;
+  hostId?: string;
+  vmName: string;
+  vmIp?: string;
+  isoName: string;
+  isoPath: string;
+  isoVdiUuid?: string;
+  status: "creating" | "uploaded" | "attached" | "installed" | "failed" | "deleted";
+  createdAt: string;
+  updatedAt: string;
+  cleanupAfter?: string;
+  decision: MaintenanceCleanupDecision;
+  reason: string;
+  localBytes: number;
+}
+
+interface MaintenanceGeneratedIsoReport {
+  generatedAt: string;
+  retentionDays: number;
+  summary: {
+    total: number;
+    eligible: number;
+    retained: number;
+    skipped: number;
+    cleaned: number;
+    failed: number;
+    localBytes: number;
+  };
+  items: MaintenanceGeneratedIsoEntry[];
 }
 
 const VM_SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -375,6 +451,7 @@ const defaultConnectionPreferences: ConnectionPreferences = {
 };
 const chromeExtensionServiceStorageKey = "vrc.chromeExtension.service";
 const chromeExtensionConnectionsStorageKey = "vrc.chromeExtension.localConnections";
+const browserConnectionsStorageKey = "vrc.browserLocalConnections.v1";
 const defaultChromeExtensionServiceSettings: ChromeExtensionServiceSettings = {
   mode: "intranet",
   scheme: "http",
@@ -382,35 +459,6 @@ const defaultChromeExtensionServiceSettings: ChromeExtensionServiceSettings = {
   port: 3987,
 };
 const deprecatedChromeExtensionSampleConnectionIds = new Set(["xs-prod", "vmware-lab", "pve-test"]);
-const defaultIpPoolItems: RuntimeIpPoolPolicy[] = [
-  {
-    id: "pool-example-a",
-    name: "203.0.113 专用网段",
-    prefix: "203.0.113",
-    gateway: "203.0.113.254",
-    startHost: 20,
-    endHost: 250,
-    hostPrefixes: ["203.0.113"],
-  },
-  {
-    id: "pool-example-b",
-    name: "192.0.2 通用网段",
-    prefix: "192.0.2",
-    gateway: "192.0.2.254",
-    startHost: 20,
-    endHost: 250,
-  },
-  {
-    id: "pool-example-c",
-    name: "198.51.100 通用网段",
-    prefix: "198.51.100",
-    gateway: "198.51.100.1",
-    networkName: "Pool-wide network associated with eth1",
-    startHost: 20,
-    endHost: 250,
-  },
-];
-
 const connection = reactive({
   providerType: defaultConnectionPreferences.providerType,
   host: defaultConnectionPreferences.host,
@@ -425,6 +473,8 @@ const vmSummary = ref<VmInventorySummary | null>(null);
 const storedConnections = ref<StoredConnectionSummary[]>([]);
 const selectedConnectionId = ref(defaultConnectionPreferences.selectedConnectionId);
 const connectionName = ref(defaultConnectionPreferences.connectionName);
+const persistentConnectionsEnabled = ref(true);
+const apiRuntimeMode = ref<"web" | "electron" | "chrome-native">("web");
 const connectionSearch = ref("");
 const showConnectionEditor = ref(true);
 const showActivityPanel = ref(false);
@@ -460,6 +510,14 @@ const vmDetailVisible = ref(false);
 const vmRenameVisible = ref(false);
 const vmRenameTarget = ref<VmNode | null>(null);
 const vmRenameSaving = ref(false);
+const vmResizeVisible = ref(false);
+const vmResizeTarget = ref<VmNode | null>(null);
+const vmResizeDisks = ref<VmDisk[]>([]);
+const vmResizeLoadingDisks = ref(false);
+const vmResizeGuestStorage = ref<GuestStorageInventory | null>(null);
+const vmResizeLoadingGuestStorage = ref(false);
+const vmResizeGuestStorageError = ref("");
+const vmResizeSaving = ref(false);
 const consoleDialogVisible = ref(false);
 const consoleTarget = ref<VmConsoleTarget | null>(null);
 const consoleProvisionTaskId = ref("");
@@ -501,6 +559,12 @@ const ipPoolSearch = ref("");
 const ipPoolLoading = ref(false);
 const ipPoolSaving = ref(false);
 const ipPoolPolicyRevision = ref(0);
+const maintenanceIsoReport = ref<MaintenanceGeneratedIsoReport | null>(null);
+const maintenanceIsoLoading = ref(false);
+const maintenanceIsoCleaning = ref(false);
+const maintenanceIsoScannedAt = ref("");
+const maintenanceIsoError = ref("");
+const provisioningDialogSession = ref(0);
 const ipPoolDraft = reactive<IpPoolEditorDraft>(emptyIpPoolDraft());
 const chromeExtensionActiveTab = ref<ChromeExtensionTab>("service");
 const chromeExtensionService = reactive<ChromeExtensionServiceSettings>(loadChromeExtensionServiceSettings());
@@ -514,6 +578,7 @@ const chromeExtensionDraftConnection = reactive<ChromeExtensionDraftConnection>(
 });
 const hostOverviewSearch = ref("");
 const hostOverviewMatchMode = ref<"exact" | "fuzzy">("exact");
+const hostOverviewSort = ref<{ prop: HostOverviewSortKey; order: TableSortOrder }>({ prop: "hostName", order: "ascending" });
 const vmSearchCache = ref<Record<string, VmSearchCacheEntry>>({});
 const currentTheme = ref<UiTheme>(normalizeTheme(document.documentElement.dataset.theme || localStorage.getItem("vrc.theme")));
 const uiPreferences = reactive<UiPreferences>({ ...defaultUiPreferences });
@@ -536,6 +601,7 @@ const provisioningPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const provisioningTaskMarks = new Map<string, string>();
 const provisioningEventSources = new Map<string, EventSource>();
 const provisioningTaskPayloads = new Map<string, VmCreateRequest>();
+const dismissedProvisionTaskIds = new Set<string>();
 
 const hosts = computed(() => inventory.value?.hosts ?? []);
 const storage = computed(() => inventory.value?.storage ?? []);
@@ -544,6 +610,7 @@ const selectedHost = computed(() => hosts.value.find((host) => host.providerId =
 const selectedHostNetworks = computed(() => networks.value.filter((item) => !selectedHost.value || !item.hostId || item.hostId === selectedHost.value.providerId));
 const selectedStoredConnection = computed(() => storedConnections.value.find((item) => item.id === selectedConnectionId.value) ?? null);
 const selectedConnectionBrand = computed(() => getProviderBrand(selectedStoredConnection.value?.providerType ?? connection.providerType));
+const canLoadDirectConnection = computed(() => Boolean(connection.host.trim() && connection.username.trim() && connection.password.trim()));
 const connectionActionPendingMessage = computed(() => {
   if (savingConnection.value) return "正在保存连接配置";
   if (testing.value) return "正在测试平台连接";
@@ -625,6 +692,14 @@ watch(
   },
   { immediate: true },
 );
+watch(
+  provisioningVisible,
+  (visible, previousVisible) => {
+    if (!visible && previousVisible) {
+      resetProvisioningDialogView(true);
+    }
+  },
+);
 const showWorkspacePlaceholder = computed(
   () => workspaceMode.value === "empty" && !loadingHosts.value && !inventory.value && !hostOverviewRows.value.length && !loadingHostOverview.value,
 );
@@ -635,14 +710,20 @@ const settingsTitle = computed(() => {
   if (settingsPanel.value === "templates") return "设置 / 创建模板";
   if (settingsPanel.value === "ipPools") return "设置 / IP 池";
   if (settingsPanel.value === "chromeExtension") return "设置 / Chrome 插件";
+  if (settingsPanel.value === "maintenance") return "设置 / 维护";
   if (settingsPanel.value === "logs") return "设置 / 日志";
   return "设置 / 外观";
 });
 const settingsDescription = computed(() => {
-  if (settingsPanel.value === "connection") return "保存、测试和选择虚拟化平台连接，左侧列表仍作为主切换入口。";
+  if (settingsPanel.value === "connection") {
+    return persistentConnectionsEnabled.value
+      ? "保存、测试和选择虚拟化平台连接，左侧列表仍作为主切换入口。"
+      : "连接账号保存到当前浏览器本地，2.26 服务器只处理本次请求，不保存账号密码。";
+  }
   if (settingsPanel.value === "templates") return "创建模板只做归档入口，真实模板能力仍以创建虚拟机弹框为准。";
   if (settingsPanel.value === "ipPools") return "只维护 ip-pools.json 地址池，创建 VM 时按物理机网段优先匹配，也允许用户手动选择。";
   if (settingsPanel.value === "chromeExtension") return "管理 Chrome 插件的服务地址和本地密文连接，和 Web、macOS、Windows 客户端配置分开。";
+  if (settingsPanel.value === "maintenance") return "清理 VRC 任务级临时介质，只处理登记、校验通过且任务已结束的残留。";
   if (settingsPanel.value === "logs") return "查看当前会话操作记录，持久化审计后续单独接入。";
   return "主题、按钮密度、表格密度和控制台偏好统一归档，不混入 VM 工具栏。";
 });
@@ -659,6 +740,16 @@ const chromeExtensionBaseUrl = computed(() => {
   const port = Number(chromeExtensionService.port) || 3987;
   return `${chromeExtensionService.scheme}://${host}:${port}`;
 });
+const maintenanceIsoSummary = computed(() => maintenanceIsoReport.value?.summary ?? {
+  total: 0,
+  eligible: 0,
+  retained: 0,
+  skipped: 0,
+  cleaned: 0,
+  failed: 0,
+  localBytes: 0,
+});
+const maintenanceIsoVisibleItems = computed(() => maintenanceIsoReport.value?.items.slice(0, 8) ?? []);
 const filteredStoredConnections = computed(() => {
   const keyword = connectionSearch.value.trim().toLowerCase();
   return storedConnections.value
@@ -688,7 +779,10 @@ const filteredIsoImages = computed(() => {
   const keyword = isoSearch.value.trim().toLowerCase();
   return isoImages.value.filter((item) => {
     if (!keyword) return true;
-    return [item.name, item.storageRepository, isoLibraryDescription(item), item.path ?? "", item.providerId].join(" ").toLowerCase().includes(keyword);
+    return [item.name, isoSourceLabel(item), item.storageRepository, isoLibraryDescription(item), item.path ?? "", item.providerId]
+      .join(" ")
+      .toLowerCase()
+      .includes(keyword);
   });
 });
 const isoTotals = computed(() => {
@@ -895,24 +989,25 @@ const hostOverviewMetricCards = computed(() => {
   ];
 });
 
-const overviewSearchKeyword = computed(() => hostOverviewSearch.value.trim().toLowerCase());
+const overviewSearchKeywords = computed(() => parseOverviewSearchKeywords(hostOverviewSearch.value));
+const overviewSearchKeyword = computed(() => overviewSearchKeywords.value.join(" "));
+const overviewSearchLabel = computed(() => overviewSearchKeywords.value.join("、"));
+const overviewSearchBatchText = computed(() => (overviewSearchKeywords.value.length > 1 ? `批量 ${overviewSearchKeywords.value.length} 项 · ` : ""));
+const overviewNeedsVmSearch = computed(() => overviewSearchKeywords.value.some(shouldSearchVmIp));
 const filteredHostOverviewRows = computed(() => {
-  const keyword = overviewSearchKeyword.value;
-  if (!keyword) return hostOverviewRows.value;
-  return hostOverviewRows.value.filter((row) => rowMatchesOverviewKeyword(row, keyword));
+  const keywords = overviewSearchKeywords.value;
+  if (!keywords.length) return hostOverviewRows.value;
+  return hostOverviewRows.value.filter((row) => rowMatchesOverviewKeywords(row, keywords));
 });
 
-const sortedHostOverviewRows = computed(() =>
-  [...filteredHostOverviewRows.value].sort((left, right) =>
-    left.host.name.localeCompare(right.host.name, "zh-CN", { numeric: true, sensitivity: "base" }),
-  ),
-);
+const sortedHostOverviewRows = computed(() => {
+  const { prop, order } = hostOverviewSort.value;
+  return [...filteredHostOverviewRows.value].sort((left, right) => compareHostOverviewRows(left, right, prop, order));
+});
 
-const vmSearchLoadingCount = computed(() => Object.values(vmSearchCache.value).filter((entry) => entry.loading).length);
 const vmSearchSettledCount = computed(() => hostOverviewRows.value.filter((row) => hasSettledVmSearchCache(row)).length);
 const overviewVmSearchLoading = computed(() => {
-  const keyword = overviewSearchKeyword.value;
-  if (!shouldSearchVmIp(keyword)) return false;
+  if (!overviewNeedsVmSearch.value) return false;
   return hostOverviewRows.value.some((row) => hasOverviewInventory(row) && !hasSettledVmSearchCache(row));
 });
 const overviewEmptyState = computed(() => {
@@ -928,14 +1023,14 @@ const overviewEmptyState = computed(() => {
     return {
       mode: "loading",
       title: "正在查询 VM IP",
-      detail: `缓存 ${vmSearchSettledCount.value} / ${total} · ${overviewSearchKeyword.value}`,
+      detail: `${overviewSearchBatchText.value}缓存 ${vmSearchSettledCount.value} / ${total} · ${overviewSearchLabel.value}`,
     };
   }
   if (overviewSearchKeyword.value) {
     return {
       mode: "empty",
       title: "未找到匹配资源",
-      detail: `没有命中物理机 IP 或 VM IP：${overviewSearchKeyword.value}`,
+      detail: `没有命中物理机 IP 或 VM IP：${overviewSearchLabel.value}`,
     };
   }
   return {
@@ -945,13 +1040,12 @@ const overviewEmptyState = computed(() => {
   };
 });
 const vmSearchStatusText = computed(() => {
-  const keyword = overviewSearchKeyword.value;
-  if (!keyword) return "";
-  if (!shouldSearchVmIp(keyword)) return `本地匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台`;
+  if (!overviewSearchKeywords.value.length) return "";
+  if (!overviewNeedsVmSearch.value) return `${overviewSearchBatchText.value}本地匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台`;
   const total = hostOverviewRows.value.filter(hasOverviewInventory).length;
   const cached = vmSearchSettledCount.value;
-  if (overviewVmSearchLoading.value) return `VM IP 缓存 ${cached} / ${total} · 加载中`;
-  return `VM IP 匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台 · 缓存 ${cached} / ${total}`;
+  if (overviewVmSearchLoading.value) return `${overviewSearchBatchText.value}VM IP 缓存 ${cached} / ${total} · 加载中`;
+  return `${overviewSearchBatchText.value}VM IP 匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台 · 缓存 ${cached} / ${total}`;
 });
 const resolvedAppearanceDark = computed(() => uiPreferences.toneMode === "dark" || (uiPreferences.toneMode === "system" && systemDark.value));
 const appearanceBackgroundImageUrl = computed(() =>
@@ -972,35 +1066,51 @@ const appearanceBackgroundPreviewStyle = computed(() => ({
 }));
 
 async function markRendererReady() {
+  document.documentElement.dataset.startupStage = "vue-mounted";
   await nextTick();
-  if (document.fonts?.ready) await document.fonts.ready;
-  await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())));
+  if (document.fonts?.ready) {
+    document.documentElement.dataset.startupStage = "fonts-waiting";
+    await Promise.race([document.fonts.ready, new Promise<void>((resolve) => window.setTimeout(resolve, 300))]);
+  }
+  document.documentElement.dataset.startupStage = "shell-ready";
   document.documentElement.dataset.appReady = "true";
 }
 
 onMounted(async () => {
-  appearanceMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-  systemDark.value = appearanceMediaQuery.matches;
-  appearanceMediaQuery.addEventListener("change", handleAppearanceMediaChange);
-  await loadAppPreferences();
+  try {
+    document.documentElement.dataset.startupStage = "mounted";
+    appearanceMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    systemDark.value = appearanceMediaQuery.matches;
+    appearanceMediaQuery.addEventListener("change", handleAppearanceMediaChange);
+    await loadRuntimeInfo();
+    document.documentElement.dataset.startupStage = "runtime-loaded";
+    await loadAppPreferences();
+    document.documentElement.dataset.startupStage = "preferences-loaded";
+  } catch (error) {
+    document.documentElement.dataset.startupError = error instanceof Error ? error.message : String(error);
+  } finally {
+    await markRendererReady();
+  }
   void loadIpPoolPolicy();
   connectInventoryEvents();
-  await markRendererReady();
   await loadStoredConnections();
-  const launchConnectionId = consumeChromeExtensionLaunchConnectionId();
-  if (launchConnectionId) {
-    if (storedConnections.value.some((item) => item.id === launchConnectionId)) {
-      applyStoredConnection(launchConnectionId);
+  const launchConnection = consumeChromeExtensionLaunchConnection();
+  if (launchConnection.connectionId) {
+    const extensionConnection = await requestChromeExtensionConnection(launchConnection).catch((error) => {
+      setErrorMessage(error instanceof Error ? error.message : "读取 Chrome 插件本地连接失败", false);
+      return null;
+    });
+    if (extensionConnection) {
+      applyChromeExtensionConnection(extensionConnection);
       await loadHostInventory();
       return;
     }
-    setErrorMessage("Chrome 插件传入的连接 ID 不存在，请在插件里重新选择连接。", false);
   }
   if (selectedConnectionId.value && storedConnections.value.some((item) => item.id === selectedConnectionId.value)) {
     applyStoredConnection(selectedConnectionId.value);
   } else if (selectedConnectionId.value) {
     selectedConnectionId.value = "";
-    void saveConnectionPreferences(buildConnectionPreferencesFromState());
+    if (persistentConnectionsEnabled.value) void saveConnectionPreferences(buildConnectionPreferencesFromState());
   }
   if (storedConnections.value.length) {
     await loadHostOverview();
@@ -1020,21 +1130,27 @@ onBeforeUnmount(() => {
 
 watch(hostOverviewSearch, (value) => {
   if (vmSearchTimer) clearTimeout(vmSearchTimer);
-  const keyword = value.trim().toLowerCase();
-  if (!shouldSearchVmIp(keyword)) return;
+  const keywords = parseOverviewSearchKeywords(value);
+  if (!keywords.some(shouldSearchVmIp)) return;
   vmSearchTimer = setTimeout(() => {
-    void ensureVmSearchCacheForKeyword(keyword);
+    void ensureVmSearchCacheForKeyword(keywords.join(" "));
   }, 350);
 });
 
 watch(vmDetailVisible, (visible) => {
-  if (!visible && hostOverviewRows.value.length && workspaceMode.value === "connection") {
+  if (visible) return;
+  resetVmOperationState();
+  if (hostOverviewRows.value.length && workspaceMode.value === "connection") {
     workspaceMode.value = "overview";
     selectedHostOverviewKey.value = "";
   }
 });
 
 watch(vmPowerFilter, () => {
+  selectedVmIds.value = [];
+});
+
+watch(search, () => {
   selectedVmIds.value = [];
 });
 
@@ -1055,12 +1171,22 @@ watch(
   },
 );
 
+watch(settingsPanel, (panel) => {
+  if (panel === "maintenance" && !maintenanceIsoReport.value && !maintenanceIsoLoading.value) {
+    void loadMaintenanceGeneratedIsos({ silent: true });
+  }
+});
+
 function normalizeTheme(value?: string | null): UiTheme {
   return value === "basalt-copper" || value === "mist-teal" || value === "graphite-sage" ? value : "graphite-sage";
 }
 
 function normalizeProviderType(value?: string | null): ProviderType {
   return value === "vmware" || value === "proxmox" || value === "libvirt" || value === "xenserver" ? value : "xenserver";
+}
+
+function isProviderType(value: ProviderType | ""): value is ProviderType {
+  return value === "vmware" || value === "proxmox" || value === "libvirt" || value === "xenserver";
 }
 
 async function loadAppPreferences() {
@@ -1071,7 +1197,7 @@ async function loadAppPreferences() {
       : result.preferences.connection;
     applyUiPreferences(result.preferences.ui ?? defaultUiPreferences);
     applyConnectionPreferences(connectionPreferences ?? defaultConnectionPreferences);
-    if (connectionPreferences === defaultConnectionPreferences && hasLegacyConnectionPreferences()) {
+    if (persistentConnectionsEnabled.value && connectionPreferences === defaultConnectionPreferences && hasLegacyConnectionPreferences()) {
       void saveConnectionPreferences(buildConnectionPreferencesFromState()).then(clearLegacyConnectionPreferences);
     }
   } catch (error) {
@@ -1080,6 +1206,17 @@ async function loadAppPreferences() {
     setErrorMessage(error instanceof Error ? `读取本地偏好失败：${error.message}` : "读取本地偏好失败", false);
   } finally {
     uiPreferencesLoaded.value = true;
+  }
+}
+
+async function loadRuntimeInfo() {
+  try {
+    const result = await postJson<ApiHealthResponse>("/api/health", undefined, "GET");
+    apiRuntimeMode.value = result.runtimeMode === "electron" || result.runtimeMode === "chrome-native" ? result.runtimeMode : "web";
+    persistentConnectionsEnabled.value = result.connectionStore?.persistentEnabled !== false;
+  } catch {
+    apiRuntimeMode.value = "web";
+    persistentConnectionsEnabled.value = false;
   }
 }
 
@@ -1336,8 +1473,8 @@ async function deleteChromeExtensionLocalConnection(item: ChromeExtensionLocalCo
 
 function defaultIpPoolPolicy(): IpPoolPolicy {
   return {
-    defaultDns: ["1.1.1.1"],
-    ipPools: defaultIpPoolItems.map(cloneIpPoolItem),
+    defaultDns: [],
+    ipPools: [],
   };
 }
 
@@ -1441,6 +1578,64 @@ async function loadIpPoolPolicy() {
   }
 }
 
+async function loadMaintenanceGeneratedIsos(options: { silent?: boolean } = {}) {
+  if (maintenanceIsoLoading.value) return;
+  const startedAt = Date.now();
+  maintenanceIsoLoading.value = true;
+  maintenanceIsoError.value = "";
+  try {
+    const result = await postJson<{ report: MaintenanceGeneratedIsoReport }>("/api/maintenance/generated-isos", undefined, "GET");
+    maintenanceIsoReport.value = result.report;
+    maintenanceIsoScannedAt.value = formatActivityTime();
+    const summary = result.report.summary;
+    if (!options.silent) {
+      ElMessage.success({
+        message: `扫描完成：记录 ${summary.total} 条，可清理 ${summary.eligible} 条`,
+        duration: 1800,
+      });
+    }
+  } catch (error) {
+    maintenanceIsoError.value = error instanceof Error ? error.message : "扫描 VRC 残留失败";
+    ElMessage.error({ message: maintenanceIsoError.value, duration: VRC_TOAST_DURATION_MS });
+  } finally {
+    const remaining = 300 - (Date.now() - startedAt);
+    if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
+    maintenanceIsoLoading.value = false;
+  }
+}
+
+async function cleanupMaintenanceGeneratedIsos() {
+  const count = maintenanceIsoSummary.value.eligible;
+  if (!count) return;
+  await confirmVrcAction({
+    heading: "清理 VRC 临时介质",
+    tone: "维护操作",
+    summary: `将清理 ${count} 条已登记、任务已结束且校验通过的 vrc-*.iso / 临时介质。`,
+    detail: "不会按文件名前缀批量删除原始系统 ISO；缺少连接信息、仍被挂载或任务未结束的记录会跳过。",
+    confirmButtonText: "确认清理",
+  });
+  maintenanceIsoCleaning.value = true;
+  try {
+    const result = await postJson<{ report: MaintenanceGeneratedIsoReport }>(
+      "/api/maintenance/generated-isos/cleanup",
+      { confirmToken: "CONFIRMED" },
+    );
+    maintenanceIsoReport.value = result.report;
+    const summary = result.report.summary;
+    const message = `清理完成：成功 ${summary.cleaned} 条，失败 ${summary.failed} 条，跳过 ${summary.skipped} 条`;
+    ElMessage.success({ message, duration: VRC_TOAST_DURATION_MS });
+    pushActivity("清理 VRC 临时介质", {
+      detail: message,
+      target: "设置 / 维护",
+      status: summary.failed ? "warning" : "success",
+    });
+  } catch (error) {
+    ElMessage.error({ message: error instanceof Error ? error.message : "清理 VRC 残留失败", duration: VRC_TOAST_DURATION_MS });
+  } finally {
+    maintenanceIsoCleaning.value = false;
+  }
+}
+
 function syncIpPoolDraftFromSelection() {
   const pool = selectedIpPool.value;
   Object.assign(ipPoolDraft, pool ? {
@@ -1478,8 +1673,9 @@ function buildIpPoolItemFromDraft(validate: boolean): RuntimeIpPoolPolicy | null
   const endHost = normalizeHostOctet(ipPoolDraft.endHost, 250);
   if (validate) {
     if (!name) return showIpPoolValidationError("请填写 IP 池名称");
-    if (!isIpv4Prefix(prefix)) return showIpPoolValidationError("请填写正确的虚拟机 IP 段，例如 192.0.2");
-    if (!isIpv4(gateway)) return showIpPoolValidationError("请填写正确的网关地址，例如 192.0.2.254");
+    if (!isIpv4Prefix(prefix)) return showIpPoolValidationError("请填写正确的虚拟机 IP 段，格式为 IPv4 前三段");
+    if (!isIpv4(gateway)) return showIpPoolValidationError("请填写正确的网关 IPv4 地址");
+    if (!gateway.startsWith(`${prefix}.`)) return showIpPoolValidationError("网关必须属于当前 IP 池网段");
     if (startHost > endHost) return showIpPoolValidationError("起始 IP 尾号不能大于结束 IP 尾号");
   }
   const item: RuntimeIpPoolPolicy = {
@@ -1508,11 +1704,40 @@ function buildIpPoolPolicyForSave(validate: boolean): IpPoolPolicy | null {
   if (!commitIpPoolDraftToMemory(validate)) return null;
   const defaultDns = parseCsvList(ipPoolDefaultDnsText.value);
   const ipPools = ipPoolPolicy.value.ipPools.map((item) => normalizeIpPoolItem(item)).filter(Boolean) as RuntimeIpPoolPolicy[];
+  if (validate && !defaultDns.length) return showIpPoolValidationError("请填写默认 DNS") as null;
   if (validate && !ipPools.length) return showIpPoolValidationError("至少保留一个 IP 池") as null;
+  if (validate) {
+    const validationMessage = validateIpPoolPolicyForSave({ defaultDns, ipPools });
+    if (validationMessage) return showIpPoolValidationError(validationMessage) as null;
+  }
   return {
-    defaultDns: defaultDns.length ? defaultDns : defaultIpPoolPolicy().defaultDns,
+    defaultDns,
     ipPools,
   };
+}
+
+function validateIpPoolPolicyForSave(policy: IpPoolPolicy): string | null {
+  const invalidDefaultDns = policy.defaultDns.filter((item) => !isIpv4(item));
+  if (invalidDefaultDns.length) return `默认 DNS 格式不正确：${invalidDefaultDns.join("、")}`;
+  const ids = new Set<string>();
+  const prefixes = new Set<string>();
+  for (const pool of policy.ipPools) {
+    if (!pool.id) return "IP 池 ID 不能为空";
+    if (ids.has(pool.id)) return `IP 池 ID 重复：${pool.id}`;
+    ids.add(pool.id);
+    if (!pool.name.trim()) return "IP 池名称不能为空";
+    if (!isIpv4Prefix(pool.prefix)) return `IP 池网段格式不正确：${pool.name}`;
+    if (prefixes.has(pool.prefix)) return `IP 池网段重复：${pool.prefix}`;
+    prefixes.add(pool.prefix);
+    if (!isIpv4(pool.gateway)) return `IP 池网关格式不正确：${pool.name}`;
+    if (!pool.gateway.startsWith(`${pool.prefix}.`)) return `IP 池网关必须属于本网段：${pool.name}`;
+    if ((pool.startHost ?? 20) > (pool.endHost ?? 250)) return `IP 池起始尾号不能大于结束尾号：${pool.name}`;
+    const invalidDns = (pool.dns ?? []).filter((item) => !isIpv4(item));
+    if (invalidDns.length) return `IP 池 DNS 格式不正确：${pool.name}，${invalidDns.join("、")}`;
+    const invalidHostPrefixes = (pool.hostPrefixes ?? []).filter((item) => !isIpv4Prefix(item));
+    if (invalidHostPrefixes.length) return `适用物理机网段格式不正确：${pool.name}，${invalidHostPrefixes.join("、")}`;
+  }
+  return null;
 }
 
 async function saveIpPoolPolicy() {
@@ -1583,9 +1808,9 @@ async function deleteSelectedIpPool() {
 }
 
 async function resetIpPoolPolicy() {
-  await ElMessageBox.confirm("恢复默认 129 / 2 / 127 三个 IP 池？当前未保存编辑会被覆盖。", "重置 IP 池", {
+  await ElMessageBox.confirm("清空当前 IP 池编辑内容？当前未保存编辑会被覆盖。", "清空 IP 池", {
     type: "warning",
-    confirmButtonText: "重置",
+    confirmButtonText: "清空",
     cancelButtonText: "取消",
   });
   applyIpPoolPolicy(defaultIpPoolPolicy());
@@ -1603,6 +1828,8 @@ async function handleIpPoolsJsonChange(event: Event) {
   ipPoolSaving.value = true;
   try {
     const policy = normalizeImportedIpPoolPolicy(JSON.parse(await file.text()));
+    const validationMessage = validateIpPoolPolicyForSave(policy);
+    if (validationMessage) throw new Error(validationMessage);
     const result = await postJson<IpPoolPolicyResponse>("/api/ip-pools/policy", policy, "PATCH");
     applyIpPoolPolicy(result.policy);
     notifyIpPoolPolicyUpdated(result.policy);
@@ -1797,6 +2024,7 @@ function buildConnectionPreferencesFromState(): ConnectionPreferences {
 }
 
 async function saveConnectionPreferences(preferences: Partial<ConnectionPreferences>) {
+  if (!persistentConnectionsEnabled.value) return;
   try {
     await postJson<{ preferences: ConnectionPreferences }>("/api/preferences/connection", preferences, "PATCH");
   } catch (error) {
@@ -1822,14 +2050,83 @@ function clearLegacyConnectionPreferences() {
   }
 }
 
-function consumeChromeExtensionLaunchConnectionId() {
+function consumeChromeExtensionLaunchConnection() {
   const url = new URL(window.location.href);
-  const connectionId = url.searchParams.get("connectionId") || url.searchParams.get("vrcConnectionId") || "";
-  if (!connectionId) return "";
+  const connectionId = url.searchParams.get("browserConnectionId") || url.searchParams.get("connectionId") || url.searchParams.get("vrcConnectionId") || "";
+  const sessionId = url.searchParams.get("browserSessionId") || "";
+  if (!connectionId) return { connectionId: "", sessionId: "" };
+  url.searchParams.delete("browserConnectionId");
+  url.searchParams.delete("browserSessionId");
   url.searchParams.delete("connectionId");
   url.searchParams.delete("vrcConnectionId");
   window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`);
-  return connectionId;
+  return { connectionId, sessionId };
+}
+
+function requestChromeExtensionConnection(input: { connectionId: string; sessionId: string }): Promise<ChromeExtensionLaunchConnection> {
+  if (!input.sessionId) {
+    return Promise.reject(new Error("Chrome 插件没有提供本地连接会话，请从插件连接库重新打开。"));
+  }
+  const requestId = `vrc-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      window.removeEventListener("message", onMessage);
+      reject(new Error("等待 Chrome 插件本地连接超时，请确认插件已启用后重新打开。"));
+    }, 5000);
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== window || event.origin !== window.location.origin) return;
+      const data = event.data as { type?: string; requestId?: string; ok?: boolean; message?: string; connection?: ChromeExtensionLaunchConnection };
+      if (data?.type !== "VRC_EXTENSION_CONNECTION_RESPONSE" || data.requestId !== requestId) return;
+      window.clearTimeout(timer);
+      window.removeEventListener("message", onMessage);
+      if (!data.ok || !data.connection) {
+        reject(new Error(data.message || "Chrome 插件未返回本地连接"));
+        return;
+      }
+      resolve(data.connection);
+    };
+    window.addEventListener("message", onMessage);
+    window.postMessage(
+      {
+        type: "VRC_EXTENSION_CONNECTION_REQUEST",
+        requestId,
+        connectionId: input.connectionId,
+        sessionId: input.sessionId,
+      },
+      window.location.origin,
+    );
+  });
+}
+
+function applyChromeExtensionConnection(input: ChromeExtensionLaunchConnection) {
+  const summary: StoredConnectionSummary = {
+    id: input.id,
+    name: input.name?.trim() || `${providerLabel(input.providerType)}:${input.host}`,
+    providerType: input.providerType,
+    host: input.host,
+    port: normalizePort(input.port, input.providerType),
+    username: input.username,
+    readonly: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    lastConnectedAt: new Date().toISOString(),
+  };
+  storedConnections.value = [summary, ...storedConnections.value.filter((item) => item.id !== summary.id)];
+  selectedConnectionId.value = summary.id;
+  connection.providerType = summary.providerType;
+  connection.host = summary.host;
+  connection.port = summary.port;
+  connection.username = summary.username;
+  connection.password = input.password;
+  connectionName.value = summary.name;
+  workspaceMode.value = "connection";
+  resetVmOperationState();
+  showConnectionEditor.value = false;
+  pushActivity("插件连接", {
+    target: summary.name,
+    detail: `${providerLabel(summary.providerType)} · ${summary.host}:${summary.port}`,
+    status: "info",
+  });
 }
 
 function shouldUseLegacyConnectionPreferences(preferences?: Partial<ConnectionPreferences>) {
@@ -1841,6 +2138,7 @@ function shouldUseLegacyConnectionPreferences(preferences?: Partial<ConnectionPr
 function openSettingsWorkspace() {
   workspaceMode.value = "settings";
   settingsPanel.value = "appearance";
+  resetVmOperationState();
   clearConnectionFeedback();
   connectionSettingsVisible.value = false;
   vmDetailVisible.value = false;
@@ -1852,14 +2150,20 @@ function openSettingsWorkspace() {
 
 function closeSettingsWorkspace() {
   if (hostOverviewRows.value.length || loadingHostOverview.value) {
+    resetVmOperationState();
     workspaceMode.value = "overview";
     selectedHostOverviewKey.value = "";
     return;
   }
+  resetVmOperationState();
   workspaceMode.value = inventory.value ? "connection" : "empty";
 }
 
 async function loadStoredConnections() {
+  if (!persistentConnectionsEnabled.value) {
+    storedConnections.value = readBrowserStoredConnections().map(stripBrowserConnectionSecret);
+    return;
+  }
   try {
     const result = await postJson<{ connections: StoredConnectionSummary[] }>("/api/connections", undefined, "GET");
     storedConnections.value = result.connections ?? [];
@@ -1868,19 +2172,123 @@ async function loadStoredConnections() {
   }
 }
 
+function readBrowserStoredConnections(): BrowserStoredConnection[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(browserConnectionsStorageKey) || "[]") as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is Partial<BrowserStoredConnection> => typeof item === "object" && item !== null)
+      .map(normalizeBrowserStoredConnection)
+      .filter((item): item is BrowserStoredConnection => Boolean(item));
+  } catch {
+    return [];
+  }
+}
+
+function normalizeBrowserStoredConnection(item: Partial<BrowserStoredConnection>): BrowserStoredConnection | null {
+  const providerType = normalizeProviderType(item.providerType);
+  const host = typeof item.host === "string" ? item.host.trim() : "";
+  const username = typeof item.username === "string" && item.username.trim() ? item.username.trim() : "root";
+  const password = typeof item.password === "string" ? item.password : "";
+  if (!host || !password) return null;
+  const now = new Date().toISOString();
+  return {
+    id: typeof item.id === "string" && item.id.trim() ? item.id.trim() : `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    name: typeof item.name === "string" && item.name.trim() ? item.name.trim() : `${providerLabel(providerType)}:${host}`,
+    providerType,
+    host,
+    port: normalizePort(item.port, providerType),
+    username,
+    password,
+    readonly: true,
+    storage: "browser-local",
+    createdAt: typeof item.createdAt === "string" ? item.createdAt : now,
+    updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : now,
+    lastConnectedAt: typeof item.lastConnectedAt === "string" ? item.lastConnectedAt : undefined,
+  };
+}
+
+function writeBrowserStoredConnections(connections: BrowserStoredConnection[]) {
+  localStorage.setItem(browserConnectionsStorageKey, JSON.stringify(connections));
+}
+
+function stripBrowserConnectionSecret(connectionItem: BrowserStoredConnection): StoredConnectionSummary {
+  const { password: _password, storage: _storage, ...summary } = connectionItem;
+  return summary;
+}
+
+function findBrowserStoredConnection(connectionId: string): BrowserStoredConnection | undefined {
+  return readBrowserStoredConnections().find((item) => item.id === connectionId);
+}
+
+function saveBrowserStoredConnection(input: {
+  id?: string;
+  name?: string;
+  providerType: ProviderType;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+}): StoredConnectionSummary {
+  const connections = readBrowserStoredConnections();
+  const now = new Date().toISOString();
+  const matchedIndex = input.id
+    ? connections.findIndex((item) => item.id === input.id)
+    : connections.findIndex((item) => item.providerType === input.providerType && item.host === input.host && item.port === input.port);
+  const existing = matchedIndex >= 0 ? connections[matchedIndex] : undefined;
+  const record: BrowserStoredConnection = {
+    id: existing?.id || `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    name: input.name?.trim() || `${providerLabel(input.providerType)}:${input.host}`,
+    providerType: input.providerType,
+    host: input.host,
+    port: input.port,
+    username: input.username,
+    password: input.password,
+    readonly: true,
+    storage: "browser-local",
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    lastConnectedAt: existing?.lastConnectedAt,
+  };
+  if (matchedIndex >= 0) connections[matchedIndex] = record;
+  else connections.unshift(record);
+  writeBrowserStoredConnections(connections);
+  return stripBrowserConnectionSecret(record);
+}
+
+function deleteBrowserStoredConnection(connectionId: string): boolean {
+  const connections = readBrowserStoredConnections();
+  const next = connections.filter((item) => item.id !== connectionId);
+  writeBrowserStoredConnections(next);
+  return next.length !== connections.length;
+}
+
+function markBrowserStoredConnectionUsed(connectionId: string) {
+  const connections = readBrowserStoredConnections();
+  const index = connections.findIndex((item) => item.id === connectionId);
+  if (index < 0) return;
+  connections[index] = {
+    ...connections[index],
+    lastConnectedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  writeBrowserStoredConnections(connections);
+}
+
 function applyStoredConnection(connectionId: string) {
   const stored = storedConnections.value.find((item) => item.id === connectionId);
   if (!stored) return;
+  const browserStored = persistentConnectionsEnabled.value ? undefined : findBrowserStoredConnection(connectionId);
   clearConnectionFeedback();
   selectedConnectionId.value = stored.id;
   connection.providerType = stored.providerType;
   connection.host = stored.host;
   connection.port = stored.port;
   connection.username = stored.username;
-  connection.password = "";
+  connection.password = browserStored?.password || "";
   connectionName.value = stored.name;
   showConnectionEditor.value = false;
-  void saveConnectionPreferences(buildConnectionPreferencesFromState());
+  if (persistentConnectionsEnabled.value) void saveConnectionPreferences(buildConnectionPreferencesFromState());
   pushActivity("选择连接", {
     target: stored.name,
     detail: `${providerLabel(stored.providerType)} · ${stored.host}:${stored.port}`,
@@ -1890,6 +2298,7 @@ function applyStoredConnection(connectionId: string) {
 
 async function selectConnectionAndLoad(connectionId: string) {
   if (workspaceMode.value === "connection" && selectedConnectionId.value === connectionId && inventory.value) {
+    resetVmOperationState();
     vmDetailVisible.value = false;
     hostDetailVisible.value = false;
     storageDetailVisible.value = false;
@@ -1898,6 +2307,7 @@ async function selectConnectionAndLoad(connectionId: string) {
     return;
   }
   workspaceMode.value = "connection";
+  resetVmOperationState();
   applyStoredConnection(connectionId);
   hostOverviewRequestSeq++;
   loadingHostOverview.value = false;
@@ -1915,9 +2325,14 @@ async function selectConnectionAndLoad(connectionId: string) {
 function startNewConnection() {
   workspaceMode.value = "settings";
   settingsPanel.value = "connection";
+  resetVmOperationState();
   clearConnectionFeedback();
   selectedConnectionId.value = "";
   connectionName.value = "";
+  connection.providerType = "xenserver";
+  connection.host = "";
+  connection.port = defaultPortForProvider(connection.providerType);
+  connection.username = "root";
   connection.password = "";
   inventory.value = null;
   vms.value = null;
@@ -1944,15 +2359,27 @@ async function saveConnection() {
   savingConnection.value = true;
 
   try {
-    const result = await postJson<{ connection: StoredConnectionSummary }>("/api/connections", {
-      ...direct,
-      id: selectedConnectionId.value || undefined,
-      name: connectionName.value.trim() || `${direct.providerType}:${direct.host}`,
-    });
+    const result = persistentConnectionsEnabled.value
+      ? await postJson<{ connection: StoredConnectionSummary }>("/api/connections", {
+          ...direct,
+          id: selectedConnectionId.value || undefined,
+          name: connectionName.value.trim() || `${direct.providerType}:${direct.host}`,
+        })
+      : {
+          connection: saveBrowserStoredConnection({
+            ...direct,
+            id: selectedConnectionId.value || undefined,
+            name: connectionName.value.trim() || `${direct.providerType}:${direct.host}`,
+          }),
+        };
     selectedConnectionId.value = result.connection.id;
     await loadStoredConnections();
     applyStoredConnection(result.connection.id);
-    setConnectionSuccessMessage(`连接已保存：${result.connection.name}。下次可直接加载资源。`);
+    setConnectionSuccessMessage(
+      persistentConnectionsEnabled.value
+        ? `连接已保存：${result.connection.name}。下次可直接加载资源。`
+        : `连接已保存到当前浏览器：${result.connection.name}。不会写入 2.26 服务器。`,
+    );
     pushActivity("保存连接", {
       target: result.connection.name,
       detail: `${providerLabel(result.connection.providerType)} · ${result.connection.host}:${result.connection.port}`,
@@ -1983,7 +2410,11 @@ async function deleteConnection() {
 
   clearMessages();
   try {
-    await postJson(`/api/connections/${selectedConnectionId.value}`, undefined, "DELETE");
+    if (persistentConnectionsEnabled.value) {
+      await postJson(`/api/connections/${selectedConnectionId.value}`, undefined, "DELETE");
+    } else {
+      deleteBrowserStoredConnection(selectedConnectionId.value);
+    }
     selectedConnectionId.value = "";
     void saveConnectionPreferences(buildConnectionPreferencesFromState());
     await loadStoredConnections();
@@ -1999,9 +2430,13 @@ async function deleteConnection() {
 }
 
 async function loadSelectedConnectionResources() {
-  if (!selectedConnectionId.value) {
+  if (!selectedConnectionId.value && !canLoadDirectConnection.value) {
     showConnectionEditor.value = true;
-    setConnectionErrorMessage("还没有保存连接。请先填写 Host、用户名和密码，点“保存”，之后就能加载资源。");
+    setConnectionErrorMessage(
+      persistentConnectionsEnabled.value
+        ? "还没有保存连接。请先填写 Host、用户名和密码，点“保存”，之后就能加载资源。"
+        : "请填写 Host、用户名和密码后加载资源；账号密码只保存到当前浏览器本地，不写入 2.26 服务器。",
+    );
     return;
   }
   clearConnectionFeedback();
@@ -2294,15 +2729,28 @@ async function confirmAccountImport() {
       return;
     }
     for (const row of rows) {
-      await postJson<{ connection: StoredConnectionSummary }>("/api/connections", {
-        id: row.matchedId,
-        name: row.name,
-        providerType: row.providerType,
-        host: row.host,
-        port: row.port,
-        username: row.username,
-        password: row.password,
-      });
+      if (!isProviderType(row.providerType)) continue;
+      if (persistentConnectionsEnabled.value) {
+        await postJson<{ connection: StoredConnectionSummary }>("/api/connections", {
+          id: row.matchedId,
+          name: row.name,
+          providerType: row.providerType,
+          host: row.host,
+          port: row.port,
+          username: row.username,
+          password: row.password,
+        });
+      } else {
+        saveBrowserStoredConnection({
+          id: row.matchedId,
+          name: row.name,
+          providerType: row.providerType,
+          host: row.host,
+          port: row.port,
+          username: row.username,
+          password: row.password,
+        });
+      }
     }
     const shouldRefreshSelectedConnection = rows.some((row) => row.matchedId && row.matchedId === selectedConnectionId.value);
     await loadStoredConnections();
@@ -2310,7 +2758,11 @@ async function confirmAccountImport() {
       applyStoredConnection(selectedConnectionId.value);
     }
     accountImportVisible.value = false;
-    setConnectionSuccessMessage(`连接测试全部通过，已导入 ${rows.length} 个服务器账号，其中 ${rows.filter((row) => row.status === "update").length} 个覆盖更新。`);
+    setConnectionSuccessMessage(
+      persistentConnectionsEnabled.value
+        ? `连接测试全部通过，已导入 ${rows.length} 个服务器账号，其中 ${rows.filter((row) => row.status === "update").length} 个覆盖更新。`
+        : `连接测试全部通过，已导入 ${rows.length} 个账号到当前浏览器，其中 ${rows.filter((row) => row.status === "update").length} 个覆盖更新。`,
+    );
     pushActivity("导入服务器账号", {
       target: "连接配置",
       detail: `${rows.length} 条账号配置测试通过并保存`,
@@ -2358,6 +2810,7 @@ function markAccountImportRowFailed(row: AccountImportDraft, message: string) {
 
 async function loadHostOverview(options: { forceRefresh?: boolean } = {}) {
   if (!options.forceRefresh && workspaceMode.value === "overview" && hostOverviewRows.value.length) {
+    resetVmOperationState();
     vmDetailVisible.value = false;
     hostDetailVisible.value = false;
     storageDetailVisible.value = false;
@@ -2368,6 +2821,7 @@ async function loadHostOverview(options: { forceRefresh?: boolean } = {}) {
   clearMessages();
   const requestId = ++hostOverviewRequestSeq;
   workspaceMode.value = "overview";
+  resetVmOperationState();
   vmSearchCache.value = {};
   vmDetailVisible.value = false;
   hostDetailVisible.value = false;
@@ -2395,9 +2849,9 @@ async function loadHostOverview(options: { forceRefresh?: boolean } = {}) {
   void runLimited(connections, 5, async (item) => {
     if (requestId !== hostOverviewRequestSeq) return;
     try {
+      const connectionPayload = buildConnectionPayloadFromSummary(item);
       const hostInventory = await postJson<HostsResponse>("/api/inventory/hosts", {
-        connectionId: item.id,
-        providerType: item.providerType,
+        ...connectionPayload,
         forceRefresh: options.forceRefresh,
       });
       if (requestId !== hostOverviewRequestSeq) return;
@@ -2450,12 +2904,6 @@ async function ensureVmSearchCacheForKeyword(keyword: string, force = false) {
   });
 }
 
-async function refreshVmSearchCache() {
-  const keyword = overviewSearchKeyword.value;
-  if (!shouldSearchVmIp(keyword)) return;
-  await ensureVmSearchCacheForKeyword(keyword, true);
-}
-
 async function loadHostVmSearchCache(row: HostOverviewRow, force = false) {
   const existing = vmSearchCache.value[row.key];
   if (!force && existing && Date.now() - existing.updatedAt < VM_SEARCH_CACHE_TTL_MS) return;
@@ -2471,9 +2919,9 @@ async function loadHostVmSearchCache(row: HostOverviewRow, force = false) {
   };
 
   try {
+    const connectionPayload = buildConnectionPayloadFromSummary(row.connection);
     const result = await postJson<VmsResponse>("/api/inventory/vms", {
-      connectionId: row.connection.id,
-      providerType: row.connection.providerType,
+      ...connectionPayload,
       hostId: row.host.providerId,
       page: 1,
       pageSize: 500,
@@ -2502,9 +2950,9 @@ async function loadHostVmSearchCache(row: HostOverviewRow, force = false) {
 async function loadHostOverviewSummary(row: HostOverviewRow, requestId = hostOverviewRequestSeq, forceRefresh = false) {
   if (!hasOverviewInventory(row)) return;
   try {
+    const connectionPayload = buildConnectionPayloadFromSummary(row.connection);
     const result = await postJson<VmSummaryResponse>("/api/inventory/vm-summary", {
-      connectionId: row.connection.id,
-      providerType: row.connection.providerType,
+      ...connectionPayload,
       hostId: row.host.providerId,
       page: 1,
       pageSize: 500,
@@ -2556,6 +3004,9 @@ async function testConnection() {
 
 async function openHostOverview(row: HostOverviewRow) {
   if (!hasOverviewInventory(row)) return;
+  resetVmOperationState();
+  const overviewKeyword = overviewSearchKeyword.value;
+  search.value = overviewKeyword && vmSearchMatches(row).length > 0 ? overviewKeyword : "";
   vmDetailVisible.value = true;
   selectedHostOverviewKey.value = row.key;
   selectedConnectionId.value = row.connection.id;
@@ -2572,10 +3023,6 @@ async function openHostOverview(row: HostOverviewRow) {
   selectedHostId.value = row.host.providerId;
   resetIsoImages();
   vmSummary.value = row.summary;
-  const keyword = overviewSearchKeyword.value;
-  search.value = keyword && vmSearchMatches(row).length > 0 ? keyword : "";
-  vmPowerFilter.value = "all";
-  selectedVmIds.value = [];
   vms.value = null;
   loadingVms.value = true;
   pushActivity("打开物理机", {
@@ -2636,10 +3083,16 @@ async function selectHost(hostId: string) {
 function prepareVmPanelForHostLoad(hasHost: boolean) {
   vms.value = null;
   vmSummary.value = null;
-  selectedVmIds.value = [];
-  vmPowerFilter.value = "all";
+  resetVmOperationState();
   loadingVms.value = hasHost;
   if (!hasHost) loadingVmSummary.value = false;
+}
+
+function resetVmOperationState() {
+  selectedVmIds.value = [];
+  search.value = "";
+  vmPowerFilter.value = "all";
+  vmActionStates.value = {};
 }
 
 function vmMatchesPowerFilter(vm: VmNode, filter: VmPowerFilter) {
@@ -2795,18 +3248,30 @@ function isoLocationText(image: IsoImage) {
 
 function isoEmptyText() {
   if (isoSearch.value.trim()) return `没有命中：${isoSearch.value.trim()}`;
-  if (connection.providerType === "xenserver") return "未读取到 XenServer ISO SR 下的 ISO，请确认 XenCenter 里已附加 NFS/SMB ISO Library。";
+  if (connection.providerType === "xenserver") return "未读取到本机 DVD 或 XenServer ISO 库，请检查物理光驱介质及 NFS/SMB ISO Library。";
   if (connection.providerType === "vmware") return "未在 Datastore Browser 中搜索到 ISO，请确认数据存储权限和镜像目录。";
   if (connection.providerType === "proxmox") return "未读取到 PVE content=iso 的存储内容，请确认存储启用了 ISO 镜像内容类型。";
   return "当前平台没有返回 ISO 清单，或账号没有存储内容读取权限。";
 }
 
 async function openProvisioningDialog() {
-  if (!provisioningSubmitting.value) {
-    provisioningProgress.value = null;
-    activeProvisionTask.value = null;
-  }
+  resetProvisioningDialogView(false);
+  provisioningDialogSession.value += 1;
   provisioningVisible.value = true;
+}
+
+function resetProvisioningDialogView(markDismissed: boolean) {
+  const taskId = activeProvisionTask.value?.id || consoleProvisionTaskId.value;
+  if (markDismissed && taskId) dismissedProvisionTaskIds.add(taskId);
+  if (taskId && consoleProvisionTaskId.value === taskId) {
+    consoleProvisionTaskId.value = "";
+    consoleTarget.value = null;
+    consoleDialogVisible.value = false;
+  }
+  activeProvisionTask.value = null;
+  provisioningProgress.value = null;
+  provisioningSubmitting.value = false;
+  provisionInlineConsoleTarget.value = null;
 }
 
 async function handleProvisioningSubmit(payload: VmCreateRequest) {
@@ -2855,14 +3320,12 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
     status: "running",
   };
   provisioningSubmitting.value = true;
-  loadingVms.value = true;
   try {
     const preflight = await postJson<ProvisionPreflightResponse>("/api/provisioning/preflight", payload);
     const blockingChecks = preflight.checks.filter((check) => check.status === "error");
     if (blockingChecks.length) {
       const detailText = formatProvisionPreflightChecks(blockingChecks);
       setErrorMessage(detailText);
-      showToast("error", "创建预检未通过");
       pushActivity("创建预检未通过", {
         target,
         detail: detailText,
@@ -2874,7 +3337,6 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
         status: "error",
       };
       provisioningSubmitting.value = false;
-      loadingVms.value = false;
       return;
     }
   } catch (error) {
@@ -2890,7 +3352,6 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
       status: "error",
     });
     provisioningSubmitting.value = false;
-    loadingVms.value = false;
     return;
   }
 
@@ -2908,6 +3369,7 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
     if (response.result.taskId || response.task?.id) {
       const taskId = response.result.taskId || response.task?.id || "";
       if (taskId) provisioningTaskPayloads.set(taskId, payload);
+      if (taskId) dismissedProvisionTaskIds.delete(taskId);
       activeProvisionTask.value = response.task ?? null;
       provisioningProgress.value = {
         title: "创建任务执行中",
@@ -2919,7 +3381,8 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
     } else {
       showToast("success", response.result.message);
       await reserveProvisioningIpsAfterCreate(payload);
-      await Promise.all([loadVmSummary({ silent: true }), loadVms({ silent: true })]);
+      resetVmOperationState();
+      await Promise.all([loadVmSummary({ silent: true, forceRefresh: true }), loadVms({ silent: true, forceRefresh: true })]);
       syncSelectedOverviewRowAfterVmChange();
     }
     if (!keepSubmittingForTask) {
@@ -2944,7 +3407,6 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
   } finally {
     if (!keepSubmittingForTask) {
       provisioningSubmitting.value = false;
-      loadingVms.value = false;
     }
   }
 }
@@ -3063,7 +3525,6 @@ async function pollProvisioningTask(taskId: string) {
     } catch (error) {
       provisioningPollTimers.delete(taskId);
       provisioningSubmitting.value = false;
-      loadingVms.value = false;
       provisioningProgress.value = {
         title: "读取创建任务失败",
         message: error instanceof Error ? error.message : "任务状态读取失败",
@@ -3113,39 +3574,47 @@ async function applyProvisioningTaskUpdate(task: ProvisionTask) {
   const mark = `${task.status}:${task.currentStep}:${task.updatedAt}:${task.eventSeq}`;
   if (provisioningTaskMarks.get(task.id) === mark) return;
   provisioningTaskMarks.set(task.id, mark);
-  if (task.status === "success" || task.status === "failed") {
+  const taskDismissedFromDialog = dismissedProvisionTaskIds.has(task.id) && !provisioningVisible.value;
+  if (task.status === "success" || task.status === "warning" || task.status === "failed") {
     pushActivity(provisionTaskActivityTitle(task.status), {
       target: task.title,
       detail: task.message,
       status: provisionTaskActivityStatus(task.status),
     });
   }
-  activeProvisionTask.value = task;
-  if (consoleProvisionTaskId.value === task.id && !consoleTarget.value) {
+  if (!taskDismissedFromDialog) {
+    activeProvisionTask.value = task;
+  }
+  if (!taskDismissedFromDialog && consoleProvisionTaskId.value === task.id && !consoleTarget.value) {
     openProvisionTaskConsole(task, false);
   }
-  provisioningProgress.value = {
-    title: provisionTaskActivityTitle(task.status),
-    message: task.message,
-    status: task.status === "success" ? "success" : task.status === "failed" ? "error" : "running",
-  };
-  if (task.status === "success") {
-    successMessage.value = task.message;
-    showToast("success", task.message);
+  if (!taskDismissedFromDialog) {
+    provisioningProgress.value = {
+      title: provisionTaskActivityTitle(task.status),
+      message: task.message,
+      status: task.status === "success" ? "success" : task.status === "warning" ? "warning" : task.status === "failed" ? "error" : "running",
+    };
+  }
+  if (task.status === "success" || task.status === "warning") {
+    if (task.status === "success") {
+      successMessage.value = task.message;
+      showToast("success", task.message);
+    } else {
+      showToast("warning", task.message);
+    }
     provisioningSubmitting.value = false;
-    loadingVms.value = false;
     const payload = provisioningTaskPayloads.get(task.id);
     if (payload) {
       await reserveProvisioningIpsAfterCreate(payload);
       provisioningTaskPayloads.delete(task.id);
     }
-    await loadVmSummary({ silent: true, forceRefresh: true });
+    resetVmOperationState();
+    await Promise.all([loadVmSummary({ silent: true, forceRefresh: true }), loadVms({ silent: true, forceRefresh: true })]);
     syncSelectedOverviewRowAfterVmChange();
   }
   if (task.status === "failed") {
     setErrorMessage(task.message);
     provisioningSubmitting.value = false;
-    loadingVms.value = false;
     provisioningTaskPayloads.delete(task.id);
   }
 }
@@ -3179,6 +3648,10 @@ async function reserveProvisioningIpsAfterCreate(payload: VmCreateRequest) {
 }
 
 function openCreatedVmConsole(created: VmProvisionCreatedVm) {
+  if (!persistentConnectionsEnabled.value) {
+    showToast("warning", "虚拟机已创建；2.26 Web 模式不使用服务器保存连接，控制台入口已关闭。");
+    return;
+  }
   consoleProvisionTaskId.value = "";
   const refreshedVm = vms.value?.items.find((item) => item.providerId === created.providerId || item.id === created.id);
   const consoleVm: VmNode =
@@ -3204,6 +3677,7 @@ function openCreatedVmConsole(created: VmProvisionCreatedVm) {
       host: connection.host,
       port: connection.port,
       username: connection.username,
+      password: persistentConnectionsEnabled.value ? undefined : connection.password,
     },
     vm: { ...consoleVm, powerState: "running" },
     hostName: selectedHost.value?.name,
@@ -3219,6 +3693,7 @@ function openCreatedVmConsole(created: VmProvisionCreatedVm) {
 }
 
 function resolveProvisionTaskVmConsoleTarget(taskVm: ProvisionTask["vms"][number]): VmConsoleTarget | null {
+  if (!persistentConnectionsEnabled.value) return null;
   const providerId = taskVm.providerId || taskVm.id;
   if (!providerId) return null;
   const refreshedVm = vms.value?.items.find((item) => item.providerId === providerId || item.id === providerId || item.name === taskVm.name);
@@ -3246,6 +3721,7 @@ function resolveProvisionTaskVmConsoleTarget(taskVm: ProvisionTask["vms"][number
       host: connection.host,
       port: connection.port,
       username: connection.username,
+      password: persistentConnectionsEnabled.value ? undefined : connection.password,
     },
     vm: consoleVm,
     hostName: selectedHost.value?.name,
@@ -3275,8 +3751,8 @@ function handleSelectProvisionInlineConsoleTarget(item: ProvisionConsoleTargetIt
   provisionInlineConsoleTarget.value = item.target;
 }
 
-function exportCsv() {
-  const rows = filteredVms.value.map((vm) => [
+function exportCsv(orderedVms: VmNode[] = filteredVms.value) {
+  const rows = orderedVms.map((vm) => [
     selectedHost.value?.name ?? "",
     vm.name,
     vm.powerState,
@@ -3391,7 +3867,6 @@ async function handleVmRename(payload: { vm: VmNode; newName: string }) {
       detail: `${response.result.previousName} → ${response.result.newName}`,
       status: "success",
     });
-    await loadVms({ silent: true, background: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : "虚拟机改名失败";
     setErrorMessage(message);
@@ -3404,6 +3879,163 @@ async function handleVmRename(payload: { vm: VmNode; newName: string }) {
   } finally {
     vmRenameSaving.value = false;
   }
+}
+
+function openVmResize(vm: VmNode) {
+  if (connection.providerType === "libvirt") return;
+  vmResizeTarget.value = vm;
+  vmResizeDisks.value = [];
+  vmResizeGuestStorage.value = null;
+  vmResizeGuestStorageError.value = "";
+  vmResizeVisible.value = true;
+}
+
+async function loadVmResizeDisks(vm: VmNode) {
+  const connectionPayload = buildConnectionPayload();
+  if (!connectionPayload) return;
+  vmResizeLoadingDisks.value = true;
+  try {
+    const response = await postJson<VmDisksResponse>("/api/inventory/vm-disks", {
+      ...connectionPayload,
+      vmId: vm.providerId,
+    });
+    if (vmResizeTarget.value?.providerId === vm.providerId) {
+      vmResizeDisks.value = response.disks;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "读取虚拟机磁盘失败";
+    setErrorMessage(message);
+    showToast("error", message);
+  } finally {
+    vmResizeLoadingDisks.value = false;
+  }
+}
+
+async function loadVmResizeGuestStorage(vm: VmNode) {
+  const connectionPayload = buildConnectionPayload();
+  if (!connectionPayload) return;
+  const vmIp = vm.ipAddresses.find((ip) => isIpv4(ip));
+  vmResizeGuestStorage.value = null;
+  vmResizeGuestStorageError.value = "";
+  if (!vmIp) {
+    vmResizeGuestStorageError.value = "未读取到 Guest IPv4，无法自动扩展分区和文件系统";
+    return;
+  }
+  vmResizeLoadingGuestStorage.value = true;
+  try {
+    const response = await postJson<GuestStorageResponse>("/api/inventory/vm-guest-storage", {
+      ...connectionPayload,
+      vmId: vm.providerId,
+      vmIp,
+    });
+    if (vmResizeTarget.value?.providerId === vm.providerId) {
+      vmResizeGuestStorage.value = response.inventory;
+    }
+  } catch (error) {
+    if (vmResizeTarget.value?.providerId === vm.providerId) {
+      vmResizeGuestStorageError.value = error instanceof Error ? error.message : "读取 Guest 磁盘与目录失败";
+    }
+  } finally {
+    vmResizeLoadingGuestStorage.value = false;
+  }
+}
+
+async function handleVmResize(request: VmResizeRequest) {
+  const vm = vmResizeTarget.value;
+  const connectionPayload = buildConnectionPayload();
+  if (!vm || !connectionPayload) return;
+  const hostName = selectedHost.value?.name || connection.host;
+  const target = `${hostName} / ${vm.name}`;
+  const changes = describeVmResizeChanges(vm, request);
+  try {
+    await confirmVrcAction({
+      heading: "确认扩容",
+      tone: request.allowShutdown ? "停机变更" : "在线变更",
+      summary: target,
+      detail: [
+        ...changes,
+        request.allowShutdown ? "执行顺序：正常关机 → 修改配置 → 自动开机 → 回读状态" : "执行期间虚拟机保持运行，并持续回读平台状态。",
+        request.guestStorage ? `Guest 自动生效：${request.guestStorage.mountPath}` : "本次不包含 Guest 文件系统调整。",
+        "扩容只允许增加，磁盘与文件系统扩展后不能通过 VRC 缩小。",
+      ].join("\n"),
+      confirmButtonText: "确认扩容",
+      customClass: "vm-resize-confirm",
+    });
+  } catch (error) {
+    if (error !== "cancel" && error !== "close") {
+      showToast("error", error instanceof Error ? error.message : "扩容确认失败");
+    }
+    return;
+  }
+
+  vmResizeSaving.value = true;
+  clearMessages();
+  pushActivity("提交虚拟机扩容", {
+    target,
+    detail: changes.join("；"),
+    status: "pending",
+  });
+  try {
+    const response = await postJson<VmResizeResponse>("/api/vms/resize", {
+      ...connectionPayload,
+      vmId: vm.providerId,
+      hostId: selectedHost.value?.providerId,
+      ...request,
+      confirmToken: "CONFIRMED",
+    });
+    if (!response.result.accepted) throw new Error(response.result.message || "虚拟机扩容请求未被平台接受");
+    const diskVirtualBytes = response.result.disks.reduce((sum, disk) => sum + Math.max(disk.virtualSizeBytes, 0), 0);
+    const updatedVm = patchVmRow(vm, {
+      cpuCount: response.result.cpuCount,
+      memoryBytes: response.result.memoryBytes,
+      diskVirtualBytes,
+      diskCount: response.result.disks.length,
+      diskSizeSummary: response.result.disks.map((disk) => formatBytes(disk.virtualSizeBytes)).join(" + "),
+      powerState: response.result.restarted ? "running" : vm.powerState,
+    });
+    vmResizeDisks.value = response.result.disks;
+    const guestStorageFailed = response.result.guestStorage?.status === "failed";
+    showToast(guestStorageFailed ? "warning" : "success", response.result.message);
+    void loadVms({ silent: true, background: true, forceRefresh: true });
+    pushActivity(guestStorageFailed ? "虚拟硬件已扩容，Guest 生效失败" : "虚拟机扩容完成", {
+      target,
+      detail: `${changes.join("；")}；${response.result.guestStorage?.message || (response.result.restarted ? "已自动开机" : "在线完成")}`,
+      status: guestStorageFailed ? "error" : "success",
+    });
+    if (guestStorageFailed) {
+      await Promise.all([loadVmResizeDisks(vm), loadVmResizeGuestStorage(vm)]);
+      return;
+    }
+    vmResizeVisible.value = false;
+    if (response.result.restarted) openConsoleAfterStart(updatedVm);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "虚拟机扩容失败";
+    setErrorMessage(message);
+    showToast("error", message);
+    pushActivity("虚拟机扩容失败", { target, detail: message, status: "error" });
+  } finally {
+    vmResizeSaving.value = false;
+  }
+}
+
+function describeVmResizeChanges(vm: VmNode, request: VmResizeRequest) {
+  const changes: string[] = [];
+  if (request.cpuCount && request.cpuCount !== vm.cpuCount) changes.push(`CPU：${vm.cpuCount} → ${request.cpuCount} vCPU`);
+  if (request.memoryBytes && request.memoryBytes !== vm.memoryBytes) changes.push(`内存：${formatBytes(vm.memoryBytes)} → ${formatBytes(request.memoryBytes)}`);
+  if (request.disk) {
+    if (request.disk.mode === "extend") {
+      const disk = vmResizeDisks.value.find((item) => item.id === request.disk?.diskId);
+      if (disk && request.disk.sizeBytes <= disk.virtualSizeBytes) {
+        changes.push(`磁盘：完成 ${disk.device || disk.name} 的未分配容量`);
+      } else {
+        changes.push(`磁盘：扩展 ${disk?.device || disk?.name || request.disk.diskId} 至 ${formatBytes(request.disk.sizeBytes)}`);
+      }
+    } else {
+      changes.push(`磁盘：新增 ${formatBytes(request.disk.sizeBytes)}`);
+    }
+  }
+  if (request.guestStorage) changes.push(`Guest：自动生效至 ${request.guestStorage.mountPath}`);
+  return changes;
 }
 
 function openGlobalVmSchedule() {
@@ -3494,14 +4126,15 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
       throw new Error(response.result.message || `VM ${meta.label}请求未被平台接受`);
     }
     if (action === "start") {
-      const runningVm = patchVmRow(vm, { powerState: "running" });
+      const runningVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
       setVmActionState(runningVm, { action, status: "success", message: "已开机" });
       openConsoleAfterStart(runningVm);
     } else if (action === "forceReboot") {
-      const runningVm = patchVmRow(vm, { powerState: "running" });
+      const runningVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
       setVmActionState(runningVm, { action, status: "success", message: "已重启" });
+      openConsoleAfterForceReboot(runningVm);
     } else if (action === "shutdown") {
-      const haltedVm = patchVmRow(vm, { powerState: "halted" });
+      const haltedVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
       setVmActionState(haltedVm, { action, status: "success", message: "已关机" });
     } else {
       successMessage.value = response.result.message;
@@ -3509,6 +4142,8 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
       removeVmRow(vm);
     }
     await refreshSelectedHostResources(action, resourceBaseline);
+    resetVmOperationState();
+    await loadVms({ silent: true, background: true, forceRefresh: true });
     pushActivity(`${meta.label}完成`, {
       target: vmTarget,
       detail: vmActionCompleteMessage(action),
@@ -3617,30 +4252,30 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
         action,
         confirmToken: "CONFIRMED",
       });
-	      if (!response.result.accepted) {
-	        throw new Error(response.result.message || `VM ${meta.label}请求未被平台接受`);
-	      }
-	      if (action === "start") {
-	        const runningVm = patchVmRow(vm, { powerState: "running" });
-	        setVmActionState(runningVm, { action, status: "success", message: "已开机" });
-	      } else if (action === "forceReboot") {
-	        const runningVm = patchVmRow(vm, { powerState: "running" });
-	        setVmActionState(runningVm, { action, status: "success", message: "已重启" });
-	      } else if (action === "shutdown") {
-	        const haltedVm = patchVmRow(vm, { powerState: "halted" });
-	        setVmActionState(haltedVm, { action, status: "success", message: "已关机" });
-	      } else {
-	        removeVmRow(vm);
-	      }
-	      successCount += 1;
+      if (!response.result.accepted) {
+        throw new Error(response.result.message || `VM ${meta.label}请求未被平台接受`);
+      }
+      if (action === "start") {
+        const runningVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+        setVmActionState(runningVm, { action, status: "success", message: "已开机" });
+      } else if (action === "forceReboot") {
+        const runningVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+        setVmActionState(runningVm, { action, status: "success", message: "已重启" });
+      } else if (action === "shutdown") {
+        const haltedVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+        setVmActionState(haltedVm, { action, status: "success", message: "已关机" });
+      } else {
+        removeVmRow(vm);
+      }
+      successCount += 1;
       if (action !== "delete") {
         scheduleClearVmActionState(vm, 1800);
       }
-	      pushActivity(`${vm.name} ${meta.label}成功`, {
-	        target: hostName,
-	        detail: vmActionCompleteMessage(action),
-	        status: "success",
-	      });
+      pushActivity(`${vm.name} ${meta.label}成功`, {
+        target: hostName,
+        detail: vmActionCompleteMessage(action),
+        status: "success",
+      });
     } catch (error) {
       setVmActionState(vm, { action, status: "error", message: `${meta.label}失败` });
       scheduleClearVmActionState(vm, 3600);
@@ -3650,6 +4285,8 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
 
   if (successCount > 0) {
     await refreshSelectedHostResources(action, resourceBaseline);
+    resetVmOperationState();
+    await loadVms({ silent: true, background: true, forceRefresh: true });
   }
 
   const summary = `批量${meta.label}完成：成功 ${successCount} 台，失败 ${failed.length} 台`;
@@ -3781,6 +4418,7 @@ async function refreshVmRow(vm: VmNode, options: RefreshVmRowOptions = {}): Prom
         page: 1,
         pageSize: 50,
         keyword: vm.name,
+        forceRefresh: true,
       });
       const updated = result.items.find((item) => isSameVm(item, vm) || item.name === vm.name);
       if (!updated || !vms.value) continue;
@@ -3839,6 +4477,18 @@ function sleep(ms: number) {
 }
 
 function openConsoleAfterStart(vm: VmNode) {
+  openConsoleAfterPowerReady(vm, "开机指令已提交");
+}
+
+function openConsoleAfterForceReboot(vm: VmNode) {
+  openConsoleAfterPowerReady(vm, "强制重启指令已提交");
+}
+
+function openConsoleAfterPowerReady(vm: VmNode, submittedMessage: string) {
+  if (!persistentConnectionsEnabled.value) {
+    showToast("warning", `${submittedMessage}；2.26 Web 模式不使用服务器保存连接，控制台入口已关闭。`);
+    return;
+  }
   consoleProvisionTaskId.value = "";
   const refreshedVm = vms.value?.items.find((item) => item.providerId === vm.providerId || item.id === vm.id);
   const consoleVm: VmNode = {
@@ -3852,13 +4502,14 @@ function openConsoleAfterStart(vm: VmNode) {
       host: connection.host,
       port: connection.port,
       username: connection.username,
+      password: persistentConnectionsEnabled.value ? undefined : connection.password,
     },
     vm: consoleVm,
     hostName: selectedHost.value?.name,
     hostAddress: selectedHost.value?.address,
   });
   if (!target) {
-    showToast("warning", "开机指令已提交，但当前平台还没有可用控制台入口。");
+    showToast("warning", `${submittedMessage}，但当前平台还没有可用控制台入口。`);
     return;
   }
   consoleTarget.value = target;
@@ -4113,6 +4764,41 @@ function overviewRowClassName({ row }: { row: HostOverviewRow }) {
   return row.key === selectedHostOverviewKey.value ? "current-overview-row" : "";
 }
 
+function handleHostOverviewSort({ prop, order }: { prop: string; order: TableSortOrder }) {
+  const supported: HostOverviewSortKey[] = ["hostName", "cpuUsage", "memoryFree", "storageFree", "vmTotal"];
+  hostOverviewSort.value = {
+    prop: supported.includes(prop as HostOverviewSortKey) ? (prop as HostOverviewSortKey) : "hostName",
+    order,
+  };
+}
+
+function compareHostOverviewRows(left: HostOverviewRow, right: HostOverviewRow, prop: HostOverviewSortKey, order: TableSortOrder) {
+  if (!order) {
+    return left.host.name.localeCompare(right.host.name, "zh-CN", { numeric: true, sensitivity: "base" });
+  }
+  const leftValue = hostOverviewSortValue(left, prop);
+  const rightValue = hostOverviewSortValue(right, prop);
+  if (leftValue == null && rightValue == null) return left.host.name.localeCompare(right.host.name, "zh-CN", { numeric: true, sensitivity: "base" });
+  if (leftValue == null) return 1;
+  if (rightValue == null) return -1;
+  const direction = order === "ascending" ? 1 : -1;
+  const compared =
+    typeof leftValue === "number" && typeof rightValue === "number"
+      ? leftValue - rightValue
+      : String(leftValue).localeCompare(String(rightValue), "zh-CN", { numeric: true, sensitivity: "base" });
+  return compared === 0
+    ? left.host.name.localeCompare(right.host.name, "zh-CN", { numeric: true, sensitivity: "base" })
+    : compared * direction;
+}
+
+function hostOverviewSortValue(row: HostOverviewRow, prop: HostOverviewSortKey): string | number | null {
+  if (prop === "hostName") return row.host.name;
+  if (prop === "cpuUsage") return hasOverviewInventory(row) && row.summary ? hostCpuPlan(row).percent : null;
+  if (prop === "memoryFree") return hasOverviewInventory(row) ? hostMemoryPlan(row).free : null;
+  if (prop === "storageFree") return hasOverviewInventory(row) ? hostStoragePlan(row).freeGiB : null;
+  return row.summary?.total ?? null;
+}
+
 function overviewStatusLabel(row: HostOverviewRow) {
   if (row.status === "error") return "异常";
   if (!hasOverviewInventory(row) || !row.summary) return "加载中";
@@ -4186,6 +4872,26 @@ function overviewResourceMeterWarning(row: HostOverviewRow, type: "cpu" | "memor
   return storagePlan.percent >= 80 || storagePlan.freeGiB < 500;
 }
 
+function normalizeOverviewSearchInput(value: string) {
+  return value
+    .replace(/[，,；;、\r\n\t]+/g, " ")
+    .replace(/\s*\.\s*/g, ".")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function parseOverviewSearchKeywords(value: string) {
+  const normalized = normalizeOverviewSearchInput(value);
+  if (!normalized) return [];
+  return Array.from(new Set(normalized.split(" ").filter(Boolean)));
+}
+
+function normalizeHostOverviewSearch() {
+  const normalized = normalizeOverviewSearchInput(hostOverviewSearch.value);
+  if (hostOverviewSearch.value !== normalized) hostOverviewSearch.value = normalized;
+}
+
 function rowMatchesOverviewKeyword(row: HostOverviewRow, keyword: string) {
   if (hostMatchesKeyword(row, keyword)) return true;
   if (!shouldSearchVmIp(keyword)) return false;
@@ -4196,12 +4902,16 @@ function rowMatchesOverviewKeyword(row: HostOverviewRow, keyword: string) {
   return cache.items.some((vm) => vmMatchesOverviewKeyword(vm, row, keyword));
 }
 
+function rowMatchesOverviewKeywords(row: HostOverviewRow, keywords: string[]) {
+  return keywords.some((keyword) => rowMatchesOverviewKeyword(row, keyword));
+}
+
 function vmSearchMatches(row: HostOverviewRow) {
-  const keyword = overviewSearchKeyword.value;
-  if (!shouldSearchVmIp(keyword)) return [];
+  const keywords = overviewSearchKeywords.value;
+  if (!keywords.some(shouldSearchVmIp)) return [];
   const cache = vmSearchCache.value[row.key];
   if (!cache?.items.length) return [];
-  return cache.items.filter((vm) => vmMatchesOverviewKeyword(vm, row, keyword));
+  return cache.items.filter((vm) => keywords.some((keyword) => vmMatchesOverviewKeyword(vm, row, keyword)));
 }
 
 function vmSearchMatchSummary(row: HostOverviewRow) {
@@ -4247,6 +4957,14 @@ function hasSettledVmSearchCache(row: HostOverviewRow) {
 
 function buildConnectionPayload() {
   if (selectedConnectionId.value && !connection.password.trim()) {
+    if (!persistentConnectionsEnabled.value) {
+      const stored = findBrowserStoredConnection(selectedConnectionId.value);
+      if (!stored) {
+        setErrorMessage("当前浏览器没有找到该连接的本地密码，请重新选择或重新保存连接。");
+        return null;
+      }
+      return buildConnectionPayloadFromStored(stored);
+    }
     if (hasUnsavedSelectedConnectionChanges()) {
       setErrorMessage("当前连接表单已修改。请重新输入密码后测试或保存，或从已保存连接列表重新选择原连接。");
       return null;
@@ -4257,6 +4975,36 @@ function buildConnectionPayload() {
     };
   }
   return buildDirectConnectionPayload();
+}
+
+function buildConnectionPayloadFromStored(stored: BrowserStoredConnection | StoredConnectionSummary) {
+  if (persistentConnectionsEnabled.value || !("password" in stored)) {
+    return {
+      connectionId: stored.id,
+      providerType: stored.providerType,
+    };
+  }
+  return {
+    providerType: stored.providerType,
+    host: stored.host,
+    port: stored.port,
+    username: stored.username,
+    password: stored.password,
+  };
+}
+
+function buildConnectionPayloadFromSummary(summary: StoredConnectionSummary) {
+  if (persistentConnectionsEnabled.value) {
+    return {
+      connectionId: summary.id,
+      providerType: summary.providerType,
+    };
+  }
+  const stored = findBrowserStoredConnection(summary.id);
+  if (!stored) {
+    throw new Error(`当前浏览器缺少连接“${summary.name}”的本地密码，请重新保存该连接。`);
+  }
+  return buildConnectionPayloadFromStored(stored);
 }
 
 function hasUnsavedSelectedConnectionChanges() {
@@ -4286,6 +5034,7 @@ function buildDirectConnectionPayload() {
 }
 
 function persistConnection(payload: ReturnType<typeof buildConnectionPayload>) {
+  if (!persistentConnectionsEnabled.value) return;
   if (!payload) return;
   if ("connectionId" in payload) {
     void saveConnectionPreferences({
@@ -4435,15 +5184,17 @@ function handleConsoleUploadResult(result: ConsoleUploadResultEvent) {
   });
 }
 
-function provisionTaskActivityTitle(status: "pending" | "running" | "success" | "failed") {
+function provisionTaskActivityTitle(status: ProvisionTask["status"]) {
   if (status === "success") return "创建链路完成";
+  if (status === "warning") return "系统创建完成，存在告警";
   if (status === "failed") return "创建链路失败";
   if (status === "running") return "创建链路执行中";
   return "创建链路排队中";
 }
 
-function provisionTaskActivityStatus(status: "pending" | "running" | "success" | "failed"): ActivityEntry["status"] {
+function provisionTaskActivityStatus(status: ProvisionTask["status"]): ActivityEntry["status"] {
   if (status === "success") return "success";
+  if (status === "warning") return "warning";
   if (status === "failed") return "error";
   if (status === "running") return "pending";
   return "info";
@@ -4470,18 +5221,7 @@ function activityFullText(item: ActivityEntry) {
 }
 
 async function postJson<T>(url: string, payload: unknown, method = "POST"): Promise<T> {
-  const init: RequestInit = { method };
-  if (payload !== undefined) {
-    init.headers = { "Content-Type": "application/json" };
-    init.body = JSON.stringify(payload);
-  }
-  const response = await fetch(url, init);
-  const text = await response.text();
-  const result = text ? JSON.parse(text) : {};
-  if (!response.ok) {
-    throw new Error(result.message || "请求失败");
-  }
-  return result as T;
+  return secureJsonRequest<T>(url, payload, method);
 }
 
 function positive(value: number) {
@@ -4768,7 +5508,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
         <HostVmPanel
           v-model:search="search"
           v-model:power-filter="vmPowerFilter"
-          :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username }"
+          :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username, password: persistentConnectionsEnabled ? undefined : connection.password }"
           :host="selectedHost"
           :network-count="selectedHostNetworks.length"
           :resource-summary="resourceSummary"
@@ -4787,7 +5527,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           table-height="100%"
           table-panel-class="single-table-panel"
           @search-change="loadVms"
-	          @refresh="loadVms({ forceRefresh: true })"
+          @refresh="loadVms({ forceRefresh: true })"
           @export="exportCsv"
           @host-detail="hostDetailVisible = true"
           @storage-detail="storageDetailVisible = true"
@@ -4799,6 +5539,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           @batch-vm-action="handleBatchVmAction"
           @schedule-vms="openVmScheduleCreate"
           @rename-vm="openVmRename"
+          @resize-vm="openVmResize"
         />
       </section>
 
@@ -4832,8 +5573,10 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               v-model="hostOverviewSearch"
               class="overview-search-input"
               :prefix-icon="Search"
-              placeholder="查物理机 IP / VM IP"
+              placeholder="查物理机 IP / VM IP，支持批量"
               clearable
+              @change="normalizeHostOverviewSearch"
+              @blur="normalizeHostOverviewSearch"
             />
             <el-segmented
               v-model="hostOverviewMatchMode"
@@ -4843,21 +5586,6 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 { label: '模糊匹配', value: 'fuzzy' },
               ]"
             />
-            <el-tooltip v-if="shouldSearchVmIp(overviewSearchKeyword)" content="刷新 VM IP 搜索缓存" placement="top">
-              <span class="toolbar-tooltip-target">
-                <button
-                  class="cache-refresh-link overview-cache-refresh"
-                  :disabled="vmSearchLoadingCount > 0"
-                  type="button"
-                  aria-label="刷新 VM IP 搜索缓存"
-                  @click="refreshVmSearchCache"
-                >
-                  <el-icon v-if="vmSearchLoadingCount > 0" class="inline-loading"><Loading /></el-icon>
-                  <el-icon v-else><Refresh /></el-icon>
-                  <span>刷新 VM</span>
-                </button>
-              </span>
-            </el-tooltip>
           </div>
           <div class="overview-action-group" aria-label="总览列表动作">
             <el-tooltip content="定时任务：跨物理机搜索并选择虚拟机" placement="top">
@@ -4894,8 +5622,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   aria-label="刷新总览"
                   @click="loadHostOverview({ forceRefresh: true })"
                 >
-                  <el-icon v-if="loadingHostOverview" class="is-loading"><Loading /></el-icon>
-                  <VrcToolbarIcon v-else name="refresh" />
+                  <VrcToolbarIcon name="refresh" />
                 </button>
               </span>
             </el-tooltip>
@@ -4903,12 +5630,15 @@ function normalizePort(value: unknown, providerType: ProviderType) {
         </div>
 
         <el-table
+          class="resource-sort-table overview-resource-table"
           :data="sortedHostOverviewRows"
           height="100%"
           row-key="key"
           stripe
           empty-text=" "
+          :default-sort="{ prop: 'hostName', order: 'ascending' }"
           :row-class-name="overviewRowClassName"
+          @sort-change="handleHostOverviewSort"
           @row-click="openHostOverview"
         >
           <template #empty>
@@ -4938,7 +5668,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
             </div>
           </template>
           <el-table-column type="index" label="序号" width="58" align="center" header-align="center" />
-          <el-table-column label="物理机" min-width="160" align="left" show-overflow-tooltip>
+          <el-table-column prop="hostName" label="物理机" min-width="160" align="left" sortable="custom" show-overflow-tooltip>
             <template #default="{ row }">
               <span class="overview-host-cell">
                 <button class="table-link drilldown-link" title="查看该物理机下的虚拟机" @click.stop="openHostOverview(row)">{{ row.host.name }}</button>
@@ -4958,7 +5688,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="CPU 运行情况" min-width="140" align="right">
+          <el-table-column prop="cpuUsage" label="CPU 运行情况" min-width="140" align="right" sortable="custom">
             <template #default="{ row }">
               <span class="overview-resource-cell" :class="{ warning: overviewResourceMeterWarning(row, 'cpu') }">
                 <strong>{{ overviewCpuMain(row) }}</strong>
@@ -4969,7 +5699,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="内存余量" min-width="140" align="right">
+          <el-table-column prop="memoryFree" label="内存余量" min-width="140" align="right" sortable="custom">
             <template #default="{ row }">
               <span class="overview-resource-cell" :class="{ warning: overviewResourceMeterWarning(row, 'memory') }">
                 <strong>{{ overviewMemoryMain(row) }}</strong>
@@ -4980,7 +5710,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="存储余量" min-width="150" align="right">
+          <el-table-column prop="storageFree" label="存储余量" min-width="150" align="right" sortable="custom">
             <template #default="{ row }">
               <span class="overview-resource-cell" :class="{ warning: overviewResourceMeterWarning(row, 'storage') }">
                 <strong>{{ overviewStorageMain(row) }}</strong>
@@ -4991,7 +5721,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="VM" min-width="58" align="center">
+          <el-table-column prop="vmTotal" label="VM" width="78" align="center" sortable="custom">
             <template #default="{ row }">
               <span v-if="row.summary">{{ row.summary.running }} / {{ row.summary.total }}</span>
               <span v-else-if="hasOverviewInventory(row)" class="state-text state-loading">
@@ -5043,6 +5773,10 @@ function normalizePort(value: unknown, providerType: ProviderType) {
             <button type="button" :class="{ active: settingsPanel === 'chromeExtension' }" @click="settingsPanel = 'chromeExtension'">
               <el-icon><Setting /></el-icon>
               <span>Chrome 插件</span>
+            </button>
+            <button type="button" :class="{ active: settingsPanel === 'maintenance' }" @click="settingsPanel = 'maintenance'">
+              <el-icon><Setting /></el-icon>
+              <span>维护</span>
             </button>
             <button type="button" :class="{ active: settingsPanel === 'logs' }" @click="settingsPanel = 'logs'">
               <el-icon><Tickets /></el-icon>
@@ -5272,9 +6006,9 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               <div class="settings-card-head connection-settings-head">
                 <div>
                   <strong>连接设置</strong>
-                  <span>保存后可在左侧连接列表中选择并读取物理机资源。</span>
+                  <span>{{ persistentConnectionsEnabled ? "保存后可在左侧连接列表中选择并读取物理机资源。" : "保存到当前浏览器本地，不写入 2.26 服务器。" }}</span>
                 </div>
-                <span>保存 / 测试 / 删除 / 加载资源</span>
+                <span>{{ persistentConnectionsEnabled ? "保存 / 测试 / 删除 / 加载资源" : "本地保存 / 测试 / 加载资源" }}</span>
               </div>
               <div class="settings-form-grid connection-settings-form">
                 <label class="settings-field">
@@ -5318,8 +6052,8 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 <el-button @click="startNewConnection">新连接</el-button>
                 <el-button :loading="testing" @click="testConnection">{{ testing ? "测试中" : "测试" }}</el-button>
                 <el-button @click="openAccountImportDialog">导入账号</el-button>
-                <el-tooltip content="加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单" placement="top">
-                  <el-button :loading="loadingHosts" :disabled="!selectedConnectionId" @click="loadSelectedConnectionResources">
+                <el-tooltip :content="persistentConnectionsEnabled ? '加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单' : '加载资源：使用当前表单账号读取物理机、存储、网络和 VM 清单，不在服务器保存账号密码'" placement="top">
+                  <el-button :loading="loadingHosts" :disabled="!selectedConnectionId && !canLoadDirectConnection" @click="loadSelectedConnectionResources">
                     {{ loadingHosts ? "加载中" : "加载资源" }}
                   </el-button>
                 </el-tooltip>
@@ -5352,7 +6086,9 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   </span>
                   <i>{{ selectedConnectionId === item.id ? "已选" : "选择" }}</i>
                 </button>
-                <div v-if="!storedConnections.length" class="settings-empty-note">还没有保存连接，请先填写上方连接信息。</div>
+                <div v-if="!storedConnections.length" class="settings-empty-note">
+                  {{ persistentConnectionsEnabled ? "还没有保存连接，请先填写上方连接信息。" : "当前浏览器还没有保存连接，请填写上方连接信息并保存到本机。" }}
+                </div>
               </div>
             </section>
           </section>
@@ -5421,32 +6157,36 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   <div class="ip-pool-form">
                     <label class="settings-field">
                       <span>默认 DNS</span>
-                      <el-input v-model="ipPoolDefaultDnsText" placeholder="例如 1.1.1.1，多个用逗号分隔" autocomplete="off" />
+                      <el-input v-model="ipPoolDefaultDnsText" placeholder="多个 DNS 用逗号分隔" autocomplete="off" />
                     </label>
                     <label class="settings-field">
                       <span>名称</span>
-                      <el-input v-model="ipPoolDraft.name" placeholder="例如 192.168.2 通用网段" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                      <el-input v-model="ipPoolDraft.name" placeholder="填写 IP 池名称" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
                     <label class="settings-field">
                       <span>网段</span>
-                      <el-input v-model="ipPoolDraft.prefix" placeholder="例如 192.168.2" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                      <el-input v-model="ipPoolDraft.prefix" placeholder="填写 IPv4 前三段" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
                     <label class="settings-field">
                       <span>适用物理机网段</span>
-                      <el-input v-model="ipPoolDraft.hostPrefixesText" placeholder="例如 192.168.129；留空表示通用池" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                      <el-input v-model="ipPoolDraft.hostPrefixesText" placeholder="填写物理机 IPv4 前三段；留空表示通用池" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
-                    <label class="settings-field">
+                    <label class="settings-field ip-gateway-field">
                       <span>网关</span>
-                      <el-input v-model="ipPoolDraft.gateway" placeholder="例如 192.0.2.254" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                      <el-input v-model="ipPoolDraft.gateway" placeholder="填写网关 IPv4 地址" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
                     <label class="settings-field ip-range-field">
                       <span>IP 池号段</span>
                       <div class="ip-range-control">
-                        <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "192.168.2" }}.</span>
-                        <el-input-number v-model="ipPoolDraft.startHost" :min="1" :max="254" controls-position="right" :disabled="!ipPoolDraft.id" />
+                        <span class="ip-range-endpoint">
+                          <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "网段" }}.</span>
+                          <el-input-number v-model="ipPoolDraft.startHost" :min="1" :max="254" controls-position="right" :disabled="!ipPoolDraft.id" />
+                        </span>
                         <span class="ip-range-separator">~</span>
-                        <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "192.168.2" }}.</span>
-                        <el-input-number v-model="ipPoolDraft.endHost" :min="1" :max="254" controls-position="right" :disabled="!ipPoolDraft.id" />
+                        <span class="ip-range-endpoint">
+                          <span class="ip-range-prefix">{{ ipPoolDraft.prefix || "网段" }}.</span>
+                          <el-input-number v-model="ipPoolDraft.endHost" :min="1" :max="254" controls-position="right" :disabled="!ipPoolDraft.id" />
+                        </span>
                       </div>
                     </label>
                     <label class="settings-field is-full">
@@ -5455,7 +6195,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                     </label>
                     <label class="settings-field is-full">
                       <span>单池 DNS</span>
-                      <el-input v-model="ipPoolDraft.dnsText" placeholder="可留空，默认使用公共 DNS；多个用逗号分隔" autocomplete="off" :disabled="!ipPoolDraft.id" />
+                      <el-input v-model="ipPoolDraft.dnsText" placeholder="可留空，默认使用上方 DNS；多个用逗号分隔" autocomplete="off" :disabled="!ipPoolDraft.id" />
                     </label>
                     <label class="settings-field">
                       <span>VLAN</span>
@@ -5467,7 +6207,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                     <el-button class="ip-pool-command-button danger" :disabled="!selectedIpPool || ipPoolPolicy.ipPools.length <= 1" @click="deleteSelectedIpPool">删除</el-button>
                     <div>
                       <el-button class="ip-pool-command-button" :disabled="!selectedIpPool" @click="copySelectedIpPool">复制</el-button>
-                      <el-button class="ip-pool-command-button" @click="resetIpPoolPolicy">重置默认</el-button>
+                      <el-button class="ip-pool-command-button" @click="resetIpPoolPolicy">清空配置</el-button>
                       <el-button class="ip-pool-command-button primary" :loading="ipPoolSaving" :disabled="!ipPoolPolicy.ipPools.length" @click="saveIpPoolPolicy">
                         {{ ipPoolSaving ? "保存中" : "保存" }}
                       </el-button>
@@ -5647,6 +6387,80 @@ serverStore: disabled</pre>
             </section>
           </section>
 
+          <section v-else-if="settingsPanel === 'maintenance'" class="settings-workspace-content maintenance-settings">
+            <section class="settings-card maintenance-card">
+              <div class="settings-card-head maintenance-card-head">
+                <div>
+                  <strong>任务临时介质</strong>
+                  <span>只清理 VRC 登记的任务级 ISO 和临时介质；原始系统 ISO 与镜像缓存不在此处删除。</span>
+                </div>
+                <div class="maintenance-head-actions">
+                  <el-button class="ip-pool-command-button" size="small" :loading="maintenanceIsoLoading" @click="loadMaintenanceGeneratedIsos()">
+                    {{ maintenanceIsoLoading ? "扫描中" : "重新扫描" }}
+                  </el-button>
+                  <el-button
+                    class="ip-pool-command-button primary"
+                    size="small"
+                    :loading="maintenanceIsoCleaning"
+                    :disabled="!maintenanceIsoSummary.eligible"
+                    @click="cleanupMaintenanceGeneratedIsos"
+                  >
+                    {{ maintenanceIsoCleaning ? "清理中" : "清理残留" }}
+                  </el-button>
+                </div>
+              </div>
+
+              <div class="maintenance-summary-grid">
+                <article>
+                  <span>可清理</span>
+                  <strong>{{ maintenanceIsoSummary.eligible }}</strong>
+                </article>
+                <article>
+                  <span>保留</span>
+                  <strong>{{ maintenanceIsoSummary.retained }}</strong>
+                </article>
+                <article>
+                  <span>已清理</span>
+                  <strong>{{ maintenanceIsoSummary.cleaned }}</strong>
+                </article>
+                <article>
+                  <span>本地占用</span>
+                  <strong>{{ formatBytes(maintenanceIsoSummary.localBytes) }}</strong>
+                </article>
+              </div>
+
+              <div v-if="maintenanceIsoLoading && !maintenanceIsoReport" class="settings-empty-note maintenance-empty">
+                正在扫描 generated-isos.json 和本地临时目录。
+              </div>
+              <div v-else-if="maintenanceIsoError" class="settings-empty-note maintenance-empty error">
+                {{ maintenanceIsoError }}
+              </div>
+              <div v-else-if="!maintenanceIsoReport || !maintenanceIsoReport.items.length" class="settings-empty-note maintenance-empty">
+                暂未发现 VRC 任务级临时介质记录。
+              </div>
+              <div v-else class="maintenance-iso-list">
+                <div class="maintenance-iso-list-head">
+                  <strong>残留记录</strong>
+                  <span>
+                    {{ maintenanceIsoScannedAt ? `最后扫描 ${maintenanceIsoScannedAt} · ` : "" }}显示
+                    {{ maintenanceIsoVisibleItems.length }} / {{ maintenanceIsoReport.items.length }} 条
+                  </span>
+                </div>
+                <article v-for="item in maintenanceIsoVisibleItems" :key="item.id" class="maintenance-iso-row" :class="`state-${item.decision}`">
+                  <span class="maintenance-iso-main">
+                    <strong :title="item.isoName">{{ item.isoName }}</strong>
+                    <small :title="item.reason">{{ item.reason }}</small>
+                  </span>
+                  <span class="maintenance-iso-meta">
+                    <small>{{ providerLabel(item.providerType) }}</small>
+                    <small>{{ item.vmIp || item.vmName || "-" }}</small>
+                  </span>
+                  <span class="maintenance-iso-size">{{ formatBytes(item.localBytes) }}</span>
+                </article>
+              </div>
+            </section>
+          </section>
+
           <section v-else class="settings-workspace-content">
             <section class="settings-card">
               <div class="settings-card-head">
@@ -5676,12 +6490,12 @@ serverStore: disabled</pre>
         <small>Virtual Resource Console</small>
       </section>
 
-      <el-dialog v-model="vmDetailVisible" title="虚拟机信息" width="80vw" class="vm-detail-dialog" top="4vh" :close-on-click-modal="false">
+      <el-dialog v-model="vmDetailVisible" title="虚拟机信息" width="80vw" class="vm-detail-dialog" top="4vh" :close-on-click-modal="false" destroy-on-close>
         <HostVmPanel
           v-if="selectedHost"
           v-model:search="search"
           v-model:power-filter="vmPowerFilter"
-          :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username }"
+          :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username, password: persistentConnectionsEnabled ? undefined : connection.password }"
           :host="selectedHost"
           :network-count="selectedHostNetworks.length"
           :resource-summary="resourceSummary"
@@ -5701,7 +6515,7 @@ serverStore: disabled</pre>
           metric-grid-class="dialog-metric-grid"
           table-panel-class="dialog-table-panel"
           @search-change="loadVms"
-	          @refresh="loadVms({ forceRefresh: true })"
+          @refresh="loadVms({ forceRefresh: true })"
           @export="exportCsv"
           @host-detail="hostDetailVisible = true"
           @storage-detail="storageDetailVisible = true"
@@ -5713,6 +6527,7 @@ serverStore: disabled</pre>
           @batch-vm-action="handleBatchVmAction"
           @schedule-vms="openVmScheduleCreate"
           @rename-vm="openVmRename"
+          @resize-vm="openVmResize"
         />
       </el-dialog>
 
@@ -5723,6 +6538,26 @@ serverStore: disabled</pre>
         :existing-names="(vms?.items ?? []).filter((item) => item.providerId !== vmRenameTarget?.providerId).map((item) => item.name)"
         :saving="vmRenameSaving"
         @submit="handleVmRename"
+      />
+
+      <VmResizeDialog
+        v-model="vmResizeVisible"
+        :vm="vmResizeTarget"
+        :host="selectedHost"
+        :provider-type="connection.providerType"
+        :disks="vmResizeDisks"
+        :loading-disks="vmResizeLoadingDisks"
+        :guest-storage="vmResizeGuestStorage"
+        :loading-guest-storage="vmResizeLoadingGuestStorage"
+        :guest-storage-error="vmResizeGuestStorageError"
+        :saving="vmResizeSaving"
+        :cpu-free="resourceSummary[0]?.free ?? 0"
+        :cpu-overcommitted="(resourceSummary[0]?.percent ?? 0) > 100"
+        :memory-free-gi-b="resourceSummary[1]?.free ?? 0"
+        :storage-free-gi-b="resourceSummary[2]?.free ?? 0"
+        @load-disks="loadVmResizeDisks"
+        @load-guest-storage="loadVmResizeGuestStorage"
+        @submit="handleVmResize"
       />
 
       <ConsoleDialog
@@ -5812,9 +6647,9 @@ serverStore: disabled</pre>
               <div class="settings-card-head connection-settings-head">
                 <div>
                   <strong>连接设置</strong>
-                  <span>保存后可在左侧连接列表中直接选择并读取物理机资源。</span>
+                  <span>{{ persistentConnectionsEnabled ? "保存后可在左侧连接列表中直接选择并读取物理机资源。" : "保存到当前浏览器本地，不写入 2.26 服务器。" }}</span>
                 </div>
-                <span>保存 / 测试 / 删除 / 加载资源</span>
+                <span>{{ persistentConnectionsEnabled ? "保存 / 测试 / 删除 / 加载资源" : "本地保存 / 测试 / 加载资源" }}</span>
               </div>
               <div class="settings-form-grid connection-settings-form">
                 <label class="settings-field">
@@ -5858,8 +6693,8 @@ serverStore: disabled</pre>
                 <el-button :icon="Plus" @click="startNewConnection">新连接</el-button>
                 <el-button :icon="Connection" :loading="testing" @click="testConnection">{{ testing ? "测试中" : "测试" }}</el-button>
                 <el-button :icon="Upload" @click="openAccountImportDialog">导入账号</el-button>
-                <el-tooltip content="加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单" placement="top">
-                  <el-button :icon="Refresh" :loading="loadingHosts" :disabled="!selectedConnectionId" @click="loadSelectedConnectionResources">
+                <el-tooltip :content="persistentConnectionsEnabled ? '加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单' : '加载资源：使用当前表单账号读取物理机、存储、网络和 VM 清单，不在服务器保存账号密码'" placement="top">
+                  <el-button :icon="Refresh" :loading="loadingHosts" :disabled="!selectedConnectionId && !canLoadDirectConnection" @click="loadSelectedConnectionResources">
                     {{ loadingHosts ? "加载中" : "加载资源" }}
                   </el-button>
                 </el-tooltip>
@@ -5887,7 +6722,7 @@ serverStore: disabled</pre>
           <div class="account-import-dialog-title">
             <div>
               <strong>服务器账号导入</strong>
-              <span>Excel / JSON / 固定格式，先测试连接，通过后再保存</span>
+              <span>{{ persistentConnectionsEnabled ? "Excel / JSON / 固定格式，先测试连接，通过后再保存" : "导入到当前浏览器本地，不写入 2.26 服务器" }}</span>
             </div>
           </div>
         </template>
@@ -6108,6 +6943,9 @@ serverStore: disabled</pre>
             </template>
             <el-table-column type="index" label="序号" width="58" align="center" />
             <el-table-column prop="name" label="镜像名称" min-width="260" align="left" show-overflow-tooltip />
+            <el-table-column label="来源" width="110" align="left">
+              <template #default="{ row }">{{ isoSourceLabel(row) }}</template>
+            </el-table-column>
             <el-table-column label="ISO 库" min-width="180" align="left" show-overflow-tooltip>
               <template #default="{ row }">
                 <span>{{ row.storageRepository || "-" }}</span>
@@ -6128,9 +6966,9 @@ serverStore: disabled</pre>
       </el-dialog>
 
       <VmProvisioningDialog
-        :key="`provisioning-${ipPoolPolicyRevision}`"
+        :key="`provisioning-${ipPoolPolicyRevision}-${provisioningDialogSession}`"
         v-model:visible="provisioningVisible"
-        :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username }"
+        :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username, password: persistentConnectionsEnabled ? undefined : connection.password }"
         :host="selectedHost"
         :networks="selectedHostNetworks"
         :vms="vms?.items ?? []"

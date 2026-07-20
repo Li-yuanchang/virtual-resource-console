@@ -4,6 +4,7 @@ export interface NoVncVmConsoleTarget {
   mode: "novnc";
   wsUrl?: string;
   prepareUrl?: string;
+  connection?: ConsoleDirectConnection;
   connectionId?: string;
   vmId?: string;
   label: string;
@@ -26,10 +27,18 @@ export interface NoVncVmConsoleTarget {
 export type VmConsoleTarget = NoVncVmConsoleTarget;
 
 export interface VmConsoleContext {
-  connection: Pick<StoredConnectionSummary, "id" | "providerType" | "host" | "port" | "username">;
+  connection: Pick<StoredConnectionSummary, "id" | "providerType" | "host" | "port" | "username"> & { password?: string };
   vm: VmNode;
   hostName?: string;
   hostAddress?: string;
+}
+
+export interface ConsoleDirectConnection {
+  providerType: ProviderType;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
 }
 
 export type ConsoleMetricKey = "cpu" | "memory" | "network" | "disk";
@@ -41,11 +50,26 @@ export interface ConsoleMetricsLoadingStrategy {
   readonly memoryPressureTone: boolean;
 }
 
+export interface ConsoleDisplayStrategy {
+  readonly scaleViewport: boolean;
+  readonly resizeSession: boolean;
+  readonly qualityLevel: number;
+  readonly compressionLevel: number;
+}
+
 interface VmConsoleStrategy {
   readonly type: ProviderType;
   readonly metrics?: ConsoleMetricsLoadingStrategy;
+  readonly display: ConsoleDisplayStrategy;
   resolve(context: VmConsoleContext): VmConsoleTarget | null;
 }
+
+const localScaleDisplay: ConsoleDisplayStrategy = {
+  scaleViewport: true,
+  resizeSession: false,
+  qualityLevel: 9,
+  compressionLevel: 2,
+};
 
 const xenServerConsoleMetrics: ConsoleMetricsLoadingStrategy = {
   placeholderMetrics: ["cpu", "memory", "network", "disk"],
@@ -71,6 +95,7 @@ const strategies: VmConsoleStrategy[] = [
   {
     type: "vmware",
     metrics: vmwareConsoleMetrics,
+    display: localScaleDisplay,
     resolve({ connection, vm }) {
       const managedObjectId = getMetadataString(vm, "managedObjectId");
       if (!connection.id || !managedObjectId || vm.powerState !== "running") return null;
@@ -83,6 +108,7 @@ const strategies: VmConsoleStrategy[] = [
         vmName: vm.name,
         ...buildConsoleSummary({ vm, hostName: connection.host, hostAddress: connection.host }),
         providerType: "vmware",
+        connection: buildDirectConnection(connection),
         aspectRatio: 4 / 3,
         connectionId: connection.id,
         vmId: managedObjectId,
@@ -92,6 +118,7 @@ const strategies: VmConsoleStrategy[] = [
   {
     type: "proxmox",
     metrics: proxmoxConsoleMetrics,
+    display: localScaleDisplay,
     resolve({ connection, vm }) {
       const [node, vmid] = parseProxmoxVmId(vm.providerId);
       if (!connection.id || !node || !vmid || vm.powerState !== "running") return null;
@@ -104,6 +131,7 @@ const strategies: VmConsoleStrategy[] = [
         vmName: vm.name,
         ...buildConsoleSummary({ vm, hostName: connection.host, hostAddress: connection.host }),
         providerType: "proxmox",
+        connection: buildDirectConnection(connection),
         aspectRatio: 4 / 3,
         connectionId: connection.id,
         vmId: vm.providerId,
@@ -113,18 +141,19 @@ const strategies: VmConsoleStrategy[] = [
   {
     type: "xenserver",
     metrics: xenServerConsoleMetrics,
+    display: localScaleDisplay,
     resolve({ connection, vm }) {
       if (!connection.id || vm.powerState !== "running") return null;
       return {
         mode: "novnc",
-        wsUrl: buildApiWebSocketUrl(
-          `/api/console/xenserver?connectionId=${encodeURIComponent(connection.id)}&vmId=${encodeURIComponent(vm.providerId)}`,
-        ),
+        prepareUrl: "/api/console/xenserver/session",
+        wsUrl: buildApiWebSocketUrl("/api/console/xenserver"),
         label: "打开控制台",
         title: "打开 XenServer noVNC 控制台",
         vmName: vm.name,
         ...buildConsoleSummary({ vm, hostName: connection.host, hostAddress: connection.host }),
         providerType: "xenserver",
+        connection: buildDirectConnection(connection),
         aspectRatio: 4 / 3,
         connectionId: connection.id,
         vmId: vm.providerId,
@@ -133,6 +162,7 @@ const strategies: VmConsoleStrategy[] = [
   },
   {
     type: "libvirt",
+    display: localScaleDisplay,
     resolve() {
       return null;
     },
@@ -148,8 +178,23 @@ export function resolveVmConsoleTarget(context: VmConsoleContext): VmConsoleTarg
   };
 }
 
+function buildDirectConnection(connection: VmConsoleContext["connection"]): ConsoleDirectConnection | undefined {
+  if (!connection.password) return undefined;
+  return {
+    providerType: connection.providerType,
+    host: connection.host,
+    port: connection.port,
+    username: connection.username,
+    password: connection.password,
+  };
+}
+
 export function resolveConsoleMetricsLoadingStrategy(providerType: ProviderType): ConsoleMetricsLoadingStrategy | null {
   return strategies.find((strategy) => strategy.type === providerType)?.metrics ?? null;
+}
+
+export function resolveConsoleDisplayStrategy(providerType: ProviderType): ConsoleDisplayStrategy {
+  return strategies.find((strategy) => strategy.type === providerType)?.display ?? localScaleDisplay;
 }
 
 function buildConsoleSummary(context: Pick<VmConsoleContext, "vm" | "hostName" | "hostAddress">) {

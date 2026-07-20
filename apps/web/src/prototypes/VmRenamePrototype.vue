@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Search, Setting } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import HostVmPanel from "../components/HostVmPanel.vue";
 import VrcLogoMark from "../components/VrcLogoMark.vue";
 import VmRenameDialog from "../components/VmRenameDialog.vue";
@@ -65,6 +65,7 @@ const renameTarget = ref<VmNode | null>(null);
 const saving = ref(false);
 const search = ref("");
 const powerFilter = ref<"all" | "running" | "stopped">("all");
+const selectedVmIds = ref<string[]>([]);
 
 const activeScenario = computed(() => scenarios.find((item) => item.id === activeScenarioId.value) ?? scenarios[0]);
 const filteredVms = computed(() => {
@@ -97,6 +98,7 @@ function selectScenario(id: string) {
   activeScenarioId.value = id;
   search.value = "";
   powerFilter.value = "all";
+  selectedVmIds.value = [];
   detailVisible.value = true;
 }
 
@@ -108,6 +110,14 @@ function openRename(target: VmNode) {
   renameTarget.value = target;
   renameVisible.value = true;
 }
+
+function handleVmSelectionChange(rows: VmNode[]) {
+  selectedVmIds.value = rows.map((row) => row.providerId);
+}
+
+watch(detailVisible, (visible) => {
+  if (!visible) selectedVmIds.value = [];
+});
 
 function submitRename(payload: { vm: VmNode; newName: string }) {
   saving.value = true;
@@ -172,7 +182,7 @@ function notifyPrototype(action: string) {
         </el-table>
       </section>
 
-      <el-dialog v-model="detailVisible" title="虚拟机信息" width="80vw" class="vm-detail-dialog" top="4vh" :close-on-click-modal="false">
+      <el-dialog v-model="detailVisible" title="虚拟机信息" width="80vw" class="vm-detail-dialog" top="4vh" :close-on-click-modal="false" destroy-on-close>
         <HostVmPanel
           v-model:search="search"
           v-model:power-filter="powerFilter"
@@ -187,7 +197,7 @@ function notifyPrototype(action: string) {
           :loading-vm-summary="false"
           :vms="filteredVms"
           :vms-total="activeScenario.vms.length"
-          :selected-vm-ids="[]"
+          :selected-vm-ids="selectedVmIds"
           :vm-action-states="{}"
           :loading-vms="false"
           :allow-vm-rename="true"
@@ -200,6 +210,7 @@ function notifyPrototype(action: string) {
           @create-vm="notifyPrototype('创建虚拟机')"
           @export="notifyPrototype('导出')"
           @refresh="notifyPrototype('刷新列表')"
+          @selection-change="handleVmSelectionChange"
           @vm-action="notifyPrototype('虚拟机操作')"
           @batch-vm-action="notifyPrototype('批量操作')"
           @schedule-vms="notifyPrototype('定时任务')"
