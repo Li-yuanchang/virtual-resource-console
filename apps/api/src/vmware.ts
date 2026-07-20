@@ -28,10 +28,13 @@ import type {
   VmProvisionResult,
   VmQuery,
   VmRenameResult,
+  VmResizeRequest,
+  VmResizeResult,
   VmSnapshot,
   XenConnectionInput,
 } from "./types.js";
 import { assertVmRenameCurrentName, assertVmRenameNameAvailable, normalizeVmRenameInput } from "./vmRename.js";
+import { normalizeGuestOsLabel } from "./guestOs.js";
 
 type XmlValue = any;
 
@@ -63,12 +66,19 @@ interface HostInventory {
   networks: NetworkInterface[];
 }
 
-interface VmwareDiskInfo {
+export interface VmwareDiskInfo {
   id: string;
   name: string;
   device: string;
   virtualSizeBytes: number;
   storageRepository?: string;
+  key: number;
+  controllerKey: number;
+  unitNumber: number;
+  backingFileName: string;
+  diskMode: string;
+  thinProvisioned: boolean;
+  eagerlyScrub: boolean;
 }
 
 interface VmwarePerformanceCounter {
@@ -263,6 +273,7 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
       name: disk.name,
       device: disk.device,
       virtualSizeBytes: disk.virtualSizeBytes,
+      storageRepositoryId: disk.storageRepository,
       storageRepository: disk.storageRepository,
     }));
   }
@@ -416,6 +427,94 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
     } finally {
       await session.logout();
     }
+  }
+
+  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeRequest): Promise<VmResizeResult> {
+    const session = await VmwareSoapSession.login(input);
+    let stopped = false;
+    let restarted = false;
+    let previousCpuCount = 0;
+    let previousMemoryBytes = 0;
+    let name = vmId;
+    try {
+      const vmObjects = await session.retrieveContainerProperties("VirtualMachine", [
+        "name",
+        "config.uuid",
+        "config.instanceUuid",
+        "config.hardware.numCPU",
+        "config.hardware.memoryMB",
+        "config.hardware.device",
+        "runtime.powerState",
+      ]);
+      const vmObject = vmObjects.find((item) => vmwareProviderId(item) === normalizeVmwareTargetId(vmId) || item.ref.value === vmId);
+      if (!vmObject) throw new Error(`未找到 VMware 虚拟机：${vmId}`);
+      name = textOf(vmObject.props.get("name")) || vmId;
+      previousCpuCount = numberOf(vmObject.props.get("config.hardware.numCPU"));
+      previousMemoryBytes = numberOf(vmObject.props.get("config.hardware.memoryMB")) * 1024 * 1024;
+      const currentDisks = collectVirtualDisks(vmObject.props.get("config.hardware.device"), normalizeVmwareTargetId(vmId));
+      assertVmwareResizeIncrease("CPU", request.cpuCount, previousCpuCount);
+      assertVmwareResizeIncrease("内存", request.memoryBytes, previousMemoryBytes);
+
+      const powerState = normalizePowerState(textOf(vmObject.props.get("runtime.powerState")));
+      const needsShutdown = powerState === "running" && Boolean(request.cpuCount || request.memoryBytes);
+      if (needsShutdown && !request.allowShutdown) throw new Error("VMware 当前配置需要先关机才能调整 CPU 或内存。");
+      if (needsShutdown) {
+        await session.shutdownGuest(vmObject.ref.value);
+        const poweredOff = await session.waitForVmPowerState(vmObject.ref.value, "halted", 60_000);
+        if (!poweredOff) throw new Error("VMware 客户机正常关机超时，未执行扩容。请检查 VMware Tools 或先手动关机。");
+        stopped = true;
+      }
+
+      const specParts: string[] = [];
+      if (request.cpuCount) specParts.push(`<numCPUs>${Math.floor(request.cpuCount)}</numCPUs>`);
+      if (request.memoryBytes) specParts.push(`<memoryMB>${Math.ceil(request.memoryBytes / 1024 / 1024)}</memoryMB>`);
+      if (request.disk?.mode === "extend") {
+        const disk = currentDisks.find((item) => item.id === request.disk?.diskId);
+        if (!disk) throw new Error("VMware 扩展原盘失败：目标磁盘不属于当前虚拟机。");
+        if (request.disk.sizeBytes < disk.virtualSizeBytes) throw new Error("不允许缩减 VMware 虚拟磁盘。");
+        if (request.disk.sizeBytes > disk.virtualSizeBytes) {
+          specParts.push(vmwareEditDiskSpec(disk, request.disk.sizeBytes));
+        }
+      } else if (request.disk?.mode === "add") {
+        const storage = request.disk.storageRepositoryId?.trim();
+        if (!storage) throw new Error("VMware 新增磁盘需要选择 Datastore。");
+        specParts.push(vmwareAddDiskSpec(currentDisks, storage, request.disk.sizeBytes, request.disk.name));
+      }
+      if (!specParts.length && !request.guestStorage) throw new Error("没有需要执行的 VMware 扩容变更。");
+      if (specParts.length) await session.reconfigureVm(vmObject.ref.value, specParts.join(""));
+
+      if (stopped && request.restartAfterResize) {
+        await session.powerOnVm(vmObject.ref.value);
+        restarted = true;
+      }
+    } catch (error) {
+      if (stopped && request.restartAfterResize && !restarted) {
+        const vmObjects = await session.retrieveContainerProperties("VirtualMachine", ["config.uuid", "config.instanceUuid"]);
+        const vmObject = vmObjects.find((item) => vmwareProviderId(item) === normalizeVmwareTargetId(vmId) || item.ref.value === vmId);
+        if (vmObject) await session.powerOnVm(vmObject.ref.value).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      await session.logout();
+    }
+
+    const updated = (await this.listVms(input, { page: 1, pageSize: 500 })).items.find(
+      (item) => item.providerId === normalizeVmwareTargetId(vmId) || item.id === vmId,
+    );
+    if (!updated) throw new Error("VMware 已执行扩容，但回读虚拟机配置失败。");
+    return {
+      vmId,
+      name: updated.name || name,
+      accepted: true,
+      previousCpuCount,
+      cpuCount: updated.cpuCount,
+      previousMemoryBytes,
+      memoryBytes: updated.memoryBytes,
+      disks: await this.listVmDisks(input, vmId),
+      stopped,
+      restarted,
+      message: `扩容完成：${updated.name || name}`,
+    };
   }
 
   async createVms(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
@@ -633,6 +732,26 @@ export async function cleanupRegisteredVmwareGeneratedIso(input: XenConnectionIn
   }
 }
 
+export async function verifyVmwareGuestTools(input: XenConnectionInput, vmId: string, timeoutMs = 120_000): Promise<void> {
+  const normalizedTarget = normalizeVmwareTargetId(vmId);
+  const session = await VmwareSoapSession.login(input);
+  try {
+    const deadline = Date.now() + timeoutMs;
+    let lastStatus = "unknown";
+    while (Date.now() < deadline) {
+      const vmObjects = await session.retrieveContainerProperties("VirtualMachine", ["config.uuid", "config.instanceUuid", "guest.toolsStatus"]);
+      const matched = vmObjects.find((item) => vmwareProviderId(item) === normalizedTarget || item.ref.value === vmId);
+      if (!matched) throw new Error(`VMware 未找到待验证 VM：${vmId}`);
+      lastStatus = textOf(matched.props.get("guest.toolsStatus")) || "unknown";
+      if (normalizeToolsStatus(lastStatus) === "installed") return;
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+    throw new Error(`VMware 未回报 Tools 运行状态，当前状态：${lastStatus}`);
+  } finally {
+    await session.logout();
+  }
+}
+
 export class VmwareSoapSession {
   private cookie = "";
 
@@ -724,6 +843,16 @@ export class VmwareSoapSession {
         <spec>
           ${cdroms.map((cdrom) => `<deviceChange><operation>edit</operation><device xsi:type="VirtualCdrom"><key>${cdrom.key}</key><deviceInfo><label>${escapeXml(cdrom.label)}</label><summary>Remote device</summary></deviceInfo><backing xsi:type="VirtualCdromRemotePassthroughBackingInfo"><deviceName></deviceName><useAutoDetect>true</useAutoDetect><exclusive>false</exclusive></backing><connectable><startConnected>false</startConnected><allowGuestControl>true</allowGuestControl><connected>false</connected></connectable><controllerKey>${cdrom.controllerKey}</controllerKey><unitNumber>${cdrom.unitNumber}</unitNumber></device></deviceChange>`).join("")}
         </spec>
+      </ReconfigVM_Task>
+    `);
+    await this.waitForTaskResult({ ...readManagedRef(response?.returnval), type: "Task" });
+  }
+
+  async reconfigureVm(vmMoid: string, specXml: string): Promise<void> {
+    const response = await this.call("ReconfigVM_Task", `
+      <ReconfigVM_Task xmlns="${SOAP_NS}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        ${managedRefXml("_this", { type: "VirtualMachine", value: vmMoid })}
+        <spec>${specXml}</spec>
       </ReconfigVM_Task>
     `);
     await this.waitForTaskResult({ ...readManagedRef(response?.returnval), type: "Task" });
@@ -1560,7 +1689,7 @@ function toVmNode(item: PropertyObject, connectionId: string): VmNode {
       (diskVirtualBytes > 0 ? `${bytesToGib(diskVirtualBytes).toFixed(1)} GiB` : undefined),
     hostId: host?.value,
     ipAddresses: collectGuestIps(item.props.get("guest.ipAddress"), item.props.get("guest.net"), name),
-    guestOs: normalizeGuestOs(
+    guestOs: normalizeGuestOsLabel(
       textOf(item.props.get("guest.guestFullName")) ||
         textOf(item.props.get("config.guestFullName")) ||
         textOf(item.props.get("guest.guestId")) ||
@@ -1810,7 +1939,7 @@ function nonNegativeNumberOf(value: XmlValue): number | null {
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
-function collectVirtualDisks(value: XmlValue, vmId: string): VmwareDiskInfo[] {
+export function collectVirtualDisks(value: XmlValue, vmId: string): VmwareDiskInfo[] {
   const disks: VmwareDiskInfo[] = [];
   const visit = (node: XmlValue) => {
     if (node == null) return;
@@ -1831,6 +1960,13 @@ function collectVirtualDisks(value: XmlValue, vmId: string): VmwareDiskInfo[] {
         device: key,
         virtualSizeBytes: capacityBytes || capacityKb * 1024,
         storageRepository: parseDatastoreName(textOf(node.backing?.fileName)),
+        key: numberOf(node.key),
+        controllerKey: numberOf(node.controllerKey),
+        unitNumber: numberOf(node.unitNumber),
+        backingFileName: textOf(node.backing?.fileName),
+        diskMode: textOf(node.backing?.diskMode) || "persistent",
+        thinProvisioned: textOf(node.backing?.thinProvisioned) === "true",
+        eagerlyScrub: textOf(node.backing?.eagerlyScrub) === "true",
       });
       return;
     }
@@ -1840,6 +1976,62 @@ function collectVirtualDisks(value: XmlValue, vmId: string): VmwareDiskInfo[] {
   };
   visit(value);
   return disks;
+}
+
+export function vmwareEditDiskSpec(disk: VmwareDiskInfo, targetSizeBytes: number): string {
+  const capacityInKb = Math.ceil(targetSizeBytes / 1024);
+  return `<deviceChange>
+    <operation>edit</operation>
+    <device xsi:type="VirtualDisk">
+      <key>${disk.key}</key>
+      <deviceInfo><label>${escapeXml(disk.name)}</label><summary>${Math.ceil(targetSizeBytes / 1024 ** 3)} GiB</summary></deviceInfo>
+      <backing xsi:type="VirtualDiskFlatVer2BackingInfo">
+        <fileName>${escapeXml(disk.backingFileName)}</fileName>
+        <diskMode>${escapeXml(disk.diskMode)}</diskMode>
+        <thinProvisioned>${disk.thinProvisioned}</thinProvisioned>
+        <eagerlyScrub>${disk.eagerlyScrub}</eagerlyScrub>
+      </backing>
+      <controllerKey>${disk.controllerKey}</controllerKey>
+      <unitNumber>${disk.unitNumber}</unitNumber>
+      <capacityInKB>${capacityInKb}</capacityInKB>
+    </device>
+  </deviceChange>`;
+}
+
+export function vmwareAddDiskSpec(disks: VmwareDiskInfo[], datastore: string, sizeBytes: number, name?: string): string {
+  const firstDisk = disks[0];
+  if (!firstDisk?.controllerKey) throw new Error("VMware 当前虚拟机没有可复用的磁盘控制器，无法自动新增磁盘。");
+  const usedUnits = new Set(disks.filter((disk) => disk.controllerKey === firstDisk.controllerKey).map((disk) => disk.unitNumber));
+  let unitNumber = -1;
+  for (let index = 0; index < 16; index += 1) {
+    if (index !== 7 && !usedUnits.has(index)) {
+      unitNumber = index;
+      break;
+    }
+  }
+  if (unitNumber < 0) throw new Error("VMware 当前磁盘控制器没有可用槽位。");
+  const label = name?.trim() || `Hard disk ${disks.length + 1}`;
+  return `<deviceChange>
+    <operation>add</operation>
+    <fileOperation>create</fileOperation>
+    <device xsi:type="VirtualDisk">
+      <key>-${100 + disks.length}</key>
+      <deviceInfo><label>${escapeXml(label)}</label><summary>${Math.ceil(sizeBytes / 1024 ** 3)} GiB thin provisioned disk</summary></deviceInfo>
+      <backing xsi:type="VirtualDiskFlatVer2BackingInfo">
+        <fileName>[${escapeXml(datastore)}]</fileName>
+        <diskMode>persistent</diskMode>
+        <thinProvisioned>true</thinProvisioned>
+      </backing>
+      <controllerKey>${firstDisk.controllerKey}</controllerKey>
+      <unitNumber>${unitNumber}</unitNumber>
+      <capacityInKB>${Math.ceil(sizeBytes / 1024)}</capacityInKB>
+    </device>
+  </deviceChange>`;
+}
+
+function assertVmwareResizeIncrease(label: string, target: number | undefined, current: number): void {
+  if (target == null) return;
+  if (!Number.isFinite(target) || target <= current) throw new Error(`${label}扩容目标必须大于当前值。`);
 }
 
 function collectVirtualCdroms(value: XmlValue): Array<{ key: number; controllerKey: number; unitNumber: number; label: string; fileName: string; datastore: string; connected: boolean }> {
@@ -2119,15 +2311,6 @@ function normalizeToolsStatus(value: string): VmNode["toolsStatus"] {
 function isVmwareGuestShutdownUnavailable(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? "");
   return message.includes("ToolsUnavailable") || message.includes("VMware Tools is not running") || message.includes("VMware Tools unavailable");
-}
-
-function normalizeGuestOs(value: string): string | undefined {
-  const text = value.trim();
-  if (!text) return undefined;
-  return text
-    .replace(/\s*\(\d+-bit\)\s*/i, " ")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 function isIpLike(value: string): boolean {

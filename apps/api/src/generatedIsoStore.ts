@@ -6,6 +6,7 @@ import type { ProviderType } from "./types.js";
 
 const storeDir = join(homedir(), ".virtual-resource-console");
 const storeFile = join(storeDir, "generated-isos.json");
+const failedGeneratedIsoRetentionMs = 7 * 24 * 60 * 60 * 1000;
 
 export type GeneratedIsoStatus = "creating" | "uploaded" | "attached" | "installed" | "failed" | "deleted";
 
@@ -88,11 +89,18 @@ function patchGeneratedIso(id: string, patch: Partial<GeneratedIsoRecord>): Gene
   const store = readStore();
   const index = store.records.findIndex((record) => record.id === id);
   if (index < 0) return undefined;
+  const previous = store.records[index];
+  const cleanupAfter =
+    patch.cleanupAfter ??
+    (patch.status === "failed" && !previous.cleanupAfter
+      ? new Date(Date.now() + failedGeneratedIsoRetentionMs).toISOString()
+      : previous.cleanupAfter);
   const record = normalizeRecord({
-    ...store.records[index],
+    ...previous,
     ...patch,
+    cleanupAfter,
     updatedAt: new Date().toISOString(),
-    deletedAt: patch.status === "deleted" ? new Date().toISOString() : store.records[index].deletedAt,
+    deletedAt: patch.status === "deleted" ? new Date().toISOString() : previous.deletedAt,
   });
   store.records[index] = record;
   writeStore(store);

@@ -31,10 +31,13 @@ import type {
   VmProvisionResult,
   VmQuery,
   VmRenameResult,
+  VmResizeRequest,
+  VmResizeResult,
   VmSnapshot,
   XenConnectionInput,
 } from "./types.js";
 import { assertVmRenameCurrentName, assertVmRenameNameAvailable, normalizeVmRenameInput } from "./vmRename.js";
+import { normalizeGuestOsLabel } from "./guestOs.js";
 
 interface ProxmoxLogin {
   ticket: string;
@@ -282,7 +285,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     if (!node || !id) return [];
     const client = await ProxmoxClient.login(input);
     const config = await client.get<ProxmoxVmConfig>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/config`);
-    return configToDisks(config, vmId);
+    return parseProxmoxVmDisks(config, vmId);
   }
 
   async listVirtualDisks(input: XenConnectionInput, scope: ProviderScope = {}): Promise<VirtualDisk[]> {
@@ -427,6 +430,90 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     };
   }
 
+  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeRequest): Promise<VmResizeResult> {
+    const [node, id] = parseVmProviderId(vmId);
+    if (!node || !id) throw new Error(`Proxmox VE VM ID 不完整：${vmId}`);
+    const client = await ProxmoxClient.login(input);
+    const [status, config] = await Promise.all([
+      client.get<ProxmoxVmStatus>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/current`),
+      client.get<ProxmoxVmConfig>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/config`),
+    ]);
+    const previousCpuCount = Number(config.cores ?? status.cpus ?? 0);
+    const previousMemoryBytes = Number(config.memory ?? 0) * 1024 * 1024 || Number(status.maxmem ?? 0);
+    const currentDisks = parseProxmoxVmDisks(config, vmId);
+    assertResizeIncrease("CPU", request.cpuCount, previousCpuCount);
+    assertResizeIncrease("内存", request.memoryBytes, previousMemoryBytes);
+
+    const needsShutdown = status.status === "running" && Boolean(request.cpuCount || request.memoryBytes);
+    if (needsShutdown && !request.allowShutdown) throw new Error("PVE 当前配置需要先关机才能调整 CPU 或内存。");
+    let stopped = false;
+    let restarted = false;
+    try {
+      if (needsShutdown) {
+        const shutdownTask = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/shutdown`);
+        await client.waitForTask(node, shutdownTask);
+        stopped = true;
+      }
+
+      const configChanges = new URLSearchParams();
+      if (request.cpuCount) configChanges.set("cores", String(Math.floor(request.cpuCount)));
+      if (request.memoryBytes) configChanges.set("memory", String(Math.ceil(request.memoryBytes / 1024 / 1024)));
+      if ([...configChanges.keys()].length) {
+        await client.put(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/config`, configChanges);
+      }
+
+      if (request.disk?.mode === "extend") {
+        const disk = currentDisks.find((item) => item.id === request.disk?.diskId);
+        if (!disk) throw new Error("PVE 扩展原盘失败：目标磁盘不属于当前虚拟机。");
+        if (request.disk.sizeBytes < disk.virtualSizeBytes) throw new Error("不允许缩减 PVE 虚拟磁盘。");
+        if (request.disk.sizeBytes > disk.virtualSizeBytes) {
+          await client.put(
+            `/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/resize`,
+            new URLSearchParams({ disk: disk.device, size: `${Math.ceil(request.disk.sizeBytes / 1024 ** 3)}G` }),
+          );
+        }
+      } else if (request.disk?.mode === "add") {
+        const storage = request.disk.storageRepositoryId?.trim();
+        if (!storage) throw new Error("PVE 新增磁盘需要选择存储。");
+        const device = nextProxmoxScsiDevice(config);
+        const sizeGiB = Math.ceil(request.disk.sizeBytes / 1024 ** 3);
+        await client.put(
+          `/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/config`,
+          new URLSearchParams({ [device]: `${storage}:${sizeGiB},discard=on` }),
+        );
+      }
+
+      if (stopped && request.restartAfterResize) {
+        const startTask = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`);
+        await client.waitForTask(node, startTask);
+        restarted = true;
+      }
+    } catch (error) {
+      if (stopped && request.restartAfterResize && !restarted) {
+        await client
+          .post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`)
+          .then((upid) => client.waitForTask(node, upid))
+          .catch(() => undefined);
+      }
+      throw error;
+    }
+
+    const updatedConfig = await client.get<ProxmoxVmConfig>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/config`);
+    return {
+      vmId,
+      name: String(updatedConfig.name ?? config.name ?? vmId),
+      accepted: true,
+      previousCpuCount,
+      cpuCount: Number(updatedConfig.cores ?? previousCpuCount),
+      previousMemoryBytes,
+      memoryBytes: Number(updatedConfig.memory ?? previousMemoryBytes / 1024 / 1024) * 1024 * 1024,
+      disks: parseProxmoxVmDisks(updatedConfig, vmId),
+      stopped,
+      restarted,
+      message: `扩容完成：${String(updatedConfig.name ?? config.name ?? vmId)}`,
+    };
+  }
+
   async createVms(input: XenConnectionInput, request: VmProvisionRequest): Promise<VmProvisionResult> {
     const strategyId = request.installStrategy || defaultProxmoxStrategyBySource.get(request.sourceType);
     if (!strategyId) throw new Error(`PVE 未配置 ${request.sourceType} 对应的安装策略。`);
@@ -454,6 +541,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
         sourceIsoVolid: iso.providerId,
         vm: item,
         ipPool: request.ipPool,
+        installProfile: request.installProfile,
       });
       const registry = registerGeneratedIso({
         taskId: request.taskId || `pve-${Date.now().toString(36)}`,
@@ -668,6 +756,30 @@ export async function startProxmoxVmFromDiskIfStopped(input: XenConnectionInput,
   const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`);
   await client.waitForTask(node, upid);
   return true;
+}
+
+export async function enableAndVerifyProxmoxGuestAgent(
+  input: XenConnectionInput,
+  vmId: string,
+  timeoutMs = 120_000,
+): Promise<void> {
+  const [node, id] = parseVmProviderId(vmId);
+  if (!node || !id) throw new Error(`PVE VM 标识不完整：${vmId}`);
+  const client = await ProxmoxClient.login(input);
+  const vmPath = `/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}`;
+  await client.put(`${vmPath}/config`, new URLSearchParams({ agent: "1" }));
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "qemu-guest-agent 尚未响应";
+  while (Date.now() < deadline) {
+    try {
+      await client.post(`${vmPath}/agent/ping`);
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+  }
+  throw new Error(`PVE 未能通过 Agent API 验证 qemu-guest-agent：${lastError}`);
 }
 
 class ProxmoxClient {
@@ -1043,7 +1155,7 @@ function toVmNode(vm: ProxmoxVm, node: string, connectionId: string, config?: Pr
     diskCount: vm.maxdisk || vm.disk ? 1 : 0,
     diskSizeSummary: vm.maxdisk || vm.disk ? `${bytesToGib(vm.maxdisk ?? vm.disk ?? 0).toFixed(1)} GiB` : undefined,
     ipAddresses: inferredIp ? [inferredIp] : [],
-    guestOs: normalizeProxmoxGuestOs(config?.ostype, name),
+    guestOs: normalizeProxmoxGuestOs(config?.ostype),
     toolsStatus: "unknown",
     reclaimLevel: "P3",
     reclaimReason: "",
@@ -1072,9 +1184,12 @@ function toVmNode(vm: ProxmoxVm, node: string, connectionId: string, config?: Pr
   return item;
 }
 
-function configToDisks(config: ProxmoxVmConfig, vmId: string): VmDisk[] {
+export function parseProxmoxVmDisks(config: ProxmoxVmConfig, vmId: string): VmDisk[] {
   return Object.entries(config)
-    .filter(([key]) => /^(ide|sata|scsi|virtio)\d+$/.test(key))
+    .filter(([key, value]) => {
+      if (!/^(ide|sata|scsi|virtio)\d+$/.test(key)) return false;
+      return !/(?:^|,)media=cdrom(?:,|$)|cloudinit/i.test(String(value ?? ""));
+    })
     .map(([device, value]) => {
       const text = String(value ?? "");
       const size = parseDiskSize(text);
@@ -1085,9 +1200,25 @@ function configToDisks(config: ProxmoxVmConfig, vmId: string): VmDisk[] {
         name: device,
         device,
         virtualSizeBytes: size,
+        storageRepositoryId: text.split(":")[0] || undefined,
         storageRepository: text.split(":")[0] || undefined,
       };
-    });
+    })
+    .filter((disk) => disk.virtualSizeBytes > 0)
+    .sort((left, right) => left.device.localeCompare(right.device, "en", { numeric: true }));
+}
+
+function nextProxmoxScsiDevice(config: ProxmoxVmConfig): string {
+  for (let index = 0; index < 31; index += 1) {
+    const device = `scsi${index}`;
+    if (!(device in config)) return device;
+  }
+  throw new Error("PVE 当前虚拟机没有可用的 SCSI 磁盘槽位。");
+}
+
+function assertResizeIncrease(label: string, target: number | undefined, current: number): void {
+  if (target == null) return;
+  if (!Number.isFinite(target) || target <= current) throw new Error(`${label}扩容目标必须大于当前值。`);
 }
 
 function parseVmProviderId(value: string): [string, string] {
@@ -1280,11 +1411,9 @@ function shouldSearchProviderId(keyword: string): boolean {
   return /^[a-f0-9:-]{8,}$/i.test(keyword);
 }
 
-function normalizeProxmoxGuestOs(value: unknown, vmName?: string): string | undefined {
+function normalizeProxmoxGuestOs(value: unknown): string | undefined {
   const ostype = String(value ?? "").trim().toLowerCase();
-  const inferred = inferGuestOsFromName(vmName);
-  if (!ostype) return inferred;
-  if (["l24", "l26", "other"].includes(ostype) && inferred) return inferred;
+  if (!ostype) return undefined;
   const labels: Record<string, string> = {
     l24: "Linux 2.4",
     l26: "Linux 2.6+",
@@ -1300,22 +1429,7 @@ function normalizeProxmoxGuestOs(value: unknown, vmName?: string): string | unde
     solaris: "Solaris",
     other: "Other",
   };
-  return labels[ostype] ?? ostype.toUpperCase();
-}
-
-function inferGuestOsFromName(value?: string): string | undefined {
-  const name = value?.toLowerCase() ?? "";
-  if (!name) return undefined;
-  if (name.includes("openeuler") || name.includes("open_euler") || name.includes("open-euler")) return "openEuler";
-  if (name.includes("centos")) return "CentOS";
-  if (name.includes("ubuntu")) return "Ubuntu";
-  if (name.includes("debian")) return "Debian";
-  if (name.includes("rocky")) return "Rocky Linux";
-  if (name.includes("alma")) return "AlmaLinux";
-  if (name.includes("kylin") || name.includes("麒麟")) return "Kylin";
-  if (name.includes("windows server") || name.includes("winserver")) return "Windows Server";
-  if (name.includes("windows") || /\bwin\d*/.test(name)) return "Windows";
-  return undefined;
+  return normalizeGuestOsLabel(labels[ostype] ?? ostype.toUpperCase());
 }
 
 function normalizeUsername(username: string): string {

@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { randomUUID } from "node:crypto";
 import WebSocket, { type RawData } from "ws";
-import { resolveStoredConnection } from "../connectionStore.js";
+import { resolveConsoleConnection, type ConsoleConnectionInput } from "./connection.js";
 import type { XenConnectionInput } from "../types.js";
 import { VmwareSoapSession } from "../vmware.js";
 
@@ -10,6 +10,7 @@ const CONSOLE_SESSION_TTL_MS = 60_000;
 
 interface ConsoleQuery {
   connectionId?: string;
+  connection?: ConsoleConnectionInput;
   vmId?: string;
 }
 
@@ -101,20 +102,10 @@ export async function registerVmwareConsoleRoutes(server: FastifyInstance): Prom
 
 async function createVmwareConsoleSession(request: FastifyRequest): Promise<{ sessionId: string; expiresAt: string }> {
   const body = request.body as ConsoleQuery | undefined;
-  if (!body?.connectionId || !body.vmId) {
-    throw new Error("控制台参数不完整：缺少连接或 VM。");
-  }
-  const stored = resolveStoredConnection(body.connectionId);
-  if (stored.providerType !== "vmware") {
+  if ((!body?.connectionId && !body?.connection) || !body.vmId) {
     throw new Error("当前控制台会话只处理 VMware。");
   }
-
-  const connection: XenConnectionInput = {
-    host: stored.host,
-    port: stored.port,
-    username: stored.username,
-    password: stored.password,
-  };
+  const { connection } = resolveConsoleConnection(body, "vmware");
   const session = await VmwareSoapSession.login(connection);
   try {
     const ticket = await session.acquireWebMksTicket(body.vmId);

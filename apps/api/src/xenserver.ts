@@ -27,12 +27,23 @@ import type {
   VmProvisionResult,
   VmQuery,
   VmRenameResult,
+  VmResizeRequest,
+  VmResizeResult,
   VmSnapshot,
   XenConnectionInput,
   XenOverview,
 } from "./types.js";
 import { assertVmRenameCurrentName, normalizeVmRenameInput, VmRenameConflictError } from "./vmRename.js";
-import { cleanupRegisteredXenGeneratedIso, prepareXenCentosUnattendedIso, resolveXenInstallMediaMode } from "./xenserverUnattendedIso.js";
+import {
+  cleanupRegisteredXenGeneratedIso,
+  prepareXenCentosUnattendedIso,
+  prepareXenWindowsUnattendIso,
+  resolveXenInstallMediaMode,
+} from "./xenserverUnattendedIso.js";
+import type { XenInstallMediaMode } from "./xenserverUnattendedIso.js";
+import { normalizeGuestOsLabel } from "./guestOs.js";
+import { isXenGuestToolsIsoName } from "./installMediaPolicy.js";
+import { prepareXenInstallMedia } from "./xenserverProvisionStrategies.js";
 
 const HOST_INVENTORY_SCRIPT = String.raw`
 bytes_to_gib() {
@@ -181,6 +192,13 @@ bytes_to_gib() {
 clean_one_line() {
   tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
 }
+rfb_console_location() {
+  vm_uuid="$1"
+  console_uuid="$(xe console-list vm-uuid="$vm_uuid" protocol=RFB --minimal 2>/dev/null | tr ',' '\n' | head -1 | clean_one_line)"
+  if [ -n "$console_uuid" ]; then
+    xe console-param-get uuid="$console_uuid" param-name=location 2>/dev/null | clean_one_line
+  fi
+}
 num_or_zero() {
   if [ -z "$1" ] || [ "$1" = "<not in database>" ]; then
     printf "0"
@@ -288,15 +306,53 @@ compact_os_version() {
     return
   fi
   name="$(printf "%s" "$raw" | sed -n 's/.*name: \([^;]*\).*/\1/p' | clean_one_line)"
-  if [ -n "$name" ]; then
+  if [ -n "$name" ] && ! printf "%s" "$name" | grep -Eq '^(Linux )?[0-9]+\.[0-9]+\.[0-9]+'; then
     printf "%s" "$name"
     return
   fi
   distro="$(printf "%s" "$raw" | sed -n 's/.*distro: \([^;]*\).*/\1/p' | clean_one_line)"
   major="$(printf "%s" "$raw" | sed -n 's/.*major: \([^;]*\).*/\1/p' | clean_one_line)"
   minor="$(printf "%s" "$raw" | sed -n 's/.*minor: \([^;]*\).*/\1/p' | clean_one_line)"
-  if [ -n "$distro" ]; then
+  if [ -n "$distro" ] && [ "$distro" != "unknown" ]; then
     printf "%s %s" "$distro" "$major.$minor" | sed 's/ \\.$//; s/\\.0$//; s/ $//'
+    return
+  fi
+  if [ -n "$name" ]; then
+    printf "%s" "$name"
+  fi
+}
+compact_template_os_name() {
+  raw="$(printf "%s" "$1" | clean_one_line)"
+  if [ -z "$raw" ] || [ "$raw" = "<not in database>" ]; then
+    return
+  fi
+  if printf "%s" "$raw" | grep -Eiq 'other install media|install media|unknown'; then
+    return
+  fi
+  printf "%s" "$raw" | sed 's/[[:space:]]*(64-bit)[[:space:]]*/ /Ig; s/[[:space:]]*(32-bit)[[:space:]]*/ /Ig; s/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+guest_os_label() {
+  vm_uuid="$1"
+  os_version="$(xe vm-param-get uuid="$vm_uuid" param-name=os-version 2>/dev/null | clean_one_line)"
+  guest_os="$(compact_os_version "$os_version")"
+  if [ -n "$guest_os" ]; then
+    printf "%s" "$guest_os"
+    return
+  fi
+  for key in vrc-guest-os vrc_guest_os guest-os guest_os; do
+    configured_os="$(xe vm-param-get uuid="$vm_uuid" param-name=other-config param-key="$key" 2>/dev/null | clean_one_line)"
+    configured_os="$(compact_template_os_name "$configured_os")"
+    if [ -n "$configured_os" ]; then
+      printf "%s" "$configured_os"
+      return
+    fi
+  done
+  other_config="$(xe vm-param-get uuid="$vm_uuid" param-name=other-config 2>/dev/null | clean_one_line)"
+  template_name="$(printf "%s" "$other_config" | sed -n 's/.*base_template_name: \([^;]*\).*/\1/p' | clean_one_line)"
+  template_os="$(compact_template_os_name "$template_name")"
+  if [ -n "$template_os" ]; then
+    printf "%s" "$template_os"
+    return
   fi
 }
 collect_vm_disk_info() {
@@ -365,10 +421,9 @@ for vm in $vm_list; do
     vcpu_count="$vcpu_live"
   fi
   mem_dyn_max="$(xe vm-param-get uuid="$vm" param-name=memory-dynamic-max 2>/dev/null | clean_one_line)"
-  os_version="$(xe vm-param-get uuid="$vm" param-name=os-version 2>/dev/null | clean_one_line)"
-  guest_os="$(compact_os_version "$os_version")"
+  guest_os="$(guest_os_label "$vm")"
   disk_info="$(collect_vm_disk_info "$vm")"
-  console_location="$(xe console-list vm-uuid="$vm" params=location --minimal 2>/dev/null | tr ',' '\n' | head -1 | clean_one_line)"
+  console_location="$(rfb_console_location "$vm")"
   effective_host="$resident"
   if [ -z "$effective_host" ] || [ "$effective_host" = "<not in database>" ]; then
     effective_host="$affinity"
@@ -400,11 +455,16 @@ for vbd in $(xe vbd-list vm-uuid="$VRC_VM_UUID" type=Disk --minimal 2>/dev/null 
   label="$(xe vdi-param-get uuid="$vdi" param-name=name-label 2>/dev/null | clean_one_line)"
   size="$(xe vdi-param-get uuid="$vdi" param-name=virtual-size 2>/dev/null | clean_one_line)"
   sr_uuid="$(xe vdi-param-get uuid="$vdi" param-name=sr-uuid 2>/dev/null | clean_one_line)"
+  allowed_operations="$(xe vdi-param-get uuid="$vdi" param-name=allowed-operations 2>/dev/null | clean_one_line)"
+  online_resize_supported="false"
+  if printf '%s' "$allowed_operations" | grep -Eq '(^|;[[:space:]]*)resize([[:space:]]*;|$)'; then
+    online_resize_supported="true"
+  fi
   sr_name=""
   if [ -n "$sr_uuid" ] && [ "$sr_uuid" != "<not in database>" ]; then
     sr_name="$(xe sr-param-get uuid="$sr_uuid" param-name=name-label 2>/dev/null | clean_one_line)"
   fi
-  printf 'DISK\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vdi" "$VRC_VM_UUID" "$device" "$label" "$(num_or_zero "$size")" "$sr_name"
+  printf 'DISK\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vdi" "$VRC_VM_UUID" "$device" "$label" "$(num_or_zero "$size")" "$sr_uuid" "$sr_name" "$online_resize_supported"
 done
 `;
 
@@ -487,6 +547,156 @@ if [ -z "$forced" ]; then
   forced="false"
 fi
 printf 'OK\t%s\t%s\t%s\t%s\n' "$VRC_VM_ACTION" "$VRC_VM_UUID" "$name" "$forced"
+`;
+
+const VM_RESIZE_SCRIPT = String.raw`
+clean_one_line() {
+  tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+require_positive_integer() {
+  label="$1"
+  value="$2"
+  if ! printf '%s' "$value" | grep -Eq '^[1-9][0-9]*$'; then
+    echo "$label 必须是正整数" >&2
+    exit 2
+  fi
+}
+vm_uuid="$VRC_VM_UUID"
+if [ -z "$vm_uuid" ]; then
+  echo "缺少虚拟机 UUID" >&2
+  exit 2
+fi
+name="$(xe vm-param-get uuid="$vm_uuid" param-name=name-label 2>/dev/null | clean_one_line)"
+power_before="$(xe vm-param-get uuid="$vm_uuid" param-name=power-state 2>/dev/null | clean_one_line)"
+if [ -z "$name" ]; then
+  echo "未找到虚拟机：$vm_uuid" >&2
+  exit 3
+fi
+old_cpu="$(xe vm-param-get uuid="$vm_uuid" param-name=VCPUs-max 2>/dev/null | clean_one_line)"
+old_memory="$(xe vm-param-get uuid="$vm_uuid" param-name=memory-dynamic-max 2>/dev/null | clean_one_line)"
+require_positive_integer "当前 CPU" "$old_cpu"
+require_positive_integer "当前内存" "$old_memory"
+target_cpu="$VRC_CPU_TARGET"
+target_memory="$VRC_MEMORY_TARGET_BYTES"
+disk_mode="$VRC_DISK_MODE"
+if [ -z "$target_cpu" ]; then target_cpu="$old_cpu"; fi
+if [ -z "$target_memory" ]; then target_memory="$old_memory"; fi
+require_positive_integer "目标 CPU" "$target_cpu"
+require_positive_integer "目标内存" "$target_memory"
+if [ "$target_cpu" -lt "$old_cpu" ]; then
+  echo "不允许缩减 CPU：当前 $old_cpu，目标 $target_cpu" >&2
+  exit 4
+fi
+if [ "$target_memory" -lt "$old_memory" ]; then
+  echo "不允许缩减内存：当前 $old_memory，目标 $target_memory" >&2
+  exit 4
+fi
+needs_shutdown="false"
+if [ "$power_before" = "running" ] && { [ "$target_cpu" -gt "$old_cpu" ] || [ "$target_memory" -gt "$old_memory" ]; }; then
+  needs_shutdown="true"
+fi
+if [ "$power_before" = "running" ] && [ "$disk_mode" = "extend" ] && [ "$VRC_DISK_ONLINE_RESIZE_SUPPORTED" != "true" ]; then
+  needs_shutdown="true"
+fi
+stopped="false"
+restarted="false"
+if [ "$needs_shutdown" = "true" ]; then
+  if [ "$VRC_ALLOW_SHUTDOWN" != "true" ]; then
+    echo "当前 XenServer 资源不支持在线扩容，需要先正常关机" >&2
+    exit 5
+  fi
+  xe vm-shutdown uuid="$vm_uuid" >/dev/null
+  stopped="true"
+fi
+if [ "$target_cpu" -gt "$old_cpu" ]; then
+  xe vm-param-set uuid="$vm_uuid" VCPUs-max="$target_cpu" >/dev/null
+  xe vm-param-set uuid="$vm_uuid" VCPUs-at-startup="$target_cpu" >/dev/null
+fi
+if [ "$target_memory" -gt "$old_memory" ]; then
+  xe vm-memory-limits-set uuid="$vm_uuid" static-min=134217728 dynamic-min="$target_memory" dynamic-max="$target_memory" static-max="$target_memory" >/dev/null
+fi
+if [ "$disk_mode" = "extend" ]; then
+  disk_uuid="$VRC_DISK_UUID"
+  target_disk_size="$VRC_DISK_SIZE_BYTES"
+  require_positive_integer "目标磁盘容量" "$target_disk_size"
+  attached="$(xe vbd-list vm-uuid="$vm_uuid" vdi-uuid="$disk_uuid" type=Disk params=uuid --minimal 2>/dev/null | clean_one_line)"
+  if [ -z "$disk_uuid" ] || [ -z "$attached" ]; then
+    echo "目标磁盘不属于当前虚拟机" >&2
+    exit 6
+  fi
+  old_disk_size="$(xe vdi-param-get uuid="$disk_uuid" param-name=virtual-size 2>/dev/null | clean_one_line)"
+  require_positive_integer "当前磁盘容量" "$old_disk_size"
+  if [ "$target_disk_size" -lt "$old_disk_size" ]; then
+    echo "不允许缩减磁盘：当前 $old_disk_size，目标 $target_disk_size" >&2
+    exit 4
+  fi
+  if [ "$target_disk_size" -gt "$old_disk_size" ]; then
+    if [ "$power_before" = "running" ] && [ "$stopped" != "true" ]; then
+      xe vdi-resize uuid="$disk_uuid" disk-size="$target_disk_size" online=true >/dev/null
+    else
+      xe vdi-resize uuid="$disk_uuid" disk-size="$target_disk_size" >/dev/null
+    fi
+    actual_disk_size="$(xe vdi-param-get uuid="$disk_uuid" param-name=virtual-size 2>/dev/null | clean_one_line)"
+    require_positive_integer "扩容后磁盘容量" "$actual_disk_size"
+    if [ "$actual_disk_size" -lt "$target_disk_size" ]; then
+      echo "磁盘扩容未生效：目标 $target_disk_size，平台回读 $actual_disk_size" >&2
+      exit 9
+    fi
+  fi
+elif [ "$disk_mode" = "add" ]; then
+  sr_uuid="$VRC_DISK_SR_UUID"
+  new_disk_size="$VRC_DISK_SIZE_BYTES"
+  require_positive_integer "新磁盘容量" "$new_disk_size"
+  if [ -z "$sr_uuid" ] || ! xe sr-param-get uuid="$sr_uuid" param-name=uuid >/dev/null 2>&1; then
+    echo "新增磁盘缺少有效的存储 SR" >&2
+    exit 6
+  fi
+  new_vdi="$(xe vdi-create name-label="$VRC_NEW_DISK_NAME" sr-uuid="$sr_uuid" virtual-size="$new_disk_size" type=user)"
+  if [ -z "$new_vdi" ]; then
+    echo "创建新 VDI 失败" >&2
+    exit 7
+  fi
+  used_devices=" $(xe vbd-list vm-uuid="$vm_uuid" type=Disk params=userdevice --minimal 2>/dev/null | tr ',' ' ') "
+  new_device=""
+  candidate="0"
+  while [ "$candidate" -le 15 ]; do
+    if ! printf '%s' "$used_devices" | grep -Eq "[[:space:]]$candidate[[:space:]]"; then
+      new_device="$candidate"
+      break
+    fi
+    candidate=$((candidate + 1))
+  done
+  if [ -z "$new_device" ]; then
+    xe vdi-destroy uuid="$new_vdi" >/dev/null 2>&1 || true
+    echo "虚拟机没有可用的磁盘设备位" >&2
+    exit 7
+  fi
+  new_vbd="$(xe vbd-create vm-uuid="$vm_uuid" vdi-uuid="$new_vdi" device="$new_device" bootable=false mode=RW type=Disk 2>/dev/null || true)"
+  if [ -z "$new_vbd" ]; then
+    xe vdi-destroy uuid="$new_vdi" >/dev/null 2>&1 || true
+    echo "挂载新 VDI 失败" >&2
+    exit 7
+  fi
+  if [ "$power_before" = "running" ] && [ "$stopped" != "true" ]; then
+    if ! xe vbd-plug uuid="$new_vbd" >/dev/null 2>&1; then
+      xe vbd-destroy uuid="$new_vbd" >/dev/null 2>&1 || true
+      xe vdi-destroy uuid="$new_vdi" >/dev/null 2>&1 || true
+      echo "运行中的虚拟机无法热挂载新磁盘，本次新建磁盘已回滚" >&2
+      exit 8
+    fi
+  fi
+elif [ -n "$disk_mode" ]; then
+  echo "不支持的磁盘扩容方式：$disk_mode" >&2
+  exit 2
+fi
+if [ "$stopped" = "true" ] && [ "$VRC_RESTART_AFTER_RESIZE" = "true" ]; then
+  xe vm-start uuid="$vm_uuid" >/dev/null
+  restarted="true"
+fi
+new_cpu="$(xe vm-param-get uuid="$vm_uuid" param-name=VCPUs-max 2>/dev/null | clean_one_line)"
+new_memory="$(xe vm-param-get uuid="$vm_uuid" param-name=memory-dynamic-max 2>/dev/null | clean_one_line)"
+power_after="$(xe vm-param-get uuid="$vm_uuid" param-name=power-state 2>/dev/null | clean_one_line)"
+printf 'OK\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vm_uuid" "$name" "$old_cpu" "$new_cpu" "$old_memory" "$new_memory" "$power_after" "$stopped" "$restarted"
 `;
 
 const VM_RENAME_SCRIPT = String.raw`
@@ -642,15 +852,6 @@ find_sr() {
   printf "%s" "$best_sr"
 }
 find_network() {
-  if [ -n "$VRC_NETWORK_NAME" ]; then
-    network="$(xe network-list name-label="$VRC_NETWORK_NAME" --minimal 2>/dev/null | first_uuid)"
-    if [ -n "$network" ] && is_network_attached_on_host "$network"; then
-      printf "%s" "$network"
-      return
-    fi
-    echo "指定网络不可用或未挂载到目标物理机：$VRC_NETWORK_NAME" >&2
-    exit 3
-  fi
   ip_prefix="$(printf "%s" "$VRC_IP" | awk -F. 'NF == 4 { printf "%s.%s.%s.", $1, $2, $3 }')"
   if [ -n "$ip_prefix" ] && [ -n "$VRC_HOST_UUID" ]; then
     for peer_vm in $(xe vm-list is-control-domain=false --minimal 2>/dev/null | tr ',' ' '); do
@@ -674,6 +875,15 @@ find_network() {
           ;;
       esac
     done
+  fi
+  if [ -n "$VRC_NETWORK_NAME" ]; then
+    network="$(xe network-list name-label="$VRC_NETWORK_NAME" --minimal 2>/dev/null | first_uuid)"
+    if [ -n "$network" ] && is_network_usable_on_host "$network"; then
+      printf "%s" "$network"
+      return
+    fi
+    echo "指定网络不可用或物理链路未连通：$VRC_NETWORK_NAME" >&2
+    exit 3
   fi
   while IFS='|' read -r prefix device; do
     if [ -z "$prefix" ] || [ -z "$device" ]; then
@@ -778,9 +988,19 @@ attach_iso() {
   fi
   xe vbd-create vm-uuid="$vm_uuid" vdi-uuid="$iso_uuid" device=3 bootable=true mode=RO type=CD >/dev/null
 }
+attach_iso_auto() {
+  vm_uuid="$1"
+  iso_uuid="$2"
+  bootable="$3"
+  cd_vbd="$(xe vbd-list vm-uuid="$vm_uuid" type=CD vdi-uuid="$iso_uuid" --minimal 2>/dev/null | first_uuid)"
+  if [ -n "$cd_vbd" ]; then
+    xe vbd-param-set uuid="$cd_vbd" bootable="$bootable" >/dev/null 2>&1 || true
+    return
+  fi
+  xe vbd-create vm-uuid="$vm_uuid" vdi-uuid="$iso_uuid" device=autodetect bootable="$bootable" mode=RO type=CD >/dev/null
+}
 should_use_unattended_install() {
-  template_name="$1"
-  printf "%s %s" "$template_name" "$VRC_ISO_NAME" | grep -qi "centos"
+  [ "$VRC_UNATTENDED_INSTALL" = "true" ]
 }
 prepare_unattended_install() {
   vm_uuid="$1"
@@ -792,9 +1012,32 @@ prepare_unattended_install() {
   require_value "网关" "$VRC_GATEWAY"
   require_value "DNS" "$VRC_DNS"
   require_value "root 密码" "$VRC_ROOT_PASSWORD"
+  if [ "$VRC_INSTALL_MEDIA_MODE" = "windows-unattended" ]; then
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=windows-unattended >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
+    return
+  fi
   if [ "$VRC_INSTALL_MEDIA_MODE" = "offline-iso" ]; then
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=offline-iso >/dev/null 2>&1 || true
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
+    return
+  fi
+  if [ "$VRC_INSTALL_MEDIA_MODE" = "native-http" ]; then
+    require_value "Kickstart URL" "$VRC_INSTALL_KS_URL"
+    require_value "安装源 URL" "$VRC_INSTALL_REPO_URL"
+    require_value "原生安装参数" "$VRC_INSTALL_ARGS"
+    install_args="$VRC_INSTALL_ARGS"
+    xe vm-param-set uuid="$vm_uuid" PV-bootloader=eliloader >/dev/null
+    # eliloader 会自动追加 other-config:install-args；PV-args 必须为空，避免网络参数被传入两次。
+    xe vm-param-set uuid="$vm_uuid" PV-args="" >/dev/null
+    xe vm-param-set uuid="$vm_uuid" other-config:install-repository="$VRC_INSTALL_REPO_URL" >/dev/null
+    xe vm-param-set uuid="$vm_uuid" other-config:install-distro=rhlike >/dev/null
+    xe vm-param-set uuid="$vm_uuid" other-config:install-arch=x86_64 >/dev/null
+    xe vm-param-set uuid="$vm_uuid" other-config:install-args="$install_args" >/dev/null
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=native-http >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-ks-url="$VRC_INSTALL_KS_URL" >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-repo-url="$VRC_INSTALL_REPO_URL" >/dev/null 2>&1 || true
     return
   fi
   # Provider 只消费 VRC 集中安装源 URL，不在 Dom0 生成 ks.cfg 或启动临时 HTTP 服务。
@@ -843,13 +1086,15 @@ fi
 vrc_timing_start "find-network"
 network_uuid="$(find_network)"
 vrc_timing_end
-require_value "ISO UUID" "$VRC_ISO_UUID"
-vrc_timing_start "verify-iso"
-if ! xe vdi-param-get uuid="$VRC_ISO_UUID" param-name=name-label >/dev/null 2>&1; then
-  echo "未找到 ISO：$VRC_ISO_UUID" >&2
-  exit 3
+if [ "$VRC_INSTALL_MEDIA_MODE" != "native-http" ]; then
+  require_value "ISO UUID" "$VRC_ISO_UUID"
+  vrc_timing_start "verify-iso"
+  if ! xe vdi-param-get uuid="$VRC_ISO_UUID" param-name=name-label >/dev/null 2>&1; then
+    echo "未找到 ISO：$VRC_ISO_UUID" >&2
+    exit 3
+  fi
+  vrc_timing_end
 fi
-vrc_timing_end
 vrc_timing_start "find-template"
 template_name="$(find_template)"
 vrc_timing_end
@@ -879,12 +1124,24 @@ vrc_timing_start "ensure-network"
 ensure_network "$vm_uuid" "$network_uuid"
 vrc_timing_end
 vrc_timing_start "boot-params"
-xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
-prepare_unattended_install "$vm_uuid" "$template_name"
-if should_use_unattended_install "$template_name"; then
+if [ "$VRC_INSTALL_MEDIA_MODE" = "native-http" ]; then
+  xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="" >/dev/null
+  prepare_unattended_install "$vm_uuid" "$template_name"
+elif [ "$VRC_INSTALL_MEDIA_MODE" = "windows-unattended" ]; then
+  xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
+  prepare_unattended_install "$vm_uuid" "$template_name"
+  # XenServer 6.5 必须自动分配光驱设备；固定 3/4/5 会让 Windows Setup 看不到应答盘。
+  attach_iso_auto "$vm_uuid" "$VRC_ISO_UUID" true
+  [ -n "$VRC_AUX_ISO_UUID" ] && attach_iso_auto "$vm_uuid" "$VRC_AUX_ISO_UUID" false
+  # Tools 只在 WinRM 就绪后换盘挂载，避免第三张光盘挤掉任务级应答介质。
+  xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=true >/dev/null 2>&1 || true
+elif should_use_unattended_install "$template_name"; then
+  xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
+  prepare_unattended_install "$vm_uuid" "$template_name"
   attach_iso "$vm_uuid" "$VRC_ISO_UUID"
   xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false >/dev/null 2>&1 || true
 else
+  xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
   attach_iso "$vm_uuid" "$VRC_ISO_UUID"
   xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc >/dev/null 2>&1 || true
 fi
@@ -893,12 +1150,6 @@ power="halted"
 if [ "$VRC_AUTO_START" = "true" ]; then
   vrc_timing_start "vm-start"
   xe vm-start uuid="$vm_uuid" >/dev/null
-  if should_use_unattended_install "$template_name"; then
-    (
-      sleep 180
-      xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=c >/dev/null 2>&1 || true
-    ) >/dev/null 2>&1 &
-  fi
   vrc_timing_end
   power="running"
 fi
@@ -951,9 +1202,13 @@ if [ -z "$sr_list" ]; then
   sr_list="$(xe sr-list --minimal 2>/dev/null | tr ',' ' ')"
 fi
 found="0"
+emitted=","
 emit_iso() {
   vdi="$1"
   sr_filter="$2"
+  case "$emitted" in
+    *",$vdi,"*) return ;;
+  esac
   label="$(xe vdi-param-get uuid="$vdi" param-name=name-label 2>/dev/null | clean_one_line)"
   virtual_size="$(xe vdi-param-get uuid="$vdi" param-name=virtual-size 2>/dev/null | clean_one_line)"
   physical_used="$(xe vdi-param-get uuid="$vdi" param-name=physical-utilisation 2>/dev/null | clean_one_line)"
@@ -965,16 +1220,34 @@ emit_iso() {
   sr_name=""
   sr_desc=""
   sr_shared=""
+  sr_type=""
+  host_uuid=""
+  source_type="iso-library"
+  volume_label=""
   if [ -n "$sr_uuid" ] && [ "$sr_uuid" != "<not in database>" ]; then
     sr_name="$(xe sr-param-get uuid="$sr_uuid" param-name=name-label 2>/dev/null | clean_one_line)"
     sr_desc="$(xe sr-param-get uuid="$sr_uuid" param-name=name-description 2>/dev/null | clean_one_line)"
     sr_shared="$(xe sr-param-get uuid="$sr_uuid" param-name=shared 2>/dev/null | clean_one_line)"
+    sr_type="$(xe sr-param-get uuid="$sr_uuid" param-name=type 2>/dev/null | clean_one_line)"
+  fi
+  if [ "$sr_type" = "udev" ] && printf '%s %s' "$sr_name" "$sr_desc" | grep -qi 'dvd'; then
+    source_type="host-dvd"
+    host_uuid="$(xe pbd-list sr-uuid="$sr_uuid" params=host-uuid --minimal 2>/dev/null | tr ',' '\n' | head -1 | clean_one_line)"
+    if [ -n "$VRC_HOST_UUID" ] && [ -n "$host_uuid" ] && [ "$host_uuid" != "$VRC_HOST_UUID" ]; then
+      return
+    fi
+    if [ -n "$location" ] && [ -r "$location" ]; then
+      volume_label="$(blkid -o value -s LABEL "$location" 2>/dev/null | clean_one_line)"
+    fi
+  elif printf '%s %s' "$sr_name" "$sr_desc" | grep -qi 'xenserver tools'; then
+    source_type="tools"
   fi
   if [ -z "$label" ] && [ -n "$location" ]; then
     label="$location"
   fi
   if [ -n "$label" ] || [ -n "$location" ]; then
-    printf 'ISO\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vdi" "$label" "$(num_or_zero "$virtual_size")" "$sr_uuid" "$sr_name" "$sr_desc" "$sr_shared" "$location" "$(num_or_zero "$physical_used")"
+    printf 'ISO\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vdi" "$label" "$(num_or_zero "$virtual_size")" "$sr_uuid" "$sr_name" "$sr_desc" "$sr_shared" "$location" "$(num_or_zero "$physical_used")" "$source_type" "$volume_label" "$host_uuid"
+    emitted="$emitted$vdi,"
     found="1"
   fi
 }
@@ -992,13 +1265,13 @@ for sr in $sr_list; do
     emit_iso "$cd" "$sr"
   done
 done
+# cd-list also exposes physical optical media and XenServer 6.x ISO entries.
+for cd in $(xe cd-list --minimal 2>/dev/null | tr ',' ' '); do
+  emit_iso "$cd" ""
+done
 if [ "$found" != "1" ]; then
-  vdi_list="$(xe vdi-list type=iso --minimal 2>/dev/null | tr ',' ' ')"
-  for vdi in $vdi_list; do
+  for vdi in $(xe vdi-list type=iso --minimal 2>/dev/null | tr ',' ' '); do
     emit_iso "$vdi" ""
-  done
-  for cd in $(xe cd-list --minimal 2>/dev/null | tr ',' ' '); do
-    emit_iso "$cd" ""
   done
 fi
 `;
@@ -1113,7 +1386,11 @@ if [ -z "$wait_seconds" ]; then
 fi
 deadline=$(( $(date +%s) + wait_seconds ))
 while true; do
-  location="$(xe console-list vm-uuid="$VRC_VM_UUID" params=location --minimal 2>/dev/null | tr ',' '\n' | head -1 | clean_one_line)"
+  console_uuid="$(xe console-list vm-uuid="$VRC_VM_UUID" protocol=RFB --minimal 2>/dev/null | tr ',' '\n' | head -1 | clean_one_line)"
+  location=""
+  if [ -n "$console_uuid" ]; then
+    location="$(xe console-param-get uuid="$console_uuid" param-name=location 2>/dev/null | clean_one_line)"
+  fi
   if [ -n "$location" ]; then
     printf "%s" "$location"
     exit 0
@@ -1225,8 +1502,14 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     return parseVirtualDisks(await runRemoteScript(input, VIRTUAL_DISKS_SCRIPT));
   }
 
-  async listIsoImages(input: XenConnectionInput, _scope: ProviderScope = {}): Promise<IsoImage[]> {
-    return parseIsoImages(await runRemoteScript(input, ISO_IMAGES_SCRIPT));
+  async listIsoImages(input: XenConnectionInput, scope: ProviderScope = {}): Promise<IsoImage[]> {
+    return parseIsoImages(
+      await runRemoteScript(input, ISO_IMAGES_SCRIPT, {
+        env: {
+          VRC_HOST_UUID: scope.hostId ? sanitizeUuid(scope.hostId) : "",
+        },
+      }),
+    );
   }
 
   async listVmSnapshots(_input: XenConnectionInput, _vmId: string): Promise<VmSnapshot[]> {
@@ -1293,6 +1576,54 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     };
   }
 
+  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeRequest): Promise<VmResizeResult> {
+    const disksBefore = request.disk ? await this.listVmDisks(input, vmId) : [];
+    const targetDisk = request.disk?.mode === "extend"
+      ? disksBefore.find((disk) => disk.id === request.disk?.diskId || disk.providerId === request.disk?.diskId)
+      : undefined;
+    const platformDiskRequest =
+      request.disk?.mode === "extend" && targetDisk && request.disk.sizeBytes <= targetDisk.virtualSizeBytes
+        ? undefined
+        : request.disk;
+    const output = await runRemoteScript(input, VM_RESIZE_SCRIPT, {
+      env: {
+        VRC_VM_UUID: sanitizeUuid(vmId),
+        VRC_CPU_TARGET: request.cpuCount ? String(Math.floor(request.cpuCount)) : "",
+        VRC_MEMORY_TARGET_BYTES: request.memoryBytes ? String(Math.floor(request.memoryBytes)) : "",
+        VRC_DISK_MODE: platformDiskRequest?.mode ?? "",
+        VRC_DISK_UUID: platformDiskRequest?.mode === "extend" ? sanitizeUuid(platformDiskRequest.diskId) : "",
+        VRC_DISK_SR_UUID: platformDiskRequest?.mode === "add" ? sanitizeUuid(platformDiskRequest.storageRepositoryId) : "",
+        VRC_DISK_SIZE_BYTES: platformDiskRequest ? String(Math.floor(platformDiskRequest.sizeBytes)) : "",
+        VRC_DISK_ONLINE_RESIZE_SUPPORTED: targetDisk?.onlineResizeSupported ? "true" : "false",
+        VRC_NEW_DISK_NAME: sanitizePlainText(request.disk?.name) || "VRC data disk",
+        VRC_ALLOW_SHUTDOWN: request.allowShutdown ? "true" : "false",
+        VRC_RESTART_AFTER_RESIZE: request.restartAfterResize ? "true" : "false",
+      },
+    });
+    const line = output
+      .trim()
+      .split(/\r?\n/)
+      .find((item) => item.startsWith("OK\t"));
+    if (!line) throw new Error("XenServer 已执行扩容命令，但没有返回可验证结果");
+    const [, resultVmId = vmId, name = vmId, oldCpu = "0", newCpu = "0", oldMemory = "0", newMemory = "0", , stopped = "false", restarted = "false"] = line.split("\t");
+    const disks = await this.listVmDisks(input, vmId);
+    const result: VmResizeResult = {
+      vmId: resultVmId,
+      name,
+      accepted: true,
+      previousCpuCount: parseNumber(oldCpu),
+      cpuCount: parseNumber(newCpu),
+      previousMemoryBytes: parseNumber(oldMemory),
+      memoryBytes: parseNumber(newMemory),
+      disks,
+      stopped: stopped === "true",
+      restarted: restarted === "true",
+      message: `扩容完成：${name}`,
+    };
+    assertXenResizeApplied(request, disksBefore, result);
+    return result;
+  }
+
   async createVms(input: XenConnectionInput, request: VmProvisionRequest, reporter?: ProvisionProgressReporter): Promise<VmProvisionResult> {
     if (request.sourceType === "template") {
       throw new Error("XenServer 当前不使用克隆源策略；请选择 VRC 创建模板中的 ISO/Kickstart 策略。");
@@ -1300,10 +1631,19 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     if (request.sourceType === "iso" && !request.isoId) {
       throw new Error("XenServer ISO 安装需要选择系统镜像。");
     }
-    const isoName = request.sourceType === "iso" ? request.isoName?.trim() || request.templateName?.trim() || request.isoId || "" : "";
+    const selectedIso = request.sourceType === "iso" && request.isoId
+      ? (await this.listIsoImages(input, { hostId: request.hostId })).find((image) => image.providerId === request.isoId || image.id === request.isoId)
+      : undefined;
+    const isoName = request.sourceType === "iso"
+      ? selectedIso?.name || request.isoName?.trim() || request.templateName?.trim() || request.isoId || ""
+      : "";
+    if (request.sourceType === "iso" && isXenGuestToolsIsoName(selectedIso?.name || selectedIso?.path || isoName)) {
+      throw new Error(`${isoName} 是 XenServer 监控工具盘，不能用于安装操作系统。请先接入或选择系统安装 ISO。`);
+    }
+    if (selectedIso?.sourceType === "host-dvd" && (!request.hostId || selectedIso.hostId !== request.hostId)) {
+      throw new Error(`${isoName} 位于宿主机本地 DVD，必须在所属物理机上创建虚拟机。`);
+    }
     const created: VmProvisionCreatedVm[] = [];
-    const shouldUseUnattendedIso = shouldUseXenCentosUnattendedIso(request, isoName);
-    const installMediaMode = resolveXenInstallMediaMode();
     for (const item of request.planItems) {
       const macAddress = macAddressForProvisionItem(item);
       reporter?.updateVm(item.name, {
@@ -1311,38 +1651,25 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
         currentStep: "create-vm",
         message: "准备 XenServer VM 创建参数",
       });
-      // XenServer Provider 属于平台策略层；无人值守安装源必须由 Provisioning 编排层提前发布。
-      if (shouldUseUnattendedIso && installMediaMode === "http-boot-iso" && !item.installSource) {
+      const preparedMedia = await prepareXenInstallMedia({
+        connection: input,
+        request,
+        item,
+        sourceIsoName: isoName,
+        sourceType: selectedIso?.sourceType,
+        macAddress,
+        reporter,
+      });
+      if (preparedMedia.requiresInstallSource && !item.installSource) {
         throw new Error("XenServer Kickstart 安装缺少集中安装源，请先发布安装源后再创建 VM。");
       }
       const isoStartedAt = Date.now();
-      const provisionIso =
-        request.sourceType === "iso" && shouldUseUnattendedIso && request.isoId && installMediaMode !== "cdrom-http-ks"
-          ? await prepareXenCentosUnattendedIso({
-              connection: input,
-              sourceIsoId: request.isoId,
-              sourceIsoName: isoName,
-              hostId: request.hostId,
-              vm: item,
-              ipPool: request.ipPool,
-              macAddress,
-              installSource: item.installSource,
-              onProgress: (message) => {
-                reporter?.markStep("create-vm", "running", `${item.name}：${message}`);
-                reporter?.updateVm(item.name, {
-                  status: "running",
-                  currentStep: "create-vm",
-                  message,
-                });
-              },
-            })
-          : { isoId: request.isoId ?? "", isoName };
       reporter?.recordTiming?.("xenserver-prepare-install-media", Date.now() - isoStartedAt, {
         vmName: item.name,
-        installMediaMode,
-        generatedIso: provisionIso.isoId !== (request.isoId ?? ""),
+        installMediaMode: preparedMedia.installMediaMode,
+        generatedIso: Boolean(preparedMedia.auxiliaryIsoId),
       });
-      if (shouldUseUnattendedIso && installMediaMode === "cdrom-http-ks") {
+      if (preparedMedia.unattended && preparedMedia.installMediaMode === "cdrom-http-ks") {
         reporter?.markStep("create-vm", "running", `${item.name}：复用原始 ISO，通过物理机 HTTP 拉取 Kickstart`);
         reporter?.updateVm(item.name, {
           status: "running",
@@ -1369,12 +1696,23 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
             VRC_ROOT_PASSWORD: sanitizePlainText(item.rootPassword),
             VRC_LOGIN_USERNAME: sanitizePlainText(item.loginUsername),
             VRC_HOST_UUID: sanitizeUuid(request.hostId),
-            VRC_ISO_UUID: sanitizeUuid(provisionIso.isoId),
-            VRC_ISO_NAME: sanitizePlainText(provisionIso.isoName),
+            VRC_ISO_UUID: sanitizeUuid(preparedMedia.originalIsoId),
+            VRC_ISO_NAME: sanitizePlainText(preparedMedia.originalIsoName),
+            VRC_AUX_ISO_UUID: sanitizeUuid(preparedMedia.auxiliaryIsoId),
             VRC_INSTALL_REPO_URL: sanitizeUrl(item.installSource?.repoUrl),
             VRC_INSTALL_KS_URL: sanitizeUrl(item.installSource?.ksUrl),
+            VRC_INSTALL_ARGS:
+              preparedMedia.installMediaMode === "native-http"
+                ? buildXenNativeInstallArgs({
+                    ksUrl: sanitizeUrl(item.installSource?.ksUrl),
+                    ip: item.ip,
+                    gateway: request.ipPool.gateway,
+                    netmask: cidrToNetmask(request.ipPool.cidr) || "255.255.255.0",
+                  })
+                : "",
             VRC_SOURCE_ISO_UUID: "",
-            VRC_INSTALL_MEDIA_MODE: installMediaMode,
+            VRC_INSTALL_MEDIA_MODE: preparedMedia.installMediaMode,
+            VRC_UNATTENDED_INSTALL: preparedMedia.unattended ? "true" : "false",
             VRC_MAC: sanitizeMac(macAddress),
             VRC_TEMPLATE_NAME: xenTemplateNameForProvision(request),
             VRC_CPU: String(Math.max(Math.floor(item.cpu), 1)),
@@ -1385,24 +1723,24 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
           },
         });
       } catch (error) {
-        if (provisionIso.registryId) {
-          await cleanupRegisteredXenGeneratedIso(input, provisionIso.registryId).catch(() => undefined);
+        if (preparedMedia.generatedIsoRegistryId) {
+          await cleanupRegisteredXenGeneratedIso(input, preparedMedia.generatedIsoRegistryId).catch(() => undefined);
         }
         throw error;
       }
       const createScriptElapsedMs = Date.now() - createScriptStartedAt;
       reporter?.recordTiming?.("xenserver-create-script-total", createScriptElapsedMs, {
         vmName: item.name,
-        installMediaMode,
+        installMediaMode: preparedMedia.installMediaMode,
       });
       for (const timing of parseProvisionScriptTimings(output)) {
         reporter?.recordTiming?.(`xenserver-create-script:${timing.phase}`, timing.elapsedMs, {
           vmName: item.name,
-          installMediaMode,
+          installMediaMode: preparedMedia.installMediaMode,
         });
       }
       const createdVm = parseCreatedVm(output, item);
-      createdVm.generatedIsoRegistryId = provisionIso.registryId;
+      createdVm.generatedIsoRegistryId = preparedMedia.generatedIsoRegistryId;
       reporter?.updateVm(item.name, {
         id: createdVm.id,
         providerId: createdVm.providerId,
@@ -1417,7 +1755,7 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     return {
       accepted: true,
       providerType: this.type,
-      message: shouldUseUnattendedIso
+      message: created.some((vm) => Boolean(vm.generatedIsoRegistryId))
         ? `XenServer 一键安装任务已提交：${created.length} 台 VM`
         : `XenServer ISO 创建任务已提交：${created.length} 台 VM`,
       created,
@@ -1468,12 +1806,19 @@ function xenActionLabel(action: VmPowerAction) {
 function xenTemplateNameForProvision(request: VmProvisionRequest) {
   const sourceName = `${request.isoName ?? ""} ${request.templateName ?? ""} ${request.isoId ?? ""}`.toLowerCase();
   if (sourceName.includes("centos")) return "CentOS 7";
+  if (sourceName.includes("2008") && sourceName.includes("windows")) return "Windows Server 2008 R2 (64-bit)";
+  if (sourceName.includes("2012") && sourceName.includes("windows")) return "Windows Server 2012 R2 (64-bit)";
   return "Other install media";
 }
 
 function shouldUseXenCentosUnattendedIso(request: VmProvisionRequest, isoName: string): boolean {
   const sourceName = `${isoName} ${request.templateName ?? ""} ${request.isoId ?? ""}`.toLowerCase();
   return request.sourceType === "iso" && sourceName.includes("centos");
+}
+
+function shouldUseXenWindowsUnattended(request: VmProvisionRequest, isoName: string): boolean {
+  const sourceName = `${isoName} ${request.templateName ?? ""} ${request.isoId ?? ""}`.toLowerCase();
+  return request.sourceType === "iso" && request.installStrategy === "windows-unattended" && sourceName.includes("windows");
 }
 
 function parseCreatedVm(output: string, fallback: { name: string; ip: string }): VmProvisionCreatedVm {
@@ -1648,7 +1993,7 @@ function parseVmList(output: string, connectionId: string): VmNode[] {
         diskSizeSummary: cols[9] || undefined,
         hostId: cols[10] || undefined,
         ipAddresses: cols[11] ? [cols[11]] : [],
-        guestOs: cols[12] || undefined,
+        guestOs: normalizeGuestOsLabel(cols[12]),
         toolsStatus: "unknown",
         reclaimLevel: "P3",
         reclaimReason: "",
@@ -1702,10 +2047,13 @@ function parseVmDisks(output: string): VmDisk[] {
         device: cols[3] ?? "",
         name: cols[4] ?? "",
         virtualSizeBytes: parseNumber(cols[5]),
-        storageRepository: cols[6] || undefined,
+        storageRepositoryId: cols[6] || undefined,
+        storageRepository: cols[7] || undefined,
+        onlineResizeSupported: parseBool(cols[8]),
       };
     })
-    .filter((disk) => disk.id);
+    .filter((disk) => disk.id)
+    .sort((left, right) => left.device.localeCompare(right.device, "zh-CN", { numeric: true, sensitivity: "base" }));
 }
 
 function parseVirtualDisks(output: string): VirtualDisk[] {
@@ -1730,30 +2078,67 @@ function parseVirtualDisks(output: string): VirtualDisk[] {
     .filter((disk) => disk.id);
 }
 
-function parseIsoImages(output: string): IsoImage[] {
+export function parseIsoImages(output: string): IsoImage[] {
   return output
     .split(/\r?\n/)
     .filter((line) => line.startsWith("ISO\t"))
     .map((line) => {
       const cols = line.split("\t");
       const providerId = cols[1] ?? "";
+      const sourceType: NonNullable<IsoImage["sourceType"]> = cols[10] === "host-dvd" || cols[10] === "tools" ? cols[10] : "iso-library";
+      const volumeLabel = cols[11]?.trim() || "";
       return {
         id: providerId,
         providerId,
-        name: cols[2] || cols[8] || providerId,
+        name: sourceType === "host-dvd" && volumeLabel ? volumeLabel : cols[2] || cols[8] || providerId,
+        sourceType,
         sizeBytes: parseNumber(cols[3]),
         storageRepositoryId: cols[4] || undefined,
         storageRepository: cols[5] || "",
         shared: parseBool(cols[7]),
         path: cols[8] || undefined,
+        hostId: cols[12] || undefined,
         metadata: {
           srDescription: cols[6] || undefined,
           physicalUtilisationBytes: parseNumber(cols[9]),
+          volumeLabel: volumeLabel || undefined,
+          deviceName: sourceType === "host-dvd" ? cols[2] || undefined : undefined,
         },
       };
     })
     .filter((image) => image.id && isXenInstallMedia(image))
     .sort(compareXenInstallMedia);
+}
+
+export function resolveXenProvisionInstallMediaMode(
+  sourceType: IsoImage["sourceType"],
+  configuredMode: XenInstallMediaMode = resolveXenInstallMediaMode(),
+): XenInstallMediaMode {
+  return sourceType === "host-dvd" ? "native-http" : configuredMode;
+}
+
+export function shouldPrepareXenUnattendedIso(installMediaMode: XenInstallMediaMode): boolean {
+  return installMediaMode === "http-boot-iso" || installMediaMode === "offline-iso";
+}
+
+export function buildXenNativeInstallArgs(input: {
+  ksUrl: string;
+  ip: string;
+  gateway: string;
+  netmask: string;
+}): string {
+  return [
+    `inst.ks=${input.ksUrl.trim()}`,
+    "inst.text",
+    "rd.neednet=1",
+    "net.ifnames=0",
+    "biosdevname=0",
+    `ip=${input.ip.trim()}::${input.gateway.trim()}:${input.netmask.trim()}:vrc:eth0:none`,
+    "bootdev=eth0",
+    "ksdevice=eth0",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function isXenInstallMedia(image: IsoImage): boolean {
@@ -1766,7 +2151,7 @@ function isXenInstallMedia(image: IsoImage): boolean {
   if (name.startsWith("old version of ")) return false;
   if (name === "xencenter.iso" || path === "xencenter.iso") return false;
   if (isGeneratedProvisioningIso(filename)) return false;
-  if (repository.includes("dvd drives") && !path.endsWith(".iso")) return false;
+  if (image.sourceType === "host-dvd") return (image.sizeBytes ?? 0) > 0;
   if (repository.includes("xenserver tools")) {
     return name === "xs-tools.iso" || name === "guest-tools.iso" || path.endsWith("xs-tools.iso") || path.endsWith("guest-tools.iso");
   }
@@ -2019,6 +2404,39 @@ function escapeShellValue(value: string): string {
 function clampPageSize(pageSize: number | undefined): number {
   if (!pageSize) return 100;
   return Math.min(Math.max(pageSize, 1), 500);
+}
+
+export function assertXenResizeApplied(request: VmResizeRequest, disksBefore: VmDisk[], result: VmResizeResult): void {
+  if (request.cpuCount && result.cpuCount < request.cpuCount) {
+    throw new Error(`CPU 扩容未生效：目标 ${request.cpuCount} vCPU，平台回读 ${result.cpuCount} vCPU`);
+  }
+  if (request.memoryBytes && result.memoryBytes < request.memoryBytes) {
+    throw new Error(`内存扩容未生效：目标 ${request.memoryBytes} 字节，平台回读 ${result.memoryBytes} 字节`);
+  }
+  if (!request.disk) return;
+
+  if (request.disk.mode === "extend") {
+    const resizedDisk = result.disks.find(
+      (disk) => disk.id === request.disk?.diskId || disk.providerId === request.disk?.diskId,
+    );
+    if (!resizedDisk) {
+      throw new Error("磁盘扩容后未能回读目标磁盘");
+    }
+    if (resizedDisk.virtualSizeBytes < request.disk.sizeBytes) {
+      throw new Error(
+        `磁盘扩容未生效：目标 ${request.disk.sizeBytes} 字节，平台回读 ${resizedDisk.virtualSizeBytes} 字节`,
+      );
+    }
+    return;
+  }
+
+  const previousDiskIds = new Set(disksBefore.flatMap((disk) => [disk.id, disk.providerId]));
+  const addedDisk = result.disks.find(
+    (disk) => !previousDiskIds.has(disk.id) && !previousDiskIds.has(disk.providerId) && disk.virtualSizeBytes >= request.disk!.sizeBytes,
+  );
+  if (!addedDisk) {
+    throw new Error("新增磁盘未生效：平台回读结果中没有找到新磁盘");
+  }
 }
 
 function parseNumber(value: string | undefined): number {

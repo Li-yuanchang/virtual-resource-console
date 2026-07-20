@@ -47,11 +47,40 @@ function defaultProvisioningConfig(): ProvisioningConfig {
         sourceType: "iso",
         isoNamePattern: "CentOS-7-x86_64-DVD-1511.iso",
         specId: "linux-standard",
-        ipPoolId: "xenserver-192-168-127",
+        ipPoolId: "",
         vmNamePrefix: "centos7",
         autoStart: true,
         installStrategy: "kickstart",
+        installProfile: "server",
         description: "按 IP 池生成 root 密码，执行无人值守安装并验收 SSH 启动。",
+      },
+      {
+        id: "xenserver-windows-2008-r2-standard",
+        name: "XenServer Windows Server 2008 R2 标准环境",
+        providerType: "xenserver",
+        sourceType: "iso",
+        isoNamePattern: "cn_windows_server_2008_r2_standard_enterprise_datacenter_and_web_with_sp1_x64_dvd_617598.iso",
+        specId: "windows-standard",
+        ipPoolId: "",
+        vmNamePrefix: "win2008",
+        autoStart: true,
+        installStrategy: "windows-unattended",
+        installProfile: "server",
+        description: "使用任务级 Windows 无人值守启动 ISO 和 XenServer Tools 完成自动安装与验收。",
+      },
+      {
+        id: "xenserver-windows-2012-r2-standard",
+        name: "XenServer Windows Server 2012 R2 标准环境",
+        providerType: "xenserver",
+        sourceType: "iso",
+        isoNamePattern: "cn_windows_server_2012_r2_vl_with_update_x64_dvd_6052729(1).iso",
+        specId: "windows-standard",
+        ipPoolId: "",
+        vmNamePrefix: "win2012",
+        autoStart: true,
+        installStrategy: "windows-unattended",
+        installProfile: "server",
+        description: "使用任务级 Windows 无人值守启动 ISO 和 XenServer Tools 完成自动安装与验收。",
       },
       {
         id: "vmware-centos7-standard",
@@ -64,6 +93,7 @@ function defaultProvisioningConfig(): ProvisioningConfig {
         vmNamePrefix: "vmware-linux",
         autoStart: true,
         installStrategy: "kickstart",
+        installProfile: "server",
         description: "使用 ESXi Datastore 原版 ISO 与任务级 Kickstart 启动 ISO 执行无人值守安装。",
       },
       {
@@ -77,6 +107,7 @@ function defaultProvisioningConfig(): ProvisioningConfig {
         vmNamePrefix: "openeuler",
         autoStart: true,
         installStrategy: "kickstart",
+        installProfile: "server",
         description: "使用 PVE 宿主机原版 openEuler ARM ISO 与任务级 Kickstart 介质执行无人值守安装。",
       },
       {
@@ -90,7 +121,22 @@ function defaultProvisioningConfig(): ProvisioningConfig {
         vmNamePrefix: "kylin",
         autoStart: true,
         installStrategy: "kickstart",
+        installProfile: "server",
         description: "使用 PVE 宿主机原版 Kylin Server ARM ISO 与任务级 Kickstart 介质执行无人值守安装。",
+      },
+      {
+        id: "pve-kylin-kickstart-desktop",
+        name: "PVE Kylin ARM 桌面环境",
+        providerType: "proxmox",
+        sourceType: "iso",
+        isoNamePattern: "Kylin-Server-V10-SP3-2403-Release-20240426-arm64.iso",
+        specId: "linux-standard",
+        ipPoolId: "",
+        vmNamePrefix: "kylin-desktop",
+        autoStart: true,
+        installStrategy: "kickstart",
+        installProfile: "desktop",
+        description: "按所选麒麟 ISO 的桌面环境组安装 UKUI 图形界面。",
       },
     ],
     specTemplates: [
@@ -162,13 +208,21 @@ function normalizeEnvironmentTemplate(
     isoNamePattern: item.isoNamePattern?.trim() || undefined,
     platformTemplateName: item.platformTemplateName?.trim() || undefined,
     specId: item.specId?.trim() || "linux-standard",
-    ipPoolId: item.ipPoolId?.trim() || "",
+    ipPoolId: normalizeTemplateIpPoolId(item.ipPoolId),
     vmNamePrefix: item.vmNamePrefix?.trim() || "vm",
     autoStart: item.autoStart !== false,
     installStrategy:
-      item.installStrategy === "template-clone" || item.installStrategy === "manual-iso" ? item.installStrategy : "kickstart",
+      item.installStrategy === "template-clone" || item.installStrategy === "windows-unattended" || item.installStrategy === "manual-iso"
+        ? item.installStrategy
+        : "kickstart",
+    installProfile: item.installProfile === "desktop" ? "desktop" : "server",
     description: item.description?.trim() || undefined,
   };
+}
+
+function normalizeTemplateIpPoolId(value: string | undefined): string {
+  const ipPoolId = value?.trim() || "";
+  return ipPoolId === "xenserver-192-168-127" ? "" : ipPoolId;
 }
 
 function normalizeSpecTemplate(item: ProvisioningSpecTemplate | ProvisioningSpecTemplateInput): ProvisioningSpecTemplate {

@@ -115,13 +115,14 @@ export function subscribeProvisionTask(taskId: string, listener: (task: Provisio
 
 export function markProvisionTaskStep(taskId: string, stepKey: ProvisionTaskStepKey, status: ProvisionTaskStepStatus, message?: string): ProvisionTask | undefined {
   const now = new Date().toISOString();
+  // Step failure/warning is emitted first; only finishProvisionTask may close the task event stream.
   return patchProvisionTask(taskId, (task) => ({
     ...task,
-    status: status === "failed" ? "failed" : status === "running" ? "running" : task.status,
+    status: status === "running" ? "running" : task.status,
     currentStep: stepKey,
     message: message || task.message,
     updatedAt: now,
-    finishedAt: status === "failed" ? now : task.finishedAt,
+    finishedAt: task.finishedAt,
     steps: task.steps.map((step) =>
       step.key === stepKey
         ? {
@@ -129,7 +130,7 @@ export function markProvisionTaskStep(taskId: string, stepKey: ProvisionTaskStep
             status,
             message,
             startedAt: status === "running" ? step.startedAt || now : step.startedAt,
-            finishedAt: status === "success" || status === "failed" || status === "skipped" ? now : step.finishedAt,
+            finishedAt: status === "success" || status === "warning" || status === "failed" || status === "skipped" ? now : step.finishedAt,
           }
         : step,
     ),
@@ -144,7 +145,7 @@ export function markProvisionTaskStepIfUnfinished(
 ): ProvisionTask | undefined {
   const task = getProvisionTask(taskId);
   const step = task?.steps.find((item) => item.key === stepKey);
-  if (!step || ["success", "failed", "skipped"].includes(step.status)) return task;
+  if (!step || ["success", "warning", "failed", "skipped"].includes(step.status)) return task;
   return markProvisionTaskStep(taskId, stepKey, status, message);
 }
 
@@ -178,12 +179,12 @@ export function updateProvisionTaskVm(taskId: string, vmName: string, patch: Par
   }));
 }
 
-export function finishProvisionTask(taskId: string, status: "success" | "failed", message: string): ProvisionTask | undefined {
+export function finishProvisionTask(taskId: string, status: "success" | "warning" | "failed", message: string): ProvisionTask | undefined {
   const now = new Date().toISOString();
   return patchProvisionTask(taskId, (task) => ({
     ...task,
     status,
-    currentStep: status === "success" ? "complete" : task.currentStep,
+    currentStep: status === "success" || status === "warning" ? "complete" : task.currentStep,
     message,
     updatedAt: now,
     finishedAt: now,
@@ -201,11 +202,11 @@ export function finishProvisionTask(taskId: string, status: "success" | "failed"
     vms: task.vms.map((vm) => ({
       ...vm,
       status: vm.status === "success" || vm.status === "failed" ? vm.status : status,
-      currentStep: vm.status === "success" || vm.status === "failed" ? vm.currentStep : status === "success" ? "complete" : vm.currentStep,
+      currentStep: vm.status === "success" || vm.status === "failed" ? vm.currentStep : status === "success" || status === "warning" ? "complete" : vm.currentStep,
       progressPercent:
         vm.status === "success" || vm.status === "failed"
           ? vm.progressPercent
-          : status === "success"
+          : status === "success" || status === "warning"
             ? 100
             : calculateProvisionStepProgress(vm.currentStep ?? task.currentStep, status),
       message: vm.message || message,
@@ -260,10 +261,10 @@ function normalizeProvisionTask(task: StoredProvisionTask): ProvisionTask {
 }
 
 function calculateProvisionTaskProgress(task: StoredProvisionTask): number {
-  if (task.status === "success") return 100;
+  if (task.status === "success" || task.status === "warning") return 100;
   const completedWeight = task.steps.reduce((sum, step) => {
     const weight = provisionStepWeights[step.key] ?? 0;
-    if (step.status === "success" || step.status === "skipped") return sum + weight;
+    if (step.status === "success" || step.status === "warning" || step.status === "skipped") return sum + weight;
     if (step.status === "running" || step.status === "failed") return sum + weight * 0.5;
     return sum;
   }, 0);
@@ -280,7 +281,7 @@ function calculateProvisionTaskProgress(task: StoredProvisionTask): number {
 }
 
 function calculateProvisionStepProgress(stepKey: ProvisionTaskStepKey, status: ProvisionTask["status"]): number {
-  if (status === "success") return 100;
+  if (status === "success" || status === "warning") return 100;
   const orderedKeys = taskSteps.map((step) => step.key);
   const currentIndex = Math.max(orderedKeys.indexOf(stepKey), 0);
   const completedBefore = orderedKeys.slice(0, currentIndex).reduce((sum, key) => sum + (provisionStepWeights[key] ?? 0), 0);

@@ -19,6 +19,10 @@ const fileUploadTimeoutPerMiBMs = 2_500;
 const maxUploadFiles = 8;
 const uploadProgressRetentionMs = 5 * 60_000;
 
+interface ConsoleUploadRouteOptions {
+  persistentConnectionsEnabled: boolean;
+}
+
 interface ConsoleUploadFieldMap {
   uploadId?: string;
   connectionId?: string;
@@ -78,7 +82,7 @@ type UploadProgressReporter = (event: Omit<ConsoleUploadProgressEvent, "uploadId
 
 const uploadProgressStates = new Map<string, ConsoleUploadProgressState>();
 
-export async function registerConsoleUploadRoutes(server: FastifyInstance): Promise<void> {
+export async function registerConsoleUploadRoutes(server: FastifyInstance, options: ConsoleUploadRouteOptions): Promise<void> {
   server.get("/api/console/upload/:uploadId/events", (request, reply) => {
     const params = request.params as { uploadId?: string };
     const uploadId = normalizeUploadId(params.uploadId);
@@ -151,7 +155,7 @@ export async function registerConsoleUploadRoutes(server: FastifyInstance): Prom
           percent: 0,
           totalBytes: files.reduce((total, file) => total + file.size, 0),
         });
-        uploaded = await uploadFilesToGuest(resolveUploadTransport(fields, vmIp), {
+        uploaded = await uploadFilesToGuest(resolveUploadTransport(fields, vmIp, options), {
           username,
           password,
           remoteDir,
@@ -249,8 +253,11 @@ interface UploadGuestInput {
   progress?: UploadProgressReporter;
 }
 
-function resolveUploadTransport(fields: ConsoleUploadFieldMap, vmIp: string): UploadTransport {
+function resolveUploadTransport(fields: ConsoleUploadFieldMap, vmIp: string, options: ConsoleUploadRouteOptions): UploadTransport {
   if (fields.connectionId && fields.providerType === "xenserver") {
+    if (!options.persistentConnectionsEnabled) {
+      throw new Error("共享 Web 模式没有服务器保存连接，文件上传不能通过保存连接跳板。请使用 VM 可直连 IP，或在桌面/本地模式使用连接跳板。");
+    }
     return {
       type: "jump",
       host: vmIp,

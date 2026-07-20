@@ -6,7 +6,12 @@ import { request as httpsRequest } from "node:https";
 import { connect as netConnect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import type { RawData, WebSocket } from "ws";
-import { resolveStoredConnection } from "../connectionStore.js";
+import {
+  consumeConsoleLaunchSession,
+  createConsoleLaunchSession,
+  resolveConsoleConnection,
+  type ConsoleConnectionInput,
+} from "./connection.js";
 import type { XenConnectionInput } from "../types.js";
 import { getXenConsoleLocation } from "../xenserver.js";
 
@@ -27,12 +32,21 @@ const xmlParser = new XMLParser({
 
 interface ConsoleQuery {
   connectionId?: string;
+  connection?: ConsoleConnectionInput;
+  sessionId?: string;
   vmId?: string;
 }
 
 interface ConsolePreflightBody {
   connectionId?: string;
+  connection?: ConsoleConnectionInput;
   vmId?: string;
+}
+
+interface XenConsoleLaunchPayload {
+  connectionId?: string;
+  connection?: ConsoleConnectionInput;
+  vmId: string;
 }
 
 interface XenConsoleSession {
@@ -43,7 +57,33 @@ interface XenConsoleSession {
   logout(): Promise<void>;
 }
 
+const consoleLaunchSessions = new Map<string, { value: XenConsoleLaunchPayload; expiresAt: number }>();
+
 export async function registerXenServerConsoleRoutes(server: FastifyInstance): Promise<void> {
+  server.post("/api/console/xenserver/session", async (request, reply) => {
+    try {
+      const payload = readConsoleParams(request);
+      if ((!payload.connectionId && !payload.connection) || !payload.vmId) {
+        throw new Error("控制台参数不完整：缺少连接或 VM。");
+      }
+      const session = createConsoleLaunchSession(consoleLaunchSessions, {
+        connectionId: payload.connectionId,
+        connection: payload.connection,
+        vmId: payload.vmId,
+      });
+      return {
+        sessionId: session.sessionId,
+        wsPath: `/api/console/xenserver?sessionId=${encodeURIComponent(session.sessionId)}`,
+        expiresAt: session.expiresAt,
+      };
+    } catch (error) {
+      server.log.warn({ error }, "failed to prepare xenserver console session");
+      return reply.status(502).send({
+        message: error instanceof Error ? error.message : "XenServer 控制台会话准备失败",
+      });
+    }
+  });
+
   server.post("/api/console/xenserver/preflight", async (request, reply) => {
     let session: XenConsoleSession | null = null;
     let tunnel: Socket | null = null;
@@ -138,41 +178,44 @@ export async function registerXenServerConsoleRoutes(server: FastifyInstance): P
 
 async function openXenConsoleSession(server: FastifyInstance, request: FastifyRequest): Promise<XenConsoleSession> {
   const params = readConsoleParams(request);
-  if (!params.connectionId || !params.vmId) {
+  if (params.sessionId) {
+    const payload = consumeConsoleLaunchSession(consoleLaunchSessions, params.sessionId);
+    if (!payload) throw new Error("XenServer 控制台会话已过期，请重新打开控制台。");
+    return openXenConsoleSessionFromPayload(server, payload);
+  }
+  if ((!params.connectionId && !params.connection) || !params.vmId) {
     throw new Error("控制台参数不完整：缺少连接或 VM。");
   }
-  const stored = resolveStoredConnection(params.connectionId);
-  if (stored.providerType !== "xenserver") {
-    throw new Error("当前控制台代理只处理 XenServer。");
-  }
+  return openXenConsoleSessionFromPayload(server, {
+    connectionId: params.connectionId,
+    connection: params.connection,
+    vmId: params.vmId,
+  });
+}
 
-  const connection: XenConnectionInput = {
-    host: stored.host,
-    port: stored.port,
-    username: stored.username,
-    password: stored.password,
-  };
-  const location = await getXenConsoleLocation(connection, params.vmId);
+async function openXenConsoleSessionFromPayload(server: FastifyInstance, payload: XenConsoleLaunchPayload): Promise<XenConsoleSession> {
+  const resolved = resolveConsoleConnection(payload, "xenserver");
+  const location = await getXenConsoleLocation(resolved.connection, payload.vmId);
   if (!location) {
     throw new Error("未读取到 XenServer 控制台地址，请确认 VM 正在运行且存在 RFB 控制台。");
   }
 
-  const consoleUrl = normalizeConsoleUrl(location, stored.host);
-  const apiHosts = uniqueHosts([stored.host, consoleUrl.hostname]);
-  const tunnelHosts = uniqueHosts([consoleUrl.hostname, stored.host]);
+  const consoleUrl = normalizeConsoleUrl(location, resolved.connection.host);
+  const apiHosts = uniqueHosts([resolved.connection.host, consoleUrl.hostname]);
+  const tunnelHosts = uniqueHosts([consoleUrl.hostname, resolved.connection.host]);
   server.log.info(
     {
-      connectionId: params.connectionId,
-      vmId: params.vmId,
+      connectionId: resolved.connectionId,
+      vmId: payload.vmId,
       consoleHost: consoleUrl.hostname,
-      configuredHost: stored.host,
+      configuredHost: resolved.connection.host,
       apiHosts,
       tunnelHosts,
       consolePath: `${consoleUrl.pathname}${consoleUrl.search}`,
     },
     "opening xenserver console session",
   );
-  const loginResult = await loginWithPasswordFallback(connection, apiHosts);
+  const loginResult = await loginWithPasswordFallback(resolved.connection, apiHosts);
 
   return {
     sessionId: loginResult.sessionId,
@@ -442,6 +485,8 @@ function readConsoleParams(request: FastifyRequest): ConsoleQuery {
   const body = request.body && typeof request.body === "object" ? (request.body as ConsolePreflightBody) : {};
   return {
     connectionId: body.connectionId || query.connectionId,
+    connection: body.connection || query.connection,
+    sessionId: query.sessionId,
     vmId: body.vmId || query.vmId,
   };
 }

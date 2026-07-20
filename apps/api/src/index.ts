@@ -13,6 +13,7 @@ import { registerProxmoxConsoleRoutes } from "./console/proxmoxConsole.js";
 import { registerConsoleUploadRoutes } from "./console/upload.js";
 import { registerVmwareConsoleRoutes } from "./console/vmwareConsole.js";
 import { registerXenServerConsoleRoutes } from "./console/xenserverConsole.js";
+import { normalizeRuntimeMode, resolvePersistentConnectionPolicy } from "./connectionAccessPolicy.js";
 import {
   deleteStoredConnection,
   listStoredConnections,
@@ -30,11 +31,20 @@ import {
 import { InventoryCache } from "./inventoryCache.js";
 import type { InventoryCacheScope } from "./inventoryCache.js";
 import { listInventoryEventsAfter, publishInventoryEvent, subscribeInventoryEvents } from "./inventoryEvents.js";
-import { cleanupXenInstallSources, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
+import { cleanupXenInstallSources, probeXenProvisioningNetwork, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
+import { isXenGuestToolsIsoName } from "./installMediaPolicy.js";
 import { listIpLeases, releaseIpLeases, reserveIpLeases } from "./ipLeaseStore.js";
 import { getIpPoolPolicy, saveIpPoolPolicy } from "./ipPoolPolicy.js";
 import { buildIsoImageCacheKey, getIsoImageCache, saveIsoImageCache } from "./isoImageStore.js";
+import { cleanupGeneratedIsoRecord, cleanupGeneratedIsoResidues, inspectGeneratedIsoResidues } from "./generatedIsoCleanupService.js";
 import { getGeneratedIso } from "./generatedIsoStore.js";
+import type { GeneratedIsoRecord } from "./generatedIsoStore.js";
+import {
+  applyGuestStorageResize,
+  inspectGuestStorage,
+  linkGuestStorageToPlatformDisks,
+  preflightGuestStorageResize,
+} from "./guestStorage.js";
 import { getProvisioningConfig, saveProvisioningConfig } from "./provisioningStore.js";
 import {
   createProvisionTask,
@@ -46,10 +56,14 @@ import {
   updateProvisionTaskVm,
   updateProvisionTaskVms,
 } from "./provisionTaskStore.js";
+import { provisionExecutionStore, type ProvisionExecutionContext } from "./provisionExecutionStore.js";
+import { resolveProvisionRecoveryVms } from "./provisionRecovery.js";
 import { runProvisioningVerifier } from "./provisioningVerifier.js";
+import { buildIpLeasePreflightResult, buildIpReachabilityPreflightResult } from "./provisioningPreflight.js";
 import { ProviderRegistry } from "./providers/provider.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
-import { cleanupRegisteredProxmoxGeneratedIso, ProxmoxProvider } from "./proxmox.js";
+import { ProxmoxProvider } from "./proxmox.js";
+import { registerRequestCrypto } from "./requestCrypto.js";
 import { getRuntimePolicy } from "./runtimePolicy.js";
 import {
   deleteUiBackgroundImage,
@@ -62,7 +76,7 @@ import {
   saveUiBackgroundImage,
   saveUiPreferences,
 } from "./uiPreferenceStore.js";
-import { cleanupRegisteredXenGeneratedIso, resolveXenInstallMediaMode } from "./xenserverUnattendedIso.js";
+import { resolveXenInstallMediaMode } from "./xenserverUnattendedIso.js";
 import type {
   HostNode,
   IsoImage,
@@ -72,12 +86,14 @@ import type {
   VirtualDisk,
   VmInventorySummary,
   VmNode,
+  VmProvisionCreatedVm,
   VmProvisionRequest,
+  VmResizeRequest,
   VmScheduleTarget,
   XenConnectionInput,
 } from "./types.js";
 import { VmRenameConflictError, VmRenameValidationError } from "./vmRename.js";
-import { cleanupRegisteredVmwareGeneratedIso, VmwareProvider } from "./vmware.js";
+import { VmwareProvider } from "./vmware.js";
 import { VmScheduleRunner } from "./vmScheduleRunner.js";
 import {
   createVmSchedule,
@@ -89,10 +105,17 @@ import {
 } from "./vmScheduleStore.js";
 import type { UpsertVmScheduleInput } from "./vmScheduleStore.js";
 import { metricSamplesToVmSnapshots, XenServerProvider } from "./xenserver.js";
+import { observeVmPowerStates, recordVmShutdown, recordVmStarted, removeVmPowerState } from "./vmPowerStateStore.js";
+
+const apiModuleLoadedAt = Date.now();
+writeApiStartupLog("api module loaded", {
+  spawnedDeltaMs: elapsedFromEnv("VRC_API_SPAWNED_AT"),
+  bootstrapDeltaMs: elapsedFromEnv("VRC_API_BOOTSTRAP_STARTED_AT"),
+});
 
 const server = Fastify({
   logger: {
-    redact: ["req.body.password", "req.body.rootPassword", "req.body.planItems[*].rootPassword", "req.body.leases[*].rootPassword", "password", "rootPassword"],
+    redact: ["req.body.password", "req.body.rootPassword", "req.body.guestStorage.password", "req.body.planItems[*].rootPassword", "req.body.leases[*].rootPassword", "password", "rootPassword"],
   },
 });
 
@@ -116,21 +139,47 @@ providers.register(new XenServerProvider());
 providers.register(new VmwareProvider());
 providers.register(new ProxmoxProvider());
 const vmScheduleRunner = new VmScheduleRunner(providers, server.log);
+const runtimeMode = normalizeRuntimeMode(process.env.VRC_RUNTIME_MODE);
+const persistentConnectionPolicy = resolvePersistentConnectionPolicy(runtimeMode);
+const persistentConnectionStoreEnabled = persistentConnectionPolicy.enabled;
 const inventoryCache = new InventoryCache();
 const isoRefreshJobs = new Set<string>();
 const vmScheduleTargetCacheTtlMs = 5 * 60_000;
+const activeProvisionRecoveryTasks = new Set<string>();
 let vmScheduleTargetCache: Awaited<ReturnType<typeof loadVmScheduleTargets>> | undefined;
 let vmScheduleTargetCacheUpdatedAt = 0;
 let vmScheduleTargetRefreshJob: Promise<Awaited<ReturnType<typeof loadVmScheduleTargets>>> | undefined;
 let vmScheduleTargetCacheVersion = 0;
 
+registerRequestCrypto(server, { requireEncryptedSensitivePayloads: !persistentConnectionStoreEnabled });
+
 await registerXenServerConsoleRoutes(server);
 await registerProxmoxConsoleRoutes(server);
 await registerVmwareConsoleRoutes(server);
-await registerConsoleUploadRoutes(server);
+await registerConsoleUploadRoutes(server, { persistentConnectionsEnabled: persistentConnectionStoreEnabled });
 registerInstallSourceRoutes(server);
 
 const execFileAsync = promisify(execFile);
+
+function publicAppPreferences() {
+  const preferences = getAppPreferences();
+  return {
+    ui: preferences.ui,
+    connection: publicConnectionPreferences(),
+  };
+}
+
+function publicConnectionPreferences() {
+  if (persistentConnectionStoreEnabled) return getConnectionPreferences();
+  return {
+    selectedConnectionId: "",
+    providerType: "xenserver" as ProviderType,
+    host: "",
+    port: 22,
+    username: "root",
+    connectionName: "",
+  };
+}
 
 interface HostInventoryCapability {
   collectHostInventory(connection: XenConnectionInput): Promise<{
@@ -224,6 +273,13 @@ const vmDisksSchema = connectionSchema.extend({
   vmId: z.string().min(1),
 });
 
+const vmGuestStorageSchema = connectionSchema.extend({
+  vmId: z.string().min(1),
+  vmIp: z.ipv4(),
+  username: z.string().trim().min(1).max(64).optional(),
+  password: z.string().max(256).optional(),
+});
+
 const vmActionSchema = connectionSchema.extend({
   vmId: z.string().min(1),
   hostId: z.string().optional(),
@@ -238,6 +294,51 @@ const vmRenameSchema = connectionSchema.extend({
   newName: z.string().min(1).max(128),
   confirmToken: z.literal("CONFIRMED"),
 });
+
+const vmResizeSchema = connectionSchema
+  .extend({
+    vmId: z.string().min(1),
+    hostId: z.string().optional(),
+    cpuCount: z.coerce.number().int().positive().max(512).optional(),
+    memoryBytes: z.coerce.number().int().min(128 * 1024 ** 2).max(Number.MAX_SAFE_INTEGER).optional(),
+    disk: z
+      .object({
+        mode: z.enum(["extend", "add"]),
+        diskId: z.string().optional(),
+        storageRepositoryId: z.string().optional(),
+        sizeBytes: z.coerce.number().int().min(1024 ** 3).max(Number.MAX_SAFE_INTEGER),
+        name: z.string().trim().max(120).optional(),
+      })
+      .optional(),
+    guestStorage: z
+      .object({
+        vmIp: z.ipv4(),
+        username: z.string().trim().min(1).max(64).optional(),
+        password: z.string().max(256).optional(),
+        mountPath: z.string().trim().min(1).max(240),
+        guestDiskPath: z.string().trim().max(120).optional(),
+        guestPartitionPath: z.string().trim().max(120).optional(),
+        filesystem: z.string().trim().max(32).optional(),
+      })
+      .optional(),
+    allowShutdown: z.boolean().default(false),
+    restartAfterResize: z.boolean().default(true),
+    confirmToken: z.literal("CONFIRMED"),
+  })
+  .superRefine((value, context) => {
+    if (!value.cpuCount && !value.memoryBytes && !value.disk) {
+      context.addIssue({ code: "custom", message: "至少选择一项扩容资源" });
+    }
+    if (value.disk?.mode === "extend" && !value.disk.diskId) {
+      context.addIssue({ code: "custom", path: ["disk", "diskId"], message: "扩展原盘需要选择目标磁盘" });
+    }
+    if (value.disk?.mode === "add" && !value.disk.storageRepositoryId) {
+      context.addIssue({ code: "custom", path: ["disk", "storageRepositoryId"], message: "新增磁盘需要选择存储 SR" });
+    }
+    if (value.guestStorage && !value.disk) {
+      context.addIssue({ code: "custom", path: ["guestStorage"], message: "Guest 自动生效必须与磁盘扩容同时提交" });
+    }
+  });
 
 const vmScheduleTargetSchema = z.object({
   vmId: z.string().min(1),
@@ -365,7 +466,8 @@ const environmentTemplateSchema = z.object({
   ipPoolId: z.string().default(""),
   vmNamePrefix: z.string().min(1),
   autoStart: z.boolean().default(true),
-  installStrategy: z.enum(["template-clone", "kickstart", "manual-iso"]).default("kickstart"),
+  installStrategy: z.enum(["template-clone", "kickstart", "windows-unattended", "manual-iso"]).default("kickstart"),
+  installProfile: z.enum(["server", "desktop"]).default("server"),
   description: z.string().optional(),
 });
 
@@ -375,11 +477,19 @@ const provisioningConfigSchema = z.object({
   ipPools: z.array(ipPoolSchema).optional(),
 });
 
-const ipProbeSchema = z.object({
+const ipProbeSchema = connectionSchema.extend({
   ips: z.array(z.string()).min(1).max(64),
   occupiedIps: z.array(z.string()).default([]),
   leasedIps: z.array(z.string()).default([]),
   timeoutMs: z.coerce.number().int().min(200).max(3000).default(900),
+  hostId: z.string().optional(),
+  network: z
+    .object({
+      cidr: z.string().min(1),
+      gateway: z.ipv4(),
+      sampleIp: z.ipv4(),
+    })
+    .optional(),
 });
 
 const reserveIpLeasesSchema = z.object({
@@ -419,7 +529,8 @@ const provisionVmsSchema = connectionSchema.extend({
   hostId: z.string().optional(),
   environmentTemplateId: z.string().optional(),
   sourceType: z.enum(["iso", "template"]),
-  installStrategy: z.enum(["template-clone", "kickstart", "manual-iso"]).optional(),
+  installStrategy: z.enum(["template-clone", "kickstart", "windows-unattended", "manual-iso"]).optional(),
+  installProfile: z.enum(["server", "desktop"]).optional(),
   isoId: z.string().optional(),
   isoName: z.string().optional(),
   templateName: z.string().optional(),
@@ -437,6 +548,11 @@ const provisionPreflightSchema = provisionVmsSchema.omit({ confirmToken: true })
 type ProvisionVmsInput = z.infer<typeof provisionVmsSchema>;
 type ProvisionPreflightInput = z.infer<typeof provisionPreflightSchema>;
 
+const generatedIsoCleanupSchema = z.object({
+  includeUnexpiredFailed: z.boolean().optional(),
+  confirmToken: z.literal("CONFIRMED"),
+});
+
 type PreflightStatus = "success" | "warning" | "error";
 
 interface ProvisionPreflightCheck {
@@ -451,15 +567,20 @@ server.get("/api/health", async () => ({
   ok: true,
   service: "virtual-resource-console-api",
   now: new Date().toISOString(),
-  scheduleRunner: vmScheduleRunner.status(),
+  runtimeMode,
+  connectionStore: {
+    persistentEnabled: persistentConnectionStoreEnabled,
+    reason: persistentConnectionPolicy.reason,
+  },
+  scheduleRunner: persistentConnectionStoreEnabled ? vmScheduleRunner.status() : { ...vmScheduleRunner.status(), owner: false, disabled: true },
 }));
 
 server.get("/api/connections", async () => ({
-  connections: [...listStoredConnections(), ...listEphemeralConnections()],
+  connections: persistentConnectionStoreEnabled ? [...listStoredConnections(), ...listEphemeralConnections()] : [],
 }));
 
 server.get("/api/ephemeral-connections", async () => ({
-  connections: listEphemeralConnections(),
+  connections: persistentConnectionStoreEnabled ? listEphemeralConnections() : [],
 }));
 
 server.get("/api/preferences/ui", async () => ({
@@ -478,7 +599,7 @@ server.get("/api/preferences/ui/background-image", async (_request, reply) => {
 });
 
 server.get("/api/preferences", async () => ({
-  preferences: getAppPreferences(),
+  preferences: publicAppPreferences(),
 }));
 
 server.patch("/api/preferences", async (request, reply) => {
@@ -490,7 +611,9 @@ server.patch("/api/preferences", async (request, reply) => {
     });
   }
   return {
-    preferences: saveAppPreferences(parsed.data),
+    preferences: persistentConnectionStoreEnabled
+      ? saveAppPreferences(parsed.data)
+      : saveAppPreferences({ ui: parsed.data.ui }),
   };
 });
 
@@ -548,7 +671,7 @@ server.delete("/api/preferences/ui/background-image", async () => {
 });
 
 server.get("/api/preferences/connection", async () => ({
-  preferences: getConnectionPreferences(),
+  preferences: publicConnectionPreferences(),
 }));
 
 server.patch("/api/preferences/connection", async (request, reply) => {
@@ -558,6 +681,11 @@ server.patch("/api/preferences/connection", async (request, reply) => {
       message: "连接偏好配置格式不正确",
       issues: parsed.error.issues,
     });
+  }
+  if (!persistentConnectionStoreEnabled) {
+    return {
+      preferences: publicConnectionPreferences(),
+    };
   }
   return {
     preferences: saveConnectionPreferences(parsed.data),
@@ -658,6 +786,27 @@ server.post("/api/provisioning/ip-probe", async (request, reply) => {
   const occupiedIps = new Set(parsed.data.occupiedIps.filter(isIpv4));
   const leasedIps = new Set(parsed.data.leasedIps.filter(isIpv4));
   const uniqueIps = Array.from(new Set(parsed.data.ips.filter(isIpv4)));
+  let network;
+  if (parsed.data.providerType === "xenserver" && parsed.data.hostId && parsed.data.network) {
+    try {
+      const resolved = resolveConnectionRequest(parsed.data);
+      network = await probeXenProvisioningNetwork({
+        connection: resolved.connection,
+        hostId: parsed.data.hostId,
+        cidr: parsed.data.network.cidr,
+        gateway: parsed.data.network.gateway,
+        sampleIp: parsed.data.network.sampleIp,
+        occupiedIps: Array.from(occupiedIps),
+      });
+    } catch (error) {
+      network = {
+        status: "unreachable" as const,
+        message: toClientErrorMessage(error, "无法从目标 XenServer 物理机校验创建网络"),
+        routeAvailable: false,
+        gatewayReachable: false,
+      };
+    }
+  }
   const results = await mapWithConcurrency(uniqueIps, 8, async (ip) => {
     if (occupiedIps.has(ip)) {
       return { ip, status: "occupied" as const, reason: "清单占用" };
@@ -675,6 +824,7 @@ server.post("/api/provisioning/ip-probe", async (request, reply) => {
   return {
     probedAt: new Date().toISOString(),
     results,
+    network,
   };
 });
 
@@ -740,6 +890,29 @@ server.get("/api/provisioning/tasks/:taskId/events", (request, reply) => {
     unsubscribe();
   };
   request.raw.once("close", cleanup);
+});
+
+server.get("/api/maintenance/generated-isos", async () => ({
+  report: await inspectGeneratedIsoResidues(),
+}));
+
+server.post("/api/maintenance/generated-isos/cleanup", async (request, reply) => {
+  const parsed = generatedIsoCleanupSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "清理参数不完整，或未完成二次确认。",
+      issues: parsed.error.issues,
+    });
+  }
+  const report = await cleanupGeneratedIsoResidues({
+    execute: true,
+    includeUnexpiredFailed: parsed.data.includeUnexpiredFailed,
+    resolveConnection: resolveGeneratedIsoCleanupConnection,
+  });
+  return {
+    operatedAt: new Date().toISOString(),
+    report,
+  };
 });
 
 server.get("/api/inventory/events", (request, reply) => {
@@ -827,6 +1000,14 @@ server.post("/api/provisioning/vms", async (request, reply) => {
         message: validationErrors.join("；"),
       });
     }
+    const preflightChecks = await runProvisionPreflight(provider, resolved.connection, resolved.providerType, requestData, parsed.data);
+    const blockingChecks = preflightChecks.filter((check) => check.status === "error");
+    if (blockingChecks.length) {
+      return reply.status(409).send({
+        message: blockingChecks.map((check) => check.message).join("；"),
+        checks: preflightChecks,
+      });
+    }
     const task = createProvisionTask({
       connectionId: resolved.connectionId,
       providerType: resolved.providerType,
@@ -835,6 +1016,7 @@ server.post("/api/provisioning/vms", async (request, reply) => {
       title: `${providerLabel(resolved.providerType)} 创建 ${parsed.data.planItems.length} 台 VM`,
       planItems: parsed.data.planItems,
     });
+    persistProvisionExecutionContext(task.id, requestData);
     setTimeout(() => {
       void runProvisionTaskExecution({
         taskId: task.id,
@@ -846,6 +1028,7 @@ server.post("/api/provisioning/vms", async (request, reply) => {
         if (getProvisionTask(task.id)?.status !== "failed") {
           finishProvisionTask(task.id, "failed", toClientErrorMessage(error, "创建虚拟机失败"));
         }
+        provisionExecutionStore.delete(task.id);
       });
     }, 0);
     return reply.status(202).send({
@@ -893,6 +1076,7 @@ async function runProvisionTaskExecution(input: {
         request: input.request,
         taskId: input.taskId,
       });
+      persistProvisionExecutionContext(input.taskId, executableRequest);
       server.log.info({ ...timingContext, phase: "publish-source", elapsedMs: Date.now() - phaseStartedAt }, "provision phase timing");
       markProvisionTaskStep(input.taskId, "publish-source", "success", "集中安装源 URL 已发布，等待 VM 安装器拉取");
     } catch (error) {
@@ -900,6 +1084,7 @@ async function runProvisionTaskExecution(input: {
       markProvisionTaskStep(input.taskId, "publish-source", "failed", toClientErrorMessage(error, "发布安装源失败"));
       finishProvisionTask(input.taskId, "failed", toClientErrorMessage(error, "发布安装源失败"));
       await cleanupXenInstallSources(input.taskId);
+      provisionExecutionStore.delete(input.taskId);
       throw error;
     }
   } else {
@@ -911,6 +1096,7 @@ async function runProvisionTaskExecution(input: {
     markProvisionTaskStep(input.taskId, "create-vm", "failed", `当前平台暂不支持一键创建虚拟机：${input.request.providerType}`);
     finishProvisionTask(input.taskId, "failed", `当前平台暂不支持一键创建虚拟机：${input.request.providerType}`);
     await cleanupXenInstallSources(input.taskId);
+    provisionExecutionStore.delete(input.taskId);
     return;
   }
   let result;
@@ -932,10 +1118,12 @@ async function runProvisionTaskExecution(input: {
     markProvisionTaskStep(input.taskId, "create-vm", "failed", toClientErrorMessage(error, "创建 VM 失败"));
     finishProvisionTask(input.taskId, "failed", toClientErrorMessage(error, "创建 VM 失败"));
     await cleanupXenInstallSources(input.taskId);
+    provisionExecutionStore.delete(input.taskId);
     throw error;
   }
 
   result.taskId = input.taskId;
+  persistProvisionExecutionContext(input.taskId, executableRequest, result.created);
   markProvisionTaskStep(input.taskId, "create-vm", "success", result.message);
   updateProvisionTaskVms(
     input.taskId,
@@ -981,15 +1169,139 @@ async function runProvisionTaskExecution(input: {
       server.log.info({ ...timingContext, phase, elapsedMs, details }, "provision verifier timing");
     },
     onComplete: async ({ status }) => {
+      provisionExecutionStore.delete(input.taskId);
       if (status !== "success") {
         server.log.warn({ ...timingContext }, "provision verifier failed; generated media retained for safe recovery");
         return;
       }
       await cleanupGeneratedIsos(input.connection, result.created);
+      void cleanupExpiredGeneratedIsoResidues().catch((error) => {
+        server.log.warn({ ...timingContext, error }, "expired generated iso cleanup failed");
+      });
       await cleanupXenInstallSources(input.taskId);
     },
   });
   server.log.info({ ...timingContext, phase: "submit-to-verifier", elapsedMs: Date.now() - taskStartedAt }, "provision task submitted to verifier");
+}
+
+/**
+ * Persists resumable task input only when the API owns a local encrypted connection.
+ * Shared Web requests intentionally remain memory-only to preserve the credential boundary.
+ */
+function persistProvisionExecutionContext(
+  taskId: string,
+  request: VmProvisionRequest,
+  created?: VmProvisionCreatedVm[],
+): void {
+  if (!persistentConnectionStoreEnabled || !request.connectionId) return;
+  try {
+    // An ephemeral or browser-local connection cannot be resolved after process restart.
+    resolveStoredConnection(request.connectionId);
+  } catch {
+    return;
+  }
+  const previous = provisionExecutionStore.get(taskId);
+  const now = new Date().toISOString();
+  provisionExecutionStore.save({
+    taskId,
+    connectionId: request.connectionId,
+    providerType: request.providerType,
+    request,
+    created: created ?? previous?.created,
+    createdAt: previous?.createdAt || now,
+    updatedAt: now,
+  });
+}
+
+/**
+ * Restarts verification for encrypted local tasks left active by an API process restart.
+ * Recovery never calls Provider.createVms; it must identify every existing VM first.
+ */
+async function resumeProvisioningExecutions(): Promise<void> {
+  const contexts = provisionExecutionStore.list();
+  for (const context of contexts) {
+    await resumeProvisioningExecution(context);
+  }
+}
+
+/**
+ * Recovers one interrupted provisioning task from its existing VM identifiers.
+ */
+async function resumeProvisioningExecution(context: ProvisionExecutionContext): Promise<void> {
+  if (activeProvisionRecoveryTasks.has(context.taskId)) return;
+  const task = getProvisionTask(context.taskId);
+  if (!task || !["pending", "running"].includes(task.status)) {
+    provisionExecutionStore.delete(context.taskId);
+    return;
+  }
+  activeProvisionRecoveryTasks.add(context.taskId);
+  try {
+    const stored = resolveStoredConnection(context.connectionId);
+    if (stored.providerType !== context.providerType) {
+      throw new Error(`连接平台已变化：任务为 ${context.providerType}，当前连接为 ${stored.providerType}`);
+    }
+    const connection: XenConnectionInput = {
+      host: stored.host,
+      port: stored.port,
+      username: stored.username,
+      password: stored.password,
+    };
+    const provider = providers.get(context.providerType);
+    const created = await resolveProvisionRecoveryVms({
+      task,
+      context,
+      provider,
+      connection,
+      onRecoveredVm: (vmName, patch) => updateProvisionTaskVm(task.id, vmName, patch),
+    });
+    provisionExecutionStore.save({ ...context, created, updatedAt: new Date().toISOString() });
+    markProvisionTaskStep(task.id, task.currentStep, "running", "VRC 服务已恢复，继续后台验收现有 VM");
+    server.log.info({ taskId: task.id, vmCount: created.length }, "resuming interrupted provision verification");
+    runProvisioningVerifier({
+      taskId: task.id,
+      connection,
+      request: context.request,
+      created,
+      onTiming: (phase, elapsedMs, details) => {
+        server.log.info({ taskId: task.id, providerType: context.providerType, phase, elapsedMs, details }, "recovered provision verifier timing");
+      },
+      onComplete: async ({ status }) => {
+        activeProvisionRecoveryTasks.delete(task.id);
+        provisionExecutionStore.delete(task.id);
+        if (status !== "success") {
+          server.log.warn({ taskId: task.id }, "recovered provision verifier ended without success; generated media retained");
+          return;
+        }
+        await cleanupGeneratedIsos(connection, created);
+        await cleanupXenInstallSources(task.id);
+      },
+    });
+  } catch (error) {
+    activeProvisionRecoveryTasks.delete(context.taskId);
+    const message = toClientErrorMessage(error, "恢复无人值守任务失败");
+    const recoveryAgeMs = Date.now() - Date.parse(context.updatedAt || context.createdAt);
+    const noVmCreatedDuringCreatePhase =
+      task.currentStep === "create-vm" &&
+      task.vms.length > 0 &&
+      task.vms.every((vm) => !vm.providerId && !vm.id) &&
+      /尚未找到已创建 VM/.test(message);
+    // 创建阶段没有任何平台 VM 标识时不能无限重试，否则服务重启后任务会永久停在 loading。
+    if (noVmCreatedDuringCreatePhase && recoveryAgeMs >= 90_000) {
+      const failureMessage = `创建任务在平台创建阶段中断，${message}；已停止恢复等待，请重新提交任务。`;
+      markProvisionTaskStep(context.taskId, task.currentStep, "failed", failureMessage);
+      finishProvisionTask(context.taskId, "failed", failureMessage);
+      provisionExecutionStore.delete(context.taskId);
+      server.log.error({ taskId: context.taskId, recoveryAgeMs }, "provision recovery stopped before platform VM creation");
+      return;
+    }
+    markProvisionTaskStep(context.taskId, task.currentStep, "running", `服务恢复等待中：${message}`);
+    server.log.warn({ taskId: context.taskId, error }, "provision recovery deferred");
+    const retryTimer = setTimeout(() => {
+      const refreshed = provisionExecutionStore.get(context.taskId);
+      if (refreshed) void resumeProvisioningExecution(refreshed);
+    }, 30_000);
+    retryTimer.unref();
+  }
 }
 
 async function cleanupGeneratedIsos(connection: XenConnectionInput, created: { generatedIsoRegistryId?: string; name?: string }[]): Promise<void> {
@@ -997,13 +1309,8 @@ async function cleanupGeneratedIsos(connection: XenConnectionInput, created: { g
     if (!vm.generatedIsoRegistryId) continue;
     try {
       const record = getGeneratedIso(vm.generatedIsoRegistryId);
-      if (record?.providerType === "vmware") {
-        await cleanupRegisteredVmwareGeneratedIso(connection, vm.generatedIsoRegistryId);
-      } else if (record?.providerType === "proxmox") {
-        await cleanupRegisteredProxmoxGeneratedIso(connection, vm.generatedIsoRegistryId);
-      } else {
-        await cleanupRegisteredXenGeneratedIso(connection, vm.generatedIsoRegistryId);
-      }
+      if (!record) throw new Error(`未找到生成 ISO 登记记录：${vm.generatedIsoRegistryId}`);
+      await cleanupGeneratedIsoRecord(record, connection);
       server.log.info({ vmName: vm.name, registryId: vm.generatedIsoRegistryId }, "cleaned generated iso");
     } catch (error) {
       server.log.warn({ vmName: vm.name, registryId: vm.generatedIsoRegistryId, error }, "failed to clean generated iso");
@@ -1011,7 +1318,22 @@ async function cleanupGeneratedIsos(connection: XenConnectionInput, created: { g
   }
 }
 
+async function cleanupExpiredGeneratedIsoResidues(): Promise<void> {
+  const report = await cleanupGeneratedIsoResidues({
+    execute: true,
+    resolveConnection: resolveGeneratedIsoCleanupConnection,
+  });
+  if (report.summary.cleaned || report.summary.failed) {
+    server.log.info({ summary: report.summary }, "expired generated iso residue cleanup finished");
+  }
+}
+
 server.post("/api/connections", async (request, reply) => {
+  if (!persistentConnectionStoreEnabled) {
+    return reply.status(403).send({
+      message: "共享 Web 模式禁止在 2.26 服务器保存连接账号。请保存到当前浏览器本地，或使用桌面客户端保存到本机。",
+    });
+  }
   const parsed = saveConnectionSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.status(400).send({
@@ -1030,6 +1352,11 @@ server.post("/api/connections", async (request, reply) => {
 });
 
 server.post("/api/ephemeral-connections", async (request, reply) => {
+  if (!persistentConnectionStoreEnabled) {
+    return reply.status(403).send({
+      message: "共享 Web 模式禁止在 2.26 服务器暂存连接账号。",
+    });
+  }
   const parsed = ephemeralConnectionSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.status(400).send({
@@ -1053,6 +1380,9 @@ server.delete("/api/connections/:id", async (request, reply) => {
       issues: parsed.error.issues,
     });
   }
+  if (!persistentConnectionStoreEnabled) {
+    return { deleted: false };
+  }
   const deletedEphemeral = deleteEphemeralConnection(parsed.data.id);
   const deletedStored = deletedEphemeral ? false : deleteStoredConnection(parsed.data.id);
   if (deletedStored) invalidateVmScheduleTargetCache();
@@ -1066,6 +1396,9 @@ server.delete("/api/ephemeral-connections/:id", async (request, reply) => {
       message: "临时连接 ID 不完整",
       issues: parsed.error.issues,
     });
+  }
+  if (!persistentConnectionStoreEnabled) {
+    return { deleted: false };
   }
   return {
     deleted: deleteEphemeralConnection(parsed.data.id),
@@ -1247,6 +1580,41 @@ server.post("/api/inventory/vm-disks", async (request, reply) => {
   }
 });
 
+server.post("/api/inventory/vm-guest-storage", async (request, reply) => {
+  const parsed = vmGuestStorageSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "请填写平台连接参数、VM 和有效的 Guest IP",
+      issues: parsed.error.issues,
+    });
+  }
+
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    const provider = providers.get(resolved.providerType);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const [inventory, disks] = await Promise.all([
+      inspectGuestStorage({
+        providerType: resolved.providerType,
+        platformConnection: resolved.connection,
+        vmIp: parsed.data.vmIp,
+        username: parsed.data.username,
+        password: parsed.data.password,
+      }),
+      provider.listVmDisks(resolved.connection, parsed.data.vmId),
+    ]);
+    return {
+      collectedAt: new Date().toISOString(),
+      inventory: linkGuestStorageToPlatformDisks(inventory, disks, resolved.providerType),
+    };
+  } catch (error) {
+    request.log.error({ error }, "failed to inspect vm guest storage");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "读取 Guest 磁盘与目录失败"),
+    });
+  }
+});
+
 server.post("/api/inventory/virtual-disks", async (request, reply) => {
   const parsed = virtualDisksSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -1367,6 +1735,13 @@ server.post("/api/vms/action", async (request, reply) => {
       }
     }
     const result = await provider.performVmAction(resolved.connection, parsed.data.vmId, parsed.data.action);
+    const operatedAt = new Date().toISOString();
+    const powerStateScope = buildVmPowerStateScope(resolved);
+    if (parsed.data.action === "shutdown") recordVmShutdown(powerStateScope, parsed.data.vmId, operatedAt);
+    if (parsed.data.action === "start" || parsed.data.action === "forceReboot") {
+      recordVmStarted(powerStateScope, parsed.data.vmId, operatedAt);
+    }
+    if (parsed.data.action === "delete") removeVmPowerState(powerStateScope, parsed.data.vmId);
     invalidateInventoryCache(resolved, parsed.data.hostId);
     if (parsed.data.hostId) {
       if (parsed.data.action === "delete") {
@@ -1386,6 +1761,7 @@ server.post("/api/vms/action", async (request, reply) => {
           vmId: parsed.data.vmId,
           patch: {
             powerState: parsed.data.action === "shutdown" ? "halted" : "running",
+            lastShutdownAt: parsed.data.action === "shutdown" ? operatedAt : null,
           },
         });
       }
@@ -1404,7 +1780,7 @@ server.post("/api/vms/action", async (request, reply) => {
           })
         : [];
     return {
-      operatedAt: new Date().toISOString(),
+      operatedAt,
       result,
       releasedLeases,
     };
@@ -1472,10 +1848,107 @@ server.post("/api/vms/rename", async (request, reply) => {
   }
 });
 
+server.post("/api/vms/resize", async (request, reply) => {
+  const parsed = vmResizeSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "VM 扩容参数不完整，或未完成确认。",
+      issues: parsed.error.issues,
+    });
+  }
+
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    const provider = providers.get(resolved.providerType);
+    if (!provider.resizeVm) {
+      return reply.status(501).send({
+        message: "当前平台暂未启用虚拟机扩容。",
+      });
+    }
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const resizeRequest: VmResizeRequest = {
+      cpuCount: parsed.data.cpuCount,
+      memoryBytes: parsed.data.memoryBytes,
+      disk: parsed.data.disk,
+      guestStorage: parsed.data.guestStorage,
+      allowShutdown: parsed.data.allowShutdown,
+      restartAfterResize: parsed.data.restartAfterResize,
+    };
+    const guestAccess = parsed.data.guestStorage
+      ? {
+          providerType: resolved.providerType,
+          platformConnection: resolved.connection,
+          vmIp: parsed.data.guestStorage.vmIp,
+          username: parsed.data.guestStorage.username,
+          password: parsed.data.guestStorage.password,
+        }
+      : undefined;
+    const guestPreflight = guestAccess
+      ? await preflightGuestStorageResize(
+          guestAccess,
+          resizeRequest,
+          await provider.listVmDisks(resolved.connection, parsed.data.vmId),
+        )
+      : undefined;
+    const result = await provider.resizeVm(resolved.connection, parsed.data.vmId, resizeRequest);
+    if (guestAccess && guestPreflight) {
+      result.guestStorage = await applyGuestStorageResize({
+        access: guestAccess,
+        request: resizeRequest,
+        preflight: guestPreflight,
+      });
+      result.message = result.guestStorage.status === "completed"
+        ? `${result.message}；${result.guestStorage.message}`
+        : result.guestStorage.message;
+    }
+    const diskVirtualBytes = result.disks.reduce((sum, disk) => sum + Math.max(disk.virtualSizeBytes, 0), 0);
+    if (result.restarted) recordVmStarted(buildVmPowerStateScope(resolved), parsed.data.vmId);
+    invalidateInventoryCache(resolved, parsed.data.hostId);
+    if (parsed.data.hostId) {
+      publishInventoryEvent({
+        type: "vm.patch",
+        connectionId: resolved.connectionId,
+        providerType: resolved.providerType,
+        hostId: parsed.data.hostId,
+        vmId: parsed.data.vmId,
+        patch: {
+          cpuCount: result.cpuCount,
+          memoryBytes: result.memoryBytes,
+          diskVirtualBytes,
+          diskCount: result.disks.length,
+          diskSizeSummary: result.disks.map((disk) => formatBytes(disk.virtualSizeBytes)).join(" + "),
+          powerState: result.restarted ? "running" : undefined,
+          lastShutdownAt: result.restarted ? null : undefined,
+        },
+      });
+      scheduleInventoryRefresh({
+        resolved,
+        hostId: parsed.data.hostId,
+        changedVmIds: [parsed.data.vmId],
+      });
+    }
+    return {
+      operatedAt: new Date().toISOString(),
+      result,
+    };
+  } catch (error) {
+    request.log.error({ error }, "failed to resize vm");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "虚拟机扩容失败"),
+    });
+  }
+});
+
 server.get("/api/vm-schedules", async (request, reply) => {
   const parsed = vmScheduleQuerySchema.safeParse(request.query);
   if (!parsed.success) {
     return reply.status(400).send({ message: "定时任务查询参数无效。", issues: parsed.error.issues });
+  }
+  if (!persistentConnectionStoreEnabled) {
+    return {
+      tasks: [],
+      runner: vmScheduleRunner.status(),
+    };
   }
   return {
     tasks: listVmSchedules(parsed.data.connectionId),
@@ -1483,9 +1956,12 @@ server.get("/api/vm-schedules", async (request, reply) => {
   };
 });
 
-server.get("/api/vm-schedule-targets", async () => listVmScheduleTargets());
+server.get("/api/vm-schedule-targets", async () => (persistentConnectionStoreEnabled ? listVmScheduleTargets() : { targets: [], errors: [] }));
 
 server.post("/api/vm-schedules", async (request, reply) => {
+  if (!persistentConnectionStoreEnabled) {
+    return reply.status(403).send({ message: "共享 Web 模式禁止创建依赖服务器保存连接的定时任务。" });
+  }
   const parsed = vmScheduleSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.status(400).send({ message: "定时任务参数不完整。", issues: parsed.error.issues });
@@ -1505,6 +1981,9 @@ server.post("/api/vm-schedules", async (request, reply) => {
 });
 
 server.put("/api/vm-schedules/:id", async (request, reply) => {
+  if (!persistentConnectionStoreEnabled) {
+    return reply.status(403).send({ message: "共享 Web 模式禁止修改依赖服务器保存连接的定时任务。" });
+  }
   const params = vmScheduleIdSchema.safeParse(request.params);
   const parsed = vmScheduleSchema.safeParse(request.body);
   if (!params.success || !parsed.success) {
@@ -1529,6 +2008,9 @@ server.put("/api/vm-schedules/:id", async (request, reply) => {
 });
 
 server.patch("/api/vm-schedules/:id/enabled", async (request, reply) => {
+  if (!persistentConnectionStoreEnabled) {
+    return reply.status(403).send({ message: "共享 Web 模式禁止启停依赖服务器保存连接的定时任务。" });
+  }
   const params = vmScheduleIdSchema.safeParse(request.params);
   const parsed = vmScheduleEnabledSchema.safeParse(request.body);
   if (!params.success || !parsed.success) {
@@ -1544,6 +2026,9 @@ server.patch("/api/vm-schedules/:id/enabled", async (request, reply) => {
 });
 
 server.delete("/api/vm-schedules/:id", async (request, reply) => {
+  if (!persistentConnectionStoreEnabled) {
+    return reply.status(403).send({ message: "共享 Web 模式禁止删除服务器定时任务。" });
+  }
   const params = vmScheduleIdSchema.safeParse(request.params);
   if (!params.success) return reply.status(400).send({ message: "任务 ID 无效。" });
   if (!deleteVmSchedule(params.data.id)) return reply.status(404).send({ message: "未找到定时任务。" });
@@ -1567,11 +2052,13 @@ server.post("/api/metrics/snapshot", async (request, reply) => {
       targetType: parsed.data.targetType,
       targetIds: parsed.data.targetIds,
     });
+    const metrics = metricSamplesToVmSnapshots(samples);
+    reconcileProvisionTasksWithGuestTelemetry(resolved.connectionId, metrics);
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
     return {
       collectedAt: new Date().toISOString(),
       samples,
-      metrics: metricSamplesToVmSnapshots(samples),
+      metrics,
     };
   } catch (error) {
     request.log.error({ error }, "failed to collect metrics snapshot");
@@ -1581,7 +2068,43 @@ server.post("/api/metrics/snapshot", async (request, reply) => {
   }
 });
 
+function reconcileProvisionTasksWithGuestTelemetry(
+  connectionId: string | undefined,
+  metrics: ReturnType<typeof metricSamplesToVmSnapshots>,
+): void {
+  if (!connectionId) return;
+  const availableVmIds = new Set(
+    metrics
+      .filter((metric) => metric.guestTelemetry?.status === "available")
+      .map((metric) => metric.uuid),
+  );
+  if (!availableVmIds.size) return;
+  for (const task of listProvisionTasks(200)) {
+    const guestToolsStep = task.steps.find((step) => step.key === "guest-tools");
+    const isToolsDelayWarning =
+      task.connectionId === connectionId &&
+      task.status === "warning" &&
+      guestToolsStep?.status === "warning" &&
+      /Guest Metrics|Tools 尚未生效|监控工具尚未生效/.test(`${guestToolsStep.message ?? ""} ${task.message}`);
+    if (!isToolsDelayWarning) continue;
+    if (!task.vms.length || task.vms.some((vm) => !vm.providerId || !availableVmIds.has(vm.providerId))) continue;
+    markProvisionTaskStep(task.id, "guest-tools", "success", "XenServer 已回报 Guest 指标，监控工具验收通过");
+    for (const vm of task.vms) {
+      updateProvisionTaskVm(task.id, vm.name, {
+        status: "success",
+        currentStep: "complete",
+        progressPercent: 100,
+        message: "系统和 XenServer Guest Tools 已就绪",
+      });
+    }
+    finishProvisionTask(task.id, "success", "VM 创建、环境安装、系统启动和监控工具验收完成。");
+  }
+}
+
 registerWebStaticRoutes();
+writeApiStartupLog("api routes registered", {
+  phaseElapsedMs: Date.now() - apiModuleLoadedAt,
+});
 
 const port = Number(process.env.PORT ?? 3987);
 const host = process.env.HOST ?? "0.0.0.0";
@@ -1590,8 +2113,43 @@ server.addHook("onClose", async () => {
   vmScheduleRunner.stop();
 });
 await server.listen({ host, port });
-vmScheduleRunner.start();
-void refreshVmScheduleTargetCache().catch((error) => server.log.warn({ error }, "vm schedule target cache warmup failed"));
+writeApiStartupLog("api fastify listen done", {
+  host,
+  port,
+  phaseElapsedMs: Date.now() - apiModuleLoadedAt,
+});
+if (persistentConnectionStoreEnabled) {
+  vmScheduleRunner.start();
+  writeApiStartupLog("api schedule runner started", {
+    phaseElapsedMs: Date.now() - apiModuleLoadedAt,
+  });
+  void refreshVmScheduleTargetCache().catch((error) => server.log.warn({ error }, "vm schedule target cache warmup failed"));
+  void resumeProvisioningExecutions().catch((error) => server.log.error({ error }, "provision execution recovery failed"));
+} else {
+  writeApiStartupLog("api schedule runner disabled", {
+    reason: persistentConnectionPolicy.reason,
+    phaseElapsedMs: Date.now() - apiModuleLoadedAt,
+  });
+}
+
+function writeApiStartupLog(phase: string, detail: Record<string, unknown> = {}) {
+  process.stdout.write(
+    `${JSON.stringify({
+      level: 30,
+      time: Date.now(),
+      pid: process.pid,
+      msg: "api startup phase",
+      phase,
+      elapsedSinceModuleLoadedMs: Date.now() - apiModuleLoadedAt,
+      ...detail,
+    })}\n`,
+  );
+}
+
+function elapsedFromEnv(name: string) {
+  const startedAt = Number(process.env[name] || 0);
+  return Number.isFinite(startedAt) && startedAt > 0 ? Date.now() - startedAt : undefined;
+}
 
 function registerWebStaticRoutes() {
   const webDistDir = resolveWebDistDir();
@@ -1760,6 +2318,9 @@ function resolveConnectionRequest(input: z.infer<typeof connectionSchema>): {
   connection: XenConnectionInput;
 } {
   if (input.connectionId) {
+    if (!persistentConnectionStoreEnabled) {
+      throw new Error("共享 Web 模式不允许复用服务器保存的连接，请重新填写账号密码。");
+    }
     const stored = resolveEphemeralConnection(input.connectionId) ?? resolveStoredConnection(input.connectionId);
     return {
       connectionId: input.connectionId,
@@ -1778,10 +2339,27 @@ function resolveConnectionRequest(input: z.infer<typeof connectionSchema>): {
   };
 }
 
+async function resolveGeneratedIsoCleanupConnection(record: GeneratedIsoRecord): Promise<XenConnectionInput | undefined> {
+  if (!persistentConnectionStoreEnabled || !record.connectionId) return undefined;
+  try {
+    const stored = resolveEphemeralConnection(record.connectionId) ?? resolveStoredConnection(record.connectionId);
+    if (stored.providerType !== record.providerType) return undefined;
+    return {
+      host: stored.host,
+      port: stored.port,
+      username: stored.username,
+      password: stored.password,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 async function listVmScheduleTargets(): Promise<{
   targets: VmScheduleTarget[];
   errors: Array<{ connectionId: string; connectionName?: string; message: string }>;
 }> {
+  if (!persistentConnectionStoreEnabled) return { targets: [], errors: [] };
   const cacheAge = Date.now() - vmScheduleTargetCacheUpdatedAt;
   if (vmScheduleTargetCache && cacheAge < vmScheduleTargetCacheTtlMs) return vmScheduleTargetCache;
   if (vmScheduleTargetCache) {
@@ -1792,6 +2370,7 @@ async function listVmScheduleTargets(): Promise<{
 }
 
 function refreshVmScheduleTargetCache() {
+  if (!persistentConnectionStoreEnabled) return Promise.resolve({ targets: [], errors: [] });
   if (vmScheduleTargetRefreshJob) return vmScheduleTargetRefreshJob;
   const cacheVersion = vmScheduleTargetCacheVersion;
   vmScheduleTargetRefreshJob = loadVmScheduleTargets()
@@ -2000,16 +2579,25 @@ function loadVmsCached(
   });
   return inventoryCache.getVmList(
     cacheScope,
-    () =>
-      provider.listVms(resolved.connection, {
+    async () => {
+      const result = await provider.listVms(resolved.connection, {
         poolId: options.poolId,
         hostId: options.hostId,
         page: options.page,
         pageSize: options.pageSize,
         keyword: options.keyword,
-      }),
+      });
+      return {
+        ...result,
+        items: observeVmPowerStates(buildVmPowerStateScope(resolved), result.items),
+      };
+    },
     Boolean(options.forceRefresh),
   );
+}
+
+function buildVmPowerStateScope(resolved: ReturnType<typeof resolveConnectionRequest>): string {
+  return resolved.connectionId || `${resolved.providerType}:${resolved.connection.host}:${resolved.connection.port}:${resolved.connection.username}`;
 }
 
 function loadVmSummaryCached(
@@ -2155,6 +2743,7 @@ function buildProvisionRequestData(
     environmentTemplateId: input.environmentTemplateId,
     sourceType: input.sourceType,
     installStrategy: input.installStrategy,
+    installProfile: input.installProfile,
     isoId: input.isoId,
     isoName: input.isoName,
     templateName: input.templateName,
@@ -2365,12 +2954,17 @@ async function runProvisionIsoPreflight(
   }
   const images = await provider.listIsoImages(connection, { hostId: request.hostId }).catch(() => []);
   const selected = images.find((image) => image.providerId === request.isoId || image.id === request.isoId || image.name === request.isoName);
-  return [
+  const selectedGuestTools = providerType === "xenserver" && selected && isXenGuestToolsIsoName(selected.name || selected.path);
+  const checks: ProvisionPreflightCheck[] = [
     {
       key: "iso",
       label: "系统镜像",
-      status: selected ? "success" : "error",
-      message: selected ? `已找到镜像：${selected.name}` : `未找到所选镜像：${request.isoName || request.isoId || "未选择"}`,
+      status: selected && !selectedGuestTools ? "success" : "error",
+      message: selectedGuestTools
+        ? `${selected.name} 是 XenServer 监控工具盘，不能用于安装操作系统`
+        : selected
+          ? `已找到镜像：${selected.name}`
+          : `未找到所选镜像：${request.isoName || request.isoId || "未选择"}`,
       details: selected
         ? {
             id: selected.providerId,
@@ -2381,6 +2975,21 @@ async function runProvisionIsoPreflight(
         : { available: images.slice(0, 20).map((image) => image.name) },
     },
   ];
+  if (request.installStrategy === "windows-unattended") {
+    const tools = images.find((image) => isXenGuestToolsIsoName(image.name || image.path));
+    checks.push({
+      key: "windows-answer-media",
+      label: "Windows 应答介质",
+      status: selected?.sourceType === "iso-library" && tools ? "success" : "error",
+      message:
+        selected?.sourceType !== "iso-library"
+          ? "Windows 无人值守必须使用可写 ISO 库中的原版镜像，不能使用本机 DVD"
+          : tools
+            ? `将生成包含 Autounattend 的任务级启动 ISO，并使用 ${tools.name} 安装监控工具`
+            : "未找到 xs-tools.iso，无法完成 Windows 监控工具安装",
+    });
+  }
+  return checks;
 }
 
 function runProvisionVmConflictPreflight(
@@ -2414,15 +3023,11 @@ function runProvisionIpConflictPreflight(
 }
 
 function runProvisionIpLeasePreflight(request: VmProvisionRequest): ProvisionPreflightCheck {
-  const targetIps = new Set(request.planItems.map((item) => item.ip.trim()).filter(isIpv4));
-  const conflicts = listIpLeases()
-    .filter((lease) => targetIps.has(lease.ip))
-    .map((lease) => `${lease.ip}：${lease.vmName}`);
+  const result = buildIpLeasePreflightResult(request.planItems, listIpLeases());
   return {
     key: "ip-lease",
     label: "本地 IP 租约",
-    status: conflicts.length ? "error" : "success",
-    message: conflicts.length ? `本地已预留：${conflicts.join("、")}` : "本地未发现 IP 预留冲突",
+    ...result,
   };
 }
 
@@ -2433,16 +3038,42 @@ async function runProvisionIpReachabilityPreflight(request: VmProvisionRequest):
     reachable: await pingIp(ip, 900),
   }));
   const reachableIps = results.filter((item) => item.reachable).map((item) => item.ip);
+  const result = buildIpReachabilityPreflightResult(reachableIps);
   return {
     key: "ip-ping",
     label: "IP 探测",
-    status: reachableIps.length ? "warning" : "success",
-    message: reachableIps.length ? `以下 IP ping 有响应：${reachableIps.join("、")}` : "目标 IP ping 无响应",
+    ...result,
   };
 }
 
 function validateProvisionPlan(providerType: ProviderType, request: VmProvisionRequest, raw: { templateName?: string }): string[] {
   const errors: string[] = [];
+  if (request.environmentTemplateId) {
+    const template = getProvisioningConfig().environmentTemplates.find((item) => item.id === request.environmentTemplateId);
+    if (!template) {
+      errors.push(`系统环境不存在：${request.environmentTemplateId}`);
+    } else {
+      if (template.providerType && template.providerType !== providerType) {
+        errors.push(`系统环境与虚拟化平台不匹配：${template.name}`);
+      }
+      if (template.sourceType !== request.sourceType) {
+        errors.push(`系统环境与安装来源不匹配：${template.name}`);
+      }
+      if (request.installStrategy && template.installStrategy !== request.installStrategy) {
+        errors.push(`系统环境与安装策略不匹配：${template.name}`);
+      }
+      const requestProfile = request.installProfile === "desktop" ? "desktop" : "server";
+      if (template.installProfile !== requestProfile) {
+        errors.push(`系统环境与安装类型不匹配：${template.name}`);
+      }
+      if (template.sourceType === "iso" && template.isoNamePattern) {
+        const isoIdentity = `${request.isoName || ""} ${request.isoId || ""}`.toLowerCase();
+        if (!isoIdentity.includes(template.isoNamePattern.toLowerCase())) {
+          errors.push(`系统环境与镜像不匹配：${template.name} 需要 ${template.isoNamePattern}`);
+        }
+      }
+    }
+  }
   if (request.count !== request.planItems.length) {
     errors.push(`创建数量与 VM 计划不一致：数量 ${request.count}，计划 ${request.planItems.length} 台`);
   }
@@ -2458,7 +3089,10 @@ function validateProvisionPlan(providerType: ProviderType, request: VmProvisionR
     if (ips.has(ip)) errors.push(`VM IP 重复：${ip}`);
     ips.add(ip);
     if (request.autoStart && !item.rootPassword?.trim()) {
-      errors.push(`缺少 ${item.name} 的登录密码，无法完成启动后的 SSH 验收`);
+      errors.push(`缺少 ${item.name} 的登录密码，无法完成启动后的账号验收`);
+    }
+    if (request.installStrategy === "windows-unattended" && !isWindowsPasswordComplex(item.rootPassword || "")) {
+      errors.push(`${item.name} 的 Administrator 密码至少 8 位，并需包含数字、特殊字符及大小写字母中的三类`);
     }
   }
   if (providerType === "xenserver") {
@@ -2478,10 +3112,33 @@ function validateProvisionPlan(providerType: ProviderType, request: VmProvisionR
       errors.push("XenServer 一键安装必须配置 CIDR，用于生成静态 IP 子网掩码");
     }
   }
+  if (request.installStrategy === "windows-unattended") {
+    const isoIdentity = `${request.isoName || ""} ${request.isoId || ""}`.toLowerCase();
+    if (providerType !== "xenserver" || request.sourceType !== "iso") {
+      errors.push("Windows 无人值守当前只支持 XenServer ISO 安装策略");
+    }
+    if (!isoIdentity.includes("windows_server_2008_r2") && !isoIdentity.includes("windows_server_2012_r2")) {
+      errors.push("Windows 无人值守当前仅支持已校验的 Windows Server 2008 R2 / 2012 R2 原版 ISO");
+    }
+  }
   if ((providerType === "vmware" || providerType === "proxmox") && request.sourceType === "template" && !raw.templateName?.trim()) {
     errors.push(`${providerLabel(providerType)} 模板克隆必须选择克隆源`);
   }
+  if (request.installProfile === "desktop") {
+    if (providerType !== "proxmox" || request.installStrategy !== "kickstart" || request.sourceType !== "iso") {
+      errors.push("桌面安装当前只支持 PVE ISO/Kickstart 策略");
+    }
+    const isoIdentity = `${request.isoName || ""} ${request.isoId || ""}`.toLowerCase();
+    if (!isoIdentity.includes("kylin") || (!isoIdentity.includes("arm64") && !isoIdentity.includes("aarch64"))) {
+      errors.push("PVE 桌面安装必须选择包含 UKUI 环境组的麒麟 ARM ISO");
+    }
+  }
   return Array.from(new Set(errors));
+}
+
+function isWindowsPasswordComplex(password: string): boolean {
+  const categories = [/[a-z]/.test(password), /[A-Z]/.test(password), /\d/.test(password), /[^A-Za-z0-9]/.test(password)].filter(Boolean).length;
+  return password.length >= 8 && categories >= 3;
 }
 
 async function pingIp(ip: string, timeoutMs: number): Promise<boolean> {

@@ -73,6 +73,7 @@ export interface VmNode {
   diskSizeSummary?: string;
   ipAddresses: string[];
   guestOs?: string;
+  lastShutdownAt?: string | null;
   toolsStatus: "installed" | "missing" | "unknown";
   metrics?: VmMetricSnapshot;
   reclaimLevel: ReclaimLevel;
@@ -98,7 +99,45 @@ export interface VmDisk {
   name: string;
   device: string;
   virtualSizeBytes: number;
+  storageRepositoryId?: string;
   storageRepository?: string;
+  onlineResizeSupported?: boolean;
+}
+
+export interface GuestStorageMount {
+  mountPath: string;
+  source: string;
+  filesystem: string;
+  sizeBytes: number;
+  usedBytes: number;
+  availableBytes: number;
+  guestDiskPath: string;
+  guestPartitionPath?: string;
+  guestPartitionSizeBytes?: number;
+  platformDiskId?: string;
+  logicalVolume: boolean;
+  pendingCapacityBytes: number;
+}
+
+export interface GuestStorageDirectory {
+  path: string;
+  state: "empty";
+}
+
+export interface GuestStorageDisk {
+  path: string;
+  sizeBytes: number;
+  filesystem?: string;
+  mountPath?: string;
+}
+
+export interface GuestStorageInventory {
+  vmIp: string;
+  supported: boolean;
+  message: string;
+  disks: GuestStorageDisk[];
+  mounts: GuestStorageMount[];
+  directories: GuestStorageDirectory[];
 }
 
 export interface VirtualDisk {
@@ -118,6 +157,7 @@ export interface IsoImage {
   id: string;
   providerId: string;
   name: string;
+  sourceType?: "iso-library" | "host-dvd" | "tools";
   storageRepositoryId?: string;
   storageRepository: string;
   path?: string;
@@ -155,7 +195,8 @@ export interface EnvironmentProvisioningTemplate {
   ipPoolId: string;
   vmNamePrefix: string;
   autoStart: boolean;
-  installStrategy: "template-clone" | "kickstart" | "manual-iso";
+  installStrategy: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso";
+  installProfile: "server" | "desktop";
   description?: string;
 }
 
@@ -214,6 +255,55 @@ export interface VmRenameResult {
   previousName: string;
   newName: string;
   accepted: boolean;
+  message: string;
+}
+
+export interface VmResizeDiskRequest {
+  mode: "extend" | "add";
+  diskId?: string;
+  storageRepositoryId?: string;
+  sizeBytes: number;
+  name?: string;
+}
+
+export interface VmResizeGuestStorageRequest {
+  vmIp: string;
+  username?: string;
+  password?: string;
+  mountPath: string;
+  guestDiskPath?: string;
+  guestPartitionPath?: string;
+  filesystem?: string;
+}
+
+export interface VmResizeRequest {
+  cpuCount?: number;
+  memoryBytes?: number;
+  disk?: VmResizeDiskRequest;
+  guestStorage?: VmResizeGuestStorageRequest;
+  allowShutdown: boolean;
+  restartAfterResize: boolean;
+}
+
+export interface VmResizeGuestStorageResult {
+  status: "completed" | "failed";
+  mountPath: string;
+  sizeBytes?: number;
+  message: string;
+}
+
+export interface VmResizeResult {
+  vmId: string;
+  name: string;
+  accepted: boolean;
+  previousCpuCount: number;
+  cpuCount: number;
+  previousMemoryBytes: number;
+  memoryBytes: number;
+  disks: VmDisk[];
+  stopped: boolean;
+  restarted: boolean;
+  guestStorage?: VmResizeGuestStorageResult;
   message: string;
 }
 
@@ -307,7 +397,8 @@ export interface VmProvisionInstallSourceRef {
 
 export interface VmProvisionRequest {
   taskId?: string;
-  installStrategy?: "template-clone" | "kickstart" | "manual-iso";
+  installStrategy?: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso";
+  installProfile?: "server" | "desktop";
   connectionId?: string;
   providerType: ProviderType;
   hostId?: string;
@@ -342,9 +433,9 @@ export interface VmProvisionResult {
   taskId?: string;
 }
 
-export type ProvisionTaskStatus = "pending" | "running" | "success" | "failed";
+export type ProvisionTaskStatus = "pending" | "running" | "success" | "warning" | "failed";
 
-export type ProvisionTaskStepStatus = "pending" | "running" | "success" | "failed" | "skipped";
+export type ProvisionTaskStepStatus = "pending" | "running" | "success" | "warning" | "failed" | "skipped";
 
 export type ProvisionTaskStepKey =
   | "plan"

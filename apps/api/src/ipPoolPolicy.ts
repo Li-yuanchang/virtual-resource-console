@@ -44,7 +44,7 @@ export function getIpPoolPolicyPath(): string {
 function loadIpPoolPolicy(): IpPoolPolicy {
   const file = getIpPoolPolicyPath();
   if (!existsSync(file)) {
-    throw new Error(`IP 池配置文件不存在：${file}，请先复制 config/ip-pools.example.json 为 ip-pools.json`);
+    throw new Error(`IP 池配置文件不存在：${file}，请在设置页新增或导入 IP 池后保存`);
   }
   try {
     const input = JSON.parse(readFileSync(file, "utf8")) as IpPoolPolicyInput;
@@ -61,6 +61,10 @@ function normalizeIpPoolPolicy(input: IpPoolPolicyInput): IpPoolPolicy {
   if (!defaultDns.length) {
     throw new Error("IP 池配置缺少 defaultDns");
   }
+  const invalidDns = defaultDns.filter((item) => !isIpv4(item));
+  if (invalidDns.length) {
+    throw new Error(`默认 DNS 格式不正确：${invalidDns.join("、")}`);
+  }
   const ipPools = normalizeIpPools(input.ipPools);
   if (!ipPools.length) {
     throw new Error("IP 池配置缺少 ipPools");
@@ -73,7 +77,9 @@ function normalizeIpPoolPolicy(input: IpPoolPolicyInput): IpPoolPolicy {
 
 function normalizeIpPools(input: RuntimeIpPoolPolicy[] | undefined): RuntimeIpPoolPolicy[] {
   if (!Array.isArray(input)) return [];
-  return dedupeIpPools(input.map(normalizeIpPool).filter((item) => item.id && item.name && item.prefix && item.gateway));
+  const ipPools = input.map(normalizeIpPool);
+  validateIpPools(ipPools);
+  return ipPools;
 }
 
 function normalizeIpPool(item: RuntimeIpPoolPolicy): RuntimeIpPoolPolicy {
@@ -91,16 +97,48 @@ function normalizeIpPool(item: RuntimeIpPoolPolicy): RuntimeIpPoolPolicy {
   };
 }
 
-function dedupeIpPools(input: RuntimeIpPoolPolicy[]): RuntimeIpPoolPolicy[] {
-  const result = new Map<string, RuntimeIpPoolPolicy>();
-  for (const pool of input) {
-    const key = pool.prefix;
-    if (!result.has(key)) result.set(key, pool);
+function validateIpPools(ipPools: RuntimeIpPoolPolicy[]): void {
+  const ids = new Set<string>();
+  const prefixes = new Set<string>();
+  for (const pool of ipPools) {
+    if (!pool.id) throw new Error("IP 池 ID 不能为空");
+    if (ids.has(pool.id)) throw new Error(`IP 池 ID 重复：${pool.id}`);
+    ids.add(pool.id);
+    if (!pool.name) throw new Error(`IP 池名称不能为空：${pool.id}`);
+    if (!isIpv4Prefix(pool.prefix)) throw new Error(`IP 池网段格式不正确：${pool.name}`);
+    if (prefixes.has(pool.prefix)) throw new Error(`IP 池网段重复：${pool.prefix}`);
+    prefixes.add(pool.prefix);
+    if (!isIpv4(pool.gateway)) throw new Error(`IP 池网关格式不正确：${pool.name}`);
+    if (!pool.gateway.startsWith(`${pool.prefix}.`)) {
+      throw new Error(`IP 池网关必须属于本网段：${pool.name}，网段 ${pool.prefix}，网关 ${pool.gateway}`);
+    }
+    if ((pool.startHost ?? 20) > (pool.endHost ?? 250)) {
+      throw new Error(`IP 池起始尾号不能大于结束尾号：${pool.name}`);
+    }
+    const invalidDns = (pool.dns ?? []).filter((item) => !isIpv4(item));
+    if (invalidDns.length) throw new Error(`IP 池 DNS 格式不正确：${pool.name}，${invalidDns.join("、")}`);
+    const invalidHostPrefixes = (pool.hostPrefixes ?? []).filter((item) => !isIpv4Prefix(item));
+    if (invalidHostPrefixes.length) {
+      throw new Error(`适用物理机网段格式不正确：${pool.name}，${invalidHostPrefixes.join("、")}`);
+    }
   }
-  return [...result.values()];
 }
 
 function toHostOctet(value: unknown, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 && parsed < 255 ? parsed : fallback;
+}
+
+function isIpv4Prefix(value: string): boolean {
+  const parts = value.split(".");
+  return parts.length === 3 && parts.every((part) => isIpv4Octet(part));
+}
+
+function isIpv4(value: string): boolean {
+  const parts = value.split(".");
+  return parts.length === 4 && parts.every((part) => isIpv4Octet(part));
+}
+
+function isIpv4Octet(value: string): boolean {
+  return /^\d{1,3}$/.test(value) && Number(value) >= 0 && Number(value) <= 255;
 }

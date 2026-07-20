@@ -28,34 +28,74 @@ export async function prepareProxmoxArmKickstartArtifacts(input: {
   sourceIsoVolid: string;
   vm: VmProvisionPlanItem;
   ipPool: IpPoolConfig;
+  installProfile?: "server" | "desktop";
 }): Promise<ProxmoxKickstartArtifacts> {
   const sourceIsoName = sourceIsoFileName(input.sourceIsoVolid);
+  const distribution = resolveProxmoxArmDistribution(sourceIsoName);
+  if (input.installProfile === "desktop" && distribution !== "kylin") {
+    throw new Error("PVE ARM 桌面安装当前仅支持包含 UKUI 环境组的麒麟 ISO。");
+  }
   const safeKey = safeFileName(`${input.taskId}-${input.vm.name}`);
   const taskDir = `/var/lib/vz/vrc-provision/${safeKey}`;
   const isoName = `vrc-${safeFileName(input.vm.name)}-ks-${Date.now().toString(36)}.iso`;
   const isoPath = `/var/lib/vz/template/iso/${isoName}`;
   const mountDir = `${taskDir}/source`;
   const configDir = `${taskDir}/config`;
-  await runProxmoxHostCommand(input.connection, [
-    "set -e",
-    `task_dir='${escapeShellValue(taskDir)}'`,
-    `mount_dir='${escapeShellValue(mountDir)}'`,
-    `config_dir='${escapeShellValue(configDir)}'`,
-    `source_iso='/var/lib/vz/template/iso/${escapeShellValue(sourceIsoName)}'`,
-    "test -f \"$source_iso\"",
-    "mkdir -p \"$mount_dir\" \"$config_dir\"",
-    "mountpoint -q \"$mount_dir\" || mount -o loop,ro \"$source_iso\" \"$mount_dir\"",
-    "test -f \"$mount_dir/images/pxeboot/vmlinuz\"",
-    "test -f \"$mount_dir/images/pxeboot/initrd.img\"",
-    "cp -f \"$mount_dir/images/pxeboot/vmlinuz\" \"$task_dir/vmlinuz\"",
-    "cp -f \"$mount_dir/images/pxeboot/initrd.img\" \"$task_dir/initrd.img\"",
-    "label=$(blkid -p -s LABEL -o value \"$source_iso\" 2>/dev/null || true)",
-    "printf '%s' \"$label\" > \"$task_dir/source-label\"",
-    "umount \"$mount_dir\"",
-  ].join("\n"));
+  try {
+    await runProxmoxHostCommand(input.connection, [
+      "set -e",
+      `task_dir='${escapeShellValue(taskDir)}'`,
+      `mount_dir='${escapeShellValue(mountDir)}'`,
+      `config_dir='${escapeShellValue(configDir)}'`,
+      `source_iso='/var/lib/vz/template/iso/${escapeShellValue(sourceIsoName)}'`,
+      `install_profile='${input.installProfile === "desktop" ? "desktop" : "server"}'`,
+      "test -f \"$source_iso\"",
+      "mkdir -p \"$mount_dir\" \"$config_dir\"",
+      "mountpoint -q \"$mount_dir\" || mount -o loop,ro \"$source_iso\" \"$mount_dir\"",
+      "trap 'mountpoint -q \"$mount_dir\" && umount \"$mount_dir\"' EXIT",
+      "test -f \"$mount_dir/images/pxeboot/vmlinuz\"",
+      "test -f \"$mount_dir/images/pxeboot/initrd.img\"",
+      "cp -f \"$mount_dir/images/pxeboot/vmlinuz\" \"$task_dir/vmlinuz\"",
+      "cp -f \"$mount_dir/images/pxeboot/initrd.img\" \"$task_dir/initrd.img\"",
+      "label=$(blkid -p -s LABEL -o value \"$source_iso\" 2>/dev/null || true)",
+      "printf '%s' \"$label\" > \"$task_dir/source-label\"",
+      "if [ \"$install_profile\" = desktop ]; then",
+      `python3 - "$mount_dir" > "$task_dir/desktop-environment" <<'PY'
+import glob
+import gzip
+import sys
+import xml.etree.ElementTree as ET
+
+mount_dir = sys.argv[1]
+paths = glob.glob(f"{mount_dir}/repodata/*comps*.xml") + glob.glob(f"{mount_dir}/repodata/*comps*.xml.gz")
+for path in paths:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rb") as stream:
+        root = ET.parse(stream).getroot()
+    for environment in root.findall("environment"):
+        groups = {node.text for node in environment.findall("./grouplist/groupid") if node.text}
+        environment_id = (environment.findtext("id") or "").strip()
+        if environment_id and "ukui-desktop" in groups:
+            print(environment_id)
+            raise SystemExit(0)
+raise SystemExit("所选 ISO 未提供 UKUI 桌面环境组")
+PY`,
+      "test -s \"$task_dir/desktop-environment\"",
+      "fi",
+      "umount \"$mount_dir\"",
+      "trap - EXIT",
+    ].join("\n"));
+  } catch (error) {
+    await cleanupProxmoxKickstartArtifacts(input.connection, { isoPath, taskDir }).catch(() => undefined);
+    throw error;
+  }
+  const packageEnvironment = input.installProfile === "desktop"
+    ? (await runProxmoxHostCommand(input.connection, `cat '${escapeShellValue(taskDir)}/desktop-environment'`)).trim()
+    : undefined;
   const kickstart = buildProxmoxArmKickstart({
     vm: { ...input.vm, name: safeGuestHostname(input.vm.name) },
     ipPool: input.ipPool,
+    packageEnvironment,
   });
   await writeProxmoxHostFile(input.connection, `${configDir}/ks.cfg`, kickstart);
   await runProxmoxHostCommand(input.connection, [
@@ -87,8 +127,13 @@ export async function prepareProxmoxArmKickstartArtifacts(input: {
   };
 }
 
-function buildProxmoxArmKickstart(input: { vm: VmProvisionPlanItem; ipPool: IpPoolConfig }): string {
-  return buildOfflineCentosKickstart(input)
+function buildProxmoxArmKickstart(input: { vm: VmProvisionPlanItem; ipPool: IpPoolConfig; packageEnvironment?: string }): string {
+  return buildOfflineCentosKickstart(input, {
+    monitoringTool: "proxmox",
+    firmware: "uefi",
+    packageEnvironment: input.packageEnvironment,
+    graphicalTarget: Boolean(input.packageEnvironment),
+  })
     .replace(/^install\n/m, "")
     .replace(/^auth\s+.*\n/m, "")
     .replace(/^reboot --eject$/m, "poweroff");

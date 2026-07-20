@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { request as httpsRequest } from "node:https";
 import { randomUUID } from "node:crypto";
 import WebSocket, { type RawData } from "ws";
-import { resolveStoredConnection } from "../connectionStore.js";
+import { resolveConsoleConnection, type ConsoleConnectionInput } from "./connection.js";
 import type { XenConnectionInput } from "../types.js";
 
 const PROXMOX_TIMEOUT_MS = 18_000;
@@ -11,6 +11,7 @@ const CONSOLE_SESSION_TTL_MS = 60_000;
 
 interface ConsoleQuery {
   connectionId?: string;
+  connection?: ConsoleConnectionInput;
   vmId?: string;
 }
 
@@ -128,23 +129,18 @@ async function openProxmoxConsole(request: FastifyRequest): Promise<WebSocket> {
   if ("sessionId" in query && typeof query.sessionId === "string") {
     return openPreparedProxmoxConsole(query.sessionId);
   }
-  if (!query.connectionId || !query.vmId) {
+  if ((!query.connectionId && !query.connection) || !query.vmId) {
     throw new Error("控制台参数不完整：缺少连接或 VM。");
-  }
-  const stored = resolveStoredConnection(query.connectionId);
-  if (stored.providerType !== "proxmox") {
-    throw new Error("当前控制台代理只处理 Proxmox VE。");
   }
   const [node, vmid] = parseProxmoxVmId(query.vmId);
   if (!node || !vmid) {
     throw new Error("Proxmox VE VM 标识无效。");
   }
 
+  const resolved = resolveConsoleConnection(query, "proxmox");
   const connection: XenConnectionInput = {
-    host: stored.host,
-    port: stored.port,
-    username: normalizeUsername(stored.username),
-    password: stored.password,
+    ...resolved.connection,
+    username: normalizeUsername(resolved.connection.username),
   };
   const login = await loginProxmox(connection);
   const proxy = await createProxmoxVncProxy(connection, login, node, vmid);
@@ -154,21 +150,16 @@ async function openProxmoxConsole(request: FastifyRequest): Promise<WebSocket> {
 async function createProxmoxConsoleSession(request: FastifyRequest): Promise<{ sessionId: string; password: string; expiresAt: string }> {
   const body = request.body as ConsoleQuery | undefined;
   if (!body?.connectionId || !body.vmId) {
-    throw new Error("控制台参数不完整：缺少连接或 VM。");
-  }
-  const stored = resolveStoredConnection(body.connectionId);
-  if (stored.providerType !== "proxmox") {
-    throw new Error("当前控制台会话只处理 Proxmox VE。");
+    if (!body?.connection || !body.vmId) throw new Error("控制台参数不完整：缺少连接或 VM。");
   }
   const [node, vmid] = parseProxmoxVmId(body.vmId);
   if (!node || !vmid) {
     throw new Error("Proxmox VE VM 标识无效。");
   }
+  const resolved = resolveConsoleConnection(body, "proxmox");
   const connection: XenConnectionInput = {
-    host: stored.host,
-    port: stored.port,
-    username: normalizeUsername(stored.username),
-    password: stored.password,
+    ...resolved.connection,
+    username: normalizeUsername(resolved.connection.username),
   };
   const login = await loginProxmox(connection);
   const proxy = await createProxmoxVncProxy(connection, login, node, vmid);

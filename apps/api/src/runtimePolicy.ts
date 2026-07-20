@@ -75,9 +75,9 @@ export function inferIpv4FromName(name: string, policy = getRuntimePolicy()): st
   const thirdOctets = policy.ipInference.shortIpThirdOctets.filter(Boolean).join("|");
   const basePrefix = policy.ipInference.shortIpBasePrefix?.trim();
   if (thirdOctets && basePrefix) {
-    const shortIp = name.match(new RegExp(`(?:^|[^0-9])((?:${thirdOctets})\\.(\\d{1,3}))(?:[^0-9]|$)`));
+    const shortIp = name.match(new RegExp(`(?:^|[^0-9])((?:${thirdOctets}))[.-](\\d{1,3})(?:[^0-9]|$)`));
     if (shortIp?.[1] && isValidHostOctet(shortIp[2])) {
-      const ip = `${basePrefix}.${shortIp[1]}`;
+      const ip = `${basePrefix}.${shortIp[1]}.${shortIp[2]}`;
       if (isManagedIpv4(ip, policy)) return ip;
     }
   }

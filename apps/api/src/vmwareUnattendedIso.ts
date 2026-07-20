@@ -85,7 +85,7 @@ export async function generateVmwareCentosKickstartIso(input: VmwareKickstartIso
     copyFileSync(input.bootFiles.isolinuxBin, join(isolinuxDir, "isolinux.bin"));
     copyFileSync(input.bootFiles.vmlinuz, join(isolinuxDir, "vmlinuz"));
     copyFileSync(input.bootFiles.initrd, join(isolinuxDir, "initrd.img"));
-    writeFileSync(join(workDir, "ks.cfg"), buildOfflineCentosKickstart(input), "utf8");
+    writeFileSync(join(workDir, "ks.cfg"), buildOfflineCentosKickstart(input, { monitoringTool: "vmware" }), "utf8");
     writeFileSync(join(isolinuxDir, "isolinux.cfg"), buildBootConfig(input, input.bootFiles.volumeLabel), "utf8");
     await execFileAsync(xorriso, [
       "-as", "mkisofs", "-o", localPath,

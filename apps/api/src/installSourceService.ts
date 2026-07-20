@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import { Client } from "ssh2";
 import type { ConnectConfig, SFTPWrapper } from "ssh2";
+import { buildCentosLvmPartitioning, buildCentosPackageSelection } from "./centosKickstart.js";
 import { markProvisionTaskStep, updateProvisionTaskVm } from "./provisionTaskStore.js";
 import type { IpPoolConfig, ProviderType, VmProvisionInstallSourceRef, VmProvisionPlanItem, VmProvisionRequest, XenConnectionInput } from "./types.js";
 import { resolveXenInstallMediaMode, type XenInstallMediaMode } from "./xenserverUnattendedIso.js";
@@ -39,6 +40,21 @@ interface XenSourceIsoInfo {
   location: string;
   remotePath: string;
   mountDir: string;
+  sourceType: "iso-library" | "host-dvd";
+}
+
+export interface XenInstallHostAddressCandidate {
+  ip: string;
+  management: boolean;
+}
+
+export interface XenProvisioningNetworkProbe {
+  status: "reachable" | "route-only" | "unreachable";
+  message: string;
+  installHost?: string;
+  routeAvailable: boolean;
+  gatewayReachable: boolean;
+  respondingTarget?: string;
 }
 
 const installSourceRecords = new Map<string, InstallSourceRecord>();
@@ -47,6 +63,42 @@ const cacheRoot = join(homedir(), ".virtual-resource-console", "install-source-c
 const xenHostInstallSourceStartPort = process.env.VRC_XEN_HOST_INSTALL_SOURCE_PORT?.trim() || "3988";
 const xenHostInstallSourcePortCount = Number(process.env.VRC_XEN_HOST_INSTALL_SOURCE_PORT_COUNT ?? "20");
 const xenHostInstallSourceRoot = process.env.VRC_XEN_HOST_INSTALL_SOURCE_ROOT?.trim() || "/var/run/vrc-install-source";
+
+export function buildXenInstalledHook(vmName: string): string {
+  return [
+    "#!/bin/sh",
+    "set -e",
+    `vm_name='${escapeShellValue(vmName)}'`,
+    'vm_uuid="$(xe vm-list name-label="$vm_name" --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
+    '[ -n "$vm_uuid" ] || { echo "未找到已安装 VM：$vm_name" >&2; exit 6; }',
+    'xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=c >/dev/null',
+    'tools_iso=""',
+    'for candidate in $(xe cd-list --minimal 2>/dev/null | tr "," " "); do',
+    '  label="$(xe vdi-param-get uuid="$candidate" param-name=name-label 2>/dev/null | tr -d "\\r\\n")"',
+    '  if [ "$label" = "xs-tools.iso" ] || [ "$label" = "guest-tools.iso" ]; then tools_iso="$candidate"; break; fi',
+    'done',
+    'if [ -n "$tools_iso" ]; then',
+    '  cd_vbd="$(xe vbd-list vm-uuid="$vm_uuid" type=CD --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
+    '  if [ -n "$cd_vbd" ]; then',
+    '    current_vdi="$(xe vbd-param-get uuid="$cd_vbd" param-name=vdi-uuid 2>/dev/null | tr -d "\\r\\n")"',
+    '    if [ "$current_vdi" != "$tools_iso" ]; then',
+    '      xe vbd-eject uuid="$cd_vbd" >/dev/null 2>&1 || { xe vbd-unplug uuid="$cd_vbd" force=true >/dev/null 2>&1 || true; xe vbd-eject uuid="$cd_vbd" >/dev/null 2>&1 || true; }',
+    '      xe vbd-insert uuid="$cd_vbd" vdi-uuid="$tools_iso" >/dev/null',
+    '    fi',
+    '  else',
+    '    cd_vbd="$(xe vbd-create vm-uuid="$vm_uuid" vdi-uuid="$tools_iso" device=3 bootable=false mode=RO type=CD)"',
+    '  fi',
+    '  attached="$(xe vbd-param-get uuid="$cd_vbd" param-name=currently-attached 2>/dev/null | tr -d "\\r\\n")"',
+    '  [ "$attached" = "true" ] || xe vbd-plug uuid="$cd_vbd" >/dev/null 2>&1 || true',
+    '  xe vm-param-set uuid="$vm_uuid" other-config:vrc-tools-media-ready=true >/dev/null 2>&1 || true',
+    'fi',
+    'xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-complete=true >/dev/null 2>&1 || true',
+  ].join("\n");
+}
+
+export function xenInstallRebootDirective(sourceType: "iso-library" | "host-dvd"): "reboot" | "reboot --eject" {
+  return sourceType === "host-dvd" ? "reboot" : "reboot --eject";
+}
 
 export function registerInstallSourceRoutes(server: FastifyInstance): void {
   // 保留兼容路由用于已有调用；XenServer 创建链路只使用目标物理机任务级安装源。
@@ -72,15 +124,15 @@ export function registerInstallSourceRoutes(server: FastifyInstance): void {
     const source = findInstallSource(getSourceId(request.params));
     if (!source) return reply.status(404).send({ message: "安装源不存在或已过期。" });
     if (!source.completedGuestInstall) {
+      await switchXenVmToDiskBoot(source);
       source.completedGuestInstall = true;
-      markProvisionTaskStep(source.taskId, "install-guest", "success", "系统安装脚本已完成，准备从硬盘启动");
-      markProvisionTaskStep(source.taskId, "wait-network", "running", "等待安装后系统重启并开放 SSH");
+      markProvisionTaskStep(source.taskId, "install-guest", "success", "系统安装完成，已切换硬盘启动并准备 Tools");
+      markProvisionTaskStep(source.taskId, "wait-network", "running", "等待系统盘启动并开放 SSH");
       updateProvisionTaskVm(source.taskId, source.vm.name, {
         status: "running",
         currentStep: "wait-network",
-        message: "系统安装脚本已完成，等待重启开放 SSH",
+        message: "已切换硬盘启动并挂载 Tools，等待 SSH",
       });
-      await switchXenVmToDiskBoot(source);
     }
     return reply.status(204).send();
   });
@@ -106,10 +158,11 @@ export async function publishXenInstallSources(input: {
 }): Promise<VmProvisionRequest> {
   if (!shouldUseXenKickstart(input.request)) return input.request;
   if (!input.request.isoId) throw new Error("XenServer Kickstart 安装需要系统 ISO。");
-  const installMediaMode = resolveXenInstallMediaMode();
+  const sourceInfo = await readXenSourceIsoInfo(input.connection, input.request.isoId);
+  const installMediaMode = sourceInfo.sourceType === "host-dvd" ? "native-http" : resolveXenInstallMediaMode();
   const hostLease = await allocateXenHostInstallSource(input.connection, input.request, input.taskId);
   if (!hostLease) {
-    throw new Error("无法在目标 XenServer 物理机发布任务级安装源，已禁止回退到客户端本机安装源。");
+    throw new Error("目标 XenServer 物理机没有可用于发布任务级安装源的 IPv4 地址。");
   }
   const planItems: VmProvisionPlanItem[] = [];
   for (const [index, vm] of input.request.planItems.entries()) {
@@ -133,6 +186,7 @@ export async function publishXenInstallSources(input: {
       ksUrl,
       installedUrl,
       xenHostPort: hostLease.port,
+      sourceInfo,
       createdAt: new Date().toISOString(),
       fetchedKickstart: false,
       startedPackageInstall: false,
@@ -179,7 +233,7 @@ export function shouldUseXenKickstart(request: VmProvisionRequest): boolean {
     request.providerType === "xenserver" &&
     request.sourceType === "iso" &&
     sourceName.includes("centos") &&
-    ["http-boot-iso", "cdrom-http-ks"].includes(resolveXenInstallMediaMode())
+    ["http-boot-iso", "cdrom-http-ks", "native-http"].includes(resolveXenInstallMediaMode())
   );
 }
 
@@ -227,10 +281,11 @@ async function findXenHostIpInVmNetwork(connection: XenConnectionInput, hostId: 
       'for pif_uuid in $(xe pif-list host-uuid="$host_uuid" --minimal 2>/dev/null | tr "," " "); do',
       '  device="$(xe pif-param-get uuid="$pif_uuid" param-name=device 2>/dev/null | tr -d "[:space:]")"',
       '  ip="$(xe pif-param-get uuid="$pif_uuid" param-name=IP 2>/dev/null | tr -d "[:space:]")"',
-      '  [ -n "$ip" ] && [ "$ip" != "<notindatabase>" ] && [ "$ip" != "<notinatabase>" ] && printf "IP\\t%s\\n" "$ip"',
+      '  management="$(xe pif-param-get uuid="$pif_uuid" param-name=management 2>/dev/null | tr -d "[:space:]")"',
+      '  [ -n "$ip" ] && [ "$ip" != "<notindatabase>" ] && [ "$ip" != "<notinatabase>" ] && printf "IP\\t%s\\t%s\\n" "$ip" "$management"',
       '  for iface in "$device" "xenbr${device#eth}"; do',
       '    [ -n "$iface" ] || continue',
-      '    ip -4 -o addr show dev "$iface" 2>/dev/null | awk \'{ split($4, a, "/"); if (a[1] != "") printf "IP\\t%s\\n", a[1] }\'',
+      '    ip -4 -o addr show dev "$iface" 2>/dev/null | awk \'{ split($4, a, "/"); if (a[1] != "") printf "IP\\t%s\\tfalse\\n", a[1] }\'',
       '  done',
       'done',
     ].join("\n"),
@@ -240,9 +295,139 @@ async function findXenHostIpInVmNetwork(connection: XenConnectionInput, hostId: 
   const candidates = output
     .split(/\r?\n/)
     .filter((line) => line.startsWith("IP\t"))
-    .map((line) => line.split("\t")[1])
-    .filter(isIpv4);
-  return candidates.find((ip) => (cidr && cidrContainsIp(cidr, ip)) || vmIps.some((vmIp) => sameIpv4Subnet(vmIp, ip, 24)));
+    .map((line) => {
+      const [, ip, management] = line.split("\t");
+      return { ip, management: management === "true" };
+    });
+  return selectXenInstallHostAddress(candidates, cidr, vmIps);
+}
+
+/** Checks the target XenServer host route and ICMP reachability without changing host network state. */
+export async function probeXenProvisioningNetwork(input: {
+  connection: XenConnectionInput;
+  hostId: string;
+  cidr: string;
+  gateway: string;
+  sampleIp: string;
+  occupiedIps: string[];
+}): Promise<XenProvisioningNetworkProbe> {
+  const installHost = await findXenHostIpInVmNetwork(input.connection, input.hostId, input.cidr, [input.sampleIp]);
+  if (!installHost) {
+    return {
+      status: "unreachable",
+      message: "目标 XenServer 物理机没有可用于发布安装源的 IPv4 地址。",
+      routeAvailable: false,
+      gatewayReachable: false,
+    };
+  }
+  if (isXenInstallHostInProvisioningNetwork(installHost, input.cidr)) {
+    return {
+      status: "reachable",
+      message: `目标宿主机 ${installHost} 与 ${input.cidr} 处于同一网段，已直接通过网络校验。`,
+      installHost,
+      routeAvailable: true,
+      gatewayReachable: false,
+    };
+  }
+  const pingTargets = Array.from(
+    new Set([
+      input.gateway,
+      ...input.occupiedIps.filter((ip) => isIpv4(ip) && cidrContainsIp(input.cidr, ip)),
+    ].filter(isIpv4)),
+  ).slice(0, 4);
+  const output = await runRemoteCommand(
+    input.connection,
+    [
+      `route_target='${escapeShellValue(input.sampleIp)}'`,
+      `ping_targets='${escapeShellValue(pingTargets.join(" "))}'`,
+      'if ip route get "$route_target" >/dev/null 2>&1; then printf "ROUTE\\ttrue\\n"; else printf "ROUTE\\tfalse\\n"; fi',
+      'if command -v ping >/dev/null 2>&1; then',
+      '  for target in $ping_targets; do',
+      '    if ping -c 1 -W 1 "$target" >/dev/null 2>&1; then printf "PING\\t%s\\n" "$target"; fi',
+      '  done',
+      'fi',
+    ].join("\n"),
+    15000,
+    "probe-xen-provisioning-network",
+  );
+  const routeAvailable = output.split(/\r?\n/).some((line) => line === "ROUTE\ttrue");
+  const respondingTarget = output
+    .split(/\r?\n/)
+    .find((line) => line.startsWith("PING\t"))
+    ?.split("\t")[1];
+  const gatewayReachable = output.split(/\r?\n/).some((line) => line === `PING\t${input.gateway}`);
+  return summarizeXenProvisioningNetworkProbe({
+    cidr: input.cidr,
+    sampleIp: input.sampleIp,
+    installHost,
+    routeAvailable,
+    gatewayReachable,
+    respondingTarget,
+  });
+}
+
+/** Returns whether the selected XenServer host address already belongs to the VM provisioning network. */
+export function isXenInstallHostInProvisioningNetwork(installHost: string, cidr: string): boolean {
+  return cidrContainsIp(cidr, installHost);
+}
+
+/** Converts route and ICMP evidence into the creation policy used by the API and UI. */
+export function summarizeXenProvisioningNetworkProbe(input: {
+  cidr: string;
+  sampleIp: string;
+  installHost: string;
+  routeAvailable: boolean;
+  gatewayReachable: boolean;
+  respondingTarget?: string;
+}): XenProvisioningNetworkProbe {
+  if (!input.routeAvailable) {
+    return {
+      status: "unreachable",
+      message: `目标宿主机 ${input.installHost} 未找到到 ${input.sampleIp} 的路由，请检查 IP 池 CIDR、网关和物理网络。`,
+      installHost: input.installHost,
+      routeAvailable: false,
+      gatewayReachable: input.gatewayReachable,
+    };
+  }
+  if (input.respondingTarget) {
+    return {
+      status: "reachable",
+      message: `目标宿主机 ${input.installHost} 可路由至 ${input.cidr}，${input.respondingTarget} Ping 有响应。`,
+      installHost: input.installHost,
+      routeAvailable: true,
+      gatewayReachable: input.gatewayReachable,
+      respondingTarget: input.respondingTarget,
+    };
+  }
+  return {
+    status: "route-only",
+    message: `目标宿主机 ${input.installHost} 已存在到 ${input.cidr} 的路由，但网关和现有节点未响应 ICMP；可能已禁用 Ping，允许继续创建。`,
+    installHost: input.installHost,
+    routeAvailable: true,
+    gatewayReachable: false,
+  };
+}
+
+/** Prefers a VM-subnet address and otherwise uses the target host management address on routed networks. */
+export function selectXenInstallHostAddress(
+  candidates: XenInstallHostAddressCandidate[],
+  cidr: string | undefined,
+  vmIps: string[],
+): string | undefined {
+  const unique = Array.from(
+    candidates
+      .filter((candidate) => isIpv4(candidate.ip))
+      .reduce((items, candidate) => {
+        const current = items.get(candidate.ip);
+        items.set(candidate.ip, { ip: candidate.ip, management: Boolean(current?.management || candidate.management) });
+        return items;
+      }, new Map<string, XenInstallHostAddressCandidate>())
+      .values(),
+  );
+  const sameSubnet = unique.find(
+    (candidate) => (cidr && cidrContainsIp(cidr, candidate.ip)) || vmIps.some((vmIp) => sameIpv4Subnet(vmIp, candidate.ip, 24)),
+  );
+  return sameSubnet?.ip ?? unique.find((candidate) => candidate.management)?.ip ?? unique[0]?.ip;
 }
 
 async function publishKickstartToXenHost(connection: XenConnectionInput, source: InstallSourceRecord): Promise<void> {
@@ -266,6 +451,10 @@ async function publishKickstartToXenHost(connection: XenConnectionInput, source:
       'server_script="/tmp/vrc-install-source-http-$port.py"',
       'mkdir -p "$source_dir"',
       'printf "" > "$source_dir/installed"',
+      "cat > \"$source_dir/installed-hook.sh\" <<'VRC_HOOK'",
+      ...buildXenInstalledHook(source.vm.name).split("\n"),
+      'VRC_HOOK',
+      'chmod 700 "$source_dir/installed-hook.sh"',
       'rm -f "$source_dir/repo"',
       'ln -s "$repo_dir" "$source_dir/repo"',
       'if command -v python >/dev/null 2>&1; then py=python; else echo "XenServer 物理机缺少 python，无法提供 Kickstart HTTP 服务" >&2; exit 7; fi',
@@ -273,7 +462,7 @@ async function publishKickstartToXenHost(connection: XenConnectionInput, source:
       '  :',
       'else',
       "  cat > \"$server_script\" <<'PYHTTP'",
-      'import BaseHTTPServer, os, posixpath, urllib, mimetypes, sys',
+      'import BaseHTTPServer, os, posixpath, urllib, mimetypes, subprocess, sys',
       'ROOT = os.path.abspath(sys.argv[1])',
       'PORT = int(sys.argv[2])',
       'class Handler(BaseHTTPServer.BaseHTTPRequestHandler):',
@@ -310,6 +499,22 @@ async function publishKickstartToXenHost(connection: XenConnectionInput, source:
       '        if not os.path.isfile(path):',
       '            self.send_error(404, "File not found")',
       '            return None',
+      '        if os.path.basename(path) == "installed":',
+      '            hook = os.path.join(os.path.dirname(path), "installed-hook.sh")',
+      '            lock = hook + ".done"',
+      '            acquired = False',
+      '            try:',
+      '                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0600)',
+      '                os.close(fd)',
+      '                acquired = True',
+      '            except OSError:',
+      '                pass',
+      '            if acquired and os.path.isfile(hook):',
+      '                if subprocess.call([hook]) != 0:',
+      '                    try: os.unlink(lock)',
+      '                    except OSError: pass',
+      '                    self.send_error(500, "Install completion hook failed")',
+      '                    return None',
       '        size = os.path.getsize(path)',
       '        start = 0',
       '        end = size - 1',
@@ -598,17 +803,41 @@ async function ensureRepoFileCached(source: InstallSourceRecord, repoPath: strin
   return localPath;
 }
 
-async function switchXenVmToDiskBoot(source: InstallSourceRecord): Promise<void> {
+export async function prepareXenVmForInstalledBoot(connection: XenConnectionInput, vmName: string): Promise<void> {
   await runRemoteCommand(
-    source.connection,
+    connection,
     [
-      `vm_name='${escapeShellValue(source.vm.name)}'`,
+      `vm_name='${escapeShellValue(vmName)}'`,
       'vm_uuid="$(xe vm-list name-label="$vm_name" --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
       '[ -n "$vm_uuid" ] || { echo "未找到已安装 VM：$vm_name" >&2; exit 6; }',
       'xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=c >/dev/null 2>&1 || true',
+      'tools_iso=""',
+      'for candidate in $(xe cd-list --minimal 2>/dev/null | tr "," " "); do',
+      '  label="$(xe vdi-param-get uuid="$candidate" param-name=name-label 2>/dev/null | tr -d "\\r\\n")"',
+      '  if [ "$label" = "xs-tools.iso" ] || [ "$label" = "guest-tools.iso" ]; then tools_iso="$candidate"; break; fi',
+      'done',
+      'if [ -n "$tools_iso" ]; then',
+      '  cd_vbd="$(xe vbd-list vm-uuid="$vm_uuid" type=CD --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
+      '  if [ -n "$cd_vbd" ]; then',
+      '    current_vdi="$(xe vbd-param-get uuid="$cd_vbd" param-name=vdi-uuid 2>/dev/null | tr -d "\\r\\n")"',
+      '    if [ "$current_vdi" != "$tools_iso" ]; then',
+      '      xe vbd-eject uuid="$cd_vbd" >/dev/null 2>&1 || { xe vbd-unplug uuid="$cd_vbd" force=true >/dev/null 2>&1 || true; xe vbd-eject uuid="$cd_vbd" >/dev/null 2>&1 || true; }',
+      '      xe vbd-insert uuid="$cd_vbd" vdi-uuid="$tools_iso" >/dev/null',
+      '    fi',
+      '  else',
+      '    cd_vbd="$(xe vbd-create vm-uuid="$vm_uuid" vdi-uuid="$tools_iso" device=3 bootable=false mode=RO type=CD)"',
+      '  fi',
+      '  attached="$(xe vbd-param-get uuid="$cd_vbd" param-name=currently-attached 2>/dev/null | tr -d "\\r\\n")"',
+      '  [ "$attached" = "true" ] || xe vbd-plug uuid="$cd_vbd" >/dev/null 2>&1 || true',
+      '  xe vm-param-set uuid="$vm_uuid" other-config:vrc-tools-media-ready=true >/dev/null 2>&1 || true',
+      'fi',
       'xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-complete=true >/dev/null 2>&1 || true',
     ].join("\n"),
   );
+}
+
+async function switchXenVmToDiskBoot(source: InstallSourceRecord): Promise<void> {
+  await prepareXenVmForInstalledBoot(source.connection, source.vm.name);
 }
 
 async function readXenSourceIsoInfo(connection: XenConnectionInput, sourceIsoId: string): Promise<XenSourceIsoInfo> {
@@ -617,24 +846,26 @@ async function readXenSourceIsoInfo(connection: XenConnectionInput, sourceIsoId:
     [
       `iso_uuid='${escapeShellValue(sourceIsoId)}'`,
       'sr_uuid="$(xe vdi-param-get uuid="$iso_uuid" param-name=sr-uuid 2>/dev/null)"',
+      'sr_type="$(xe sr-param-get uuid="$sr_uuid" param-name=type 2>/dev/null)"',
       'location="$(xe vdi-param-get uuid="$iso_uuid" param-name=location 2>/dev/null)"',
-      'remote_path="/var/run/sr-mount/$sr_uuid/$location"',
+      'source_type="iso-library"',
+      'if [ "$sr_type" = "udev" ] && printf "%s" "$location" | grep -q "^/dev/"; then source_type="host-dvd"; remote_path="$location"; else remote_path="/var/run/sr-mount/$sr_uuid/$location"; fi',
       'mount_dir="/tmp/vrc-source-iso-$iso_uuid"',
-      '[ -f "$remote_path" ] || { echo "未找到源 ISO 文件：$remote_path" >&2; exit 6; }',
+      '[ -e "$remote_path" ] || { echo "未找到源 ISO 介质：$remote_path" >&2; exit 6; }',
       'mkdir -p "$mount_dir"',
       'current_source="$(mount | awk -v dir="$mount_dir" \'$3 == dir {print $1; exit}\')"',
       '[ -z "$current_source" ] || [ "$current_source" = "$remote_path" ] || umount "$mount_dir" >/dev/null 2>&1 || true',
-      'mountpoint -q "$mount_dir" || mount -o loop,ro "$remote_path" "$mount_dir"',
+      'if ! mountpoint -q "$mount_dir"; then if [ "$source_type" = "host-dvd" ]; then mount -o ro "$remote_path" "$mount_dir"; else mount -o loop,ro "$remote_path" "$mount_dir"; fi; fi',
       '[ -f "$mount_dir/.treeinfo" ] || [ -d "$mount_dir/repodata" ] || { echo "源 ISO 不是可用安装源：$remote_path" >&2; exit 6; }',
-      'printf "ISO\\t%s\\t%s\\t%s\\t%s\\n" "$sr_uuid" "$location" "$remote_path" "$mount_dir"',
+      'printf "ISO\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$sr_uuid" "$location" "$remote_path" "$mount_dir" "$source_type"',
     ].join("\n"),
   );
   const line = output.split(/\r?\n/).find((item) => item.startsWith("ISO\t"));
-  const [, srUuid = "", location = "", remotePath = "", mountDir = ""] = line?.split("\t") ?? [];
+  const [, srUuid = "", location = "", remotePath = "", mountDir = "", sourceType = "iso-library"] = line?.split("\t") ?? [];
   if (!srUuid || !location || !remotePath || !mountDir) {
     throw new Error("未读取到 XenServer 源 ISO 文件路径，无法发布安装源。");
   }
-  return { srUuid, location, remotePath, mountDir };
+  return { srUuid, location, remotePath, mountDir, sourceType: sourceType === "host-dvd" ? "host-dvd" : "iso-library" };
 }
 
 function buildKickstart(source: InstallSourceRecord): string {
@@ -650,8 +881,10 @@ function buildKickstart(source: InstallSourceRecord): string {
   const hostname = sanitizeKickstartValue(source.vm.name);
   const installedUrl = sanitizeKickstartValue(source.installedUrl);
   const installSourceLine = source.installMediaMode === "cdrom-http-ks" ? "cdrom" : `url --url="${source.repoUrl}"`;
-  return `#version=DEVEL
+  const rebootDirective = xenInstallRebootDirective(source.sourceInfo?.sourceType ?? "iso-library");
+return `#version=DEVEL
 install
+text
 ${installSourceLine}
 lang en_US.UTF-8
 keyboard us
@@ -663,16 +896,9 @@ firewall --disabled
 firstboot --disabled
 network --bootproto=static --device=eth0 --ip=${ip} --netmask=${netmask} --gateway=${gateway} --nameserver=${dns} --hostname=${hostname} --onboot=on --activate
 bootloader --location=mbr
-zerombr
-clearpart --all --initlabel
-autopart --type=lvm
-reboot --eject
-%packages
-@core
-net-tools
-openssh-server
--dracut-config-rescue
-%end
+${buildCentosLvmPartitioning(source.vm.diskGiB)}
+${rebootDirective}
+${buildCentosPackageSelection()}
 %post --log=/root/vrc-kickstart-post.log
 cat > /etc/sysconfig/network-scripts/ifcfg-eth0 <<'VRC_IFCFG'
 TYPE=Ethernet
