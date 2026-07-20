@@ -5,16 +5,30 @@ const net = require("node:net");
 const path = require("node:path");
 
 const APP_DISPLAY_NAME = "VRC";
+const MAIN_PROCESS_STARTED_AT = Date.now();
+const WINDOWS_APP_USER_MODEL_ID = "com.virtualresource.console";
+const WINDOWS_SINGLE_INSTANCE_PIPE = "\\\\.\\pipe\\vrc-desktop-single-instance";
 const MIN_STARTUP_VISIBLE_MS = 650;
 const STARTUP_READY_STATUS_MS = 60;
 const STARTUP_EXIT_ANIMATION_MS = 260;
-const RENDERER_READY_TIMEOUT_MS = 15000;
+const RENDERER_READY_TIMEOUT_MS = 5000;
 
 if (app && app.setName) {
   app.setName(APP_DISPLAY_NAME);
 }
+if (process.platform === "win32") {
+  app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID);
+  try {
+    const userDataDir = path.join(app.getPath("appData"), APP_DISPLAY_NAME);
+    fs.mkdirSync(userDataDir, { recursive: true });
+    app.setPath("userData", userDataDir);
+  } catch (error) {
+    // 固定 userData 失败时继续依赖 Electron 默认路径，并把问题写入日志。
+  }
+}
 
 let mainWindow;
+let windowCreationPromise;
 let startupView;
 let startupStartedAt = 0;
 let startupResizeHandler;
@@ -27,13 +41,33 @@ let apiLogStream;
 let mainLogStream;
 let isQuitting = false;
 let logStreamsClosing = false;
+let pendingShowMainWindow = false;
+let windowsSingleInstanceServer;
+
+appendMainLog("startup phase", buildStartupDetail("main process started", {
+  platform: process.platform,
+  arch: process.arch,
+  packaged: app.isPackaged,
+  version: typeof app.getVersion === "function" ? app.getVersion() : undefined,
+}));
+
+const singleInstanceLock = app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
+  void notifyExistingWindowsInstance().finally(() => app.quit());
+} else {
+  app.on("second-instance", () => {
+    appendMainLog("second instance requested; focusing existing window");
+    void showMainWindow();
+  });
+}
+
+const instanceReadyPromise = singleInstanceLock && process.platform === "win32" ? startWindowsSingleInstanceServer() : Promise.resolve(singleInstanceLock);
 
 async function createWindow() {
+  appendMainLog("startup phase", buildStartupDetail("create window start"));
   const startupAppearance = readStartupAppearance();
   startupOverlayReady = false;
   const shouldStartBundledApi = app.isPackaged && !process.env.VRC_WEB_URL;
-  const bundledApiPromise = shouldStartBundledApi ? startBundledApi() : Promise.resolve(apiBaseUrl);
-  bundledApiPromise.catch(() => undefined);
   const macWindowOptions =
     process.platform === "darwin"
       ? {
@@ -57,6 +91,7 @@ async function createWindow() {
       nodeIntegration: false,
     },
   });
+  appendMainLog("startup phase", buildStartupDetail("browser window created"));
 
   mainWindow.on("close", (event) => {
     appendMainLog("main window close requested", { isQuitting, startupActive: Boolean(startupView) });
@@ -67,6 +102,7 @@ async function createWindow() {
 
   startupStartedAt = Date.now();
   try {
+    appendMainLog("startup phase", buildStartupDetail("startup overlay load start"));
     await attachStartupView(startupAppearance);
     startupOverlayReady = true;
   } catch (error) {
@@ -74,17 +110,31 @@ async function createWindow() {
     disposeStartupView();
     startupOverlayReady = true;
   }
-  appendMainLog("startup overlay ready", { elapsedMs: Date.now() - startupStartedAt });
+  appendMainLog("startup overlay ready", buildStartupDetail("startup overlay ready", { phaseElapsedMs: Date.now() - startupStartedAt }));
   mainWindow.show();
+  appendMainLog("startup phase", buildStartupDetail("main window shown with startup overlay"));
 
   try {
     await setStartupStatus("正在载入资源配置");
+    const bundledApiPromise = shouldStartBundledApi ? startBundledApi() : Promise.resolve(apiBaseUrl);
+    bundledApiPromise.catch(() => undefined);
+    appendMainLog("startup phase", buildStartupDetail("waiting for api base url"));
     apiBaseUrl = await bundledApiPromise;
+    appendMainLog("startup phase", buildStartupDetail("api base url ready", { apiBaseUrl }));
     const rendererLoadStartedAt = Date.now();
+    appendMainLog("startup phase", buildStartupDetail("renderer load start", { apiBaseUrl }));
     await mainWindow.loadURL(apiBaseUrl);
+    appendMainLog("startup phase", buildStartupDetail("renderer load url resolved", { phaseElapsedMs: Date.now() - rendererLoadStartedAt }));
     await setStartupStatus("正在准备工作区");
     const rendererReady = await waitForRendererReady(mainWindow.webContents);
-    appendMainLog("renderer startup readiness resolved", { rendererReady, elapsedMs: Date.now() - rendererLoadStartedAt });
+    appendMainLog("renderer startup readiness resolved", buildStartupDetail("renderer app ready", {
+      rendererReady: rendererReady.ready,
+      rendererState: rendererReady.state,
+      phaseElapsedMs: Date.now() - rendererLoadStartedAt,
+    }));
+    if (!rendererReady.ready) {
+      await setStartupStatus("工作区初始化较慢，先进入主界面");
+    }
     await finishStartupView();
   } catch (error) {
     appendMainLog("desktop startup failed", { message: error instanceof Error ? error.message : String(error) });
@@ -94,29 +144,74 @@ async function createWindow() {
 
 }
 
-app.whenReady().then(async () => {
-  configureApplicationMenu();
-  createTray();
-  await createWindow();
-}).catch((error) => {
-  appendMainLog("electron initialization failed", { message: error instanceof Error ? error.message : String(error) });
-});
+if (singleInstanceLock) {
+  instanceReadyPromise.then((canStart) => {
+    if (!canStart) return undefined;
+    return app.whenReady();
+  }).then(async () => {
+    appendMainLog("startup phase", buildStartupDetail("app ready"));
+    configureApplicationMenu();
+    appendMainLog("startup phase", buildStartupDetail("application menu configured"));
+    createTray();
+    appendMainLog("startup phase", buildStartupDetail("tray created"));
+    await ensureMainWindow();
+    if (pendingShowMainWindow) {
+      pendingShowMainWindow = false;
+      await showMainWindow();
+    }
+  }).catch((error) => {
+    appendMainLog("electron initialization failed", { message: error instanceof Error ? error.message : String(error) });
+  });
+}
 
 app.on("window-all-closed", () => undefined);
 
 app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    void createWindow();
+  void showMainWindow();
+});
+
+async function ensureMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+  if (windowCreationPromise) {
+    await windowCreationPromise;
+    return mainWindow;
+  }
+  windowCreationPromise = createWindow().finally(() => {
+    windowCreationPromise = undefined;
+  });
+  await windowCreationPromise;
+  return mainWindow;
+}
+
+async function showMainWindow() {
+  if (!app.isReady()) {
+    pendingShowMainWindow = true;
     return;
   }
-  if (!startupOverlayReady) return;
-  mainWindow?.show();
-  mainWindow?.focus();
-});
+  const targetWindow = await ensureMainWindow();
+  if (!targetWindow || targetWindow.isDestroyed()) return;
+  if (targetWindow.isMinimized()) targetWindow.restore();
+  targetWindow.setSkipTaskbar(false);
+  if (!targetWindow.isVisible()) targetWindow.show();
+  if (process.platform === "win32") {
+    targetWindow.setAlwaysOnTop(true);
+  }
+  targetWindow.moveTop();
+  targetWindow.focus();
+  if (process.platform === "win32") {
+    setTimeout(() => {
+      if (!targetWindow.isDestroyed()) targetWindow.setAlwaysOnTop(false);
+    }, 250);
+  }
+}
 
 app.on("before-quit", () => {
   isQuitting = true;
   logStreamsClosing = true;
+  if (windowsSingleInstanceServer) {
+    windowsSingleInstanceServer.close();
+    windowsSingleInstanceServer = undefined;
+  }
   disposeStartupView();
   if (apiProcess && !apiProcess.killed) {
     apiProcess.kill();
@@ -126,6 +221,55 @@ app.on("before-quit", () => {
   apiLogStream = undefined;
   mainLogStream = undefined;
 });
+
+function startWindowsSingleInstanceServer() {
+  return new Promise((resolve) => {
+    const server = net.createServer((socket) => {
+      appendMainLog("windows single instance pipe requested; focusing window");
+      void showMainWindow();
+      socket.end("ok");
+    });
+    server.once("listening", () => {
+      windowsSingleInstanceServer = server;
+      appendMainLog("windows single instance pipe listening", { pipe: WINDOWS_SINGLE_INSTANCE_PIPE });
+      resolve(true);
+    });
+    server.once("error", (error) => {
+      appendMainLog("windows single instance pipe failed", { code: error.code, message: error.message });
+      if (error.code === "EADDRINUSE") {
+        void notifyExistingWindowsInstance().finally(() => {
+          isQuitting = true;
+          app.quit();
+          resolve(false);
+        });
+        return;
+      }
+      resolve(true);
+    });
+    server.listen(WINDOWS_SINGLE_INSTANCE_PIPE);
+  });
+}
+
+function notifyExistingWindowsInstance() {
+  if (process.platform !== "win32") return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const socket = net.connect(WINDOWS_SINGLE_INSTANCE_PIPE);
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(result);
+    };
+    socket.setTimeout(800);
+    socket.once("connect", () => {
+      socket.end("show");
+      done(true);
+    });
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
 
 async function attachStartupView(appearance) {
   startupView = new WebContentsView({
@@ -172,6 +316,7 @@ async function setStartupStatus(message) {
 async function finishStartupView() {
   if (!startupView) return;
   const remaining = Math.max(MIN_STARTUP_VISIBLE_MS - (Date.now() - startupStartedAt), 0);
+  appendMainLog("startup phase", buildStartupDetail("startup overlay finish start", { remainingVisibleMs: remaining }));
   if (remaining) await delay(remaining);
   await setStartupStatus("资源控制台已就绪");
   await delay(STARTUP_READY_STATUS_MS);
@@ -181,11 +326,11 @@ async function finishStartupView() {
     // 覆盖层仍会在下方统一释放。
   }
   await delay(STARTUP_EXIT_ANIMATION_MS);
-  appendMainLog("releasing startup overlay", { visibleBefore: mainWindow?.isVisible() });
+  appendMainLog("releasing startup overlay", buildStartupDetail("startup overlay release start", { visibleBefore: mainWindow?.isVisible() }));
   disposeStartupView();
   mainWindow?.show();
   mainWindow?.focus();
-  appendMainLog("startup overlay released", { visibleAfter: mainWindow?.isVisible() });
+  appendMainLog("startup overlay released", buildStartupDetail("startup overlay released", { visibleAfter: mainWindow?.isVisible() }));
 }
 
 function disposeStartupView() {
@@ -206,17 +351,32 @@ function disposeStartupView() {
 
 async function waitForRendererReady(webContents) {
   const deadline = Date.now() + RENDERER_READY_TIMEOUT_MS;
+  let lastState = null;
   while (Date.now() < deadline) {
-    if (webContents.isDestroyed()) return false;
+    if (webContents.isDestroyed()) return { ready: false, state: lastState };
     try {
-      const ready = await webContents.executeJavaScript("document.documentElement.dataset.appReady === 'true'");
-      if (ready) return true;
+      const state = await readRendererStartupState(webContents);
+      lastState = state;
+      if (state.appReady) return { ready: true, state };
     } catch {
       // 页面导航或首轮脚本执行期间继续等待。
     }
     await delay(50);
   }
-  return false;
+  return { ready: false, state: lastState };
+}
+
+async function readRendererStartupState(webContents) {
+  return webContents.executeJavaScript(`(() => {
+    const dataset = document.documentElement.dataset;
+    return {
+      appReady: dataset.appReady === "true",
+      startupStage: dataset.startupStage || "",
+      startupError: dataset.startupError || "",
+      readyState: document.readyState,
+      visibilityState: document.visibilityState
+    };
+  })()`);
 }
 
 function readStartupAppearance() {
@@ -261,29 +421,32 @@ function delay(milliseconds) {
 
 async function startBundledApi() {
   const apiStartupStartedAt = Date.now();
+  appendMainLog("startup phase", buildStartupDetail("bundled api startup start"));
   const preferredPort = Number(process.env.PORT || 3987);
   const preferredBaseUrl = `http://127.0.0.1:${preferredPort}`;
   if (process.env.VRC_REUSE_EXISTING_API === "1" && await isVrcApiHealthy(preferredBaseUrl)) {
-    appendMainLog("reusing existing vrc api", { baseUrl: preferredBaseUrl, elapsedMs: Date.now() - apiStartupStartedAt });
+    appendMainLog("reusing existing vrc api", buildStartupDetail("bundled api reused", { baseUrl: preferredBaseUrl, phaseElapsedMs: Date.now() - apiStartupStartedAt }));
     return preferredBaseUrl;
   }
   const port = await resolveApiPort(preferredPort);
   const resourcesPath = process.resourcesPath;
-  const apiEntry = path.join(resourcesPath, "api", "index.js");
+  const apiBootstrapEntry = path.join(resourcesPath, "api", "bootstrap.js");
+  const apiIndexEntry = path.join(resourcesPath, "api", "index.js");
+  const apiEntry = fs.existsSync(apiBootstrapEntry) ? apiBootstrapEntry : apiIndexEntry;
   const webDistDir = path.join(resourcesPath, "web");
   const nodeModulesDir = path.join(resourcesPath, "node_modules");
   const nodeRuntime = resolveNodeRuntimePath(resourcesPath);
   const useElectronAsNode = nodeRuntime === process.execPath;
   const logsPath = getLogDir();
   const dataDir = getVrcDataDir();
-  ensureBundledIpPoolsConfig(resourcesPath, dataDir);
   apiLogStream = createLogStream("api.log");
-  appendMainLog("starting bundled api", { port, apiEntry, webDistDir, nodeModulesDir, logsPath, nodeRuntime, useElectronAsNode, dataDir });
+  appendMainLog("starting bundled api", buildStartupDetail("bundled api spawn start", { port, apiEntry, webDistDir, nodeModulesDir, logsPath, nodeRuntime, useElectronAsNode, dataDir }));
 
   apiProcess = spawn(nodeRuntime, [apiEntry], {
     env: {
       ...process.env,
       ...(useElectronAsNode ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
+      VRC_API_SPAWNED_AT: String(Date.now()),
       HOST: "127.0.0.1",
       PORT: String(port),
       NODE_PATH: nodeModulesDir,
@@ -294,6 +457,7 @@ async function startBundledApi() {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  appendMainLog("startup phase", buildStartupDetail("bundled api process spawned", { pid: apiProcess.pid, phaseElapsedMs: Date.now() - apiStartupStartedAt }));
 
   apiProcess.stdout?.on("data", (chunk) => writeApiLog("stdout", chunk));
   apiProcess.stderr?.on("data", (chunk) => writeApiLog("stderr", chunk));
@@ -306,7 +470,7 @@ async function startBundledApi() {
   apiProcess.unref();
   const baseUrl = `http://127.0.0.1:${port}`;
   await waitForHealth(baseUrl);
-  appendMainLog("bundled api ready", { baseUrl, elapsedMs: Date.now() - apiStartupStartedAt });
+  appendMainLog("bundled api ready", buildStartupDetail("bundled api health ready", { baseUrl, phaseElapsedMs: Date.now() - apiStartupStartedAt }));
   return baseUrl;
 }
 
@@ -314,32 +478,23 @@ function getVrcDataDir() {
   return process.env.VRC_DATA_DIR?.trim() || path.join(app.getPath("home"), ".virtual-resource-console");
 }
 
-function ensureBundledIpPoolsConfig(resourcesPath, dataDir = getVrcDataDir()) {
-  const targetFile = path.join(dataDir, "ip-pools.json");
-  if (fs.existsSync(targetFile)) return;
-  const sourceFile = path.join(resourcesPath, "config", "ip-pools.json");
-  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  fs.copyFileSync(sourceFile, targetFile);
-  try {
-    fs.chmodSync(targetFile, 0o600);
-  } catch {
-    // Windows 不支持 POSIX mode，忽略即可。
-  }
-  appendMainLog("seeded default ip pools config", { targetFile });
-}
-
 function createTray() {
-  const trayIcon = nativeImage.createFromPath(resolveAssetPath("tray.png"));
+  if (tray && !tray.isDestroyed()) return;
+  const trayIcon = resolveTrayIcon();
   tray = new Tray(trayIcon);
   tray.setToolTip("Virtual Resource Console");
+  tray.on("click", () => {
+    void showMainWindow();
+  });
+  tray.on("double-click", () => {
+    void showMainWindow();
+  });
   tray.setContextMenu(
     Menu.buildFromTemplate([
       {
         label: "打开资源控制台",
         click: () => {
-          if (!mainWindow) return;
-          mainWindow.show();
-          mainWindow.focus();
+          void showMainWindow();
         },
       },
       {
@@ -367,6 +522,21 @@ function createTray() {
       },
     ]),
   );
+}
+
+function resolveTrayIcon() {
+  const iconCandidates =
+    process.platform === "win32"
+      ? ["app-icon.ico", "tray.png"]
+      : ["tray.png", "app-icon.icns"];
+  for (const filename of iconCandidates) {
+    const icon = nativeImage.createFromPath(resolveAssetPath(filename));
+    if (!icon.isEmpty()) {
+      return process.platform === "win32" ? icon.resize({ width: 16, height: 16 }) : icon;
+    }
+  }
+  appendMainLog("tray icon failed to load; using empty native image", { iconCandidates });
+  return nativeImage.createEmpty();
 }
 
 function configureApplicationMenu() {
@@ -554,6 +724,14 @@ function createLogStream(filename) {
   return stream;
 }
 
+function buildStartupDetail(phase, detail = {}) {
+  return {
+    phase,
+    elapsedSinceMainStartMs: Date.now() - MAIN_PROCESS_STARTED_AT,
+    ...detail,
+  };
+}
+
 function appendMainLog(message, detail) {
   try {
     if (logStreamsClosing) return;
@@ -644,12 +822,18 @@ function canListen(port) {
 }
 
 async function waitForHealth(baseUrl) {
+  const healthStartedAt = Date.now();
   const deadline = Date.now() + 15000;
   let lastError;
+  let attempts = 0;
   while (Date.now() < deadline) {
+    attempts += 1;
     try {
       const response = await fetch(`${baseUrl}/api/health`);
-      if (response.ok) return;
+      if (response.ok) {
+        appendMainLog("startup phase", buildStartupDetail("api health check passed", { baseUrl, attempts, phaseElapsedMs: Date.now() - healthStartedAt }));
+        return;
+      }
     } catch (error) {
       lastError = error;
     }

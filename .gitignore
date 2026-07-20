@@ -7,6 +7,7 @@ docs/
 !docs/
 docs/*
 !docs/分发与打包策略.md
+!docs/虚拟机存储扩容策略.md
 !docs/ui-prototypes/
 docs/ui-prototypes/*
 !docs/ui-prototypes/vrc-chrome-extension-private-connections.html
@@ -19,6 +20,7 @@ docs/ui-prototypes/*
 apps/electron/out/
 apps/electron/dist/
 apps/electron/.runtime/
+apps/electron/.api-runtime/
 apps/electron/assets/app-icon.iconset/
 
 # Local credentials and private connection material.

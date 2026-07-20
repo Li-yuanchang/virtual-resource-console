@@ -9,6 +9,7 @@ const STORAGE_KEYS = {
   service: "serviceSettings",
   connections: "localConnections",
 };
+const LAUNCH_SESSION_PREFIX = "vrcLaunchConnection:";
 const PROVIDER_LABELS = {
   xenserver: "XenServer",
   vmware: "VMware",
@@ -37,7 +38,6 @@ async function init() {
   if (document.body.classList.contains("options-page")) {
     bindOptionsEvents();
     renderOptions();
-    await refreshSessions(false);
   } else {
     renderPopup();
   }
@@ -130,7 +130,7 @@ function renderTabs() {
   $$(".tab-button").forEach((button) => button.classList.toggle("active", button.dataset.tab === state.activeTab));
   $$(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.dataset.panel === state.activeTab));
   if (state.activeTab === "vault") renderConnectionTable();
-  if (state.activeTab === "sessions") void refreshSessions(false);
+  if (state.activeTab === "sessions") renderSessions();
 }
 
 function renderConnectionTable() {
@@ -166,7 +166,7 @@ function renderSessions() {
   const list = $("#sessionsList");
   if (!list) return;
   if (!state.sessions.length) {
-    list.innerHTML = `<div class="empty-note">当前没有临时连接会话。</div>`;
+    list.innerHTML = `<div class="empty-note">共享 Web 不创建服务端临时连接；账号只在浏览器本地解密，并加密本次请求。</div>`;
     return;
   }
   list.innerHTML = state.sessions
@@ -256,16 +256,14 @@ async function deleteLocalConnection(id) {
 
 async function testLocalConnection(connection) {
   try {
-    const session = await createEphemeralConnection(connection);
-    const response = await fetch(`${getBaseUrl()}/api/connections/test`, {
+    const payload = await buildDirectConnectionPayload(connection);
+    const response = await secureFetchJson(`${getBaseUrl()}/api/connections/test`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connectionId: session.id, providerType: session.providerType }),
+      body: payload,
     });
-    if (!response.ok) throw new Error(await readErrorMessage(response));
     markConnectionReady(connection.id);
-    setStatus("ok", "连接可用", `${connection.name} 已通过后台检测。`);
-    await refreshSessions(false);
+    setStatus("ok", "连接可用", `${connection.name} 已通过加密请求检测。`);
+    return response;
   } catch (error) {
     setStatus("error", "检测失败", formatError(error));
   }
@@ -273,36 +271,134 @@ async function testLocalConnection(connection) {
 
 async function openConsoleWithConnection(connection) {
   try {
-    const session = await createEphemeralConnection(connection);
+    const payload = await buildDirectConnectionPayload(connection);
+    const sessionId = createNonce();
+    await chrome.storage.session.set({
+      [`${LAUNCH_SESSION_PREFIX}${sessionId}`]: {
+        id: connection.id,
+        name: connection.name,
+        ...payload,
+        expiresAt: Date.now() + 10 * 60_000,
+      },
+    });
     markConnectionReady(connection.id);
-    await chrome.tabs.create({ url: `${getBaseUrl()}/?connectionId=${encodeURIComponent(session.id)}` });
-    await refreshSessions(false);
+    await chrome.tabs.create({
+      url: `${getBaseUrl()}/?browserConnectionId=${encodeURIComponent(connection.id)}&browserSessionId=${encodeURIComponent(sessionId)}`,
+    });
   } catch (error) {
     setStatus("error", "打开失败", formatError(error));
   }
 }
 
-async function createEphemeralConnection(connection) {
+async function buildDirectConnectionPayload(connection) {
   readServiceFromPage();
   await saveServiceSettings();
   const masterPassword = getRequiredValue("#masterPassword", "请先填写主密码解锁本地连接库");
   const password = await decryptSecret(connection.encryptedPassword, masterPassword);
-  const response = await fetch(`${getBaseUrl()}/api/ephemeral-connections`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: connection.name,
-      providerType: connection.providerType,
-      host: connection.host,
-      port: connection.port,
-      username: connection.username,
-      password,
-      ttlMinutes: 30,
-    }),
+  return {
+    providerType: connection.providerType,
+    host: connection.host,
+    port: connection.port,
+    username: connection.username,
+    password,
+  };
+}
+
+async function secureFetchJson(url, { method = "POST", body } = {}) {
+  const requestInit = { method };
+  if (body !== undefined) {
+    requestInit.headers = { "Content-Type": "application/json" };
+    requestInit.body = JSON.stringify(containsSensitiveField(body) ? await encryptRequestPayload(url, method, body) : body);
+  }
+  const response = await fetch(url, requestInit);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.message || `请求失败：HTTP ${response.status}`);
+  return payload;
+}
+
+async function encryptRequestPayload(url, method, payload) {
+  const keyInfo = await getTrustedRequestPublicKey(url);
+  const aesKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+  const rawAesKey = await crypto.subtle.exportKey("raw", aesKey);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aad = {
+    method: method.toUpperCase(),
+    path: new URL(url).pathname,
+    ts: Date.now(),
+    nonce: createNonce(),
+  };
+  const encryptedBytes = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, additionalData: new TextEncoder().encode(stableJson(aad)), tagLength: 128 },
+      aesKey,
+      new TextEncoder().encode(JSON.stringify(payload)),
+    ),
+  );
+  const publicKey = await crypto.subtle.importKey("jwk", keyInfo.publicKey, { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
+  const encryptedKey = new Uint8Array(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, publicKey, rawAesKey));
+  const tagStart = encryptedBytes.length - 16;
+  return {
+    encrypted: true,
+    keyId: keyInfo.keyId,
+    alg: "RSA-OAEP-256+A256GCM",
+    iv: bytesToBase64Url(iv),
+    encryptedKey: bytesToBase64Url(encryptedKey),
+    ciphertext: bytesToBase64Url(encryptedBytes.slice(0, tagStart)),
+    tag: bytesToBase64Url(encryptedBytes.slice(tagStart)),
+    aad,
+  };
+}
+
+async function getTrustedRequestPublicKey(url) {
+  const baseUrl = new URL(url).origin;
+  const response = await fetch(`${baseUrl}/api/crypto/public-key`, { cache: "no-store" });
+  const keyInfo = await response.json();
+  if (!response.ok) throw new Error(keyInfo.message || "读取 VRC API 加密公钥失败");
+  const trustKey = `requestCryptoFingerprint:${baseUrl}`;
+  const stored = await chrome.storage.local.get(trustKey);
+  const trusted = stored[trustKey];
+  if (!trusted) {
+    await chrome.storage.local.set({ [trustKey]: keyInfo.fingerprint });
+    return keyInfo;
+  }
+  if (trusted !== keyInfo.fingerprint) {
+    throw new Error("VRC API 加密公钥指纹已变化，请确认服务器后重新信任。");
+  }
+  return keyInfo;
+}
+
+function containsSensitiveField(value) {
+  if (Array.isArray(value)) return value.some((item) => containsSensitiveField(item));
+  if (!value || typeof value !== "object") return false;
+  return Object.entries(value).some(([key, item]) => {
+    if (["password", "rootpassword", "token", "secret", "privatekey"].includes(key.toLowerCase())) return true;
+    return containsSensitiveField(item);
   });
-  if (!response.ok) throw new Error(await readErrorMessage(response));
-  const payload = await response.json();
-  return payload.connection;
+}
+
+function createNonce() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function markConnectionReady(id) {
@@ -320,32 +416,15 @@ function markConnectionReady(id) {
 }
 
 async function refreshSessions(showStatus) {
-  try {
-    const response = await fetch(`${getBaseUrl()}/api/ephemeral-connections`, { cache: "no-store" });
-    if (!response.ok) throw new Error(await readErrorMessage(response));
-    const payload = await response.json();
-    state.sessions = payload.connections || [];
-    renderSessions();
-    if (showStatus) setStatus("ok", "已刷新", `当前 ${state.sessions.length} 个临时会话。`);
-  } catch (error) {
-    state.sessions = [];
-    renderSessions();
-    if (showStatus) setStatus("error", "刷新失败", formatError(error));
-  }
+  state.sessions = [];
+  renderSessions();
+  if (showStatus) setStatus("checking", "已停用", "共享 Web 不再创建服务端临时连接会话。");
 }
 
 async function clearSessions() {
-  await refreshSessions(false);
-  await Promise.all(
-    state.sessions.map((item) =>
-      fetch(`${getBaseUrl()}/api/ephemeral-connections/${encodeURIComponent(item.id)}`, {
-        method: "DELETE",
-      }).catch(() => undefined),
-    ),
-  );
   state.sessions = [];
   renderSessions();
-  setStatus("checking", "已清理", "临时连接会话已从后台内存移除。");
+  setStatus("checking", "无需清理", "共享 Web 不再创建服务端临时连接会话。");
 }
 
 async function checkHealth(showChecking) {

@@ -37,12 +37,12 @@
           <div class="card-head">
             <div>
               <strong>Chrome 插件配置项</strong>
-              <span>配置后端地址、本地连接库、临时会话和插件弹窗行为。</span>
+              <span>配置后端地址、本地连接库、加密链路和插件弹窗行为。</span>
             </div>
             <div class="tabs" role="tablist">
               <button class="tab-button active" data-tab="service" type="button">服务地址</button>
               <button class="tab-button" data-tab="vault" type="button">本地连接库</button>
-              <button class="tab-button" data-tab="sessions" type="button">临时会话</button>
+              <button class="tab-button" data-tab="sessions" type="button">加密链路</button>
               <button class="tab-button" data-tab="popup" type="button">弹窗预览</button>
             </div>
           </div>
@@ -65,13 +65,13 @@
             </section>
             <aside class="note-panel">
               <strong>部署边界</strong>
-              <span>nginx 只做 HTTPS、反向代理和访问控制；XenAPI、控制台 WebSocket、临时连接仍必须由 VRC API 处理。</span>
-              <pre>POST /api/ephemeral-connections
+              <span>nginx 可选；无证书 HTTP 部署时，账号密码请求必须走 VRC 应用层加密。</span>
+              <pre>GET  /api/crypto/public-key
 GET  /api/inventory/*
 WS   /api/console/*
 
 connectionStore: disabled
-sessionStore: memory ttl=30m</pre>
+requestCrypto: RSA-OAEP + AES-GCM</pre>
             </aside>
           </div>
 
@@ -106,18 +106,18 @@ sessionStore: memory ttl=30m</pre>
           <div class="tab-panel" data-panel="sessions">
             <section class="inner-panel">
               <div class="inner-head">
-                <div><strong>临时连接会话</strong><span>后台只保存在内存，过期立即失效。</span></div>
-                <div class="head-actions"><button id="refreshSessionsButton" type="button">刷新</button><button id="clearSessionsButton" type="button">清理全部</button></div>
+                <div><strong>加密链路</strong><span>共享 Web 不创建服务端临时连接，会直接加密本次请求。</span></div>
+                <div class="head-actions"><button id="refreshSessionsButton" type="button">检查状态</button><button id="clearSessionsButton" type="button">清空显示</button></div>
               </div>
               <div id="sessionsList" class="session-list"></div>
             </section>
             <aside class="inner-panel">
-              <div class="inner-head"><div><strong>执行链路</strong><span>插件解密后只交给后台短期使用。</span></div></div>
+              <div class="inner-head"><div><strong>执行链路</strong><span>插件解密后只用于生成本次加密请求。</span></div></div>
               <div class="flow-list">
                 <span><i>1</i><strong>插件解锁本地连接库</strong><small>用户输入主密码，WebCrypto 解密连接。</small></span>
-                <span><i>2</i><strong>创建 ephemeral connection</strong><small>API 只生成内存 ID，不写 connectionStore。</small></span>
-                <span><i>3</i><strong>业务接口使用临时 ID</strong><small>资源、控制台、任务都走 connectionId。</small></span>
-                <span><i>4</i><strong>TTL 到期自动清除</strong><small>日志不得记录密码，只记录摘要和 ID。</small></span>
+                <span><i>2</i><strong>读取 API 公钥</strong><small>本地锁定 fingerprint，变化时阻断敏感请求。</small></span>
+                <span><i>3</i><strong>加密本次请求</strong><small>AES-GCM 加密 JSON，RSA-OAEP 加密 dataKey。</small></span>
+                <span><i>4</i><strong>API 内存解密执行</strong><small>账号不落盘，不生成服务端临时会话。</small></span>
               </div>
             </aside>
           </div>

@@ -17,8 +17,8 @@ mkdir -p "$LOG_DIR"
 seed_ip_pools_config() {
   local data_dir="${VRC_DATA_DIR:-$HOME/.virtual-resource-console}"
   local target_file="$data_dir/ip-pools.json"
-  local source_file="$ROOT_DIR/config/ip-pools.example.json"
-  if [[ -f "$target_file" ]]; then
+  local source_file="$ROOT_DIR/config/ip-pools.json"
+  if [[ -f "$target_file" || ! -f "$source_file" ]]; then
     return 0
   fi
   mkdir -p "$data_dir"
@@ -119,7 +119,7 @@ command = (
     f"cd {shlex.quote(root_dir)} && "
     f"HOST=0.0.0.0 PORT=3987 "
     f"VRC_RUNTIME_MODE=web "
-    "./node_modules/.bin/tsx apps/api/src/index.ts"
+    "exec node apps/api/dist/index.js"
 )
 data = {
     "Label": "com.virtual-resource-console.api",
