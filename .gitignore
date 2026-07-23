@@ -8,6 +8,8 @@ docs/
 docs/*
 !docs/分发与打包策略.md
 !docs/虚拟机存储扩容策略.md
+!docs/平台能力与前后端接口归一方案.md
+!docs/UI规范全量审计与整改清单.md
 !docs/ui-prototypes/
 docs/ui-prototypes/*
 !docs/ui-prototypes/vrc-chrome-extension-private-connections.html
@@ -31,6 +33,13 @@ apps/electron/assets/app-icon.iconset/
 id_rsa*
 id_ed25519*
 credentials*.json
+vm-system-credentials.json
+vm-system-credentials.json.tmp
+inventory-snapshots.json
+vm-search-index.json
+key.bin
+*.json.*.tmp
+*.json.bak
 secrets*.json
 connections*.json
 server*.json

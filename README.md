@@ -2,7 +2,7 @@
 
 虚拟机资源管理平台，用于在 macOS、Windows、Linux 上统一查看和管理虚拟化环境资源。
 
-项目当前以 XenServer 资源盘点、物理机与虚拟机总览、控制台接入、ISO / 模板创建虚拟机和回收分析为主要能力，同时预留 VMware、Proxmox VE、KVM-libvirt 等 Provider 扩展。
+项目当前已接入 XenServer、VMware、Proxmox VE，提供资源盘点、物理机与虚拟机总览、控制台接入、ISO / 模板创建虚拟机、虚拟机扩容和回收分析能力。KVM/libvirt 目前仅保留能力描述，尚未注册 Provider。
 
 ---
 
@@ -25,18 +25,32 @@
 ### 3. 虚拟机管理
 
 - 展示 VM 电源状态、CPU、内存、磁盘、IP、Guest OS、Tools 状态
-- 支持 VM 详情、磁盘列表、快照和指标快照查询
+- 支持 VM 详情、磁盘列表和指标快照查询；平台快照接口已预留，当前暂未返回快照数据
 - 支持 VNC / Web Console 接入 XenServer、VMware、Proxmox 控制台
-- 支持受控执行开机、关机、删除等操作，后端要求确认令牌
+- 支持受控执行开机、关机、删除、改名和扩容等操作，后端要求确认令牌
+- 支持 Linux CLI 终端；终端使用短时一次性 SSH PTY 会话，不把系统密码放入 WebSocket URL
 
 ### 4. 创建虚拟机
 
 - 支持基于 ISO 或平台模板创建 VM
 - 支持规格模板、环境模板、IP 池和批量创建计划
-- 支持 XenServer Kickstart / unattended ISO 安装链路
+- 支持 XenServer、VMware、Proxmox VE 的模板克隆或 unattended ISO 安装策略
+- 支持 Linux Kickstart、Windows unattended 和手动 ISO 安装链路
 - 支持创建任务进度、预检查、IP 占用探测和租约释放
 
-### 5. 回收分析
+### 5. 虚拟机扩容
+
+- 支持 CPU、内存、原有虚拟磁盘扩展和新增虚拟磁盘
+- 支持在 Guest 内完成分区、LVM、文件系统和挂载目录生效
+- Guest 系统凭据按连接 ID 和 VM ID 加密保存，可选使用 JumpServer 作为扩容执行通道
+
+### 6. 桌面端与发布
+
+- Electron 桌面端复用 Web UI，支持 macOS 和 Windows 打包
+- 支持桌面端更新检查、下载和安装；免安装版更新需要替换新版 ZIP
+- Chrome 插件只连接 VRC 服务，不直接连接虚拟化平台，也不保存平台密码
+
+### 7. 回收分析
 
 - 对虚拟机运行状态、CPU、磁盘、网络等指标进行统一建模
 - 输出 P0 / P1 / P2 / P3 / KEEP 等回收建议等级
@@ -50,7 +64,7 @@
 ```
 Vue 3 + Element Plus Web UI
         │
-        │ HTTP / WebSocket
+        │ HTTP / SSE / WebSocket
         ▼
 Fastify + TypeScript API
         │
@@ -62,11 +76,26 @@ Fastify + TypeScript API
         ├── Console Gateway
         ├── Provisioning Service
         ├── Install Source Service
+        ├── Terminal Gateway
         └── Local Stores
 
 Electron Desktop Shell
         └── 复用同一套 Web UI
+
+Chrome Extension
+        └── 连接本机或内网 VRC 服务
 ```
+
+### Provider 能力范围
+
+| Provider | 资源盘点 | 控制台 | 创建 VM | 改名 | 扩容 | 快照查询 |
+|----------|----------|--------|---------|------|------|----------|
+| XenServer | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 暂未返回数据 |
+| VMware | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 暂未返回数据 |
+| Proxmox VE | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 暂未返回数据 |
+| KVM/libvirt | 未接入 | 未接入 | 未接入 | 未接入 | 未接入 | 未接入 |
+
+表中的“已接入”表示 Provider 和统一 API 已提供该能力入口，具体平台版本、权限和安装介质仍需按目标环境进行验收。
 
 | 模块 | 技术栈 |
 |------|--------|
@@ -89,13 +118,17 @@ virtual-resource-console/
 │   │       ├── xenserver.ts             # XenServer Provider
 │   │       ├── vmware.ts                # VMware Provider
 │   │       ├── proxmox.ts               # Proxmox Provider
+│   │       ├── providers/               # Provider SPI 与注册表
 │   │       ├── console/                 # Web Console / VNC 网关
-│   │       └── analysis/                # 回收状态机
+│   │       ├── terminal/                # Linux CLI / SSH PTY 网关
+│   │       ├── analysis/                # 回收状态机
+│   │       ├── *Store.ts                # 本机缓存、任务和配置存储
 │   ├── web/                 # Vue 3 前端
 │   │   └── src/
 │   │       ├── App.vue                  # 主控制台
 │   │       ├── components/              # 资源面板、创建 VM、控制台弹窗
 │   │       └── domain/                  # 前端策略与品牌映射
+│   ├── chrome-extension/    # Chrome 插件
 │   └── electron/            # Electron 桌面壳
 ├── scripts/                 # 本地启动、停止、状态检查脚本
 ├── package.json             # workspace 脚本入口
@@ -156,8 +189,13 @@ http://<内网服务器 IP 或域名>:3987/api/health
 
 ```bash
 docker build -t virtual-resource-console .
+mkdir -p "$HOME/.virtual-resource-console"
+cp config/ip-pools.example.json "$HOME/.virtual-resource-console/ip-pools.json"
+# 按目标环境修改 ip-pools.json 后再启动容器
 docker run -d --name vrc -p 3987:3987 -v "$HOME/.virtual-resource-console:/root/.virtual-resource-console" virtual-resource-console
 ```
+
+IP 池配置是创建 VM、IP 探测和租约功能的必需配置。Docker 不会自动把仓库中的示例文件写入数据卷；如果要在设置页保存配置，数据卷必须保持可写。
 
 XenServer 无人值守安装源由目标物理机按任务发布，不需要配置客户端本机安装源地址。
 
@@ -192,6 +230,19 @@ npm run install:native-host
 npm run dev:electron
 ```
 
+桌面端打包：
+
+```bash
+npm run dist:mac
+npm run dist:win
+```
+
+准备桌面端更新资源：
+
+```bash
+npm run release:update
+```
+
 ### 本地后台启动
 
 ```bash
@@ -212,6 +263,10 @@ npm run typecheck
 
 # 构建 API 和 Web
 npm run build
+
+# 运行 API 和 Web 单元测试
+npm --workspace apps/api test
+npm --workspace apps/web test
 
 # 单独构建前端
 npm --workspace apps/web run build
@@ -238,7 +293,10 @@ npm --workspace apps/api run build
 
 - `connections.json`：平台连接摘要和加密后的密码
 - `key.bin`：本机加密密钥
-- provisioning 配置、IP 租约、ISO 缓存和任务记录
+- `vm-system-credentials.json`：可选的 Guest 系统凭据密文
+- `preferences.json`、`provisioning.json`：界面偏好和创建配置
+- `ip-leases.json`、`generated-isos.json`、ISO 缓存和创建任务记录
+- `inventory-snapshots.json`、`vm-search-index.json`：资源快照和 VM 搜索索引
 - `runtime-policy.json`：本机运行识别策略，例如 IP 白名单、VM 名称转 IP、口令模板和 XenServer 网卡映射
 - `ip-pools.json`：本机 IP 池配置，例如默认 DNS、地址池、物理机网段匹配规则和可分配主机号
 
@@ -421,11 +479,18 @@ npm run dev
 |------|------|
 | `HOST` | API 监听地址，默认本地脚本使用 `0.0.0.0` |
 | `PORT` | API 端口，默认 `3987` |
+| `VRC_DATA_DIR` | VRC 本机运行数据根目录，默认 `~/.virtual-resource-console` |
+| `VRC_IP_POOLS_FILE` | IP 池配置完整路径，优先于 `VRC_DATA_DIR` |
 | `VRC_RUNTIME_POLICY_FILE` | 自定义运行策略配置文件路径 |
+| `VRC_WEB_DIST_DIR` | 自定义 Web 静态资源目录；未设置时使用 `apps/web/dist` |
+| `VRC_RUNTIME_MODE` | 运行模式：`web`、`electron` 或 `chrome-native` |
+| `VRC_SHARED_WEB_MODE` | 设为 `true` 后禁用服务端持久化连接和依赖连接的定时任务 |
+| `VRC_DISABLE_PERSISTENT_CONNECTIONS` | 设为 `true` 后强制禁用持久化连接 |
 | `VRC_XEN_INSTALL_MEDIA_MODE` | XenServer 安装介质模式 |
 | `VRC_XEN_HOST_INSTALL_SOURCE_PORT` | XenServer 物理机安装源租约起始端口，默认 `3988` |
 | `VRC_XEN_HOST_INSTALL_SOURCE_PORT_COUNT` | XenServer 物理机安装源端口探测数量，默认 `20` |
 | `VRC_XEN_HOST_INSTALL_SOURCE_ROOT` | XenServer 物理机安装源临时目录，默认 `/var/run/vrc-install-source` |
+| `VRC_DESKTOP_UPDATE_DIR` | 桌面端更新文件目录；API 会通过 `/desktop-updates/*` 提供静态文件 |
 
 XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进入 ISO 镜像缓存；任务完成并切回硬盘启动后会按登记记录自动清理。
 
@@ -439,7 +504,19 @@ XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进�
 - 不确定是否会改变虚拟化平台状态的命令，按变更操作处理
 - 开机、关机、删除、创建 VM、挂载 ISO、修改 CPU / 内存 / 磁盘等操作必须经过界面确认和后端参数校验
 - 连接密码在后端日志中做脱敏处理
+- 保存到本机的数据中的 Guest 系统凭据和平台连接密码使用本机密钥加密；密码、私钥和长期 token 不放入 URL、localStorage 或任务响应
+- 当前活动记录仅在会话内保存，持久化审计尚未接入
 - README 和仓库源码不包含任何真实服务器账号、密码或连接清单
+
+### 共享 Web 模式
+
+面向多人访问的内网 Web 部署建议设置：
+
+```bash
+VRC_SHARED_WEB_MODE=true HOST=0.0.0.0 PORT=3987 npm run start:server
+```
+
+该模式不保存服务端平台连接，不返回持久化连接列表，并禁用依赖服务端连接的 VM 定时任务。需要保存连接、任务和本机凭据时，应使用本机 Electron、Chrome Native 或单用户 Web 模式，并限制服务访问范围。
 
 ---
 
@@ -448,18 +525,22 @@ XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进�
 | 能力 | 接口 |
 |------|------|
 | 健康检查 | `GET /api/health` |
+| Provider 能力 | `GET /api/providers` |
 | 连接管理 | `GET /api/connections`, `POST /api/connections`, `DELETE /api/connections/:id` |
 | 连接测试 | `POST /api/connections/test` |
-| 资源清单 | `POST /api/inventory/pools`, `POST /api/inventory/hosts`, `POST /api/inventory/vms` |
-| 存储与 ISO | `POST /api/inventory/virtual-disks`, `POST /api/inventory/iso-images` |
-| VM 操作 | `POST /api/vms/action` |
-| VM 改名 | `POST /api/vms/rename` |
+| 资源清单 | `POST /api/inventory/pools`, `POST /api/inventory/hosts`, `POST /api/inventory/vms`, `POST /api/inventory/vm-summary`, `POST /api/inventory/vm-search-index` |
+| 存储与 ISO | `POST /api/inventory/virtual-disks`, `POST /api/inventory/vm-disks`, `POST /api/inventory/vm-guest-storage`, `POST /api/inventory/iso-images` |
+| 资源增量事件 | `GET /api/inventory/events`（SSE） |
+| VM 操作 | `POST /api/vms/action`, `POST /api/vms/rename`, `POST /api/vms/resize` |
 | VM 定时任务 | `GET /api/vm-schedules`, `POST /api/vm-schedules`, `PUT /api/vm-schedules/:id`, `PATCH /api/vm-schedules/:id/enabled`, `DELETE /api/vm-schedules/:id` |
 | 指标快照 | `POST /api/metrics/snapshot` |
 | 创建 VM | `POST /api/provisioning/preflight`, `POST /api/provisioning/vms` |
-| 创建任务 | `GET /api/provisioning/tasks`, `GET /api/provisioning/tasks/:taskId` |
-| 控制台 | `/api/console/xenserver`, `/api/console/vmware`, `/api/console/proxmox` |
+| 创建任务与事件 | `GET /api/provisioning/tasks`, `GET /api/provisioning/tasks/:taskId`, `GET /api/provisioning/tasks/:taskId/events`（SSE） |
+| IP 池与租约 | `GET/PATCH /api/ip-pools/policy`, `GET/POST /api/provisioning/ip-leases`, `POST /api/provisioning/ip-probe` |
+| 控制台 | `POST /api/console/*/session` 后通过 `/api/console/xenserver`、`/api/console/vmware`、`/api/console/proxmox` 建立 WebSocket |
 | 控制台上传 | `POST /api/console/upload`, `GET /api/console/upload/:uploadId/events` |
+| Linux CLI | `POST /api/terminal/session` 后通过 `/api/terminal?sessionId=...` 建立 WebSocket |
+| 介质维护 | `GET /api/maintenance/generated-isos`, `POST /api/maintenance/generated-isos/cleanup` |
 
 ---
 
@@ -468,7 +549,7 @@ XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进�
 - 新增平台时优先实现 `apps/api/src/providers/provider.ts` 中定义的 Provider 能力
 - UI 不直接处理平台私有字段，平台差异应在 Provider 或前端 domain 策略内收敛
 - 资源盘点接口应避免首屏一次性读取所有 VM、磁盘、快照和指标
-- 变更类能力需要保留确认、审计和失败提示语义
+- 变更类能力需要保留确认、失败提示和操作上下文；持久化审计单独建设
 - 前端样式遵循已有 Element Plus 与项目主题变量，不新增一次性颜色体系
 
 ## 文档索引
@@ -476,6 +557,9 @@ XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进�
 | 文档 | 内容 |
 |------|------|
 | `docs/分发与打包策略.md` | Chrome 插件、内网服务器、macOS / Windows 桌面客户端和多形态交付策略 |
+| `docs/平台能力与前后端接口归一方案.md` | Provider 能力、统一 DTO、创建计划和任务状态契约 |
+| `docs/架构设计与演进约束.md` | 多平台架构、无人值守安装、终端和安全边界 |
+| `docs/虚拟机存储扩容策略.md` | Guest 存储探测、磁盘扩容和系统内生效策略 |
 
 其它设计、原型和排查文档默认保留在本地 `docs/` 目录，不随仓库提交。
 
