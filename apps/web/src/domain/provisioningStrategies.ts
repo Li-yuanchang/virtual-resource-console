@@ -20,17 +20,11 @@ export interface ProvisioningStrategy {
   defaultIpPools(connection: ProvisioningConnectionScope, host: HostNode | null, policy: IpPoolPolicy): IpPoolConfig[];
   deriveRootPassword(ip: string, policy: RuntimePolicy): string;
   accountPolicy(source: ProvisioningInstallStepSource): ProvisioningAccountPolicy;
-  installSteps(source: ProvisioningInstallStepSource): ProvisioningInstallStep[];
 }
 
 export interface ProvisioningInstallStepSource {
   isoName: string;
   toolsIsoName?: string;
-}
-
-export interface ProvisioningInstallStep {
-  title: string;
-  detail: string;
 }
 
 export interface ProvisioningAccountPolicy {
@@ -55,7 +49,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return buildProvisioningScopeKey(connection, host);
     },
     installIsoImages(images) {
-      return images.filter((image) => !isXenGuestToolsIso(image));
+      return installableIsoImages(images);
     },
     sortIsoImages(images) {
       return sortIsoImages(images, ["CentOS-7-x86_64-DVD-1511.iso"], ["xs-tools.iso"]);
@@ -78,35 +72,6 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
     accountPolicy(source) {
       return resolveLinuxAccountPolicy(source.isoName);
     },
-    installSteps(source) {
-      const account = resolveLinuxAccountPolicy(source.isoName);
-      return [
-        {
-          title: "创建 VM 并挂载系统 ISO",
-          detail: `使用 ${source.isoName || "CentOS-7-x86_64-DVD-1511.iso"} 作为安装介质。`,
-        },
-        {
-          title: "安装系统并配置网络",
-          detail: "从 IP 池分配未被任何 VM 占用过的地址，网关和 DNS 按模板配置写入。",
-        },
-        {
-          title: account.mode === "root" ? "设置 root 默认密码" : "创建登录用户",
-          detail: account.mode === "root" ? "按环境模板生成初始 root 口令，创建后应及时变更。" : "安装时创建普通登录用户，初始口令由环境模板生成。",
-        },
-        {
-          title: "系统安装完成后重启",
-          detail: "首次进入系统后确认网络与 root 登录可用。",
-        },
-        {
-          title: "挂载 XenServer Tools 并重启",
-          detail: `选择 ${source.toolsIsoName || "xs-tools.iso"}，安装监控工具后再次重启。`,
-        },
-        {
-          title: "验收账号与监控状态",
-          detail: "测试 root 密码、IP 连通性，并确认 XenServer 能读取监控指标。",
-        },
-      ];
-    },
   },
   vmware: {
     type: "vmware",
@@ -115,7 +80,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return buildProvisioningScopeKey(connection, host);
     },
     installIsoImages(images) {
-      return images;
+      return installableIsoImages(images);
     },
     sortIsoImages(images) {
       return sortIsoImages(images);
@@ -137,9 +102,6 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
     },
     accountPolicy(source) {
       return resolveLinuxAccountPolicy(source.isoName);
-    },
-    installSteps(source) {
-      return genericInstallSteps(source, "open-vm-tools");
     },
   },
   proxmox: {
@@ -149,7 +111,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return buildProvisioningScopeKey(connection, host);
     },
     installIsoImages(images) {
-      return images;
+      return installableIsoImages(images);
     },
     sortIsoImages(images) {
       return sortIsoImages(images);
@@ -171,9 +133,6 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
     },
     accountPolicy(source) {
       return resolveLinuxAccountPolicy(source.isoName);
-    },
-    installSteps(source) {
-      return genericInstallSteps(source, "qemu-guest-agent");
     },
   },
   libvirt: {
@@ -183,7 +142,7 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
       return buildProvisioningScopeKey(connection, host);
     },
     installIsoImages(images) {
-      return images;
+      return installableIsoImages(images);
     },
     sortIsoImages(images) {
       return sortIsoImages(images);
@@ -205,9 +164,6 @@ const strategies: Record<ProviderType, ProvisioningStrategy> = {
     },
     accountPolicy(source) {
       return resolveLinuxAccountPolicy(source.isoName);
-    },
-    installSteps(source) {
-      return genericInstallSteps(source);
     },
   },
 };
@@ -222,9 +178,8 @@ export function buildProvisioningScopeKey(connection: ProvisioningConnectionScop
   return `${connection.providerType}::${connectionKey}::${hostKey}`;
 }
 
-export function isXenGuestToolsIso(image: IsoImage): boolean {
-  const name = (image.name || image.path || "").trim().split("/").pop() ?? "";
-  return /^(?:xs-tools|guest-tools)(?:-[^/]*)?\.iso$/i.test(name);
+function installableIsoImages(images: IsoImage[]): IsoImage[] {
+  return images.filter((image) => image.sourceType !== "tools");
 }
 
 export function isoSourceLabel(image: IsoImage): IsoSourceGroup["label"] {
@@ -333,39 +288,6 @@ function derivePasswordFromTemplate(ip: string, policy: RuntimePolicy) {
     .replaceAll("{third}", parts[2])
     .replaceAll("{fourth}", parts[3])
     .replaceAll("{ip}", ip);
-}
-
-function genericInstallSteps(source: ProvisioningInstallStepSource, monitoringTool?: string): ProvisioningInstallStep[] {
-  const account = resolveLinuxAccountPolicy(source.isoName);
-  return [
-    {
-      title: "创建 VM",
-      detail: "按所选规格、网络和存储生成创建计划。",
-    },
-    {
-      title: "挂载安装介质",
-      detail: source.isoName ? `使用 ${source.isoName} 作为安装介质。` : "等待选择 ISO 或模板来源。",
-    },
-    {
-      title: "配置系统网络",
-      detail: "使用 IP 池中的未占用地址、网关和 DNS 完成网络配置。",
-    },
-    {
-      title: account.mode === "root" ? "启动并验收" : "创建用户并验收",
-      detail:
-        account.mode === "root"
-          ? "开机后打开控制台确认账号、网络和平台监控状态。"
-          : "安装时创建普通登录用户，开机后确认账号、网络和平台监控状态。",
-    },
-    ...(monitoringTool
-      ? [
-          {
-            title: "安装监控工具",
-            detail: `安装并启用 ${monitoringTool}，以管理平台回读 Guest 状态作为验收结果。`,
-          },
-        ]
-      : []),
-  ];
 }
 
 function resolveLinuxAccountPolicy(isoName: string): ProvisioningAccountPolicy {

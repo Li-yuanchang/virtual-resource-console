@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import type { ITheme } from "@xterm/xterm";
 import { ArrowDown, ArrowUp, Close, Loading, WarningFilled } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import ConsoleDialog from "./ConsoleDialog.vue";
@@ -31,15 +32,15 @@ import type {
   VmNode,
   VmCreateRequest,
 } from "../types";
-import type { NoVncVmConsoleTarget } from "../domain/consoleStrategies";
+import type { VmConsoleTarget } from "../domain/consoleStrategies";
 import { validateProvisioningIpPool } from "../domain/ipPoolValidation";
-import { groupIsoImagesBySource, isoSourceLabel, isXenGuestToolsIso, resolveProvisioningStrategy } from "../domain/provisioningStrategies";
+import { getProviderBrand } from "../domain/providerBrand";
+import { groupIsoImagesBySource, isoSourceLabel, resolveProvisioningStrategy } from "../domain/provisioningStrategies";
 import { secureJsonRequest } from "../domain/secureRequest";
 
 interface StorageTotals {
   usedGiB: number;
   physicalGiB: number;
-  virtualGiB: number;
   usagePercent: number;
 }
 
@@ -83,26 +84,12 @@ interface ProvisionConsoleTargetItem {
   currentStep?: ProvisionTaskVm["currentStep"];
   installPackageDone?: number;
   installPackageTotal?: number;
-  target: NoVncVmConsoleTarget | null;
+  target: VmConsoleTarget | null;
 }
-
-const PROVISION_FOOTER_STEPS = [
-  { key: "submit", name: "提交任务" },
-  { key: "plan", name: "生成计划" },
-  { key: "publish-source", name: "发布安装源" },
-  { key: "create-vm", name: "创建 VM" },
-  { key: "boot", name: "启动系统" },
-  { key: "fetch-source", name: "拉取安装源" },
-  { key: "install-guest", name: "安装系统" },
-  { key: "wait-network", name: "等待网络" },
-  { key: "verify-login", name: "验证登录" },
-  { key: "finalize", name: "启动收尾" },
-  { key: "guest-tools", name: "监控工具" },
-  { key: "complete", name: "完成" },
-] satisfies Array<{ key: string; name: string }>;
 
 const IP_CANDIDATE_PREVIEW_LIMIT = 48;
 const VRC_TOAST_DURATION_MS = 3000;
+const SUPPORTED_WINDOWS_ISO_PATTERN = /windows_server_2008_r2|windows_server_2012_r2/i;
 
 function defaultRuntimePolicy(): RuntimePolicy {
   return {
@@ -148,8 +135,21 @@ const props = defineProps<{
   progress: ProvisioningProgressState | null;
   provisionTask: ProvisionTask | null;
   consoleAvailable?: boolean;
-  consoleTarget?: NoVncVmConsoleTarget | null;
+  consoleTarget?: VmConsoleTarget | null;
   provisionConsoleTargets?: ProvisionConsoleTargetItem[];
+  terminalFontFamily?: string;
+  terminalFontSize?: number;
+  terminalLineHeight?: number;
+  terminalCursorStyle?: "block" | "underline" | "bar";
+  terminalCursorBlink?: boolean;
+  terminalTheme?: ITheme;
+  displayScaleMode?: "local" | "remote";
+  displayQuality?: "auto" | "high" | "smooth";
+  throttleResize?: boolean;
+  watermarkEnabled?: boolean;
+  watermarkDensity?: "sparse" | "standard" | "dense";
+  watermarkOpacity?: number;
+  watermarkText?: string;
 }>();
 
 const emit = defineEmits<{
@@ -169,12 +169,17 @@ const provisioningConfig = ref<ProvisioningConfig>({ environmentTemplates: [], s
 const runtimePolicy = ref<RuntimePolicy>(defaultRuntimePolicy());
 const ipPoolPolicy = ref<IpPoolPolicy>(defaultIpPoolPolicy());
 const isoImages = ref<IsoImage[]>([]);
-const xenToolsIsoImage = ref<IsoImage | null>(null);
+const toolsIsoImage = ref<IsoImage | null>(null);
 const loadingProvisioningConfig = ref(false);
 const loadingIsoImages = ref(false);
 const loadingIpLeases = ref(false);
+const initializingProvisioningDialog = ref(false);
 const probingIps = ref(false);
 const ipCandidateFilter = ref<"available" | "all">("available");
+const ipCandidateFilterOptions = [
+  { label: "可用", value: "available" },
+  { label: "全部", value: "all" },
+];
 const ipLeases = ref<IpLease[]>([]);
 const ipProbeResults = ref<Record<string, IpProbeResult>>({});
 const provisioningNetworkProbe = ref<ProvisioningNetworkProbeResult | null>(null);
@@ -186,7 +191,7 @@ const environmentTemplateOptions = computed(() =>
   provisioningConfig.value.environmentTemplates.filter((item) => !item.providerType || item.providerType === props.connection.providerType),
 );
 const selectedEnvironmentTemplate = computed(
-  () => environmentTemplateOptions.value.find((item) => item.id === provisioningForm.environmentTemplateId) ?? environmentTemplateOptions.value[0] ?? null,
+  () => environmentTemplateOptions.value.find((item) => item.id === provisioningForm.environmentTemplateId) ?? null,
 );
 const strategyIpPools = computed(() => provisioningStrategy.value.defaultIpPools(props.connection, props.host, ipPoolPolicy.value));
 const provisioningPoolOptions = computed(() => {
@@ -229,13 +234,20 @@ const selectedIsoImage = computed(() => isoImages.value.find((item) => item.id =
 const installProfileOptions = computed(() => {
   const image = selectedIsoImage.value;
   if (!image) return [{ label: "CLI", value: "server" as const }];
-  const windowsImage = /windows|winserver/i.test(image.name);
-  const profiles = new Set(
-    environmentTemplateOptions.value.filter((template) => templateMatchesIso(template, image)).map((template) => template.installProfile),
-  );
-  const options: Array<{ label: string; value: "server" | "desktop" }> = [{ label: windowsImage ? "Windows Server" : "CLI", value: "server" }];
-  if (profiles.has("desktop")) options.push({ label: "Desktop", value: "desktop" });
-  return options;
+  const availableProfiles = isSupportedWindowsIso(image)
+    ? (["server", "desktop"] as const)
+    : (image.installProfileHint?.available ?? ["server"]);
+  return availableProfiles.map((profile) => ({
+    label: profile === "desktop" ? "Desktop" : "CLI",
+    value: profile,
+  }));
+});
+const effectiveInstallStrategy = computed(() => {
+  if (selectedEnvironmentTemplate.value?.installStrategy) return selectedEnvironmentTemplate.value.installStrategy;
+  if (props.connection.providerType === "xenserver" && provisioningForm.sourceType === "iso" && isSupportedWindowsIso(selectedIsoImage.value)) {
+    return "windows-unattended";
+  }
+  return "manual-iso";
 });
 const templateIsoMismatchMessage = computed(() => {
   const template = selectedEnvironmentTemplate.value;
@@ -246,7 +258,7 @@ const templateIsoMismatchMessage = computed(() => {
   return actual.includes(expected) ? "" : `系统环境与镜像不匹配：${template.name} 需要 ${template.isoNamePattern}`;
 });
 const isoOptionGroups = computed(() => groupIsoImagesBySource(isoImages.value));
-const selectedToolsIsoImage = computed(() => xenToolsIsoImage.value);
+const selectedToolsIsoImage = computed(() => toolsIsoImage.value);
 const provisioningAccountPolicy = computed(() =>
   provisioningStrategy.value.accountPolicy({
     isoName: selectedIsoImage.value?.name ?? "",
@@ -274,8 +286,7 @@ const rawProvisioningAvailableIps = computed(() => {
   );
 });
 const provisioningAvailableIps = computed(() => {
-  const probedAvailable = rawProvisioningAvailableIps.value.filter((ip) => ipProbeResults.value[ip]?.status === "available");
-  return orderAvailableIps(probedAvailable);
+  return rawProvisioningAvailableIps.value.filter((ip) => ipProbeResults.value[ip]?.status === "available");
 });
 const allIpCandidates = computed(() => enumerateIpRange(currentProvisioningPoolDraft().startIp, currentProvisioningPoolDraft().endIp));
 const visibleIpCandidates = computed(() => {
@@ -283,7 +294,7 @@ const visibleIpCandidates = computed(() => {
   return source.slice(0, IP_CANDIDATE_PREVIEW_LIMIT);
 });
 const provisioningPoolError = computed(() =>
-  validateProvisioningIpPool(currentProvisioningPoolDraft(), props.connection.providerType),
+  validateProvisioningIpPool(currentProvisioningPoolDraft()),
 );
 const provisioningNetworkError = computed(() =>
   provisioningNetworkProbe.value?.status === "unreachable" ? provisioningNetworkProbe.value.message : "",
@@ -311,7 +322,7 @@ const runningVcpuForCreate = computed(() =>
   props.vms.filter((vm) => vm.powerState === "running").reduce((sum, vm) => sum + vm.cpuCount, 0),
 );
 const provisioningPlan = computed(() => buildProvisioningPlan());
-const provisioningWarnings = computed(() => categorizeProvisioningWarnings(provisioningPlan.value?.warnings ?? []));
+const provisioningWarnings = computed(() => provisioningPlan.value?.warnings ?? []);
 const blockingProvisioningWarnings = computed(() => provisioningWarnings.value.filter((warning) => warning.severity === "blocking"));
 const advisoryProvisioningWarnings = computed(() => provisioningWarnings.value.filter((warning) => warning.severity === "advisory"));
 const blockingWarningSummary = computed(() => summarizeProvisioningWarnings(blockingProvisioningWarnings.value));
@@ -343,44 +354,31 @@ const canSubmit = computed(
 const activeProgressSteps = computed<ProvisioningProgressStep[]>(() => {
   const task = props.provisionTask;
   if (!task) {
-    return PROVISION_FOOTER_STEPS.map((step, index) => ({
-      key: step.key,
-      name: index === 0 ? props.progress?.title ?? step.name : step.name,
-      status:
-        index === 0
-          ? props.progress?.status === "error"
-            ? "failed"
-            : props.progress?.status === "warning"
-              ? "warning"
-            : props.progress?.status === "success"
-              ? "success"
-              : "running"
-          : "pending",
-      message: index === 0 ? props.progress?.message : undefined,
-    }));
+    return [{
+      key: "submit",
+      name: props.progress?.title ?? "提交任务",
+      status: props.progress?.status === "error"
+        ? "failed"
+        : props.progress?.status === "warning"
+          ? "warning"
+          : props.progress?.status === "success"
+            ? "success"
+            : "running",
+      message: props.progress?.message,
+    }];
   }
-  const stepMap = new Map(task.steps.map((step) => [step.key, step]));
   const submitStep: ProvisioningProgressStep = {
     key: "submit",
     name: "提交任务",
-    status: task.steps.some((step) => step.status === "running") || task.status === "success" || task.status === "warning" ? "success" : task.status === "failed" ? "failed" : "running",
-    message: task.message,
+    status: "success",
+    message: "创建任务已提交",
   };
-  const steps = PROVISION_FOOTER_STEPS.map((step) => {
-    if (step.key === "submit") return submitStep;
-    const taskStep = stepMap.get(step.key as ProvisionTaskStep["key"]);
-    return {
-      key: step.key,
-      name: taskStep?.name ?? step.name,
-      status: taskStep?.status ?? "pending",
-      message: taskStep?.message,
-    };
-  });
-  const createdWithoutAutoStart = task.status === "success" && task.steps.some((step) => step.key === "boot" && step.status === "skipped");
-  if (createdWithoutAutoStart) {
-    return steps.map((step) => (["boot", "fetch-source", "install-guest", "wait-network", "verify-login", "finalize", "guest-tools"].includes(step.key) ? { ...step, status: "skipped" } : step));
-  }
-  return steps;
+  return [submitStep, ...task.steps.map((step) => ({
+    key: step.key,
+    name: step.name,
+    status: step.status,
+    message: step.message,
+  }))];
 });
 const activeProgressPercent = computed(() => {
   const explicitPercent = Number((props.provisionTask as (ProvisionTask & { progressPercent?: number }) | null)?.progressPercent);
@@ -412,7 +410,15 @@ const targetHostSummary = computed(() => {
 const passwordManuallyEdited = ref(false);
 const advisoryWarningsAcknowledged = ref(false);
 const vmDraftOverrides = reactive<Record<number, VmDraftOverride>>({});
+const activeDraftIndex = ref(0);
 const expandedProvisionSections = ref<Array<"network">>([]);
+const activeProvisioningPlanItem = computed(() => provisioningPlan.value?.items[activeDraftIndex.value] ?? null);
+const activeIpCandidateText = computed(() => {
+  const count = provisioningPlan.value?.items.length ?? Math.max(Math.floor(provisioningForm.count), 1);
+  const ip = activeProvisioningPlanItem.value?.ip || provisioningForm.preferredIp;
+  if (count > 1) return `当前第 ${activeDraftIndex.value + 1} 台${ip ? ` ${ip}` : " 待分配"}`;
+  return ip ? `当前 ${ip}` : loadingIpLeases.value ? "读取 IP 池文件中" : `本地预留 ${provisioningLeasedIps.value.size} 个`;
+});
 
 watch(
   () => props.visible,
@@ -423,6 +429,7 @@ watch(
     } else {
       dialogSessionId += 1;
       if (ipProbeTimer) clearTimeout(ipProbeTimer);
+      initializingProvisioningDialog.value = false;
       resetProvisioningSession();
     }
   },
@@ -440,7 +447,7 @@ watch(
   () => currentScopeKey.value,
   () => {
     isoImages.value = [];
-    xenToolsIsoImage.value = null;
+    toolsIsoImage.value = null;
     if (props.visible) {
       void loadIsoImages();
     }
@@ -491,12 +498,16 @@ watch(
 );
 
 watch(
+  () => Math.max(Math.floor(provisioningForm.count), 1),
+  (count) => {
+    activeDraftIndex.value = clampDraftIndex(activeDraftIndex.value, count);
+  },
+);
+
+watch(
   () =>
     [
-      provisioningForm.preferredIp,
       provisioningForm.reservedIpsText,
-      provisioningForm.count,
-      provisioningForm.loginUsername,
       Array.from(provisioningOccupiedIps.value).sort().join("|"),
       Array.from(provisioningLeasedIps.value).sort().join("|"),
     ].join("::"),
@@ -531,12 +542,13 @@ function resetProvisioningSession() {
   loadingIpLeases.value = false;
   passwordManuallyEdited.value = false;
   advisoryWarningsAcknowledged.value = false;
+  activeDraftIndex.value = 0;
   expandedProvisionSections.value = [];
   ipProbeResults.value = {};
   provisioningNetworkProbe.value = null;
   ipCandidateFilter.value = "available";
   isoImages.value = [];
-  xenToolsIsoImage.value = null;
+  toolsIsoImage.value = null;
   ipLeases.value = [];
   for (const key of Object.keys(vmDraftOverrides)) {
     delete vmDraftOverrides[Number(key)];
@@ -593,9 +605,11 @@ function handleProvisionPanelDoubleClick(event: MouseEvent) {
 
 async function openDialog(sessionId: number) {
   resetProvisioningSession();
+  initializingProvisioningDialog.value = true;
   await Promise.all([loadRuntimePolicy(sessionId), loadIpPoolPolicy(sessionId), loadProvisioningConfig(sessionId), loadIsoImages(sessionId), loadIpLeases(sessionId)]);
   if (!isActiveDialogSession(sessionId)) return;
   initializeProvisioningForm();
+  initializingProvisioningDialog.value = false;
   scheduleIpProbe(0);
 }
 
@@ -673,11 +687,9 @@ async function loadIsoImages(sessionId = dialogSessionId, options: { forceRefres
       forceRefresh: options.forceRefresh,
     });
     if (!isActiveDialogSession(sessionId)) return;
-    xenToolsIsoImage.value = props.connection.providerType === "xenserver"
-      ? result.images.find(isXenGuestToolsIso) ?? null
-      : null;
+    toolsIsoImage.value = result.images.find((image) => image.sourceType === "tools") ?? null;
     isoImages.value = provisioningStrategy.value.sortIsoImages(provisioningStrategy.value.installIsoImages(result.images));
-    const imageSummary = `${isoImages.value.length} 个系统 ISO${xenToolsIsoImage.value ? " · Tools 已读取" : ""}`;
+    const imageSummary = `${isoImages.value.length} 个系统 ISO${toolsIsoImage.value ? " · Tools 已读取" : ""}`;
     emit("activity", {
       title: result.source === "cache" ? "系统镜像缓存已加载" : "系统镜像读取完成",
       target: hostName,
@@ -772,6 +784,7 @@ watch(
   () => provisioningForm.isoId,
   () => {
     if (!props.visible) return;
+    provisioningForm.installProfile = recommendedInstallProfile(selectedIsoImage.value);
     syncEnvironmentTemplateToIso();
     applyAccountPolicyDefault();
     applyVmNamePrefixDefault();
@@ -817,10 +830,17 @@ function applyEnvironmentTemplate() {
 function syncEnvironmentTemplateToIso() {
   if (provisioningForm.sourceType !== "iso" || !selectedIsoImage.value) return;
   const matchingTemplates = environmentTemplateOptions.value.filter((template) => templateMatchesIso(template, selectedIsoImage.value!));
-  const matchingProfile = matchingTemplates.find((template) => template.installProfile === provisioningForm.installProfile);
-  const template = matchingProfile ?? matchingTemplates.find((item) => item.installProfile === "server") ?? matchingTemplates[0];
-  if (!template) return;
-  provisioningForm.installProfile = template.installProfile;
+  if (!matchingTemplates.length) {
+    provisioningForm.environmentTemplateId = "";
+    return;
+  }
+  const template = matchingTemplates.find((item) => item.installProfile === provisioningForm.installProfile);
+  if (!template) {
+    // The selected profile is authoritative. Older config files may not have a matching
+    // Desktop template; keep the normalized profile and let the provider strategy infer it.
+    provisioningForm.environmentTemplateId = "";
+    return;
+  }
   if (provisioningForm.environmentTemplateId !== template.id) {
     provisioningForm.environmentTemplateId = template.id;
   }
@@ -829,6 +849,16 @@ function syncEnvironmentTemplateToIso() {
 function templateMatchesIso(template: EnvironmentProvisioningTemplate, image: IsoImage) {
   if (template.sourceType !== "iso" || !template.isoNamePattern) return false;
   return `${image.name} ${image.id}`.toLowerCase().includes(template.isoNamePattern.toLowerCase());
+}
+
+function isSupportedWindowsIso(image: IsoImage | null | undefined): boolean {
+  if (!image) return false;
+  return SUPPORTED_WINDOWS_ISO_PATTERN.test(`${image.name} ${image.id}`);
+}
+
+function recommendedInstallProfile(image: IsoImage | null | undefined): "server" | "desktop" {
+  if (isSupportedWindowsIso(image)) return "desktop";
+  return image?.installProfileHint?.recommended ?? "server";
 }
 
 function applyProvisioningPool() {
@@ -890,29 +920,38 @@ function buildProvisioningPlan(): ProvisioningPlanResult | null {
   const source = provisioningSourceLabel();
 
   const count = Math.max(Math.floor(provisioningForm.count), 1);
-  const warnings: string[] = [];
-  const availableIps = poolError ? [] : provisioningAvailableIps.value.slice(0, count);
-  if (poolError) warnings.push(poolError);
+  const warnings: ProvisioningWarning[] = [];
+  const overrideIps = new Set(
+    Array.from({ length: count }, (_, index) => vmDraftOverrides[index]?.ip?.trim() ?? "")
+      .filter(isIpv4),
+  );
+  const overrideIpCount = Array.from({ length: count }, (_, index) => vmDraftOverrides[index]?.ip?.trim() ?? "")
+    .filter(isIpv4)
+    .length;
+  const availableIps = poolError ? [] : provisioningAvailableIps.value.filter((ip) => !overrideIps.has(ip));
+  let nextAvailableIpIndex = 0;
+  if (poolError) warnings.push(blockingProvisioningWarning(poolError, "IP_POOL_INVALID"));
   if (provisioningNetworkProbe.value?.status === "route-only") {
-    warnings.push(provisioningNetworkProbe.value.message);
+    warnings.push(advisoryProvisioningWarning(provisioningNetworkProbe.value.message, "NETWORK_ROUTE_ONLY"));
   }
-  if (!source) warnings.push(provisioningForm.sourceType === "iso" ? "未读取到可用 ISO，当前仅能先生成 IP 预览。" : "请填写克隆源名称。");
-  if (templateIsoMismatchMessage.value) warnings.push(templateIsoMismatchMessage.value);
-  if (provisioningAccountPolicy.value.requiresUsername && !provisioningForm.loginUsername.trim()) warnings.push("请填写新建登录用户名。");
+  if (!source) warnings.push(blockingProvisioningWarning(provisioningForm.sourceType === "iso" ? "未读取到可用 ISO，当前仅能先生成 IP 预览。" : "请填写克隆源名称。", "SOURCE_REQUIRED"));
+  if (templateIsoMismatchMessage.value) warnings.push(blockingProvisioningWarning(templateIsoMismatchMessage.value, "SOURCE_TEMPLATE_MISMATCH"));
+  if (provisioningAccountPolicy.value.requiresUsername && !provisioningForm.loginUsername.trim()) warnings.push(blockingProvisioningWarning("请填写新建登录用户名。", "LOGIN_USERNAME_REQUIRED"));
   if (provisioningForm.preferredIp && preferredIpProbeResult.value?.status !== "available") {
-    warnings.push(`分配 IP ${provisioningForm.preferredIp} 未确认可用。`);
+    warnings.push(blockingProvisioningWarning(`分配 IP ${provisioningForm.preferredIp} 未确认可用。`, "PREFERRED_IP_UNAVAILABLE"));
   }
-  if (!poolError && probingIps.value) warnings.push("IP ping 探测中，完成后才会生成可提交预案。");
-  if (!poolError && !probingIps.value && availableIps.length < count) warnings.push(`IP 池可用 IP 不足：需要 ${count} 个，仅找到 ${availableIps.length} 个。`);
+  if (!poolError && probingIps.value) warnings.push(blockingProvisioningWarning("IP ping 探测中，完成后才会生成可提交预案。", "IP_PROBE_RUNNING"));
+  const autoAssignedCount = count - overrideIpCount;
+  if (!poolError && !probingIps.value && availableIps.length < autoAssignedCount) warnings.push(blockingProvisioningWarning(`IP 池可用 IP 不足：需要 ${count} 个，仍缺 ${autoAssignedCount - availableIps.length} 个。`, "IP_POOL_EXHAUSTED"));
   if (!props.vms.length) {
-    warnings.push("当前 VM 清单未完整加载，IP 占用判断可能不完整。");
+    warnings.push(advisoryProvisioningWarning("当前 VM 清单未完整加载，IP 占用判断可能不完整。", "VM_INVENTORY_INCOMPLETE"));
   }
-  if (provisioningForm.sourceType === "iso" && selectedEnvironmentTemplate.value?.installStrategy === "manual-iso") {
-    warnings.push("PVE ISO 安装介质会随虚拟机挂载，系统安装需在控制台内完成。");
+  if (provisioningForm.sourceType === "iso" && effectiveInstallStrategy.value === "manual-iso") {
+    warnings.push(advisoryProvisioningWarning("手动 ISO 模式只挂载安装介质，系统安装需在控制台内完成。", "MANUAL_ISO_INSTALL"));
   }
   const items = Array.from({ length: count }, (_, index) => {
     const override = vmDraftOverrides[index] ?? {};
-    const ip = override.ip?.trim() || availableIps[index] || "";
+    const ip = override.ip?.trim() || availableIps[nextAvailableIpIndex++] || "";
     const cpu = Math.max(Math.floor(Number(override.cpu ?? spec.cpu) || 0), 1);
     const memoryGiB = Math.max(Number(override.memoryGiB ?? spec.memoryGiB) || 0, 1);
     const systemDiskGiB = Math.max(Number(override.diskGiB ?? spec.systemDiskGiB) || 0, 1);
@@ -924,7 +963,7 @@ function buildProvisioningPlan(): ProvisioningPlanResult | null {
           ? provisioningStrategy.value.deriveRootPassword(ip, runtimePolicy.value)
           : provisioningForm.rootPassword.trim());
     return {
-      name: override.name?.trim() || defaultVmNameForIp(ip, index),
+      name: resolveVmNameForAssignedIp(override.name, ip, index),
       ip,
       rootPassword,
       loginUsername: override.loginUsername?.trim() || resolveLoginUsername(),
@@ -935,9 +974,18 @@ function buildProvisioningPlan(): ProvisioningPlanResult | null {
       dataDiskGiB: 0,
     };
   });
+  const assignedIpIndexes = new Map<string, number>();
   for (const [index, item] of items.entries()) {
     const status = item.ip ? ipProbeResults.value[item.ip]?.status : undefined;
-    if (!item.ip || status !== "available") warnings.push(`第 ${index + 1} 台 IP 未确认可用。`);
+    if (!item.ip || status !== "available") warnings.push(blockingProvisioningWarning(`第 ${index + 1} 台 IP 未确认可用。`, "PLAN_IP_UNAVAILABLE"));
+    if (item.ip) {
+      const previousIndex = assignedIpIndexes.get(item.ip);
+      if (previousIndex !== undefined) {
+        warnings.push(blockingProvisioningWarning(`第 ${previousIndex + 1} 台和第 ${index + 1} 台使用了相同 IP ${item.ip}。`, "PLAN_IP_DUPLICATED"));
+      } else {
+        assignedIpIndexes.set(item.ip, index);
+      }
+    }
   }
   warnings.push(...resourcePlanWarnings(items));
   const readyItems = items.filter((item) => item.ip && ipProbeResults.value[item.ip]?.status === "available");
@@ -947,11 +995,6 @@ function buildProvisioningPlan(): ProvisioningPlanResult | null {
     warnings,
     summary: `${readyItems.length} / ${count} 台 · ${items.reduce((sum, item) => sum + item.cpu, 0)} vCPU · ${formatNumber(items.reduce((sum, item) => sum + item.memoryGiB, 0))} GiB 内存 · ${formatNumber(items.reduce((sum, item) => sum + item.systemDiskGiB + item.dataDiskGiB, 0))} GiB 磁盘`,
   };
-}
-
-function orderAvailableIps(ips: string[]) {
-  if (!provisioningForm.preferredIp || !ips.includes(provisioningForm.preferredIp)) return ips;
-  return [provisioningForm.preferredIp, ...ips.filter((ip) => ip !== provisioningForm.preferredIp)];
 }
 
 function provisioningSourceLabel() {
@@ -977,6 +1020,19 @@ function installStrategyLabel(template: EnvironmentProvisioningTemplate | null) 
   return "手动 ISO";
 }
 
+function clampDraftIndex(index: number, count = Math.max(Math.floor(provisioningForm.count), 1)) {
+  return Math.min(Math.max(Math.floor(index), 0), Math.max(count - 1, 0));
+}
+
+function setActiveDraftIndex(index: number) {
+  activeDraftIndex.value = clampDraftIndex(index, provisioningPlan.value?.items.length ?? Math.max(Math.floor(provisioningForm.count), 1));
+  provisioningForm.preferredIp = provisioningPlan.value?.items[activeDraftIndex.value]?.ip ?? "";
+}
+
+function findPlanIpIndex(ip: string, exceptIndex?: number) {
+  return provisioningPlan.value?.items.findIndex((item, index) => item.ip === ip && index !== exceptIndex) ?? -1;
+}
+
 function setVmDraftOverride(index: number, field: keyof VmDraftOverride, value: string | number | undefined) {
   if (provisioningFormLocked.value) return;
   if (!vmDraftOverrides[index]) vmDraftOverrides[index] = {};
@@ -991,15 +1047,18 @@ function setVmDraftOverride(index: number, field: keyof VmDraftOverride, value: 
 
 function setVmDraftText(index: number, field: "name" | "ip" | "rootPassword" | "loginUsername", value: string | number) {
   if (provisioningFormLocked.value) return;
+  setActiveDraftIndex(index);
   setVmDraftOverride(index, field, String(value));
   if (field === "ip") {
     const name = vmDraftOverrides[index]?.name?.trim();
     if (!name) setVmDraftOverride(index, "name", defaultVmNameForIp(String(value), index));
+    provisioningForm.preferredIp = String(value);
   }
 }
 
 function setVmDraftNumber(index: number, field: "cpu" | "memoryGiB" | "diskGiB", value: number | undefined) {
   if (provisioningFormLocked.value) return;
+  setActiveDraftIndex(index);
   setVmDraftOverride(index, field, value);
 }
 
@@ -1096,18 +1155,12 @@ function submitProvisioning() {
     scopeKey: currentScopeKey.value,
     environmentTemplateId: provisioningForm.environmentTemplateId || undefined,
     sourceType: provisioningForm.sourceType,
-    installStrategy: selectedEnvironmentTemplate.value?.installStrategy,
-    installProfile: selectedEnvironmentTemplate.value?.installProfile,
+    installStrategy: effectiveInstallStrategy.value,
+    installProfile: provisioningForm.installProfile,
     isoId: provisioningForm.sourceType === "iso" ? provisioningForm.isoId || selectedIsoImage.value?.id || undefined : undefined,
     isoName: provisioningForm.sourceType === "iso" ? selectedIsoImage.value?.name : undefined,
     templateName: provisioningForm.sourceType === "template" ? provisioningForm.templateName.trim() : undefined,
     specId: spec.id,
-    spec: {
-      cpu: spec.cpu,
-      memoryGiB: spec.memoryGiB,
-      systemDiskGiB: spec.systemDiskGiB,
-      dataDiskGiB: spec.dataDiskGiB,
-    },
     vmNamePrefix: provisioningForm.vmNamePrefix.trim(),
     count: Math.max(Math.floor(provisioningForm.count), 1),
     ipPool: currentProvisioningPoolDraft(),
@@ -1124,37 +1177,32 @@ function submitProvisioning() {
   });
 }
 
-function resourcePlanWarnings(items: ProvisioningPlanItem[]) {
-  const warnings: string[] = [];
+function resourcePlanWarnings(items: ProvisioningPlanItem[]): ProvisioningWarning[] {
+  const warnings: ProvisioningWarning[] = [];
   const host = props.host;
-  if (!host) return ["未选择目标物理机。"];
+  if (!host) return [blockingProvisioningWarning("未选择目标物理机。", "HOST_REQUIRED")];
   const memoryFree = Math.max(host.memoryFreeBytes ?? 0, 0);
   const freeStorageGiB = storageFreeGiB.value;
   const newMemoryBytes = items.reduce((sum, item) => sum + item.memoryGiB, 0) * 1024 ** 3;
   const newDiskGiB = items.reduce((sum, item) => sum + item.systemDiskGiB + item.dataDiskGiB, 0);
 
-  if (memoryFree < newMemoryBytes) warnings.push(`内存余量不足：剩余 ${formatBytes(memoryFree)}，计划新增 ${formatBytes(newMemoryBytes)}。`);
-  if (freeStorageGiB < newDiskGiB) warnings.push(`存储余量不足：剩余 ${formatNumber(freeStorageGiB)} GiB，计划新增 ${formatNumber(newDiskGiB)} GiB。`);
+  if (memoryFree < newMemoryBytes) warnings.push(blockingProvisioningWarning(`内存余量不足：剩余 ${formatBytes(memoryFree)}，计划新增 ${formatBytes(newMemoryBytes)}。`, "MEMORY_CAPACITY_INSUFFICIENT"));
+  if (freeStorageGiB < newDiskGiB) warnings.push(blockingProvisioningWarning(`存储余量不足：剩余 ${formatNumber(freeStorageGiB)} GiB，计划新增 ${formatNumber(newDiskGiB)} GiB。`, "STORAGE_CAPACITY_INSUFFICIENT"));
   return warnings;
 }
 
-function categorizeProvisioningWarnings(warnings: string[]): ProvisioningWarning[] {
-  return warnings.map((message) => ({
-    message,
-    severity: isBlockingProvisioningWarning(message) ? "blocking" : "advisory",
-  }));
+function blockingProvisioningWarning(message: string, code: string): ProvisioningWarning {
+  return { code, message, severity: "blocking" };
+}
+
+function advisoryProvisioningWarning(message: string, code: string): ProvisioningWarning {
+  return { code, message, severity: "advisory" };
 }
 
 function summarizeProvisioningWarnings(warnings: ProvisioningWarning[]) {
   if (!warnings.length) return "";
   const [first] = warnings;
   return warnings.length === 1 ? first.message : `${first.message} 等 ${warnings.length} 项`;
-}
-
-function isBlockingProvisioningWarning(message: string) {
-  if (message.startsWith("当前 VM 清单未完整加载")) return false;
-  if (message.includes("允许继续创建")) return false;
-  return /不足|未选择|未读取|不匹配|探测中|未确认|不能|请填写|请改用|格式不正确|起始地址不能|范围过大|不可达|网关|CIDR|DNS|未选择目标物理机/.test(message);
 }
 
 function currentProvisioningPoolDraft(): IpPoolConfig {
@@ -1186,8 +1234,9 @@ function applyAccountPolicyDefault(force = false) {
 function applyVmNamePrefixDefault(force = false) {
   const nextPrefix = defaultVmNamePrefixForIso();
   const current = provisioningForm.vmNamePrefix.trim();
-  const managedPrefixPattern = /-(centos7|ubuntu)$/i;
-  if (force || !current || current === "vm" || managedPrefixPattern.test(current)) {
+  const templateManagedPrefix = environmentTemplateOptions.value.some((template) => template.vmNamePrefix === current);
+  const managedPrefixPattern = /(?:^|-)(centos7|ubuntu|win2008|win2012)$/i;
+  if (force || !current || current === "vm" || templateManagedPrefix || managedPrefixPattern.test(current)) {
     provisioningForm.vmNamePrefix = nextPrefix;
   }
 }
@@ -1221,15 +1270,16 @@ function resolveLoginUsername() {
 }
 
 function scheduleIpProbe(delay = 350, sessionId = dialogSessionId) {
-  if (!isActiveDialogSession(sessionId)) return;
+  if (!isActiveDialogSession(sessionId) || initializingProvisioningDialog.value) return;
   if (ipProbeTimer) clearTimeout(ipProbeTimer);
   ipProbeTimer = setTimeout(() => {
+    ipProbeTimer = undefined;
     void probeProvisioningIps(sessionId, false);
   }, delay);
 }
 
 async function probeProvisioningIps(sessionId = dialogSessionId, notifyValidationError = true) {
-  if (!isActiveDialogSession(sessionId) || provisioningFormLocked.value) return;
+  if (!isActiveDialogSession(sessionId) || initializingProvisioningDialog.value || probingIps.value || provisioningFormLocked.value) return;
   const poolError = provisioningPoolError.value;
   if (poolError) {
     ipProbeResults.value = {};
@@ -1255,14 +1305,13 @@ async function probeProvisioningIps(sessionId = dialogSessionId, notifyValidatio
       leasedIps: Array.from(provisioningLeasedIps.value),
       timeoutMs: 900,
       hostId: props.host?.providerId,
-      network:
-        props.connection.providerType === "xenserver"
-          ? {
-              cidr: pool.cidr,
-              gateway: pool.gateway,
-              sampleIp: ips[0],
-            }
-          : undefined,
+      network: pool.cidr && isIpv4(pool.gateway) && ips[0]
+        ? {
+            cidr: pool.cidr,
+            gateway: pool.gateway,
+            sampleIp: ips[0],
+          }
+        : undefined,
     });
     if (!isActiveDialogSession(sessionId)) return;
     provisioningNetworkProbe.value = result.network ?? null;
@@ -1295,13 +1344,18 @@ function syncPreferredIpAfterProbe(results: IpProbeResult[]) {
 }
 
 function ipCandidateClass(ip: string) {
+  const activeIp = activeProvisioningPlanItem.value?.ip || provisioningForm.preferredIp;
+  const usedIndex = findPlanIpIndex(ip, activeDraftIndex.value);
   return {
     [`status-${ipProbeResults.value[ip]?.status ?? "pending"}`]: true,
-    selected: provisioningForm.preferredIp === ip,
+    selected: activeIp === ip,
+    "is-used-in-plan": usedIndex >= 0,
   };
 }
 
 function ipCandidateStatusText(ip: string) {
+  const usedIndex = findPlanIpIndex(ip, activeDraftIndex.value);
+  if (usedIndex >= 0) return `第 ${usedIndex + 1} 台`;
   const status = ipProbeResults.value[ip]?.status;
   if (status === "available") return "可用";
   if (status === "reachable") return "有响应";
@@ -1319,6 +1373,16 @@ function selectIpCandidate(ip: string) {
     showMessage(`${ip} ${ipCandidateStatusText(ip)}，不能分配给新环境。`, "warning");
     return;
   }
+  const targetIndex = clampDraftIndex(activeDraftIndex.value, provisioningPlan.value?.items.length ?? Math.max(Math.floor(provisioningForm.count), 1));
+  const usedIndex = findPlanIpIndex(ip, targetIndex);
+  if (usedIndex >= 0) {
+    showMessage(`${ip} 已用于第 ${usedIndex + 1} 台，请先调整该行 IP。`, "warning");
+    return;
+  }
+  setActiveDraftIndex(targetIndex);
+  setVmDraftOverride(targetIndex, "ip", ip);
+  const name = vmDraftOverrides[targetIndex]?.name?.trim();
+  if (!name) setVmDraftOverride(targetIndex, "name", defaultVmNameForIp(ip, targetIndex));
   provisioningForm.preferredIp = ip;
   syncRootPasswordDefault();
 }
@@ -1328,6 +1392,16 @@ function defaultVmNameForIp(ip: string, index: number) {
   if (ipPrefix) return ipPrefix;
   const base = provisioningForm.vmNamePrefix.trim() || "vm";
   return `${base}-${String(index + 1).padStart(2, "0")}`;
+}
+
+function resolveVmNameForAssignedIp(name: string | undefined, ip: string, index: number) {
+  const currentName = name?.trim();
+  if (!currentName) return defaultVmNameForIp(ip, index);
+  const assignedPrefix = vmNamePrefixFromIp(ip);
+  if (!assignedPrefix) return currentName;
+  const currentIpPrefix = currentName.match(/^(?:\d{1,3}\.){1,3}\d{1,3}_/)?.[0];
+  // The IP-derived prefix remains authoritative while the user-owned suffix is preserved.
+  return currentIpPrefix ? `${assignedPrefix}${currentName.slice(currentIpPrefix.length)}` : currentName;
 }
 
 function vmNamePrefixFromIp(ip: string) {
@@ -1384,10 +1458,7 @@ function formatNumber(value: number) {
 }
 
 function providerLabel(value: ProviderType) {
-  if (value === "xenserver") return "XenServer";
-  if (value === "vmware") return "VMware";
-  if (value === "proxmox") return "Proxmox VE";
-  return "KVM/libvirt";
+  return getProviderBrand(value).resourceName;
 }
 
 function showMessage(message: string, type: "success" | "error" | "warning" | "info") {
@@ -1453,11 +1524,12 @@ interface ProvisioningPlanItem {
 
 interface ProvisioningPlanResult {
   items: ProvisioningPlanItem[];
-  warnings: string[];
+  warnings: ProvisioningWarning[];
   summary: string;
 }
 
 interface ProvisioningWarning {
+  code: string;
   message: string;
   severity: "blocking" | "advisory";
 }
@@ -1525,8 +1597,9 @@ type ProvisioningSourceType = "iso" | "template";
                 :loading="loadingIsoImages"
                 :disabled="provisioningFormLocked"
                 popper-class="vrc-provision-select-dropdown vrc-provision-iso-dropdown"
-                fit-input-width
                 placement="bottom-start"
+                :offset="0"
+                :show-arrow="false"
                 :fallback-placements="['bottom-start', 'top-start']"
                 loading-text="正在读取镜像资源"
                 no-data-text="当前平台未读到 ISO"
@@ -1534,7 +1607,7 @@ type ProvisioningSourceType = "iso" | "template";
               >
                 <el-option-group v-for="group in isoOptionGroups" :key="group.label" :label="group.label">
                   <el-option v-for="image in group.options" :key="image.id" :label="image.name" :value="image.id">
-                    <span>{{ image.name }}</span>
+                    <span class="option-title">{{ image.name }}</span>
                     <small class="option-subtitle">{{ isoOptionDescription(image) }}</small>
                   </el-option>
                 </el-option-group>
@@ -1553,7 +1626,7 @@ type ProvisioningSourceType = "iso" | "template";
                 :options="installProfileOptions"
                 :disabled="provisioningFormLocked"
               />
-              <strong v-else>CLI</strong>
+              <strong v-else>{{ installProfileOptions[0]?.label ?? "CLI" }}</strong>
             </div>
 
             <label class="form-field compact">
@@ -1602,8 +1675,15 @@ type ProvisioningSourceType = "iso" | "template";
               <span class="provision-panel-meta">
                 {{ provisioningForm.startIp && provisioningForm.endIp ? `${provisioningForm.startIp} - ${provisioningForm.endIp}` : "未配置地址范围" }}
               </span>
-              <button class="provision-network-action" type="button" :disabled="probingIps || provisioningFormLocked" @click.stop="probeProvisioningIps()">
-                <el-icon v-if="probingIps" class="inline-loading"><Loading /></el-icon>
+              <button
+                class="provision-network-action"
+                type="button"
+                :aria-busy="probingIps"
+                :aria-label="probingIps ? '正在 PING IP' : 'PING IP'"
+                :disabled="initializingProvisioningDialog || probingIps || provisioningFormLocked"
+                @click.stop="probeProvisioningIps()"
+              >
+                <el-icon v-if="probingIps" class="provision-network-action-icon" aria-hidden="true"><Loading /></el-icon>
                 <span>PING IP</span>
               </button>
               <button
@@ -1623,10 +1703,7 @@ type ProvisioningSourceType = "iso" | "template";
 
             <div v-if="isProvisionSectionExpanded('network')" class="provision-panel-body">
               <div class="provision-inline-actions">
-                <div class="ip-candidate-filter" role="group" aria-label="候选 IP 筛选">
-                  <button type="button" :class="{ active: ipCandidateFilter === 'available' }" @click="ipCandidateFilter = 'available'">可用</button>
-                  <button type="button" :class="{ active: ipCandidateFilter === 'all' }" @click="ipCandidateFilter = 'all'">全部</button>
-                </div>
+                <el-segmented v-model="ipCandidateFilter" class="ip-candidate-filter" :options="ipCandidateFilterOptions" aria-label="候选 IP 筛选" />
               </div>
               <el-select
                 v-model="provisioningForm.ipPoolId"
@@ -1656,7 +1733,7 @@ type ProvisioningSourceType = "iso" | "template";
               <div class="ip-candidates">
                 <div class="ip-candidates-head">
                   <strong>候选 IP</strong>
-                  <span>{{ provisioningForm.preferredIp ? `首选 ${ provisioningForm.preferredIp }` : loadingIpLeases ? "读取 IP 池文件中" : `本地预留 ${ provisioningLeasedIps.size } 个` }}</span>
+                  <span>{{ activeIpCandidateText }}</span>
                 </div>
                 <div v-if="provisioningCandidateError" class="ip-candidate-validation-error" role="alert">
                   <el-icon><WarningFilled /></el-icon>
@@ -1725,6 +1802,19 @@ type ProvisioningSourceType = "iso" | "template";
               :target="consoleTarget"
               :provision-task="provisionTask"
               :provision-targets="provisionConsoleTargets ?? []"
+              :terminal-font-family="terminalFontFamily"
+              :terminal-font-size="terminalFontSize"
+              :terminal-line-height="terminalLineHeight"
+              :terminal-cursor-style="terminalCursorStyle"
+              :terminal-cursor-blink="terminalCursorBlink"
+              :terminal-theme="terminalTheme"
+              :display-scale-mode="displayScaleMode"
+              :display-quality="displayQuality"
+              :throttle-resize="throttleResize"
+              :watermark-enabled="watermarkEnabled"
+              :watermark-density="watermarkDensity"
+              :watermark-opacity="watermarkOpacity"
+              :watermark-text="watermarkText"
               @select-provision-target="emit('select-console-target', $event)"
             />
             <div v-else class="provision-inline-console-empty">
@@ -1739,7 +1829,8 @@ type ProvisioningSourceType = "iso" | "template";
           <div
             v-else
             class="vm-plan-list-table"
-            :style="{ height: `${Math.min(158, 32 + (provisioningPlan?.items.length ?? 0) * 42)}px` }"
+            :class="{ 'is-static-body': (provisioningPlan?.items.length ?? 0) <= 3 }"
+            :style="{ height: `${Math.min(160, 34 + (provisioningPlan?.items.length ?? 0) * 42)}px` }"
           >
             <div class="vm-plan-list-row vm-plan-list-header">
               <span>序号</span>
@@ -1751,14 +1842,20 @@ type ProvisioningSourceType = "iso" | "template";
               <span>密码</span>
             </div>
             <div class="vm-plan-list-body vrc-scroll-container">
-              <div v-for="(item, index) in provisioningPlan?.items ?? []" :key="index" class="vm-plan-list-row">
+              <div
+                v-for="(item, index) in provisioningPlan?.items ?? []"
+                :key="index"
+                class="vm-plan-list-row"
+                :class="{ 'is-active-draft': activeDraftIndex === index }"
+                @click="setActiveDraftIndex(index)"
+              >
                 <span class="vm-draft-index">{{ index + 1 }}</span>
-                <el-input class="vm-plan-inline-input" :model-value="item.name" :disabled="provisioningFormLocked" @update:model-value="setVmDraftText(index, 'name', $event)" />
-                <el-input class="vm-plan-inline-input" :model-value="item.ip" placeholder="待分配" :disabled="provisioningFormLocked" @update:model-value="setVmDraftText(index, 'ip', $event)" />
-                <el-input-number class="vm-plan-inline-number" :model-value="item.cpu" :min="1" :max="256" controls-position="right" :disabled="provisioningFormLocked" @update:model-value="setVmDraftNumber(index, 'cpu', $event)" />
-                <el-input-number class="vm-plan-inline-number" :model-value="item.memoryGiB" :min="1" :max="2048" controls-position="right" :disabled="provisioningFormLocked" @update:model-value="setVmDraftNumber(index, 'memoryGiB', $event)" />
-                <el-input-number class="vm-plan-inline-number" :model-value="item.systemDiskGiB + item.dataDiskGiB" :min="1" :max="65535" controls-position="right" :disabled="provisioningFormLocked" @update:model-value="setVmDraftNumber(index, 'diskGiB', $event)" />
-                <el-input class="vm-plan-inline-input" :model-value="item.rootPassword" show-password :disabled="provisioningFormLocked" @update:model-value="setVmDraftText(index, 'rootPassword', $event)" />
+                <el-input class="vm-plan-inline-input" :model-value="item.name" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftText(index, 'name', $event)" />
+                <el-input class="vm-plan-inline-input" :model-value="item.ip" placeholder="待分配" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftText(index, 'ip', $event)" />
+                <el-input-number class="vm-plan-inline-number" :model-value="item.cpu" :min="1" :max="256" controls-position="right" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftNumber(index, 'cpu', $event)" />
+                <el-input-number class="vm-plan-inline-number" :model-value="item.memoryGiB" :min="1" :max="2048" controls-position="right" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftNumber(index, 'memoryGiB', $event)" />
+                <el-input-number class="vm-plan-inline-number" :model-value="item.systemDiskGiB + item.dataDiskGiB" :min="1" :max="65535" controls-position="right" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftNumber(index, 'diskGiB', $event)" />
+                <el-input class="vm-plan-inline-input" :model-value="item.rootPassword" show-password :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftText(index, 'rootPassword', $event)" />
               </div>
             </div>
           </div>

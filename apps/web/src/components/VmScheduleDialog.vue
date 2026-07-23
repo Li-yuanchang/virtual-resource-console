@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Close, Delete, EditPen, Finished } from "@element-plus/icons-vue";
-import { ElMessage, ElMessageBox } from "element-plus";
+import { ElMessage } from "element-plus";
 import { computed, ref, watch } from "vue";
 import type {
   HostNode,
@@ -17,6 +17,8 @@ import type {
   VmSchedulesResponse,
 } from "../types";
 import VrcVmActionIcon from "./VrcVmActionIcon.vue";
+import { getProviderBrand } from "../domain/providerBrand";
+import { confirmVrcAction } from "../domain/confirmAction";
 
 type ScheduleView = "create" | "tasks";
 
@@ -31,7 +33,10 @@ const props = defineProps<{
   host: HostNode | null;
   availableVms: VmNode[];
   selectedVms: VmNode[];
+  showIconTooltips?: boolean;
 }>();
+
+const iconTooltipsDisabled = computed(() => props.showIconTooltips === false);
 
 const emit = defineEmits<{
   "update:visible": [value: boolean];
@@ -303,11 +308,12 @@ async function toggleTask(task: VmSchedule, enabled: string | number | boolean) 
 
 async function removeTask(task: VmSchedule) {
   try {
-    await ElMessageBox.confirm(`对象：${task.name}\n动作：删除定时任务\n影响范围：后续不再自动执行`, "", {
+    await confirmVrcAction({
+      heading: "删除定时任务",
+      tone: "危险操作",
+      summary: `对象：${task.name}`,
+      detail: "删除后该计划不再自动执行，已执行记录不受影响。",
       confirmButtonText: "确认删除",
-      cancelButtonText: "取消",
-      customClass: "vrc-confirm-message-box",
-      type: "warning",
     });
   } catch {
     return;
@@ -353,11 +359,7 @@ function singleTargetHost() {
 }
 
 function providerLabel(value?: ProviderType) {
-  if (value === "xenserver") return "XenServer";
-  if (value === "vmware") return "VMware";
-  if (value === "proxmox") return "Proxmox VE";
-  if (value === "libvirt") return "Libvirt";
-  return "平台未知";
+  return value ? getProviderBrand(value).resourceName : "平台未知";
 }
 
 function powerStateLabel(value?: VmScheduleTarget["powerState"]) {
@@ -455,14 +457,16 @@ function errorMessage(error: unknown, fallback: string) {
           <section class="schedule-section schedule-target-section">
             <div class="schedule-section-heading schedule-target-heading"><strong>目标虚拟机 <em>已选 {{ targets.length }} 台</em></strong><span>{{ targetOptions.length }} 台可选 · 已选 {{ runningTargetCount }} 台运行中 / {{ stoppedTargetCount }} 台已关机</span></div>
             <div class="schedule-target-filters">
-              <el-input v-model="targetSearch" clearable placeholder="搜索虚拟机名称 / IP / 系统" />
-              <el-select v-model="targetHostFilter" multiple collapse-tags collapse-tags-tooltip clearable placeholder="全部物理机">
-                <el-option v-for="option in targetHostOptions" :key="option.value" :label="option.label" :value="option.value" />
-              </el-select>
-              <el-segmented v-model="targetPowerFilter" class="schedule-target-power-filter" :options="[{ label: '全部', value: 'all' }, { label: '运行中', value: 'running' }, { label: '已关机', value: 'stopped' }]" />
+              <div class="schedule-target-query-group">
+                <el-input v-model="targetSearch" clearable placeholder="搜索虚拟机名称 / IP / 系统" />
+                <el-select v-model="targetHostFilter" multiple collapse-tags collapse-tags-tooltip clearable placeholder="全部物理机">
+                  <el-option v-for="option in targetHostOptions" :key="option.value" :label="option.label" :value="option.value" />
+                </el-select>
+                <el-segmented v-model="targetPowerFilter" class="schedule-target-power-filter" :options="[{ label: '全部', value: 'all' }, { label: '运行中', value: 'running' }, { label: '已关机', value: 'stopped' }]" />
+              </div>
               <div class="schedule-target-batch-actions">
-                <el-tooltip content="选择当前筛选结果" placement="top"><span class="toolbar-tooltip-target"><button type="button" class="schedule-target-icon-action" :disabled="!filteredTargetOptions.length" aria-label="选择当前筛选结果" @click="toggleAllTargets(true)"><el-icon><Finished /></el-icon></button></span></el-tooltip>
-                <el-tooltip content="清空当前筛选结果" placement="top"><span class="toolbar-tooltip-target"><button type="button" class="schedule-target-icon-action" :disabled="!targets.length" aria-label="清空当前筛选结果" @click="toggleAllTargets(false)"><el-icon><Close /></el-icon></button></span></el-tooltip>
+                <el-tooltip content="选择当前筛选结果" placement="top" :disabled="iconTooltipsDisabled"><span class="toolbar-tooltip-target"><button type="button" class="schedule-target-icon-action" :disabled="!filteredTargetOptions.length" aria-label="选择当前筛选结果" @click="toggleAllTargets(true)"><el-icon><Finished /></el-icon></button></span></el-tooltip>
+                <el-tooltip content="清空当前筛选结果" placement="top" :disabled="iconTooltipsDisabled"><span class="toolbar-tooltip-target"><button type="button" class="schedule-target-icon-action" :disabled="!targets.length" aria-label="清空当前筛选结果" @click="toggleAllTargets(false)"><el-icon><Close /></el-icon></button></span></el-tooltip>
               </div>
             </div>
             <div v-if="catalogErrors.length" class="schedule-target-load-note">{{ catalogErrors.length }} 个连接读取失败，其余虚拟机仍可选择</div>
@@ -488,7 +492,7 @@ function errorMessage(error: unknown, fallback: string) {
             <el-table-column label="目标" width="62" align="center"><template #default="{ row }">{{ row.targets.length }} 台</template></el-table-column>
             <el-table-column label="下一次执行" width="112"><template #default="{ row }">{{ row.enabled ? formatDateTime(row.nextRunAt, row.timezone) : '已停用' }}</template></el-table-column>
             <el-table-column label="启用" width="62" align="center"><template #default="{ row }"><el-switch v-model="row.enabled" size="small" @change="toggleTask(row, $event)" /></template></el-table-column>
-            <el-table-column label="操作" width="82" align="center" fixed="right"><template #default="{ row }"><div class="schedule-row-actions"><button type="button" aria-label="编辑任务" @click="editTask(row)"><el-icon><EditPen /></el-icon></button><button type="button" class="danger" aria-label="删除任务" @click="removeTask(row)"><el-icon><Delete /></el-icon></button></div></template></el-table-column>
+            <el-table-column label="操作" width="82" align="center" fixed="right"><template #default="{ row }"><div class="schedule-row-actions"><button type="button" title="编辑任务" aria-label="编辑任务" @click="editTask(row)"><el-icon><EditPen /></el-icon></button><button type="button" class="danger" title="删除任务" aria-label="删除任务" @click="removeTask(row)"><el-icon><Delete /></el-icon></button></div></template></el-table-column>
           </el-table>
         </section>
       </el-tab-pane>
@@ -507,7 +511,7 @@ function errorMessage(error: unknown, fallback: string) {
 :global(.vm-schedule-dialog .el-dialog__footer) { margin: 0; padding: 0; border-top: 0; }
 .schedule-dialog-header, .schedule-dialog-footer, .schedule-task-toolbar, .schedule-target-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .schedule-dialog-header, .schedule-task-toolbar > div, .schedule-task-name { display: grid; gap: 3px; }
-.schedule-dialog-header strong { color: var(--vrc-text); font-size: 18px; font-weight: 400; line-height: 24px; }
+.schedule-dialog-header strong { color: var(--vrc-text); font-size: var(--vrc-font-size-dialog-title); font-weight: var(--vrc-font-weight-heading); line-height: 24px; }
 .schedule-dialog-header span { color: var(--vrc-text-muted); font-size: 11px; line-height: 1.3; }
 :global(.vm-schedule-dialog .schedule-tabs > .el-tabs__header) { margin: 0; padding: 0 12px; border-bottom: 0; }
 :global(.vm-schedule-dialog .schedule-tabs > .el-tabs__header .el-tabs__nav-wrap::after) { display: none; }
@@ -515,7 +519,7 @@ function errorMessage(error: unknown, fallback: string) {
 :global(.vm-schedule-dialog .schedule-tabs > .el-tabs__header .el-tabs__active-bar + .el-tabs__item) { padding-left: 0; }
 :global(.vm-schedule-dialog .schedule-tabs > .el-tabs__header .el-tabs__item.is-active) { color: var(--vrc-accent); font-weight: 400; }
 :global(.vm-schedule-dialog .schedule-tabs > .el-tabs__header .el-tabs__active-bar) { height: 2px; background: var(--vrc-accent); }
-:global(.vm-schedule-dialog .schedule-tabs > .el-tabs__content) { max-height: calc(88vh - 116px); overflow: auto; overscroll-behavior: contain; }
+:global(.vm-schedule-dialog .schedule-tabs > .el-tabs__content) { max-height: calc(88vh - 116px); overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .schedule-create-content { display: grid; gap: 10px; padding: 10px 12px 8px; }
 .schedule-section { display: grid; gap: 7px; min-width: 0; padding: 12px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 8px; }
 .schedule-section-heading { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
@@ -525,10 +529,10 @@ function errorMessage(error: unknown, fallback: string) {
 .schedule-field { display: grid; align-content: start; gap: 5px; min-width: 0; }
 .schedule-field > span:first-child { color: var(--vrc-text-muted); font-size: 11px; font-weight: 400; line-height: 1; }
 .schedule-field :deep(.el-input), .schedule-field :deep(.el-select), .schedule-field :deep(.el-date-editor), .schedule-field :deep(.el-input-number) { width: 100%; }
-.schedule-field :deep(.el-input__wrapper), .schedule-field :deep(.el-select__wrapper), .schedule-field :deep(.el-input-number .el-input__wrapper) { height: 28px; min-height: 28px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 6px; box-shadow: none; }
+.schedule-field :deep(.el-input__wrapper), .schedule-field :deep(.el-select__wrapper), .schedule-field :deep(.el-input-number .el-input__wrapper) { height: var(--vrc-control-height); min-height: var(--vrc-control-height); background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: var(--vrc-control-radius); box-shadow: none; }
 .schedule-field :deep(.el-input__wrapper:hover), .schedule-field :deep(.el-select__wrapper:hover), .schedule-field :deep(.el-input-number .el-input__wrapper:hover) { border-color: var(--vrc-border); box-shadow: none; }
 .schedule-field :deep(.el-input__wrapper.is-focus), .schedule-field :deep(.el-select__wrapper.is-focused) { border-color: var(--vrc-border-strong); box-shadow: none; }
-.schedule-field :deep(.el-input__inner), .schedule-field :deep(.el-select__selected-item), .schedule-field :deep(.el-select__placeholder) { font-size: 12px; }
+.schedule-field :deep(.el-input__inner), .schedule-field :deep(.el-select__selected-item), .schedule-field :deep(.el-select__placeholder) { height: calc(var(--vrc-control-height) - 2px); color: var(--vrc-text); font-size: var(--vrc-font-size-body); font-weight: var(--vrc-font-weight-regular); line-height: calc(var(--vrc-control-height) - 2px); }
 .schedule-action-segmented, .schedule-cycle-segmented { --el-segmented-item-selected-color: var(--vrc-text); --el-segmented-item-selected-bg-color: var(--vrc-surface); box-sizing: border-box; width: 100%; height: 28px; min-height: 28px; padding: 2px; color: var(--vrc-text-muted); background: var(--vrc-surface-muted); border: 1px solid transparent; border-radius: 7px; box-shadow: none; }
 .schedule-action-segmented :deep(.el-segmented__group), .schedule-cycle-segmented :deep(.el-segmented__group) { align-items: center; height: 22px; min-height: 22px; }
 .schedule-action-segmented :deep(.el-segmented__item), .schedule-cycle-segmented :deep(.el-segmented__item) { height: 22px; min-height: 22px; padding: 0 8px; color: var(--vrc-text-muted); border-radius: 5px; font-size: 12px; font-weight: 400; line-height: 22px; }
@@ -541,7 +545,7 @@ function errorMessage(error: unknown, fallback: string) {
 .schedule-policy-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; gap: 10px; }
 .schedule-timeout-control { display: flex; align-items: center; width: 100%; }
 .schedule-timeout-control :deep(.el-input-number) { flex: 1 1 auto; width: auto; min-width: 0; }
-.schedule-timeout-control :deep(.el-input-number__decrease), .schedule-timeout-control :deep(.el-input-number__increase) { width: 26px; height: 14px; color: var(--vrc-text-muted); background: var(--vrc-surface); border-color: var(--vrc-border); font-size: 11px; line-height: 14px; }
+.schedule-timeout-control :deep(.el-input-number__decrease), .schedule-timeout-control :deep(.el-input-number__increase) { width: 28px; height: var(--vrc-number-step-height); color: var(--vrc-text-muted); background: var(--vrc-surface); border-color: var(--vrc-border); font-size: 11px; line-height: var(--vrc-number-step-height); }
 .schedule-timeout-control :deep(.el-input-number__decrease:hover), .schedule-timeout-control :deep(.el-input-number__increase:hover) { color: var(--vrc-accent); background: var(--vrc-surface); border-color: var(--vrc-border); }
 .schedule-skip-control { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 28px; min-width: 0; padding: 0 2px; }
 .schedule-skip-control small { min-width: 0; overflow: hidden; color: var(--vrc-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
@@ -551,22 +555,23 @@ function errorMessage(error: unknown, fallback: string) {
 .schedule-target-heading { align-items: center; }
 .schedule-target-heading strong { display: inline-flex; align-items: center; gap: 5px; line-height: 16px; }
 .schedule-target-heading strong em { color: var(--vrc-text-muted); font-size: 11px; font-style: normal; font-weight: 400; font-variant-numeric: tabular-nums; line-height: 16px; white-space: nowrap; }
-.schedule-target-filters { display: grid; grid-template-columns: minmax(190px, 1fr) minmax(170px, .9fr) 210px auto; align-items: center; gap: 8px; }
-.schedule-target-filters :deep(.el-input__wrapper), .schedule-target-filters :deep(.el-select__wrapper) { align-items: center; height: 28px; min-height: 28px; box-shadow: none; }
+.schedule-target-filters { display: flex; align-items: center; gap: 12px; }
+.schedule-target-query-group { display: grid; flex: 1 1 auto; grid-template-columns: minmax(190px, 1fr) minmax(170px, .9fr) 210px; align-items: center; gap: 8px; min-width: 0; }
+.schedule-target-filters :deep(.el-input__wrapper), .schedule-target-filters :deep(.el-select__wrapper) { align-items: center; height: var(--vrc-control-height); min-height: var(--vrc-control-height); box-shadow: none; }
 .schedule-target-filters :deep(.el-input__wrapper) { padding-top: 1px; padding-bottom: 1px; background: var(--vrc-surface-muted); border: 1px solid transparent; border-radius: 7px; }
 .schedule-target-filters :deep(.el-select__wrapper) { padding-top: 0; padding-bottom: 0; background: var(--vrc-surface-muted); border: 1px solid transparent; border-radius: 7px; }
 .schedule-target-filters :deep(.el-input__wrapper:hover) { border-color: transparent; box-shadow: none; }
 .schedule-target-filters :deep(.el-select__wrapper:hover) { border-color: transparent; box-shadow: none; }
-.schedule-target-filters :deep(.el-input__wrapper.is-focus) { background: var(--vrc-surface-muted); border-color: color-mix(in srgb, var(--vrc-accent) 50%, var(--vrc-border)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vrc-accent) 14%, transparent); }
-.schedule-target-filters :deep(.el-select__wrapper.is-focused) { background: var(--vrc-surface-muted); border-color: color-mix(in srgb, var(--vrc-accent) 50%, var(--vrc-border)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vrc-accent) 14%, transparent); }
-.schedule-target-filters :deep(.el-input__inner), .schedule-target-filters :deep(.el-select__selected-item), .schedule-target-filters :deep(.el-select__placeholder) { height: 26px; font-size: 12px; line-height: 26px; }
+.schedule-target-filters :deep(.el-input__wrapper.is-focus) { background: var(--vrc-surface-muted); border-color: color-mix(in srgb, var(--vrc-accent) 50%, var(--vrc-border)); box-shadow: none; }
+.schedule-target-filters :deep(.el-select__wrapper.is-focused) { background: var(--vrc-surface-muted); border-color: color-mix(in srgb, var(--vrc-accent) 50%, var(--vrc-border)); box-shadow: none; }
+.schedule-target-filters :deep(.el-input__inner), .schedule-target-filters :deep(.el-select__selected-item), .schedule-target-filters :deep(.el-select__placeholder) { height: calc(var(--vrc-control-height) - 2px); font-size: var(--vrc-font-size-body); line-height: calc(var(--vrc-control-height) - 2px); }
 .schedule-target-filters :deep(.el-select__selected-item), .schedule-target-filters :deep(.el-select__placeholder) { display: flex; align-items: center; }
-.schedule-target-filters :deep(.el-input__inner::placeholder) { color: var(--vrc-text-subtle); font-size: 12px; font-weight: 400; line-height: inherit; }
-.schedule-target-filters :deep(.el-select__placeholder.is-transparent) { color: var(--vrc-text-subtle); font-size: 12px; font-weight: 400; }
+.schedule-target-filters :deep(.el-input__inner::placeholder) { color: var(--vrc-text-subtle); font-size: var(--vrc-font-size-label); font-weight: var(--vrc-font-weight-regular); line-height: calc(var(--vrc-control-height) - 2px); }
+.schedule-target-filters :deep(.el-select__placeholder.is-transparent) { color: var(--vrc-text-subtle); font-size: var(--vrc-font-size-label); font-weight: var(--vrc-font-weight-regular); }
 .schedule-target-power-filter { --el-segmented-item-selected-color: var(--vrc-text); --el-segmented-item-selected-bg-color: var(--vrc-surface); box-sizing: border-box; width: 100%; height: 28px; min-height: 28px; padding: 2px; color: var(--vrc-text-muted); background: var(--vrc-surface-muted); border: 1px solid transparent; border-radius: 7px; }
 .schedule-target-power-filter :deep(.el-segmented__group), .schedule-target-power-filter :deep(.el-segmented__item) { height: 22px; min-height: 22px; }
 .schedule-target-power-filter :deep(.el-segmented__item) { padding: 0 7px; border-radius: 5px; font-size: 12px; font-weight: 400; line-height: 22px; }
-.schedule-target-batch-actions { display: flex; gap: 6px; white-space: nowrap; }
+.schedule-target-batch-actions { display: flex; flex: 0 0 auto; gap: 6px; margin-left: auto; white-space: nowrap; }
 .schedule-target-batch-actions .toolbar-tooltip-target { display: inline-flex; }
 .schedule-target-icon-action { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; color: var(--vrc-text-muted); background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 6px; cursor: pointer; }
 .schedule-target-icon-action:hover:not(:disabled), .schedule-target-icon-action:focus-visible { color: var(--vrc-accent); border-color: color-mix(in srgb, var(--vrc-accent) 30%, var(--vrc-border)); outline: none; }
@@ -577,7 +582,7 @@ function errorMessage(error: unknown, fallback: string) {
 .schedule-target-table-head, .schedule-target-row { display: grid; grid-template-columns: 34px 48px minmax(180px, 1.25fr) minmax(140px, .85fr) 126px 84px; align-items: center; column-gap: 10px; padding: 0 10px; }
 .schedule-target-table-head { min-height: 36px; color: var(--vrc-text-muted); background: var(--vrc-surface-muted); border-bottom: 1px solid var(--vrc-border); font-size: 12px; font-weight: 600; line-height: 18px; }
 .schedule-target-table-head > span { min-width: 0; text-align: center; }
-.schedule-target-table-body { max-height: 242px; overflow: auto; overscroll-behavior: contain; }
+.schedule-target-table-body { max-height: 242px; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .schedule-target-row { min-height: 48px; color: var(--vrc-text); background: var(--vrc-surface); font-size: 12px; }
 .schedule-target-row + .schedule-target-row { border-top: 1px solid color-mix(in srgb, var(--vrc-border) 72%, transparent); }
 .schedule-target-row strong, .schedule-target-row > span:not(.schedule-target-select-cell) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -607,13 +612,13 @@ function errorMessage(error: unknown, fallback: string) {
 .schedule-action-label :deep(svg) { width: 14px; height: 14px; }
 .schedule-action-label.action-shutdown { color: var(--vrc-warning); }
 .schedule-row-actions { display: flex; justify-content: center; gap: 6px; }
-.schedule-row-actions button { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; color: var(--vrc-text-muted); background: transparent; border: 1px solid var(--vrc-border); border-radius: 7px; cursor: pointer; }
-.schedule-row-actions button:hover { color: var(--vrc-accent); border-color: color-mix(in srgb, var(--vrc-accent) 32%, var(--vrc-border)); }
+.schedule-row-actions button { display: grid; place-items: center; width: var(--vrc-row-action-size); height: var(--vrc-row-action-size); padding: 0; color: var(--vrc-text-muted); background: transparent; border: 1px solid var(--vrc-border); border-radius: var(--vrc-command-radius); cursor: pointer; }
+.schedule-row-actions button:hover, .schedule-row-actions button:focus-visible { color: var(--vrc-accent); border-color: color-mix(in srgb, var(--vrc-accent) 32%, var(--vrc-border)); outline: none; box-shadow: var(--vrc-focus-ring); }
 .schedule-row-actions button.danger { color: var(--vrc-danger); }
 .schedule-dialog-footer { padding: 8px 12px 10px; }
 .schedule-dialog-footer > div { display: flex; gap: 8px; }
 .schedule-dialog-footer :deep(.el-button + .el-button) { margin-left: 0; }
 .schedule-dialog-footer > span strong { color: var(--vrc-text); font-size: 11px; font-weight: 400; }
-@media (max-width: 920px) { .schedule-target-filters { grid-template-columns: 1fr 1fr; } .schedule-target-batch-actions { justify-content: flex-end; } }
-@media (max-width: 760px) { .schedule-form-grid, .schedule-policy-grid { grid-template-columns: 1fr 1fr; } .schedule-target-table-head, .schedule-target-row { grid-template-columns: 34px 42px minmax(150px, 1fr) minmax(120px, .8fr) 76px; } .schedule-target-table-head > :nth-child(5), .schedule-target-row > :nth-child(5) { display: none; } }
+@media (max-width: 920px) { .schedule-target-filters { align-items: flex-end; } .schedule-target-query-group { grid-template-columns: 1fr 1fr; } .schedule-target-power-filter { grid-column: 1 / -1; } }
+@media (max-width: 760px) { .schedule-form-grid, .schedule-policy-grid { grid-template-columns: 1fr 1fr; } .schedule-target-filters { flex-wrap: wrap; } .schedule-target-query-group { flex-basis: 100%; } .schedule-target-batch-actions { justify-content: flex-end; } .schedule-target-table-head, .schedule-target-row { grid-template-columns: 34px 42px minmax(150px, 1fr) minmax(120px, .8fr) 76px; } .schedule-target-table-head > :nth-child(5), .schedule-target-row > :nth-child(5) { display: none; } }
 </style>

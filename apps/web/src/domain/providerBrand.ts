@@ -7,15 +7,15 @@ export interface ProviderBrand {
   resourceName: string;
 }
 
+const providerBrands: Record<ProviderType, ProviderBrand> = {
+  xenserver: { type: "xenserver", mark: "XEN", consoleName: "XenServer Console", resourceName: "XenServer" },
+  vmware: { type: "vmware", mark: "VMW", consoleName: "VMware Console", resourceName: "VMware" },
+  proxmox: { type: "proxmox", mark: "PVE", consoleName: "Proxmox VE Console", resourceName: "Proxmox VE" },
+  libvirt: { type: "libvirt", mark: "KVM", consoleName: "KVM Console", resourceName: "KVM/libvirt" },
+};
+
 export function getProviderBrand(providerType?: ProviderType): ProviderBrand {
-  switch (providerType) {
-    case "vmware":
-      return { type: "vmware", mark: "VMW", consoleName: "VMware Console", resourceName: "VMware" };
-    case "proxmox":
-      return { type: "proxmox", mark: "PVE", consoleName: "Proxmox VE Console", resourceName: "Proxmox VE" };
-    case "xenserver":
-      return { type: "xenserver", mark: "XEN", consoleName: "XenServer Console", resourceName: "XenServer" };
-    default:
-      return { type: "default", mark: "VRC", consoleName: "Virtual Console", resourceName: "虚拟化平台" };
-  }
+  return providerType
+    ? providerBrands[providerType]
+    : { type: "default", mark: "VRC", consoleName: "Virtual Console", resourceName: "虚拟化平台" };
 }

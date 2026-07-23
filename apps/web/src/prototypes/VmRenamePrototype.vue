@@ -82,6 +82,7 @@ const vmTotals = computed(() => ({
   vcpu: activeScenario.value.vms.reduce((sum, item) => sum + item.cpuCount, 0),
   runningVcpu: activeScenario.value.vms.filter((item) => item.powerState === "running").reduce((sum, item) => sum + item.cpuCount, 0),
   memoryBytes: activeScenario.value.vms.reduce((sum, item) => sum + item.memoryBytes, 0),
+  runningMemoryBytes: activeScenario.value.vms.filter((item) => item.powerState === "running").reduce((sum, item) => sum + item.memoryBytes, 0),
   diskBytes: activeScenario.value.vms.reduce((sum, item) => sum + (item.diskVirtualBytes ?? 0), 0),
 }));
 const resourceSummary = computed(() => [
@@ -191,7 +192,11 @@ function notifyPrototype(action: string) {
           :network-count="5"
           :resource-summary="resourceSummary"
           :host-memory-percent="63"
-          :storage-totals="{ usedGiB: 11900, physicalGiB: 15770, virtualGiB: 18420, usagePercent: 75 }"
+          :storage-totals="{ usedGiB: 11900, physicalGiB: 15770, usagePercent: 75 }"
+          :resource-capacity="{
+            memory: { physicalTotalGiB: 512, physicalUsedGiB: 296, physicalFreeGiB: 216, physicalStatus: 'normal', vmConfiguredGiB: 448, vmConfigurableGiB: 64, vmOverconfiguredGiB: 0, vmStatus: 'within-capacity', allocatableGiB: 64, runningConfiguredGiB: 296, haltedConfiguredGiB: 152, guaranteedHeadroomGiB: 64, startupDeficitGiB: 0, startupStatus: 'guaranteed' },
+            storage: { physicalTotalGiB: 15770, physicalUsedGiB: 11900, physicalFreeGiB: 3870, physicalStatus: 'normal', vmConfiguredGiB: 18420, vmConfigurableGiB: 0, vmOverconfiguredGiB: 2650, vmStatus: 'overconfigured', allocatableGiB: 0 },
+          }"
           :vm-totals="vmTotals"
           :has-vm-summary="true"
           :loading-vm-summary="false"

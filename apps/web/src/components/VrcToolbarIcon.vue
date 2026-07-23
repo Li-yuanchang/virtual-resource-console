@@ -2,6 +2,7 @@
 export type VrcToolbarIconName =
   | "create-vm"
   | "export"
+  | "overview"
   | "refresh"
   | "schedule";
 
@@ -23,6 +24,12 @@ defineProps<{
       <path d="M12 5.25v9.2" />
       <path d="M8.55 10.95 12 14.4l3.45-3.45" />
       <path d="M6.15 16.35v1.45c0 .78.62 1.4 1.4 1.4h8.9c.78 0 1.4-.62 1.4-1.4v-1.45" />
+    </template>
+    <template v-else-if="name === 'overview'">
+      <rect x="4.25" y="4.25" width="6.25" height="6.25" rx="1.1" />
+      <rect x="13.5" y="4.25" width="6.25" height="6.25" rx="1.1" />
+      <rect x="4.25" y="13.5" width="6.25" height="6.25" rx="1.1" />
+      <path d="M13.5 19.75h6.25v-6.25H13.5z" />
     </template>
     <template v-else-if="name === 'refresh'">
       <path d="M17.85 7.35A7.05 7.05 0 0 0 5.35 9.9" />

@@ -1,19 +1,24 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import RFB from "@novnc/novnc";
+import type { ITheme } from "@xterm/xterm";
 import { ElDialog } from "element-plus";
 import { Close, CopyDocument, FullScreen, Monitor, Refresh } from "@element-plus/icons-vue";
 import ConsoleVmMetrics from "./ConsoleVmMetrics.vue";
 import VrcLogoMark from "./VrcLogoMark.vue";
-import type { NoVncVmConsoleTarget } from "../domain/consoleStrategies";
+import type { NoVncVmConsoleTarget, VmConsoleTarget } from "../domain/consoleStrategies";
 import { resolveConsoleDisplayStrategy, resolveConsoleMetricsLoadingStrategy } from "../domain/consoleStrategies";
+import type { TerminalConsoleInstance, TerminalInputEvent, TerminalReadyEvent, TerminalResizeEvent } from "./TerminalConsole.vue";
 import {
   normalizeConsoleClipboardText,
   normalizeConsoleTextInput,
 } from "../domain/consoleTextInput";
 import { getProviderBrand } from "../domain/providerBrand";
-import { secureJsonRequest } from "../domain/secureRequest";
+import { SecureRequestError, secureJsonRequest } from "../domain/secureRequest";
+import { TerminalLoginPrompt, type TerminalSessionCredentials } from "../domain/terminalLogin";
 import type { ProvisionTask, ProvisionTaskStep, ProvisionTaskStepKey, ProvisionTaskVm, VmMetricSnapshot } from "../types";
+
+const TerminalConsole = defineAsyncComponent(() => import("./TerminalConsole.vue"));
 
 interface ProvisionConsoleTargetItem {
   key: string;
@@ -25,15 +30,29 @@ interface ProvisionConsoleTargetItem {
   currentStep?: ProvisionTaskVm["currentStep"];
   installPackageDone?: number;
   installPackageTotal?: number;
-  target: NoVncVmConsoleTarget | null;
+  target: VmConsoleTarget | null;
 }
 
 const props = defineProps<{
   visible: boolean;
-  target: NoVncVmConsoleTarget | null;
+  target: VmConsoleTarget | null;
   provisionTask?: ProvisionTask | null;
   provisionTargets?: ProvisionConsoleTargetItem[];
   embedded?: boolean;
+  terminalFontFamily?: string;
+  terminalFontSize?: number;
+  terminalLineHeight?: number;
+  terminalCursorStyle?: "block" | "underline" | "bar";
+  terminalCursorBlink?: boolean;
+  terminalTheme?: ITheme;
+  displayScaleMode?: "local" | "remote";
+  displayQuality?: "auto" | "high" | "smooth";
+  throttleResize?: boolean;
+  watermarkEnabled?: boolean;
+  watermarkDensity?: "sparse" | "standard" | "dense";
+  watermarkOpacity?: number;
+  watermarkText?: string;
+  showIconTooltips?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -54,10 +73,16 @@ const emit = defineEmits<{
 const screenRef = ref<HTMLElement | null>(null);
 const consoleFrameRef = ref<HTMLElement | null>(null);
 const clipboardCaptureRef = ref<HTMLTextAreaElement | null>(null);
+const terminalConsoleRef = ref<TerminalConsoleInstance | null>(null);
 const dialogRef = ref<{ $el?: Element } | null>(null);
 const statusText = ref("等待连接");
 const connected = ref(false);
 const consoleNoticeText = ref("");
+const terminalSession = ref<TerminalSessionDescriptor | null>(null);
+const terminalStatus = ref<TerminalConnectionStatus>("idle");
+const terminalErrorMessage = ref("");
+const terminalLoginDisplay = ref("");
+const terminalLoginPrompt = new TerminalLoginPrompt();
 const consolePasteSending = ref(false);
 const uploadDragActive = ref(false);
 const uploadStatusText = ref("");
@@ -111,6 +136,11 @@ const CONSOLE_FRAME_RECONNECT_TIMEOUT_MS = 8000;
 const CONSOLE_STAGE_RECONNECT_DELAY_MS = 500;
 const CONSOLE_PROVISION_BLANK_RECONNECT_DELAY_MS = 8000;
 const CONSOLE_PROVISION_BLANK_RECONNECT_MAX_DELAY_MS = 30000;
+const CONSOLE_PROVISION_STALE_SAMPLE_INTERVAL_MS = 5000;
+const CONSOLE_PROVISION_STALE_RECONNECT_DELAY_MS = 30000;
+const CONSOLE_PROVISION_STALE_RECONNECT_MAX_DELAY_MS = 120000;
+const CONSOLE_PROVISION_FRAME_SAMPLE_WIDTH = 32;
+const CONSOLE_PROVISION_FRAME_SAMPLE_HEIGHT = 24;
 const CONSOLE_MODIFIER_RELEASE_DELAY_MS = 12;
 const CONSOLE_NATIVE_PASTE_CAPTURE_TIMEOUT_MS = 1200;
 const CONSOLE_MAX_PASTE_CHARACTERS = 5000;
@@ -172,6 +202,11 @@ const CONSOLE_KEY_STROKE_MAP: Record<string, { keysym: number; code: string; shi
 const consoleAspectRatioCache = new Map<string, number>();
 
 let rfb: RFB | null = null;
+let terminalSocket: WebSocket | null = null;
+let terminalAbortController: AbortController | null = null;
+let terminalConnectSeq = 0;
+let terminalTargetKey = "";
+const terminalCredentialCache = new Map<string, TerminalSessionCredentials>();
 let screenResizeObserver: ResizeObserver | null = null;
 let consoleLoadingStartedAt = 0;
 let consoleWakeRefreshTimer: number | null = null;
@@ -180,11 +215,14 @@ let consoleConnectAttemptTimer: number | null = null;
 let consoleFrameWatchTimer: number | null = null;
 let consoleCanvasProbeTimer: number | null = null;
 let consoleBlankReconnectTimer: number | null = null;
+let consoleStaleWatchTimer: number | null = null;
 let consoleStageReconnectTimer: number | null = null;
 let consoleCanvasObserver: MutationObserver | null = null;
 let consoleReconnectAttempt = 0;
 let consoleBlankReconnectAttempt = 0;
-let suppressNextConsoleDisconnect = false;
+let consoleStaleReconnectAttempt = 0;
+let consoleLastFrameFingerprint = "";
+let consoleLastFrameChangedAt = 0;
 let suppressLocalShortcutUntil = 0;
 let suppressedLocalShortcutKey = "";
 let suppressedLocalShortcutModifier: "meta" | "ctrl" | "" = "";
@@ -230,6 +268,34 @@ interface PreparedConsoleSession {
   password?: string;
 }
 
+type TerminalConnectionStatus = "idle" | "authenticating" | "connecting" | "connected" | "disconnected" | "error";
+
+interface TerminalSessionDescriptor {
+  sessionId: string;
+  transport: "websocket" | "serial" | "ssh-pty";
+  label?: string;
+  endpoint?: string;
+  expiresAt?: string;
+}
+
+interface PreparedTerminalSession {
+  sessionId: string;
+  connectionId: string;
+  vmId: string;
+  runtime: "web" | "electron" | "chrome-extension";
+  mode: "linux-cli" | "serial-console";
+  transport: "ssh-pty" | "serial-pty";
+  state: "created" | "active" | "closing" | "closed" | "failed";
+  expiresAt: string;
+  websocketPath: string;
+}
+
+type TerminalServerMessage =
+  | { type: "connected" }
+  | { type: "output"; data: string }
+  | { type: "exit"; code?: number }
+  | { type: "error"; message?: string };
+
 interface ConsoleUploadResponse {
   message?: string;
   uploaded?: Array<{
@@ -268,6 +334,11 @@ interface ConsoleTextSendResult {
 
 interface ConsoleTextSendOptions {
   onProgress?: (sentCount: number) => void;
+}
+
+interface NoVncDisplayCoordinateMapper {
+  absX(position: number): number;
+  absY(position: number): number;
 }
 
 const consoleLoadingBrand = computed(() => {
@@ -317,7 +388,7 @@ const consolePendingCopy = computed(() => {
   const step = activeProvisionConsoleStep.value;
   const taskStatus = props.provisionTask?.status;
   const detail = vm?.message || provisionTaskCurrentStep.value?.message || props.provisionTask?.message || statusText.value;
-  const consoleRecovering = /自动重试|暂时黑屏|重新获取当前画面|画面未就绪/.test(statusText.value);
+  const consoleRecovering = /自动重试|暂时黑屏|重新获取当前画面|画面未就绪|画面长时间未更新/.test(statusText.value);
   if (taskStatus === "success") {
     return { title: "环境已完成", detail: "系统启动、登录验证和后续验收已完成" };
   }
@@ -387,10 +458,17 @@ const consoleTaskStatusRows = computed(() => {
 });
 const effectiveVisible = computed(() => (props.embedded ? !!props.target : props.visible));
 const shouldAutoConnectConsole = computed(() => !!props.target);
+const isCliConsole = computed(() => props.target?.mode === "cli");
+const noVncTarget = computed(() => props.target?.mode === "novnc" ? props.target : null);
+const cliCapability = computed(() => props.target?.capabilities.cli);
+const cliTerminalMessage = computed(() => terminalErrorMessage.value || cliCapability.value?.message || "当前没有可用的 Linux CLI 通道。");
+const cliInitialData = computed(() => terminalLoginDisplay.value);
+const terminalAcceptsInput = computed(() => terminalStatus.value === "connected" || terminalLoginPrompt.acceptsInput);
 const consoleRootComponent = computed(() => (props.embedded ? "section" : ElDialog));
 const consoleRootClass = computed(() => [
   "console-dialog",
   "is-medium-terminal",
+  { "is-console-cli": isCliConsole.value },
   {
     "is-console-resizing": isResizing.value,
     "is-console-expanded": isExpanded.value,
@@ -403,6 +481,8 @@ const consoleMetricsStrategy = computed(() =>
   props.target ? resolveConsoleMetricsLoadingStrategy(props.target.providerType) : null,
 );
 const consoleDisplayStrategy = computed(() => resolveConsoleDisplayStrategy(props.target?.providerType ?? "xenserver"));
+const consoleWatermarkCopies = computed(() => ({ sparse: 3, standard: 6, dense: 10 })[props.watermarkDensity ?? "standard"]);
+const consoleWatermarkStyle = computed(() => ({ "--console-watermark-opacity": String(Math.min(24, Math.max(6, props.watermarkOpacity ?? 12)) / 100) }));
 const canCollectConsoleMetrics = computed(() => {
   const target = props.target;
   return !isProvisionConsole.value && consoleMetricsStrategy.value != null && !!target?.connectionId && !!target.vmId;
@@ -497,14 +577,35 @@ const consoleRootAttrs = computed(() =>
         top: "4vh",
         draggable: true,
         closeOnClickModal: false,
-        destroyOnClose: true,
+        destroyOnClose: false,
         appendToBody: true,
       },
 );
 watch(
-  () => [effectiveVisible.value, props.target?.wsUrl, props.target?.vmId, props.target?.connectionId, props.target?.providerType, isProvisionConsole.value] as const,
+  () => [
+    effectiveVisible.value,
+    props.target?.mode,
+    noVncTarget.value?.wsUrl,
+    props.target?.vmId,
+    props.target?.connectionId,
+    props.target?.providerType,
+    isProvisionConsole.value,
+  ] as const,
   async ([visible]) => {
-    if (!visible || !props.target) {
+    resetProvisionStaleConsoleWatchState();
+    const nextTerminalTargetKey = resolveTerminalTargetKey();
+    if (terminalTargetKey && terminalTargetKey !== nextTerminalTargetKey) disconnectTerminal();
+    if (!props.target) {
+      stopDialogDrag();
+      stopConsoleMetricsPolling();
+      disconnectConsole();
+      disconnectTerminal();
+      disconnectScreenResizeObserver();
+      clearConsoleReconnectTimer();
+      clearConsoleFrameWatchTimer();
+      return;
+    }
+    if (!visible) {
       stopDialogDrag();
       stopConsoleMetricsPolling();
       disconnectConsole();
@@ -513,18 +614,38 @@ watch(
       clearConsoleFrameWatchTimer();
       return;
     }
+    if (isCliConsole.value) {
+      disconnectConsole();
+      consoleFrameReady.value = true;
+      resetDialogOffset();
+      resetDialogSize();
+      startConsoleMetricsPolling();
+      await nextTick();
+      if (canResumeTerminal(nextTerminalTargetKey)) {
+        terminalConsoleRef.value?.fit();
+        terminalConsoleRef.value?.focus();
+        return;
+      }
+      statusText.value = "CLI 会话准备中";
+      void connectTerminal();
+      return;
+    }
     if (!shouldAutoConnectConsole.value) {
       stopConsoleMetricsPolling();
       disconnectConsole();
+      disconnectTerminal();
       statusText.value = props.provisionTask?.status === "success" ? "任务已完成" : "任务已结束";
       consoleFrameReady.value = false;
       return;
     }
+    disconnectTerminal();
     clearConsoleReconnectTimer();
     consoleReconnectAttempt = 0;
     consoleBlankReconnectAttempt = 0;
-    const cachedAspectRatio = getCachedConsoleAspectRatio(props.target);
-    consoleAspectRatio.value = cachedAspectRatio || props.target.aspectRatio || 4 / 3;
+    const target = noVncTarget.value;
+    if (!target) return;
+    const cachedAspectRatio = getCachedConsoleAspectRatio(target);
+    consoleAspectRatio.value = cachedAspectRatio || target.aspectRatio || 4 / 3;
     consoleLoadingStartedAt = Date.now();
     consoleFrameReady.value = false;
     isExpanded.value = false;
@@ -564,9 +685,22 @@ watch(
 );
 
 watch(
+  () => [props.displayScaleMode, props.displayQuality] as const,
+  () => {
+    if (!rfb) return;
+    applyNoVncDisplayPreferences(rfb);
+    requestConsoleResize({ focus: false });
+  },
+);
+
+watch(
   () => props.provisionTask?.status ?? "",
   (status, previousStatus) => {
-    if (status === previousStatus || !["success", "warning"].includes(status) || !effectiveVisible.value || !isProvisionConsole.value || !props.target) return;
+    if (status === previousStatus) return;
+    if (["success", "warning", "failed"].includes(status)) {
+      stopProvisionStaleConsoleWatch({ reset: true });
+    }
+    if (!["success", "warning"].includes(status) || !effectiveVisible.value || !isProvisionConsole.value || !props.target) return;
     clearConsoleStageReconnectTimer();
     consoleFrameReady.value = false;
     statusText.value = "任务结束，正在获取最终控制台画面";
@@ -594,6 +728,7 @@ onBeforeUnmount(() => {
   clearNativePasteFallbackTimer();
   stopConsoleMetricsPolling();
   closeUploadProgressSource();
+  disconnectTerminal();
   disconnectConsole();
   disconnectScreenResizeObserver();
   clearConsoleFrameWatchTimer();
@@ -611,7 +746,8 @@ onMounted(async () => {
   if (effectiveVisible.value && props.target) {
     startConsoleMetricsPolling();
     await nextTick();
-    if (shouldAutoConnectConsole.value) void connectConsole();
+    if (isCliConsole.value) void connectTerminal();
+    else if (shouldAutoConnectConsole.value) void connectConsole();
   }
 });
 
@@ -669,9 +805,10 @@ async function pollConsoleMetrics(requestSeq: number) {
 }
 
 async function connectConsole() {
-  disconnectConsole();
+  if (isCliConsole.value) return;
+  disconnectConsole({ preserveProvisionStaleWatchState: true });
   const screen = screenRef.value;
-  const target = props.target;
+  const target = noVncTarget.value;
   if (!screen || !target) return;
   screen.replaceChildren();
   connected.value = false;
@@ -695,12 +832,9 @@ async function connectConsole() {
     shared: true,
     ...(prepared.password ? { credentials: { password: prepared.password } } : {}),
   });
-  rfb.scaleViewport = consoleDisplayStrategy.value.scaleViewport;
+  applyNoVncDisplayPreferences(rfb);
   rfb.clipViewport = false;
-  rfb.resizeSession = props.embedded || consoleDisplayStrategy.value.resizeSession;
-  const displayClient = rfb as RFB & { qualityLevel: number; compressionLevel: number };
-  displayClient.qualityLevel = consoleDisplayStrategy.value.qualityLevel;
-  displayClient.compressionLevel = consoleDisplayStrategy.value.compressionLevel;
+  enableEmbeddedStretchPointerMapping(rfb);
   rfb.focusOnClick = true;
   setNoVncDotCursor(true);
   setNoVncBackground("#000");
@@ -709,16 +843,13 @@ async function connectConsole() {
   consoleConnectAttemptTimer = window.setTimeout(() => {
     consoleConnectAttemptTimer = null;
     if (!effectiveVisible.value || rfb !== connectingRfb || connected.value) return;
-    suppressNextConsoleDisconnect = true;
-    connectingRfb.disconnect();
     rfb = null;
-    window.setTimeout(() => {
-      suppressNextConsoleDisconnect = false;
-    }, 250);
+    connectingRfb.disconnect();
     scheduleConsoleReconnect("控制台握手超时");
   }, CONSOLE_CONNECT_ATTEMPT_TIMEOUT_MS);
 
   rfb.addEventListener("connect", () => {
+    if (rfb !== connectingRfb) return;
     clearConsoleConnectAttemptTimer();
     clearConsoleReconnectTimer();
     consoleReconnectAttempt = 0;
@@ -730,9 +861,11 @@ async function connectConsole() {
     startConsoleFrameWatch();
     startConsoleCanvasProbe();
     startProvisionBlankConsoleWatch();
+    startProvisionStaleConsoleWatch();
     refreshNoVncViewport();
   });
   rfb.addEventListener("disconnect", (event) => {
+    if (rfb !== connectingRfb) return;
     clearConsoleConnectAttemptTimer();
     stopConsoleBackspaceRepeat();
     connected.value = false;
@@ -740,27 +873,28 @@ async function connectConsole() {
     clearConsoleFrameWatchTimer();
     stopConsoleCanvasProbe();
     clearProvisionBlankConsoleWatch();
-    if (suppressNextConsoleDisconnect) {
-      suppressNextConsoleDisconnect = false;
-      return;
-    }
+    stopProvisionStaleConsoleWatch({ reset: false });
     const clean = event instanceof CustomEvent ? Boolean((event.detail as { clean?: boolean } | undefined)?.clean) : false;
     scheduleConsoleReconnect(clean ? "连接已断开" : "RFB 握手失败或远端控制台关闭");
   });
   rfb.addEventListener("securityfailure", () => {
+    if (rfb !== connectingRfb) return;
     clearConsoleConnectAttemptTimer();
     connected.value = false;
     clearConsoleFrameWatchTimer();
     stopConsoleCanvasProbe();
     clearProvisionBlankConsoleWatch();
+    stopProvisionStaleConsoleWatch({ reset: false });
     scheduleConsoleReconnect("认证失败或控制台被拒绝");
   });
   rfb.addEventListener("credentialsrequired", () => {
+    if (rfb !== connectingRfb) return;
     clearConsoleConnectAttemptTimer();
     connected.value = false;
     clearConsoleFrameWatchTimer();
     stopConsoleCanvasProbe();
     clearProvisionBlankConsoleWatch();
+    stopProvisionStaleConsoleWatch({ reset: false });
     statusText.value = "需要额外控制台认证";
   });
 }
@@ -782,8 +916,8 @@ async function prepareConsoleTarget(target: NoVncVmConsoleTarget): Promise<{ wsU
   };
 }
 
-function buildConsoleConnectionRequest(target: NoVncVmConsoleTarget) {
-  if (target.connection) {
+function buildConsoleConnectionRequest(target: VmConsoleTarget) {
+  if (target.mode === "novnc" && target.connection) {
     return {
       providerType: target.connection.providerType,
       host: target.connection.host,
@@ -799,7 +933,7 @@ function buildConsoleConnectionRequest(target: NoVncVmConsoleTarget) {
   };
 }
 
-function disconnectConsole() {
+function disconnectConsole(options: { preserveProvisionStaleWatchState?: boolean } = {}) {
   stopConsoleBackspaceRepeat();
   clearConsoleWakeRefreshTimer();
   clearConsoleReconnectTimer();
@@ -807,16 +941,258 @@ function disconnectConsole() {
   clearConsoleFrameWatchTimer();
   clearConsoleStageReconnectTimer();
   clearProvisionBlankConsoleWatch();
+  stopProvisionStaleConsoleWatch({ reset: !options.preserveProvisionStaleWatchState });
   clearNativePasteFallbackTimer();
   activeNativePasteRequestId = 0;
   cancelConsolePaste("", { clearNotice: true });
   if (!rfb) return;
-  suppressNextConsoleDisconnect = true;
-  rfb.disconnect();
+  const currentRfb = rfb;
   rfb = null;
-  window.setTimeout(() => {
-    suppressNextConsoleDisconnect = false;
-  }, 250);
+  currentRfb.disconnect();
+}
+
+async function connectTerminal(credentials?: TerminalSessionCredentials) {
+  const target = props.target;
+  if (!target || target.mode !== "cli") return;
+  const nextTerminalTargetKey = resolveTerminalTargetKey(target);
+  const cachedCredentials = credentials ? undefined : terminalCredentialCache.get(nextTerminalTargetKey);
+  const resolvedCredentials = credentials ?? cachedCredentials;
+  const manualLogin = Boolean(resolvedCredentials);
+  disconnectTerminal({ keepStatus: true, keepLoginPrompt: manualLogin });
+  terminalTargetKey = nextTerminalTargetKey;
+  if (!manualLogin) {
+    terminalLoginPrompt.reset();
+    terminalConsoleRef.value?.clear();
+  } else if (cachedCredentials) {
+    // A manual reconnect starts a fresh PTY, so remove the previous screen
+    // buffer before the new shell writes its first prompt.
+    terminalConsoleRef.value?.clear();
+  }
+  if (!target.connectionId || !target.vmId) {
+    terminalStatus.value = "error";
+    terminalErrorMessage.value = "终端参数不完整，请刷新列表后重试。";
+    return;
+  }
+  const connectSeq = ++terminalConnectSeq;
+  terminalStatus.value = "connecting";
+  terminalErrorMessage.value = "";
+  statusText.value = "CLI 会话准备中";
+  const controller = new AbortController();
+  terminalAbortController = controller;
+  try {
+    const session = await secureJsonRequest<PreparedTerminalSession>("/api/terminal/session", {
+      connectionId: target.connectionId,
+      vmId: target.vmId,
+      providerType: target.providerType,
+      mode: "linux-cli",
+      powerState: "unknown",
+      runtime: resolveTerminalRuntime(),
+      ...(resolvedCredentials ? { credentials: resolvedCredentials } : {}),
+    }, "POST", { signal: controller.signal });
+    if (connectSeq !== terminalConnectSeq || props.target?.mode !== "cli") return;
+    terminalSession.value = {
+      sessionId: session.sessionId,
+      transport: session.transport === "serial-pty" ? "serial" : session.transport,
+      endpoint: session.websocketPath,
+      expiresAt: session.expiresAt,
+    };
+    openTerminalSocket(session, connectSeq, resolvedCredentials);
+  } catch (error) {
+    if (connectSeq !== terminalConnectSeq) return;
+    if (error instanceof DOMException && error.name === "AbortError") return;
+    if (error instanceof SecureRequestError && error.code === "SYSTEM_CREDENTIAL_REQUIRED") {
+      showTerminalLoginPrompt();
+      return;
+    }
+    if (manualLogin) {
+      showTerminalLoginPrompt(error instanceof Error ? error.message : "Login incorrect");
+      return;
+    }
+    terminalStatus.value = "error";
+    terminalErrorMessage.value = error instanceof Error ? error.message : "Linux CLI 会话创建失败。";
+    statusText.value = "CLI 连接失败";
+  } finally {
+    if (terminalAbortController === controller) terminalAbortController = null;
+  }
+}
+
+function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number, credentials?: TerminalSessionCredentials) {
+  const socket = new WebSocket(buildApiWebSocketUrl(session.websocketPath));
+  let established = false;
+  const manualLogin = Boolean(credentials);
+  terminalSocket = socket;
+  socket.addEventListener("open", () => {
+    if (terminalSocket !== socket || connectSeq !== terminalConnectSeq) return;
+    terminalStatus.value = "connecting";
+    statusText.value = "CLI 握手中";
+  });
+  socket.addEventListener("message", (event) => {
+    if (terminalSocket !== socket || connectSeq !== terminalConnectSeq) return;
+    const message = parseTerminalServerMessage(event.data);
+    if (!message) return;
+    if (message.type === "connected") {
+      established = true;
+      if (credentials && terminalTargetKey) terminalCredentialCache.set(terminalTargetKey, credentials);
+      terminalLoginPrompt.reset();
+      terminalStatus.value = "connected";
+      connected.value = true;
+      statusText.value = "已连接";
+      void nextTick(() => terminalConsoleRef.value?.focus());
+      return;
+    }
+    if (message.type === "output") {
+      terminalConsoleRef.value?.write(message.data);
+      return;
+    }
+    if (message.type === "error") {
+      if (manualLogin && !established) {
+        if (isTerminalAuthenticationFailure(message.message)) terminalCredentialCache.delete(terminalTargetKey);
+        returnToTerminalLogin(socket, message.message || "Login incorrect");
+        return;
+      }
+      terminalStatus.value = "error";
+      terminalErrorMessage.value = message.message || "Linux CLI 连接失败。";
+      statusText.value = "CLI 连接失败";
+      return;
+    }
+    terminalStatus.value = "disconnected";
+    connected.value = false;
+    statusText.value = "CLI 已断开";
+  });
+  socket.addEventListener("close", (event) => {
+    if (terminalSocket !== socket || connectSeq !== terminalConnectSeq) return;
+    terminalSocket = null;
+    connected.value = false;
+    if (!established && (manualLogin || event.code === 4403)) {
+      if (event.code === 4403 || isTerminalAuthenticationFailure(event.reason)) terminalCredentialCache.delete(terminalTargetKey);
+      showTerminalLoginPrompt(event.reason || "Login incorrect");
+      return;
+    }
+    if (terminalStatus.value === "connected" || terminalStatus.value === "connecting") {
+      terminalStatus.value = event.wasClean ? "disconnected" : "error";
+      terminalErrorMessage.value = event.wasClean ? "" : event.reason || "Linux CLI 连接已断开。";
+      statusText.value = event.wasClean ? "CLI 已断开" : "CLI 连接失败";
+    }
+  });
+  socket.addEventListener("error", () => {
+    if (terminalSocket !== socket || connectSeq !== terminalConnectSeq) return;
+    if (manualLogin && !established) return;
+    terminalStatus.value = "error";
+    terminalErrorMessage.value = "Linux CLI WebSocket 连接失败。";
+    statusText.value = "CLI 连接失败";
+  });
+}
+
+function disconnectTerminal(options: { keepStatus?: boolean; keepLoginPrompt?: boolean } = {}) {
+  terminalConnectSeq += 1;
+  terminalAbortController?.abort();
+  terminalAbortController = null;
+  if (terminalSocket) {
+    const socket = terminalSocket;
+    terminalSocket = null;
+    socket.close(1000, "console renderer changed");
+  }
+  terminalSession.value = null;
+  terminalTargetKey = "";
+  connected.value = false;
+  if (!options.keepLoginPrompt) {
+    terminalLoginPrompt.reset();
+    terminalLoginDisplay.value = "";
+  }
+  if (!options.keepStatus) {
+    terminalStatus.value = "idle";
+    terminalErrorMessage.value = "";
+  }
+}
+
+function handleConsoleClosed() {
+  if (!isCliConsole.value || terminalTargetKey !== resolveTerminalTargetKey()) disconnectTerminal();
+  disconnectConsole();
+}
+
+function resolveTerminalTargetKey(target = props.target): string {
+  if (!target || target.mode !== "cli" || !target.connectionId || !target.vmId) return "";
+  return `${target.providerType}:${target.connectionId}:${target.vmId}`;
+}
+
+function isTerminalAuthenticationFailure(message: string | undefined): boolean {
+  return typeof message === "string" && /login incorrect/i.test(message);
+}
+
+function canResumeTerminal(targetKey: string): boolean {
+  if (!targetKey || terminalTargetKey !== targetKey) return false;
+  return terminalSocket != null || terminalAbortController != null || terminalLoginPrompt.acceptsInput;
+}
+
+function handleTerminalReady(event: TerminalReadyEvent) {
+  sendTerminalResize(event.cols, event.rows);
+}
+
+function handleTerminalInput(event: TerminalInputEvent) {
+  if (!event.data) return;
+  if (terminalLoginPrompt.acceptsInput) {
+    const result = terminalLoginPrompt.consume(event.data);
+    if (result.output) {
+      terminalLoginDisplay.value += result.output;
+      terminalConsoleRef.value?.write(result.output);
+    }
+    if (result.credentials) {
+      terminalLoginDisplay.value = "";
+      void connectTerminal(result.credentials);
+    }
+    return;
+  }
+  if (terminalSocket?.readyState !== WebSocket.OPEN) return;
+  terminalSocket.send(JSON.stringify({ type: "input", data: event.data }));
+}
+
+function showTerminalLoginPrompt(message = "") {
+  terminalSession.value = null;
+  connected.value = false;
+  terminalStatus.value = "authenticating";
+  terminalErrorMessage.value = "";
+  statusText.value = "等待登录";
+  const prompt = terminalLoginPrompt.start(message);
+  // TerminalConsole 是异步组件，登录失败返回时可能尚未完成挂载；保留初始提示，
+  // 让组件挂载时通过 initialData 重放，避免用户看到只有光标的黑屏。
+  terminalLoginDisplay.value = prompt;
+  void nextTick(() => {
+    terminalConsoleRef.value?.clear();
+    terminalConsoleRef.value?.write(prompt);
+    terminalConsoleRef.value?.focus();
+  });
+}
+
+function returnToTerminalLogin(socket: WebSocket, message: string) {
+  if (terminalSocket === socket) terminalSocket = null;
+  socket.close(1000, "retry login");
+  showTerminalLoginPrompt(message);
+}
+
+function handleTerminalResize(event: TerminalResizeEvent) {
+  sendTerminalResize(event.cols, event.rows);
+}
+
+function sendTerminalResize(cols: number, rows: number) {
+  if (terminalSocket?.readyState !== WebSocket.OPEN || cols <= 0 || rows <= 0) return;
+  terminalSocket.send(JSON.stringify({ type: "resize", cols, rows }));
+}
+
+function parseTerminalServerMessage(data: unknown): TerminalServerMessage | null {
+  try {
+    const parsed = JSON.parse(String(data)) as Partial<TerminalServerMessage>;
+    if (parsed.type === "connected") return { type: "connected" };
+    if (parsed.type === "output" && typeof parsed.data === "string") return { type: "output", data: parsed.data };
+    if (parsed.type === "exit") return { type: "exit", code: typeof parsed.code === "number" ? parsed.code : undefined };
+    if (parsed.type === "error") return { type: "error", message: typeof parsed.message === "string" ? parsed.message : undefined };
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function resolveTerminalRuntime(): "web" | "electron" {
+  return window.vrcDesktopUpdate ? "electron" : "web";
 }
 
 function clearConsoleStageReconnectTimer() {
@@ -950,6 +1326,10 @@ function handleConsoleCommand(command: string) {
 }
 
 function focusConsole() {
+  if (isCliConsole.value) {
+    terminalConsoleRef.value?.focus();
+    return;
+  }
   screenRef.value?.focus({ preventScroll: true });
   rfb?.focus();
 }
@@ -1290,7 +1670,7 @@ function syncConsoleAspectRatio(options: { reveal?: boolean; attempt?: number } 
   }
   const nextAspectRatio = snapshot.aspectRatio;
   if (!Number.isFinite(nextAspectRatio) || nextAspectRatio <= 0) return;
-  const target = props.target;
+  const target = noVncTarget.value;
   if (target) cacheConsoleAspectRatio(target, nextAspectRatio);
   if (Math.abs(nextAspectRatio - consoleAspectRatio.value) >= 0.01) {
     consoleAspectRatio.value = nextAspectRatio;
@@ -1467,6 +1847,110 @@ function hasNonBlankCanvasPixels(canvas: HTMLCanvasElement): boolean {
   return false;
 }
 
+function startProvisionStaleConsoleWatch() {
+  stopProvisionStaleConsoleWatch({ reset: false });
+  if (!shouldWatchProvisionConsoleForStaleFrame()) return;
+  consoleStaleWatchTimer = window.setTimeout(pollProvisionStaleConsole, CONSOLE_PROVISION_STALE_SAMPLE_INTERVAL_MS);
+}
+
+function pollProvisionStaleConsole() {
+  consoleStaleWatchTimer = null;
+  if (!shouldWatchProvisionConsoleForStaleFrame()) {
+    stopProvisionStaleConsoleWatch({ reset: true });
+    return;
+  }
+
+  const fingerprint = getConsoleFrameFingerprint();
+  const sampledAt = Date.now();
+  if (!fingerprint) {
+    scheduleNextProvisionStaleConsoleSample();
+    return;
+  }
+  if (fingerprint !== consoleLastFrameFingerprint) {
+    consoleLastFrameFingerprint = fingerprint;
+    consoleLastFrameChangedAt = sampledAt;
+    consoleStaleReconnectAttempt = 0;
+    scheduleNextProvisionStaleConsoleSample();
+    return;
+  }
+  if (!consoleLastFrameChangedAt) {
+    consoleLastFrameChangedAt = sampledAt;
+  }
+
+  const staleDelay = Math.min(
+    CONSOLE_PROVISION_STALE_RECONNECT_DELAY_MS * 2 ** consoleStaleReconnectAttempt,
+    CONSOLE_PROVISION_STALE_RECONNECT_MAX_DELAY_MS,
+  );
+  if (sampledAt - consoleLastFrameChangedAt < staleDelay) {
+    scheduleNextProvisionStaleConsoleSample();
+    return;
+  }
+
+  consoleStaleReconnectAttempt += 1;
+  consoleLastFrameChangedAt = sampledAt;
+  consoleFrameReady.value = false;
+  statusText.value = `控制台画面长时间未更新，正在重新获取当前画面（第 ${consoleStaleReconnectAttempt} 次）`;
+  void connectConsole();
+}
+
+function scheduleNextProvisionStaleConsoleSample() {
+  if (!shouldWatchProvisionConsoleForStaleFrame()) {
+    stopProvisionStaleConsoleWatch({ reset: true });
+    return;
+  }
+  consoleStaleWatchTimer = window.setTimeout(pollProvisionStaleConsole, CONSOLE_PROVISION_STALE_SAMPLE_INTERVAL_MS);
+}
+
+function stopProvisionStaleConsoleWatch(options: { reset: boolean }) {
+  if (consoleStaleWatchTimer != null) {
+    window.clearTimeout(consoleStaleWatchTimer);
+    consoleStaleWatchTimer = null;
+  }
+  if (options.reset) resetProvisionStaleConsoleWatchState();
+}
+
+function resetProvisionStaleConsoleWatchState() {
+  consoleStaleReconnectAttempt = 0;
+  consoleLastFrameFingerprint = "";
+  consoleLastFrameChangedAt = 0;
+}
+
+function shouldWatchProvisionConsoleForStaleFrame() {
+  if (!effectiveVisible.value || !props.target || !connected.value || !rfb || !isProvisionConsole.value || isProvisionTaskTerminal.value) {
+    return false;
+  }
+  const vmStatus = currentProvisionVm.value?.status;
+  if (vmStatus && !["pending", "running"].includes(vmStatus)) return false;
+  const stepKey = activeProvisionConsoleStep.value;
+  return ["boot", "fetch-source", "install-guest", "wait-network", "verify-login", "finalize", "guest-tools"].includes(String(stepKey));
+}
+
+function getConsoleFrameFingerprint(): string {
+  const canvas = screenRef.value?.querySelector("canvas");
+  if (!canvas?.width || !canvas.height) return "";
+  try {
+    const sampleCanvas = document.createElement("canvas");
+    sampleCanvas.width = CONSOLE_PROVISION_FRAME_SAMPLE_WIDTH;
+    sampleCanvas.height = CONSOLE_PROVISION_FRAME_SAMPLE_HEIGHT;
+    const sampleContext = sampleCanvas.getContext("2d", { willReadFrequently: true });
+    if (!sampleContext) return "";
+    sampleContext.drawImage(canvas, 0, 0, sampleCanvas.width, sampleCanvas.height);
+    const pixels = sampleContext.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height).data;
+    let hash = 2166136261;
+    for (let index = 0; index < pixels.length; index += 4) {
+      hash ^= pixels[index] >> 4;
+      hash = Math.imul(hash, 16777619);
+      hash ^= pixels[index + 1] >> 4;
+      hash = Math.imul(hash, 16777619);
+      hash ^= pixels[index + 2] >> 4;
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${canvas.width}x${canvas.height}:${(hash >>> 0).toString(16)}`;
+  } catch {
+    return "";
+  }
+}
+
 function getConsoleAspectRatioSnapshot(): { aspectRatio: number; source: "framebuffer" | "rendered-canvas" | "canvas" } | null {
   const framebufferSize = getRemoteFramebufferSize();
   if (framebufferSize) {
@@ -1520,7 +2004,34 @@ function isConsoleCanvasFitted() {
   const fitsWithinScreen = canvasRect.width <= screenRect.width + 3 && canvasRect.height <= screenRect.height + 3;
   const touchesScreenEdge = Math.abs(screenRect.width - canvasRect.width) <= 3 || Math.abs(screenRect.height - canvasRect.height) <= 3;
   const preservesAspectRatio = Math.abs(sourceAspectRatio - renderedAspectRatio) <= 0.01;
-  return fitsWithinScreen && touchesScreenEdge && preservesAspectRatio;
+  const fillsEmbeddedScreen = props.embedded && !isExpanded.value &&
+    Math.abs(screenRect.width - canvasRect.width) <= 3 &&
+    Math.abs(screenRect.height - canvasRect.height) <= 3;
+  return fitsWithinScreen && touchesScreenEdge && (preservesAspectRatio || fillsEmbeddedScreen);
+}
+
+function enableEmbeddedStretchPointerMapping(client: RFB) {
+  if (!props.embedded) return;
+  const display = (client as RFB & { _display?: NoVncDisplayCoordinateMapper })._display;
+  const canvas = screenRef.value?.querySelector("canvas");
+  if (!display || !canvas) return;
+
+  const originalAbsX = display.absX.bind(display);
+  const originalAbsY = display.absY.bind(display);
+  display.absX = (position) => mapStretchedConsoleCoordinate(position, canvas.getBoundingClientRect().width, canvas.width, originalAbsX);
+  display.absY = (position) => mapStretchedConsoleCoordinate(position, canvas.getBoundingClientRect().height, canvas.height, originalAbsY);
+}
+
+function mapStretchedConsoleCoordinate(
+  position: number,
+  renderedSize: number,
+  framebufferSize: number,
+  fallback: (position: number) => number,
+) {
+  if (!Number.isFinite(renderedSize) || renderedSize <= 0 || !Number.isFinite(framebufferSize) || framebufferSize <= 0) {
+    return fallback(position);
+  }
+  return clamp(Math.floor((position / renderedSize) * framebufferSize), 0, Math.max(0, framebufferSize - 1));
 }
 
 function refreshNoVncViewport(options: { focus?: boolean } = {}) {
@@ -1530,18 +2041,22 @@ function refreshNoVncViewport(options: { focus?: boolean } = {}) {
     viewportRefreshFrame = null;
     const shouldFocus = shouldFocusAfterViewportRefresh;
     shouldFocusAfterViewportRefresh = false;
-    const client = rfb as
-      | (RFB & {
-          _updateClip?: () => void;
-          _updateScale?: () => void;
-          _saveExpectedClientSize?: () => void;
-        })
-      | null;
-    client?._updateClip?.();
-    client?._updateScale?.();
-    client?._saveExpectedClientSize?.();
-    if (shouldFocus) focusConsole();
+    refreshNoVncViewportNow(shouldFocus);
   });
+}
+
+function refreshNoVncViewportNow(shouldFocus: boolean) {
+  const client = rfb as
+    | (RFB & {
+        _updateClip?: () => void;
+        _updateScale?: () => void;
+        _saveExpectedClientSize?: () => void;
+      })
+    | null;
+  client?._updateClip?.();
+  client?._updateScale?.();
+  client?._saveExpectedClientSize?.();
+  if (shouldFocus) focusConsole();
 }
 
 function setNoVncBackground(background: string) {
@@ -1601,16 +2116,40 @@ function disconnectScreenResizeObserver() {
 }
 
 function requestConsoleResize(options: { focus?: boolean } = {}) {
+  if (props.throttleResize === false) {
+    refreshNoVncViewportNow(options.focus !== false);
+    return;
+  }
   refreshNoVncViewport({ focus: options.focus !== false });
 }
 
+function applyNoVncDisplayPreferences(client: RFB) {
+  const remoteResize = props.displayScaleMode === "remote";
+  client.scaleViewport = props.displayScaleMode ? !remoteResize : consoleDisplayStrategy.value.scaleViewport;
+  client.resizeSession = props.embedded || (props.displayScaleMode ? remoteResize : consoleDisplayStrategy.value.resizeSession);
+  const displayClient = client as RFB & { qualityLevel: number; compressionLevel: number };
+  const quality = props.displayQuality ?? "auto";
+  if (quality === "high") {
+    displayClient.qualityLevel = 9;
+    displayClient.compressionLevel = 1;
+  } else if (quality === "smooth") {
+    displayClient.qualityLevel = 5;
+    displayClient.compressionLevel = 6;
+  } else {
+    displayClient.qualityLevel = consoleDisplayStrategy.value.qualityLevel;
+    displayClient.compressionLevel = consoleDisplayStrategy.value.compressionLevel;
+  }
+}
+
 function handleConsoleDragEnter(event: DragEvent) {
+  if (isCliConsole.value) return;
   if (!event.dataTransfer?.types.includes("Files")) return;
   event.preventDefault();
   uploadDragActive.value = true;
 }
 
 function handleConsoleDragOver(event: DragEvent) {
+  if (isCliConsole.value) return;
   if (!event.dataTransfer?.types.includes("Files")) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = uploadBusy.value ? "none" : "copy";
@@ -1618,6 +2157,7 @@ function handleConsoleDragOver(event: DragEvent) {
 }
 
 function handleConsoleDragLeave(event: DragEvent) {
+  if (isCliConsole.value) return;
   const currentTarget = event.currentTarget as HTMLElement | null;
   const relatedTarget = event.relatedTarget as Node | null;
   if (currentTarget && relatedTarget && currentTarget.contains(relatedTarget)) return;
@@ -1625,6 +2165,7 @@ function handleConsoleDragLeave(event: DragEvent) {
 }
 
 function handleConsoleDrop(event: DragEvent) {
+  if (isCliConsole.value) return;
   event.preventDefault();
   uploadDragActive.value = false;
   if (uploadBusy.value) return;
@@ -1634,7 +2175,7 @@ function handleConsoleDrop(event: DragEvent) {
 }
 
 async function uploadConsoleFiles(files: File[]) {
-  const target = props.target;
+  const target = noVncTarget.value;
   if (!target?.connectionId || !target.vmId) {
     showUploadStatus("控制台参数不完整，无法上传", "error");
     return;
@@ -1998,6 +2539,7 @@ function handleConsoleShortcutKeyup(event: KeyboardEvent) {
 }
 
 function handleConsolePaste(event: ClipboardEvent) {
+  if (isCliConsole.value) return;
   if (event.target === clipboardCaptureRef.value) return;
   if (!effectiveVisible.value || !connected.value || !rfb || !isConsoleKeyboardContext(event.target)) return;
   const text = event.clipboardData?.getData("text/plain") ?? "";
@@ -2301,7 +2843,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
     :class="consoleRootClass"
     v-bind="consoleRootAttrs"
     @update:model-value="!embedded && emit('update:visible', $event)"
-    @closed="disconnectConsole"
+    @closed="handleConsoleClosed"
   >
     <section class="console-layout">
       <aside v-if="isProvisionConsole" class="console-side console-task-rail" aria-label="创建任务控制台">
@@ -2385,8 +2927,8 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
           </div>
         </div>
 
-        <div class="console-action-grid">
-          <el-tooltip content="常用命令" placement="bottom" :show-after="120" :hide-after="0">
+        <div v-if="!isCliConsole" class="console-action-grid">
+          <el-tooltip content="常用命令" placement="bottom" :show-after="120" :hide-after="0" :disabled="props.showIconTooltips === false">
             <el-dropdown trigger="click" placement="bottom-start" popper-class="console-command-menu" :disabled="!connected" @command="handleConsoleCommand">
               <button class="console-action-icon active" :disabled="!connected" aria-label="常用命令">
                 <svg class="console-command-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -2407,12 +2949,12 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
               </template>
             </el-dropdown>
           </el-tooltip>
-          <el-tooltip content="重新连接控制台" placement="bottom" :show-after="120" :hide-after="0">
+          <el-tooltip content="重新连接控制台" placement="bottom" :show-after="120" :hide-after="0" :disabled="props.showIconTooltips === false">
             <button class="console-action-icon" aria-label="重新连接控制台" @click.stop="connectConsole">
               <el-icon><Refresh /></el-icon>
             </button>
           </el-tooltip>
-          <el-tooltip v-if="!embedded" content="放大控制台窗口" placement="bottom" :show-after="120" :hide-after="0">
+          <el-tooltip v-if="!embedded" content="放大控制台窗口" placement="bottom" :show-after="120" :hide-after="0" :disabled="props.showIconTooltips === false">
             <button class="console-action-icon" aria-label="放大控制台窗口" @click.stop="toggleExpandedConsole">
               <el-icon><FullScreen /></el-icon>
             </button>
@@ -2452,7 +2994,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
           </div>
           <div class="console-tools" @pointerdown.stop>
             <span v-if="consoleNoticeText" class="console-paste-status">{{ consoleNoticeText }}</span>
-            <el-tooltip v-if="consolePasteSending" content="取消文本发送" placement="bottom" :show-after="80" :hide-after="0">
+            <el-tooltip v-if="!isCliConsole && consolePasteSending" content="取消文本发送" placement="bottom" :show-after="80" :hide-after="0" :disabled="props.showIconTooltips === false">
               <button class="console-paste-cancel" aria-label="取消文本发送" @click.stop="cancelConsolePaste('已取消文本发送')">
                 <el-icon><Close /></el-icon>
               </button>
@@ -2463,6 +3005,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
               placement="bottom"
               :show-after="120"
               :hide-after="0"
+              :disabled="props.showIconTooltips === false"
             >
               <button
                 class="console-tool-button"
@@ -2474,12 +3017,12 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
                 <el-icon><Monitor /></el-icon>
               </button>
             </el-tooltip>
-            <el-tooltip content="复制控制台信息" placement="bottom" :show-after="120" :hide-after="0">
+            <el-tooltip content="复制控制台信息" placement="bottom" :show-after="120" :hide-after="0" :disabled="props.showIconTooltips === false">
               <button class="console-tool-button" aria-label="复制控制台信息" @click.stop="copyConsoleInfo">
                 <el-icon><CopyDocument /></el-icon>
               </button>
             </el-tooltip>
-            <el-tooltip content="常用命令" placement="bottom" :show-after="120" :hide-after="0">
+            <el-tooltip v-if="!isCliConsole" content="常用命令" placement="bottom" :show-after="120" :hide-after="0" :disabled="props.showIconTooltips === false">
               <el-dropdown trigger="click" placement="bottom-end" popper-class="console-command-menu" :disabled="!connected" @command="handleConsoleCommand">
                 <button class="console-tool-button" :disabled="!connected" aria-label="常用命令">
                   <svg class="console-command-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -2500,12 +3043,12 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
                 </template>
               </el-dropdown>
             </el-tooltip>
-            <el-tooltip content="重新连接控制台" placement="bottom" :show-after="120" :hide-after="0">
-              <button class="console-tool-button" aria-label="重新连接控制台" @click.stop="connectConsole">
+            <el-tooltip content="重新连接控制台" placement="bottom" :show-after="120" :hide-after="0" :disabled="props.showIconTooltips === false">
+              <button class="console-tool-button" aria-label="重新连接控制台" @click.stop="isCliConsole ? connectTerminal() : connectConsole()">
                 <el-icon><Refresh /></el-icon>
               </button>
             </el-tooltip>
-            <el-tooltip :content="isExpanded ? '退出放大' : '放大控制台窗口'" placement="bottom" :show-after="120" :hide-after="0">
+            <el-tooltip :content="isExpanded ? '退出放大' : '放大控制台窗口'" placement="bottom" :show-after="120" :hide-after="0" :disabled="props.showIconTooltips === false">
               <button
                 class="console-tool-button"
                 :aria-label="isExpanded ? '退出放大' : '放大控制台窗口'"
@@ -2564,6 +3107,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
           </div>
           <div v-if="uploadStatusText" class="console-upload-status" :class="`is-${uploadStatusLevel}`">{{ uploadStatusText }}</div>
           <textarea
+            v-if="!isCliConsole"
             ref="clipboardCaptureRef"
             class="console-clipboard-capture"
             aria-hidden="true"
@@ -2573,8 +3117,28 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
             spellcheck="false"
             @paste.capture="handleClipboardCapturePaste"
           ></textarea>
+          <div v-if="isCliConsole" class="console-cli-frame">
+            <TerminalConsole
+              ref="terminalConsoleRef"
+              :session="terminalSession"
+              :status="terminalStatus"
+              :initial-data="cliInitialData"
+              :font-family="terminalFontFamily"
+              :font-size="terminalFontSize"
+              :line-height="terminalLineHeight"
+              :cursor-style="terminalCursorStyle"
+              :cursor-blink="terminalCursorBlink"
+              :theme="terminalTheme"
+              :read-only="!terminalAcceptsInput"
+              :error-message="cliTerminalMessage"
+              :aria-label="`${target?.vmName || '虚拟机'} Linux CLI`"
+              @ready="handleTerminalReady"
+              @input="handleTerminalInput"
+              @resize="handleTerminalResize"
+            />
+          </div>
           <div
-            v-if="!consoleFrameReady"
+            v-if="!isCliConsole && !consoleFrameReady"
             class="console-frame-pending console-terminal-overlay"
             :class="`platform-${consoleLoadingBrand.type}`"
           >
@@ -2590,6 +3154,7 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
             </div>
           </div>
           <div
+            v-if="!isCliConsole"
             ref="screenRef"
             class="console-screen"
             tabindex="-1"
@@ -2601,6 +3166,14 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
             @keydown.capture="handleConsoleScreenShortcut"
             @keyup.capture="handleConsoleScreenShortcutKeyup"
           ></div>
+          <div
+            v-if="watermarkEnabled"
+            class="console-security-watermark"
+            :style="consoleWatermarkStyle"
+            aria-hidden="true"
+          >
+            <span v-for="index in consoleWatermarkCopies" :key="index">{{ watermarkText || "VRC · console" }}</span>
+          </div>
         </section>
 
       </main>

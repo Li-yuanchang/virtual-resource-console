@@ -26,6 +26,17 @@ interface SecureRequestEnvelope {
 const trustedFingerprintPrefix = "vrc.crypto.trustedFingerprint.";
 let publicKeyCache: Promise<RequestCryptoPublicKeyResponse> | null = null;
 
+export class SecureRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = "SecureRequestError";
+  }
+}
+
 export async function secureJsonRequest<T>(url: string, payload: unknown, method = "POST", options: Pick<RequestInit, "signal"> = {}): Promise<T> {
   const normalizedMethod = method.toUpperCase();
   const init: RequestInit = { method: normalizedMethod, ...options };
@@ -38,7 +49,7 @@ export async function secureJsonRequest<T>(url: string, payload: unknown, method
   const text = await response.text();
   const result = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(result.message || `请求失败：HTTP ${response.status}`);
+    throw new SecureRequestError(result.message || `请求失败：HTTP ${response.status}`, response.status, typeof result.code === "string" ? result.code : undefined);
   }
   return result as T;
 }

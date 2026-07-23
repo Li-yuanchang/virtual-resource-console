@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ArrowLeft, Brush, Check, Connection, Delete, Download, Loading, Picture, Plus, Refresh, Search, Setting, Tickets, Upload } from "@element-plus/icons-vue";
-import { ElMessage, ElMessageBox } from "element-plus";
+import { ElMessage } from "element-plus";
 import ConsoleDialog from "./components/ConsoleDialog.vue";
 import HostVmPanel from "./components/HostVmPanel.vue";
+import UpdateCenterPanel from "./components/UpdateCenterPanel.vue";
 import VrcLogoMark from "./components/VrcLogoMark.vue";
 import VrcToolbarIcon from "./components/VrcToolbarIcon.vue";
 import VmProvisioningDialog from "./components/VmProvisioningDialog.vue";
@@ -11,7 +12,8 @@ import VmRenameDialog from "./components/VmRenameDialog.vue";
 import VmResizeDialog from "./components/VmResizeDialog.vue";
 import VmScheduleDialog from "./components/VmScheduleDialog.vue";
 import VrcVmActionIcon from "./components/VrcVmActionIcon.vue";
-import { resolveVmConsoleTarget, type VmConsoleTarget } from "./domain/consoleStrategies";
+import { resolveVmConsoleTarget, resolveVmGraphConsoleTarget, type VmConsoleTarget } from "./domain/consoleStrategies";
+import { confirmVrcAction } from "./domain/confirmAction";
 import { getProviderBrand } from "./domain/providerBrand";
 import { isoSourceLabel } from "./domain/provisioningStrategies";
 import { secureJsonRequest } from "./domain/secureRequest";
@@ -26,24 +28,29 @@ import type {
   IpLeaseReservationResponse,
   IsoImage,
   IsoImagesResponse,
+  ProviderDescriptor,
+  ProviderDescriptorsResponse,
   ProviderType,
   PowerState,
+  ResourceCapacitySummary,
   StoredConnectionSummary,
   VmInventorySummary,
   VmNode,
+  VmSearchIndexItem,
   VmDisk,
   VmDisksResponse,
   VmPowerAction,
   VmResizeRequest,
   VmResizeResult,
+  VmSystemCredentials,
   VmCreateRequest,
   VmProvisionCreatedVm,
   VmProvisionResponse,
-  ProvisionPreflightCheck,
   ProvisionPreflightResponse,
   ProvisionTask,
   ProvisionTaskResponse,
   VmsResponse,
+  VmSearchIndexResponse,
 } from "./types";
 
 type HostNodeItem = HostsResponse["hosts"][number];
@@ -54,6 +61,7 @@ interface HostOverviewRow {
   inventory: HostsResponse;
   host: HostNodeItem;
   summary: VmInventorySummary | null;
+  resourceCapacity: ResourceCapacitySummary | null;
   status: "loading" | "ready" | "error";
   error?: string;
 }
@@ -74,7 +82,7 @@ interface ChromeExtensionLaunchConnection {
 }
 
 interface VmSearchCacheEntry {
-  items: VmNode[];
+  items: VmSearchIndexItem[];
   updatedAt: number;
   loading: boolean;
   error?: string;
@@ -88,6 +96,7 @@ interface VmActionResponse {
     accepted: boolean;
     message: string;
   };
+  stoppedProvisionTaskIds?: string[];
 }
 
 interface VmRenameResponse {
@@ -109,6 +118,7 @@ interface VmResizeResponse {
 interface VmSummaryResponse {
   collectedAt: string;
   summary: VmInventorySummary;
+  resourceCapacity?: ResourceCapacitySummary;
   source?: "cache" | "live";
   cacheUpdatedAt?: string;
   refreshing?: boolean;
@@ -158,6 +168,7 @@ type InventoryEvent =
       providerType: ProviderType;
       hostId?: string;
       summary: VmInventorySummary;
+      resourceCapacity?: ResourceCapacitySummary;
       eventSeq: number;
       updatedAt: string;
     };
@@ -181,6 +192,13 @@ interface ProvisioningProgressState {
   message: string;
   status: "running" | "success" | "warning" | "error";
 }
+
+const providerBootstrapPorts: Record<ProviderType, number> = {
+  xenserver: 22,
+  vmware: 443,
+  proxmox: 8006,
+  libvirt: 22,
+};
 
 interface ProvisionConsoleTargetItem {
   key: string;
@@ -214,11 +232,19 @@ interface ConsoleUploadResultEvent {
 }
 
 type ActivityStatusFilter = "all" | ActivityEntry["status"];
-type UiTheme = "graphite-sage" | "basalt-copper" | "mist-teal";
+type UiTheme = "graphite-sage" | "basalt-copper" | "mist-teal" | "prism-frost" | "aurora-mint" | "neon-carbon";
 type UiToneMode = "system" | "light" | "dark";
 type UiBackgroundMode = "default" | "solid" | "image";
+type UiFontPreset = "system" | "humanist" | "compact";
+type ConsoleThemeMode = "vrc" | "tokyo-night" | "catppuccin" | "dracula" | "nord" | "rose-pine" | "solarized" | "light";
+type ConsoleFontPreset = "system-mono" | "jetbrains" | "cascadia" | "menlo";
+type ConsolePreviewMode = "graphical" | "cli";
+type ConsoleScaleMode = "local" | "remote";
+type ConsoleQuality = "auto" | "high" | "smooth";
+type WatermarkScope = "console" | "workspace";
+type WatermarkDensity = "sparse" | "standard" | "dense";
 type WorkspaceMode = "empty" | "overview" | "connection" | "settings";
-type SettingsPanel = "appearance" | "connection" | "templates" | "ipPools" | "chromeExtension" | "maintenance" | "logs";
+type SettingsPanel = "appearance" | "connection" | "templates" | "ipPools" | "chromeExtension" | "updates" | "maintenance" | "logs";
 type VmPowerFilter = "all" | "running" | "stopped";
 type TableSortOrder = "ascending" | "descending" | null;
 type HostOverviewSortKey = "hostName" | "cpuUsage" | "memoryFree" | "storageFree" | "vmTotal";
@@ -246,6 +272,21 @@ interface UiPreferences {
   showIconTooltips: boolean;
   truncateLongNames: boolean;
   throttleConsoleResize: boolean;
+  uiFontPreset: UiFontPreset;
+  uiFontSize: number;
+  reduceMotion: boolean;
+  consoleTheme: ConsoleThemeMode;
+  consoleFontPreset: ConsoleFontPreset;
+  consoleFontSize: number;
+  consoleLineHeight: number;
+  consoleCursorStyle: "block" | "underline" | "bar";
+  consoleCursorBlink: boolean;
+  consoleScaleMode: ConsoleScaleMode;
+  consoleQuality: ConsoleQuality;
+  consoleWatermarkEnabled: boolean;
+  consoleWatermarkScope: WatermarkScope;
+  consoleWatermarkDensity: WatermarkDensity;
+  consoleWatermarkOpacity: number;
 }
 
 interface ChromeExtensionServiceSettings {
@@ -302,6 +343,8 @@ interface AppearanceImportConfig {
   toneMode?: unknown;
   colors?: Record<string, unknown>;
   background?: Record<string, unknown>;
+  typography?: Record<string, unknown>;
+  console?: Record<string, unknown>;
 }
 
 interface AccountImportDraft {
@@ -370,8 +413,17 @@ interface MaintenanceGeneratedIsoReport {
 }
 
 const VM_SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const VM_SEARCH_REVALIDATE_INTERVAL_MS = 2_000;
+const VM_SEARCH_REVALIDATE_MAX_ATTEMPTS = 15;
+const INVENTORY_SNAPSHOT_REVALIDATE_INTERVAL_MS = 2_000;
+const INVENTORY_SNAPSHOT_REVALIDATE_MAX_ATTEMPTS = 15;
 const VRC_TOAST_DURATION_MS = 3000;
+const ISO_TABLE_MAX_HEIGHT = 420;
 const activityStatusOptions: ActivityStatusFilter[] = ["all", "pending", "success", "warning", "error", "info"];
+const activityStatusSegmentOptions = activityStatusOptions.map((status) => ({
+  label: activityStatusLabel(status),
+  value: status,
+}));
 const themeOptions: Array<{
   value: UiTheme;
   label: string;
@@ -420,8 +472,137 @@ const themeOptions: Array<{
     warningColor: "#ad7833",
     dangerColor: "#a3483f",
   },
+  {
+    value: "prism-frost",
+    label: "冰川光谱",
+    name: "冰川光谱",
+    tone: "现代渐变",
+    description: "冷白底融合蓝、青与柔紫，适合现代化资源工作台。",
+    colors: ["#edf2f6", "#fbfcfe", "#527fa8", "#263441"],
+    accentColor: "#527fa8",
+    successColor: "#46856e",
+    warningColor: "#b17a35",
+    dangerColor: "#ad5260",
+  },
+  {
+    value: "aurora-mint",
+    label: "极光薄荷",
+    name: "极光薄荷",
+    tone: "清透渐变",
+    description: "薄荷青、湖蓝与珊瑚色过渡，明亮但保留业务层级。",
+    colors: ["#edf5f2", "#fbfdfc", "#397d78", "#263734"],
+    accentColor: "#397d78",
+    successColor: "#4b8668",
+    warningColor: "#b77734",
+    dangerColor: "#b25355",
+  },
+  {
+    value: "neon-carbon",
+    label: "霓虹夜幕",
+    name: "霓虹夜幕",
+    tone: "深色渐变",
+    description: "碳黑界面配青蓝与洋红光谱，适合低光环境。",
+    colors: ["#11151c", "#1a2029", "#5d9fe3", "#e7edf5"],
+    accentColor: "#5d9fe3",
+    successColor: "#64bd91",
+    warningColor: "#d49a51",
+    dangerColor: "#d36c7b",
+  },
 ];
 const accentColorPresets = ["#426b57", "#2f6f68", "#315f92", "#6a5b88", "#9b5f35", "#8a4f5d"];
+const uiFontOptions: Array<{ value: UiFontPreset; label: string; family: string }> = [
+  { value: "system", label: "跟随系统", family: "-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"PingFang SC\", sans-serif" },
+  { value: "humanist", label: "思源黑体", family: "\"Source Han Sans SC\", \"Microsoft YaHei UI\", \"PingFang SC\", sans-serif" },
+  { value: "compact", label: "紧凑字体", family: "\"DIN Next\", \"Roboto Condensed\", \"PingFang SC\", sans-serif" },
+];
+const consoleThemeOptions: Array<{
+  value: ConsoleThemeMode;
+  label: string;
+  source: string;
+  description: string;
+  swatches: string[];
+  colors: {
+    background: string;
+    surface: string;
+    toolbar: string;
+    border: string;
+    borderStrong: string;
+    text: string;
+    selection: string;
+    success: string;
+  };
+}> = [
+  {
+    value: "vrc",
+    label: "VRC 墨青",
+    source: "默认",
+    description: "低对比墨青终端，适合长期运维操作。",
+    swatches: ["#101715", "#315b4a", "#73a486", "#dce8df"],
+    colors: {
+      background: "#101715", surface: "#101715", toolbar: "#1b2823", border: "#2d4037", borderStrong: "#24362e",
+      text: "#dce8df", selection: "#315b4a", success: "#79b88e",
+    },
+  },
+  {
+    value: "tokyo-night",
+    label: "Tokyo Night",
+    source: "GitHub",
+    description: "蓝紫夜色配色，命令层级清晰。",
+    swatches: ["#1a1b26", "#7aa2f7", "#bb9af7", "#7dcfff"],
+    colors: {
+      background: "#1a1b26", surface: "#1a1b26", toolbar: "#24283b", border: "#3b4261", borderStrong: "#2f354d",
+      text: "#c0caf5", selection: "#364a82", success: "#9ece6a",
+    },
+  },
+  {
+    value: "catppuccin",
+    label: "Catppuccin",
+    source: "Mocha",
+    description: "柔和深色终端，适合长时间阅读。",
+    swatches: ["#1e1e2e", "#89b4fa", "#cba6f7", "#f5c2e7"],
+    colors: {
+      background: "#1e1e2e", surface: "#1e1e2e", toolbar: "#29293f", border: "#45475a", borderStrong: "#36364d",
+      text: "#cdd6f4", selection: "#45475a", success: "#a6e3a1",
+    },
+  },
+  {
+    value: "dracula",
+    label: "Dracula",
+    source: "GitHub",
+    description: "高辨识紫青配色，强调状态输出。",
+    swatches: ["#282a36", "#8be9fd", "#bd93f9", "#ff79c6"],
+    colors: {
+      background: "#282a36", surface: "#282a36", toolbar: "#343746", border: "#4c5062", borderStrong: "#3f4252",
+      text: "#f8f8f2", selection: "#44475a", success: "#50fa7b",
+    },
+  },
+  {
+    value: "nord", label: "Nord", source: "Arctic Ice", description: "克制冷灰配色，适合低光环境。",
+    swatches: ["#2e3440", "#5e81ac", "#88c0d0", "#8fbcbb"],
+    colors: { background: "#2e3440", surface: "#2e3440", toolbar: "#3b4252", border: "#4c566a", borderStrong: "#434c5e", text: "#eceff4", selection: "#4c566a", success: "#a3be8c" },
+  },
+  {
+    value: "rose-pine", label: "Rose Pine", source: "Moon", description: "低饱和紫灰配色，层次柔和。",
+    swatches: ["#232136", "#3e8fb0", "#c4a7e7", "#ea9a97"],
+    colors: { background: "#232136", surface: "#232136", toolbar: "#2d2945", border: "#44415a", borderStrong: "#39354d", text: "#e0def4", selection: "#393552", success: "#9ccfd8" },
+  },
+  {
+    value: "solarized", label: "Solarized", source: "Dark", description: "经典低对比配色，日志阅读稳定。",
+    swatches: ["#002b36", "#268bd2", "#2aa198", "#b58900"],
+    colors: { background: "#002b36", surface: "#002b36", toolbar: "#073642", border: "#31535b", borderStrong: "#1d4750", text: "#93a1a1", selection: "#28535c", success: "#859900" },
+  },
+  {
+    value: "light", label: "Paper", source: "浅色", description: "亮光环境与截图使用的浅色终端。",
+    swatches: ["#f6f7f5", "#b7c9be", "#658e78", "#29302c"],
+    colors: { background: "#f6f7f5", surface: "#f6f7f5", toolbar: "#e8ede9", border: "#c9d2cc", borderStrong: "#b3bfb7", text: "#29302c", selection: "#b7c9be", success: "#477a45" },
+  },
+];
+const consoleFontOptions: Array<{ value: ConsoleFontPreset; label: string; family: string }> = [
+  { value: "system-mono", label: "系统等宽", family: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" },
+  { value: "jetbrains", label: "JetBrains Mono（本机）", family: "\"JetBrains Mono\", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" },
+  { value: "cascadia", label: "Cascadia Mono（本机）", family: "\"Cascadia Mono\", Consolas, ui-monospace, monospace" },
+  { value: "menlo", label: "Menlo（macOS）", family: "Menlo, Monaco, \"SF Mono\", ui-monospace, monospace" },
+];
 const defaultUiPreferences: UiPreferences = {
   theme: normalizeTheme(document.documentElement.dataset.theme || localStorage.getItem("vrc.theme")),
   toneMode: "light",
@@ -440,6 +621,21 @@ const defaultUiPreferences: UiPreferences = {
   showIconTooltips: true,
   truncateLongNames: true,
   throttleConsoleResize: true,
+  uiFontPreset: "system",
+  uiFontSize: 12,
+  reduceMotion: false,
+  consoleTheme: "vrc",
+  consoleFontPreset: "system-mono",
+  consoleFontSize: 13,
+  consoleLineHeight: 1.2,
+  consoleCursorStyle: "block",
+  consoleCursorBlink: true,
+  consoleScaleMode: "local",
+  consoleQuality: "auto",
+  consoleWatermarkEnabled: true,
+  consoleWatermarkScope: "console",
+  consoleWatermarkDensity: "standard",
+  consoleWatermarkOpacity: 12,
 };
 const defaultConnectionPreferences: ConnectionPreferences = {
   selectedConnectionId: localStorage.getItem("vrc.connectionId") || "",
@@ -458,6 +654,10 @@ const defaultChromeExtensionServiceSettings: ChromeExtensionServiceSettings = {
   host: "vrc-server",
   port: 3987,
 };
+const chromeExtensionServiceModeOptions: Array<{ label: string; value: ChromeExtensionServiceMode }> = [
+  { label: "内网", value: "intranet" },
+  { label: "本机", value: "local" },
+];
 const deprecatedChromeExtensionSampleConnectionIds = new Set(["xs-prod", "vmware-lab", "pve-test"]);
 const connection = reactive({
   providerType: defaultConnectionPreferences.providerType,
@@ -470,11 +670,13 @@ const connection = reactive({
 const inventory = ref<HostsResponse | null>(null);
 const vms = ref<VmsResponse | null>(null);
 const vmSummary = ref<VmInventorySummary | null>(null);
+const selectedResourceCapacity = ref<ResourceCapacitySummary | null>(null);
 const storedConnections = ref<StoredConnectionSummary[]>([]);
 const selectedConnectionId = ref(defaultConnectionPreferences.selectedConnectionId);
 const connectionName = ref(defaultConnectionPreferences.connectionName);
 const persistentConnectionsEnabled = ref(true);
 const apiRuntimeMode = ref<"web" | "electron" | "chrome-native">("web");
+const desktopUpdateStage = ref<VrcDesktopUpdateStage>("idle");
 const connectionSearch = ref("");
 const showConnectionEditor = ref(true);
 const showActivityPanel = ref(false);
@@ -537,6 +739,8 @@ const storageDetailVisible = ref(false);
 const isoDetailVisible = ref(false);
 const loadingIsoImages = ref(false);
 const isoImages = ref<IsoImage[]>([]);
+const isoImagesEmptyState = ref<IsoImagesResponse["emptyState"]>();
+const providerDescriptors = ref<ProviderDescriptor[]>([]);
 const isoSearch = ref("");
 const provisioningVisible = ref(false);
 const vmScheduleVisible = ref(false);
@@ -552,6 +756,7 @@ const loadingHostOverview = ref(false);
 const selectedHostOverviewKey = ref("");
 const workspaceMode = ref<WorkspaceMode>("empty");
 const settingsPanel = ref<SettingsPanel>("appearance");
+const appearanceConsolePreviewMode = ref<ConsolePreviewMode>("graphical");
 const ipPoolPolicy = ref<IpPoolPolicy>({ defaultDns: [], ipPools: [] });
 const ipPoolDefaultDnsText = ref("");
 const ipPoolSelectedId = ref("");
@@ -563,6 +768,7 @@ const maintenanceIsoReport = ref<MaintenanceGeneratedIsoReport | null>(null);
 const maintenanceIsoLoading = ref(false);
 const maintenanceIsoCleaning = ref(false);
 const maintenanceIsoScannedAt = ref("");
+const maintenanceIsoStatus = ref("");
 const maintenanceIsoError = ref("");
 const provisioningDialogSession = ref(0);
 const ipPoolDraft = reactive<IpPoolEditorDraft>(emptyIpPoolDraft());
@@ -589,6 +795,8 @@ const isMacElectron = isElectron && /Mac/i.test(navigator.platform);
 const isWindowsElectron = isElectron && /Win/i.test(navigator.platform);
 let hostOverviewRequestSeq = 0;
 let vmSearchRequestSeq = 0;
+let vmSummaryRequestSeq = 0;
+let vmListRequestSeq = 0;
 let activitySeq = 0;
 let lastErrorToast = "";
 let lastErrorToastAt = 0;
@@ -596,12 +804,16 @@ let vmSearchTimer: ReturnType<typeof setTimeout> | undefined;
 let connectionPreferenceSaveTimer: ReturnType<typeof setTimeout> | undefined;
 let appearanceMediaQuery: MediaQueryList | undefined;
 let inventoryEventSource: EventSource | null = null;
+let removeDesktopUpdateListener: (() => void) | undefined;
 let lastInventoryEventSeq = 0;
 const provisioningPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const vmSearchRefreshTimers = new Set<ReturnType<typeof setTimeout>>();
+const inventorySnapshotRefreshTimers = new Set<ReturnType<typeof setTimeout>>();
 const provisioningTaskMarks = new Map<string, string>();
 const provisioningEventSources = new Map<string, EventSource>();
 const provisioningTaskPayloads = new Map<string, VmCreateRequest>();
 const dismissedProvisionTaskIds = new Set<string>();
+const provisionTasksStoppedByVmDelete = new Set<string>();
 
 const hosts = computed(() => inventory.value?.hosts ?? []);
 const storage = computed(() => inventory.value?.storage ?? []);
@@ -610,6 +822,7 @@ const selectedHost = computed(() => hosts.value.find((host) => host.providerId =
 const selectedHostNetworks = computed(() => networks.value.filter((item) => !selectedHost.value || !item.hostId || item.hostId === selectedHost.value.providerId));
 const selectedStoredConnection = computed(() => storedConnections.value.find((item) => item.id === selectedConnectionId.value) ?? null);
 const selectedConnectionBrand = computed(() => getProviderBrand(selectedStoredConnection.value?.providerType ?? connection.providerType));
+const selectedProviderDescriptor = computed(() => providerDescriptorFor(connection.providerType));
 const canLoadDirectConnection = computed(() => Boolean(connection.host.trim() && connection.username.trim() && connection.password.trim()));
 const connectionActionPendingMessage = computed(() => {
   if (savingConnection.value) return "正在保存连接配置";
@@ -654,6 +867,13 @@ const provisioningReservedIps = computed(() => {
 const activeConsoleProvisionTask = computed(() =>
   consoleProvisionTaskId.value && activeProvisionTask.value?.id === consoleProvisionTaskId.value ? activeProvisionTask.value : null,
 );
+const activeProvisioningConsoleVmIds = computed(() => {
+  const task = activeProvisionTask.value;
+  if (!task || task.status === "success") return [];
+  return task.vms
+    .filter((vm) => shouldUseProvisionGraphConsole(vm))
+    .flatMap((vm) => [vm.providerId, vm.id, vm.name].filter((value): value is string => Boolean(value)));
+});
 function buildProvisionConsoleTargets(task: ProvisionTask | null) {
   if (!task) return [];
   return task.vms.map((taskVm, index) => {
@@ -705,11 +925,13 @@ const showWorkspacePlaceholder = computed(
 );
 const isOverviewNavActive = computed(() => workspaceMode.value === "overview" && (hostOverviewRows.value.length > 0 || loadingHostOverview.value));
 const isSettingsNavActive = computed(() => workspaceMode.value === "settings");
+const hasPendingDesktopUpdate = computed(() => ["available", "downloading", "ready"].includes(desktopUpdateStage.value));
 const settingsTitle = computed(() => {
   if (settingsPanel.value === "connection") return "设置 / 连接";
   if (settingsPanel.value === "templates") return "设置 / 创建模板";
   if (settingsPanel.value === "ipPools") return "设置 / IP 池";
   if (settingsPanel.value === "chromeExtension") return "设置 / Chrome 插件";
+  if (settingsPanel.value === "updates") return "设置 / 更新";
   if (settingsPanel.value === "maintenance") return "设置 / 维护";
   if (settingsPanel.value === "logs") return "设置 / 日志";
   return "设置 / 外观";
@@ -723,7 +945,8 @@ const settingsDescription = computed(() => {
   if (settingsPanel.value === "templates") return "创建模板只做归档入口，真实模板能力仍以创建虚拟机弹框为准。";
   if (settingsPanel.value === "ipPools") return "只维护 ip-pools.json 地址池，创建 VM 时按物理机网段优先匹配，也允许用户手动选择。";
   if (settingsPanel.value === "chromeExtension") return "管理 Chrome 插件的服务地址和本地密文连接，和 Web、macOS、Windows 客户端配置分开。";
-  if (settingsPanel.value === "maintenance") return "清理 VRC 任务级临时介质，只处理登记、校验通过且任务已结束的残留。";
+  if (settingsPanel.value === "updates") return "按当前运行端检查版本并应用更新，macOS、Windows、Web 和 Chrome 插件分别使用对应的更新策略。";
+  if (settingsPanel.value === "maintenance") return "查看无人值守安装生成的临时介质，只清理任务已结束且校验通过的记录。";
   if (settingsPanel.value === "logs") return "查看当前会话操作记录，持久化审计后续单独接入。";
   return "主题、按钮密度、表格密度和控制台偏好统一归档，不混入 VM 工具栏。";
 });
@@ -749,7 +972,10 @@ const maintenanceIsoSummary = computed(() => maintenanceIsoReport.value?.summary
   failed: 0,
   localBytes: 0,
 });
-const maintenanceIsoVisibleItems = computed(() => maintenanceIsoReport.value?.items.slice(0, 8) ?? []);
+const maintenanceIsoActiveItems = computed(() =>
+  maintenanceIsoReport.value?.items.filter((item) => item.status !== "deleted" && item.decision !== "cleaned") ?? [],
+);
+const maintenanceIsoVisibleItems = computed(() => maintenanceIsoActiveItems.value.slice(0, 8));
 const filteredStoredConnections = computed(() => {
   const keyword = connectionSearch.value.trim().toLowerCase();
   return storedConnections.value
@@ -811,11 +1037,9 @@ const hostUsage = computed(() => {
 const storageTotals = computed(() => {
   const physicalGiB = storage.value.reduce((sum, sr) => sum + positive(sr.physicalGiB), 0);
   const usedGiB = storage.value.reduce((sum, sr) => sum + positive(sr.usedGiB), 0);
-  const virtualGiB = storage.value.reduce((sum, sr) => sum + positive(sr.virtualGiB), 0);
   return {
     physicalGiB,
     usedGiB,
-    virtualGiB,
     usagePercent: percent(usedGiB, physicalGiB),
   };
 });
@@ -902,17 +1126,17 @@ const resourceSummary = computed(() => {
       over: 0,
       total: storageTotalGiB,
       headline: `${formatNumber(storageUsedGiB)} / ${formatNumber(storageTotalGiB)} GiB`,
-      subline: `剩余 ${formatNumber(Math.max(storageTotalGiB - storageUsedGiB, 0))} GiB · 虚拟分配 ${formatNumber(storageTotals.value.virtualGiB)} GiB`,
+      subline: `剩余 ${formatNumber(Math.max(storageTotalGiB - storageUsedGiB, 0))} GiB`,
       percent: percent(storageUsedGiB, storageTotalGiB),
     },
   ];
 });
 
 const filteredVms = computed(() => {
-  const keyword = search.value.trim().toLowerCase();
+  const keywords = parseSearchKeywords(search.value);
   return (vms.value?.items ?? [])
     .filter((vm) => vmMatchesPowerFilter(vm, vmPowerFilter.value))
-    .filter((vm) => !keyword || vmMatchesKeyword(vm, selectedHost.value?.address, keyword))
+    .filter((vm) => !keywords.length || keywords.some((keyword) => vmMatchesKeyword(vm, selectedHost.value?.address, keyword, "fuzzy")))
     .sort(compareVmByIp);
 });
 const selectedVmRows = computed(() => {
@@ -997,6 +1221,13 @@ const overviewNeedsVmSearch = computed(() => overviewSearchKeywords.value.some(s
 const filteredHostOverviewRows = computed(() => {
   const keywords = overviewSearchKeywords.value;
   if (!keywords.length) return hostOverviewRows.value;
+  const waitingForVmIndex = keywords.some(shouldSearchVmIp) && hostOverviewRows.value.some((row) => hasOverviewInventory(row) && !hasSettledVmSearchCache(row));
+  if (waitingForVmIndex) {
+    // Keep unresolved rows visible while connections refresh; an empty table makes a slow connection look like a failed search.
+    return hostOverviewRows.value.filter(
+      (row) => !hasOverviewInventory(row) || !hasSettledVmSearchCache(row) || keywords.some((keyword) => hostMatchesKeyword(row, keyword)),
+    );
+  }
   return hostOverviewRows.value.filter((row) => rowMatchesOverviewKeywords(row, keywords));
 });
 
@@ -1044,10 +1275,62 @@ const vmSearchStatusText = computed(() => {
   if (!overviewNeedsVmSearch.value) return `${overviewSearchBatchText.value}本地匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台`;
   const total = hostOverviewRows.value.filter(hasOverviewInventory).length;
   const cached = vmSearchSettledCount.value;
-  if (overviewVmSearchLoading.value) return `${overviewSearchBatchText.value}VM IP 缓存 ${cached} / ${total} · 加载中`;
+  if (overviewVmSearchLoading.value) return `${overviewSearchBatchText.value}VM IP 缓存 ${cached} / ${total} · 已展示待查询连接`;
   return `${overviewSearchBatchText.value}VM IP 匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台 · 缓存 ${cached} / ${total}`;
 });
 const resolvedAppearanceDark = computed(() => uiPreferences.toneMode === "dark" || (uiPreferences.toneMode === "system" && systemDark.value));
+const currentAppearanceTheme = computed(() => themeOptions.find((item) => item.value === uiPreferences.theme) ?? themeOptions[0]);
+const appearanceToneText = computed(() => {
+  if (uiPreferences.toneMode === "system") return systemDark.value ? "跟随系统 · 深色" : "跟随系统 · 浅色";
+  return uiPreferences.toneMode === "dark" ? "深色" : "浅色";
+});
+const appearanceBackgroundText = computed(() => {
+  if (uiPreferences.backgroundMode === "solid") return "纯色背景";
+  if (uiPreferences.backgroundMode === "image") return `图片背景 · ${uiPreferences.backgroundOpacity}%`;
+  return currentAppearanceTheme.value.tone;
+});
+const currentUiFont = computed(() => uiFontOptions.find((item) => item.value === uiPreferences.uiFontPreset) ?? uiFontOptions[0]);
+const currentConsoleTheme = computed(() => consoleThemeOptions.find((item) => item.value === uiPreferences.consoleTheme) ?? consoleThemeOptions[0]);
+const currentConsoleFont = computed(() => consoleFontOptions.find((item) => item.value === uiPreferences.consoleFontPreset) ?? consoleFontOptions[0]);
+const consoleWatermarkCopies = computed(() => ({ sparse: 3, standard: 6, dense: 10 })[uiPreferences.consoleWatermarkDensity]);
+const consoleWatermarkText = computed(() => {
+  const operator = connection.username?.trim() || "VRC";
+  const source = window.location.hostname || "local";
+  const timestamp = new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date()).replaceAll("/", "-");
+  return `${operator} · ${source} · ${timestamp}`;
+});
+const appearanceConsolePreviewStyle = computed(() => ({
+  "--appearance-console-bg": currentConsoleTheme.value.colors.background,
+  "--appearance-console-fg": currentConsoleTheme.value.colors.text,
+  "--appearance-console-muted": `color-mix(in srgb, ${currentConsoleTheme.value.colors.text} 62%, transparent)`,
+  "--appearance-console-accent": currentConsoleTheme.value.colors.selection,
+  "--appearance-console-success": currentConsoleTheme.value.colors.success,
+  "--appearance-console-font": currentConsoleFont.value.family,
+  "--appearance-console-size": `${uiPreferences.consoleFontSize}px`,
+  "--appearance-console-line-height": String(uiPreferences.consoleLineHeight),
+  "--appearance-watermark-opacity": String(uiPreferences.consoleWatermarkOpacity / 100),
+}));
+const consoleTerminalTheme = computed(() => ({
+  background: currentConsoleTheme.value.colors.background,
+  foreground: currentConsoleTheme.value.colors.text,
+  cursor: currentConsoleTheme.value.colors.text,
+  selectionBackground: withHexAlpha(currentConsoleTheme.value.colors.selection, "66"),
+  selectionInactiveBackground: withHexAlpha(currentConsoleTheme.value.colors.selection, "3d"),
+  black: currentConsoleTheme.value.colors.background,
+  brightBlack: currentConsoleTheme.value.colors.border,
+  green: currentConsoleTheme.value.colors.success,
+  brightGreen: currentConsoleTheme.value.colors.success,
+  cyan: currentConsoleTheme.value.colors.selection,
+  brightCyan: currentConsoleTheme.value.colors.selection,
+  white: currentConsoleTheme.value.colors.text,
+  brightWhite: "#ffffff",
+}));
+
+function withHexAlpha(color: string, alpha: string) {
+  return /^#[0-9a-f]{6}$/i.test(color) ? `${color}${alpha}` : color;
+}
 const appearanceBackgroundImageUrl = computed(() =>
   uiPreferences.backgroundImageUpdatedAt
     ? `/api/preferences/ui/background-image?v=${encodeURIComponent(uiPreferences.backgroundImageUpdatedAt)}`
@@ -1076,6 +1359,25 @@ async function markRendererReady() {
   document.documentElement.dataset.appReady = "true";
 }
 
+async function initializeDesktopUpdateReminder() {
+  const desktopUpdateApi = window.vrcDesktopUpdate;
+  if (!desktopUpdateApi) return;
+  const applyState = (state: VrcDesktopUpdateState) => {
+    desktopUpdateStage.value = state.stage;
+  };
+  removeDesktopUpdateListener = desktopUpdateApi.onState(applyState);
+  try {
+    const state = await desktopUpdateApi.getState();
+    applyState(state);
+    const autoCheckEnabled = localStorage.getItem("vrc.update.auto-check") !== "false";
+    if (autoCheckEnabled && state.supported && state.stage === "idle" && !state.checkedAt) {
+      applyState(await desktopUpdateApi.check());
+    }
+  } catch {
+    desktopUpdateStage.value = "error";
+  }
+}
+
 onMounted(async () => {
   try {
     document.documentElement.dataset.startupStage = "mounted";
@@ -1084,7 +1386,7 @@ onMounted(async () => {
     appearanceMediaQuery.addEventListener("change", handleAppearanceMediaChange);
     await loadRuntimeInfo();
     document.documentElement.dataset.startupStage = "runtime-loaded";
-    await loadAppPreferences();
+    await Promise.all([loadAppPreferences(), loadProviderDescriptors()]);
     document.documentElement.dataset.startupStage = "preferences-loaded";
   } catch (error) {
     document.documentElement.dataset.startupError = error instanceof Error ? error.message : String(error);
@@ -1092,6 +1394,7 @@ onMounted(async () => {
     await markRendererReady();
   }
   void loadIpPoolPolicy();
+  void initializeDesktopUpdateReminder();
   connectInventoryEvents();
   await loadStoredConnections();
   const launchConnection = consumeChromeExtensionLaunchConnection();
@@ -1118,10 +1421,16 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  removeDesktopUpdateListener?.();
+  removeDesktopUpdateListener = undefined;
   appearanceMediaQuery?.removeEventListener("change", handleAppearanceMediaChange);
   if (connectionPreferenceSaveTimer) clearTimeout(connectionPreferenceSaveTimer);
   for (const timer of provisioningPollTimers.values()) clearTimeout(timer);
   provisioningPollTimers.clear();
+  for (const timer of vmSearchRefreshTimers) clearTimeout(timer);
+  vmSearchRefreshTimers.clear();
+  for (const timer of inventorySnapshotRefreshTimers) clearTimeout(timer);
+  inventorySnapshotRefreshTimers.clear();
   for (const source of provisioningEventSources.values()) source.close();
   provisioningEventSources.clear();
   inventoryEventSource?.close();
@@ -1178,7 +1487,7 @@ watch(settingsPanel, (panel) => {
 });
 
 function normalizeTheme(value?: string | null): UiTheme {
-  return value === "basalt-copper" || value === "mist-teal" || value === "graphite-sage" ? value : "graphite-sage";
+  return themeOptions.some((item) => item.value === value) ? value as UiTheme : "graphite-sage";
 }
 
 function normalizeProviderType(value?: string | null): ProviderType {
@@ -1220,6 +1529,15 @@ async function loadRuntimeInfo() {
   }
 }
 
+async function loadProviderDescriptors() {
+  try {
+    const result = await postJson<ProviderDescriptorsResponse>("/api/providers", undefined, "GET");
+    providerDescriptors.value = result.providers;
+  } catch {
+    providerDescriptors.value = [];
+  }
+}
+
 function applyUiPreferences(preferences: Partial<UiPreferences>) {
   const theme = normalizeTheme(preferences.theme);
   const themeOption = themeOptions.find((item) => item.value === theme) ?? themeOptions[0];
@@ -1241,11 +1559,36 @@ function applyUiPreferences(preferences: Partial<UiPreferences>) {
   uiPreferences.showIconTooltips = preferences.showIconTooltips ?? defaultUiPreferences.showIconTooltips;
   uiPreferences.truncateLongNames = preferences.truncateLongNames ?? defaultUiPreferences.truncateLongNames;
   uiPreferences.throttleConsoleResize = preferences.throttleConsoleResize ?? defaultUiPreferences.throttleConsoleResize;
+  uiPreferences.uiFontPreset = normalizeUiFontPreset(preferences.uiFontPreset);
+  uiPreferences.uiFontSize = normalizeAppearanceNumber(preferences.uiFontSize, 11, 13, defaultUiPreferences.uiFontSize);
+  uiPreferences.reduceMotion = preferences.reduceMotion ?? defaultUiPreferences.reduceMotion;
+  uiPreferences.consoleTheme = normalizeConsoleTheme(preferences.consoleTheme);
+  uiPreferences.consoleFontPreset = normalizeConsoleFontPreset(preferences.consoleFontPreset);
+  uiPreferences.consoleFontSize = normalizeAppearanceNumber(preferences.consoleFontSize, 11, 18, defaultUiPreferences.consoleFontSize);
+  uiPreferences.consoleLineHeight = normalizeAppearanceDecimal(preferences.consoleLineHeight, 1.05, 1.6, defaultUiPreferences.consoleLineHeight);
+  uiPreferences.consoleCursorStyle =
+    preferences.consoleCursorStyle === "underline" || preferences.consoleCursorStyle === "bar" ? preferences.consoleCursorStyle : "block";
+  uiPreferences.consoleCursorBlink = preferences.consoleCursorBlink ?? defaultUiPreferences.consoleCursorBlink;
+  uiPreferences.consoleScaleMode = preferences.consoleScaleMode === "remote" ? "remote" : "local";
+  uiPreferences.consoleQuality = preferences.consoleQuality === "high" || preferences.consoleQuality === "smooth" ? preferences.consoleQuality : "auto";
+  uiPreferences.consoleWatermarkEnabled = preferences.consoleWatermarkEnabled ?? defaultUiPreferences.consoleWatermarkEnabled;
+  uiPreferences.consoleWatermarkScope = preferences.consoleWatermarkScope === "workspace" ? "workspace" : "console";
+  uiPreferences.consoleWatermarkDensity =
+    preferences.consoleWatermarkDensity === "sparse" || preferences.consoleWatermarkDensity === "dense"
+      ? preferences.consoleWatermarkDensity
+      : "standard";
+  uiPreferences.consoleWatermarkOpacity = normalizeAppearanceNumber(
+    preferences.consoleWatermarkOpacity,
+    6,
+    24,
+    defaultUiPreferences.consoleWatermarkOpacity,
+  );
   applyThemeToDocument(uiPreferences.theme);
   applyAppearanceToDocument();
   document.documentElement.dataset.iconTooltips = String(uiPreferences.showIconTooltips);
   document.documentElement.dataset.truncateLongNames = String(uiPreferences.truncateLongNames);
   document.documentElement.dataset.consoleResizeThrottle = String(uiPreferences.throttleConsoleResize);
+  document.documentElement.dataset.reduceMotion = String(uiPreferences.reduceMotion);
 }
 
 function applyThemeToDocument(theme: UiTheme) {
@@ -1284,12 +1627,27 @@ function updateUiPreference<K extends keyof UiPreferences>(key: K, value: UiPref
 function applyAppearanceToDocument() {
   const style = document.documentElement.style;
   const isDark = resolvedAppearanceDark.value;
+  const consoleTheme = currentConsoleTheme.value.colors;
   style.setProperty("--vrc-accent", uiPreferences.accentColor);
   style.setProperty("--vrc-accent-hover", `color-mix(in srgb, ${uiPreferences.accentColor} ${isDark ? 76 : 82}%, ${isDark ? "white" : "black"})`);
   style.setProperty("--vrc-accent-soft", `color-mix(in srgb, ${uiPreferences.accentColor} ${isDark ? 22 : 13}%, var(--vrc-surface))`);
   style.setProperty("--vrc-success", uiPreferences.successColor);
   style.setProperty("--vrc-warning", uiPreferences.warningColor);
   style.setProperty("--vrc-danger", uiPreferences.dangerColor);
+  style.setProperty("--vrc-ui-font", currentUiFont.value.family);
+  style.setProperty("--vrc-ui-font-size", `${uiPreferences.uiFontSize}px`);
+  style.setProperty("--vrc-terminal-bg", consoleTheme.background);
+  style.setProperty("--vrc-terminal-surface", consoleTheme.surface);
+  style.setProperty("--vrc-terminal-toolbar", consoleTheme.toolbar);
+  style.setProperty("--vrc-terminal-border", consoleTheme.border);
+  style.setProperty("--vrc-terminal-border-strong", consoleTheme.borderStrong);
+  style.setProperty("--vrc-terminal-text", consoleTheme.text);
+  style.setProperty("--vrc-terminal-text-muted", `color-mix(in srgb, ${consoleTheme.text} 66%, transparent)`);
+  style.setProperty("--vrc-terminal-control-bg", `color-mix(in srgb, ${consoleTheme.text} 8%, transparent)`);
+  style.setProperty("--vrc-terminal-control-border", `color-mix(in srgb, ${consoleTheme.text} 12%, transparent)`);
+  style.setProperty("--vrc-terminal-overlay", `color-mix(in srgb, ${consoleTheme.toolbar} 92%, transparent)`);
+  style.setProperty("--vrc-terminal-shadow", `0 12px 28px color-mix(in srgb, ${consoleTheme.background} 58%, transparent)`);
+  style.setProperty("--vrc-terminal-success", consoleTheme.success);
   style.setProperty("color-scheme", isDark ? "dark" : "light");
   document.documentElement.dataset.tone = isDark ? "dark" : "light";
 
@@ -1326,6 +1684,26 @@ function normalizeAppearanceNumber(value: unknown, min: number, max: number, fal
   return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback;
 }
 
+function normalizeAppearanceDecimal(value: unknown, min: number, max: number, fallback: number) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number * 100) / 100)) : fallback;
+}
+
+function normalizeConsoleTheme(value: unknown): ConsoleThemeMode {
+  const legacyMap: Record<string, ConsoleThemeMode> = { classic: "vrc", slate: "tokyo-night", matrix: "nord", paper: "light" };
+  const normalized = typeof value === "string" ? legacyMap[value] ?? value : value;
+  return consoleThemeOptions.some((item) => item.value === normalized) ? normalized as ConsoleThemeMode : defaultUiPreferences.consoleTheme;
+}
+
+function normalizeConsoleFontPreset(value: unknown): ConsoleFontPreset {
+  const normalized = value === "consolas" ? "cascadia" : value;
+  return consoleFontOptions.some((item) => item.value === normalized) ? normalized as ConsoleFontPreset : defaultUiPreferences.consoleFontPreset;
+}
+
+function normalizeUiFontPreset(value: unknown): UiFontPreset {
+  return uiFontOptions.some((item) => item.value === value) ? value as UiFontPreset : defaultUiPreferences.uiFontPreset;
+}
+
 async function saveUiPreferences(preferences: Partial<UiPreferences>) {
   try {
     const result = await postJson<{ preferences: Partial<UiPreferences> }>("/api/preferences/ui", preferences, "PATCH");
@@ -1344,7 +1722,7 @@ function updateAppearanceColor(key: "accentColor" | "successColor" | "warningCol
   updateUiPreference(key, normalizeHexColor(color, uiPreferences[key]));
 }
 
-function persistAppearanceNumber(key: "backgroundOpacity" | "backgroundBlur" | "backgroundOverlay") {
+function persistAppearanceNumber(key: "backgroundOpacity" | "backgroundBlur" | "backgroundOverlay" | "consoleFontSize" | "consoleWatermarkOpacity") {
   persistAppearancePreference(key);
 }
 
@@ -1416,6 +1794,11 @@ function setChromeExtensionServiceMode(mode: ChromeExtensionServiceMode) {
     chromeExtensionService.host = defaultChromeExtensionServiceSettings.host;
   }
   persistChromeExtensionServiceSettings(false);
+}
+
+function handleChromeExtensionServiceModeChange(mode: string | number | boolean) {
+  if (mode !== "intranet" && mode !== "local") return;
+  setChromeExtensionServiceMode(mode);
 }
 
 function testChromeExtensionService() {
@@ -1582,19 +1965,16 @@ async function loadMaintenanceGeneratedIsos(options: { silent?: boolean } = {}) 
   if (maintenanceIsoLoading.value) return;
   const startedAt = Date.now();
   maintenanceIsoLoading.value = true;
+  maintenanceIsoStatus.value = options.silent ? maintenanceIsoStatus.value : "正在扫描安装临时介质";
   maintenanceIsoError.value = "";
   try {
     const result = await postJson<{ report: MaintenanceGeneratedIsoReport }>("/api/maintenance/generated-isos", undefined, "GET");
     maintenanceIsoReport.value = result.report;
     maintenanceIsoScannedAt.value = formatActivityTime();
     const summary = result.report.summary;
-    if (!options.silent) {
-      ElMessage.success({
-        message: `扫描完成：记录 ${summary.total} 条，可清理 ${summary.eligible} 条`,
-        duration: 1800,
-      });
-    }
+    maintenanceIsoStatus.value = `扫描完成：记录 ${summary.total} 条，可清理 ${summary.eligible} 条`;
   } catch (error) {
+    maintenanceIsoStatus.value = "";
     maintenanceIsoError.value = error instanceof Error ? error.message : "扫描 VRC 残留失败";
     ElMessage.error({ message: maintenanceIsoError.value, duration: VRC_TOAST_DURATION_MS });
   } finally {
@@ -1620,9 +2000,10 @@ async function cleanupMaintenanceGeneratedIsos() {
       "/api/maintenance/generated-isos/cleanup",
       { confirmToken: "CONFIRMED" },
     );
-    maintenanceIsoReport.value = result.report;
     const summary = result.report.summary;
     const message = `清理完成：成功 ${summary.cleaned} 条，失败 ${summary.failed} 条，跳过 ${summary.skipped} 条`;
+    await loadMaintenanceGeneratedIsos({ silent: true });
+    maintenanceIsoStatus.value = message;
     ElMessage.success({ message, duration: VRC_TOAST_DURATION_MS });
     pushActivity("清理 VRC 临时介质", {
       detail: message,
@@ -1797,7 +2178,13 @@ async function deleteSelectedIpPool() {
     ElMessage.warning({ message: "至少保留一个 IP 池", duration: VRC_TOAST_DURATION_MS });
     return;
   }
-  await ElMessageBox.confirm(`确认删除 ${selectedIpPool.value.name}？`, "删除 IP 池", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+  await confirmVrcAction({
+    heading: "删除 IP 池",
+    tone: "危险操作",
+    summary: `对象：${selectedIpPool.value.name}`,
+    detail: "删除后该地址池不再参与后续虚拟机地址分配；当前未保存的修改也会丢失。",
+    confirmButtonText: "删除",
+  });
   const deletingId = selectedIpPool.value.id;
   ipPoolPolicy.value = {
     ...ipPoolPolicy.value,
@@ -1808,10 +2195,12 @@ async function deleteSelectedIpPool() {
 }
 
 async function resetIpPoolPolicy() {
-  await ElMessageBox.confirm("清空当前 IP 池编辑内容？当前未保存编辑会被覆盖。", "清空 IP 池", {
-    type: "warning",
+  await confirmVrcAction({
+    heading: "清空 IP 池配置",
+    tone: "需确认",
+    summary: "对象：当前 IP 池编辑内容",
+    detail: "当前未保存的编辑会被默认配置覆盖。",
     confirmButtonText: "清空",
-    cancelButtonText: "取消",
   });
   applyIpPoolPolicy(defaultIpPoolPolicy());
 }
@@ -1930,6 +2319,9 @@ function normalizeImportedAppearance(config: AppearanceImportConfig): Partial<Ui
   const themeOption = themeOptions.find((item) => item.value === theme) ?? themeOptions[0];
   const colors = config.colors ?? config;
   const background = config.background ?? config;
+  const typography = config.typography ?? config;
+  const console = config.console ?? config;
+  const cursorStyle = console.cursorStyle;
   return {
     theme,
     toneMode: config.toneMode === "system" || config.toneMode === "dark" ? config.toneMode : "light",
@@ -1942,6 +2334,39 @@ function normalizeImportedAppearance(config: AppearanceImportConfig): Partial<Ui
     backgroundOpacity: normalizeAppearanceNumber(background.opacity ?? background.backgroundOpacity, 5, 60, defaultUiPreferences.backgroundOpacity),
     backgroundBlur: normalizeAppearanceNumber(background.blur ?? background.backgroundBlur, 0, 16, defaultUiPreferences.backgroundBlur),
     backgroundOverlay: normalizeAppearanceNumber(background.overlay ?? background.backgroundOverlay, 0, 35, defaultUiPreferences.backgroundOverlay),
+    uiFontPreset: normalizeUiFontPreset(typography.family ?? typography.uiFontPreset),
+    uiFontSize: normalizeAppearanceNumber(typography.size ?? typography.uiFontSize, 11, 13, defaultUiPreferences.uiFontSize),
+    reduceMotion: typeof typography.reduceMotion === "boolean" ? typography.reduceMotion : defaultUiPreferences.reduceMotion,
+    consoleTheme: normalizeConsoleTheme(console.theme ?? console.consoleTheme),
+    consoleFontPreset: normalizeConsoleFontPreset(console.fontPreset ?? console.consoleFontPreset),
+    consoleFontSize: normalizeAppearanceNumber(console.fontSize ?? console.consoleFontSize, 11, 18, defaultUiPreferences.consoleFontSize),
+    consoleLineHeight: normalizeAppearanceDecimal(console.lineHeight ?? console.consoleLineHeight, 1.05, 1.6, defaultUiPreferences.consoleLineHeight),
+    consoleCursorStyle: cursorStyle === "underline" || cursorStyle === "bar" || cursorStyle === "block" ? cursorStyle : "block",
+    consoleCursorBlink: typeof console.cursorBlink === "boolean" ? console.cursorBlink : defaultUiPreferences.consoleCursorBlink,
+    consoleScaleMode: console.scaleMode === "remote" ? "remote" : "local",
+    consoleQuality: console.quality === "high" || console.quality === "smooth" ? console.quality : "auto",
+    consoleWatermarkEnabled:
+      typeof console.watermarkEnabled === "boolean"
+        ? console.watermarkEnabled
+        : typeof (console.watermark as Record<string, unknown> | undefined)?.enabled === "boolean"
+          ? Boolean((console.watermark as Record<string, unknown>).enabled)
+          : defaultUiPreferences.consoleWatermarkEnabled,
+    consoleWatermarkScope:
+      (console.watermark as Record<string, unknown> | undefined)?.scope === "workspace" || console.watermarkScope === "workspace"
+        ? "workspace"
+        : "console",
+    consoleWatermarkDensity:
+      (console.watermark as Record<string, unknown> | undefined)?.density === "sparse" || (console.watermark as Record<string, unknown> | undefined)?.density === "dense"
+        ? (console.watermark as Record<string, unknown>).density as WatermarkDensity
+        : console.watermarkDensity === "sparse" || console.watermarkDensity === "dense"
+          ? console.watermarkDensity as WatermarkDensity
+          : "standard",
+    consoleWatermarkOpacity: normalizeAppearanceNumber(
+      (console.watermark as Record<string, unknown> | undefined)?.opacity ?? console.watermarkOpacity,
+      6,
+      24,
+      defaultUiPreferences.consoleWatermarkOpacity,
+    ),
   };
 }
 
@@ -1963,6 +2388,27 @@ function exportAppearanceConfig() {
       opacity: uiPreferences.backgroundOpacity,
       blur: uiPreferences.backgroundBlur,
       overlay: uiPreferences.backgroundOverlay,
+    },
+    typography: {
+      family: uiPreferences.uiFontPreset,
+      size: uiPreferences.uiFontSize,
+      reduceMotion: uiPreferences.reduceMotion,
+    },
+    console: {
+      theme: uiPreferences.consoleTheme,
+      fontPreset: uiPreferences.consoleFontPreset,
+      fontSize: uiPreferences.consoleFontSize,
+      lineHeight: uiPreferences.consoleLineHeight,
+      cursorStyle: uiPreferences.consoleCursorStyle,
+      cursorBlink: uiPreferences.consoleCursorBlink,
+      scaleMode: uiPreferences.consoleScaleMode,
+      quality: uiPreferences.consoleQuality,
+      watermark: {
+        enabled: uiPreferences.consoleWatermarkEnabled,
+        scope: uiPreferences.consoleWatermarkScope,
+        density: uiPreferences.consoleWatermarkDensity,
+        opacity: uiPreferences.consoleWatermarkOpacity,
+      },
     },
   };
   const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
@@ -1993,6 +2439,21 @@ async function resetAppearancePreferences() {
         backgroundOpacity: defaultUiPreferences.backgroundOpacity,
         backgroundBlur: defaultUiPreferences.backgroundBlur,
         backgroundOverlay: defaultUiPreferences.backgroundOverlay,
+        uiFontPreset: defaultUiPreferences.uiFontPreset,
+        uiFontSize: defaultUiPreferences.uiFontSize,
+        reduceMotion: defaultUiPreferences.reduceMotion,
+        consoleTheme: defaultUiPreferences.consoleTheme,
+        consoleFontPreset: defaultUiPreferences.consoleFontPreset,
+        consoleFontSize: defaultUiPreferences.consoleFontSize,
+        consoleLineHeight: defaultUiPreferences.consoleLineHeight,
+        consoleCursorStyle: defaultUiPreferences.consoleCursorStyle,
+        consoleCursorBlink: defaultUiPreferences.consoleCursorBlink,
+        consoleScaleMode: defaultUiPreferences.consoleScaleMode,
+        consoleQuality: defaultUiPreferences.consoleQuality,
+        consoleWatermarkEnabled: defaultUiPreferences.consoleWatermarkEnabled,
+        consoleWatermarkScope: defaultUiPreferences.consoleWatermarkScope,
+        consoleWatermarkDensity: defaultUiPreferences.consoleWatermarkDensity,
+        consoleWatermarkOpacity: defaultUiPreferences.consoleWatermarkOpacity,
       },
       "PATCH",
     );
@@ -2457,6 +2918,12 @@ function switchAccountImportMode(mode: AccountImportMode) {
   accountImportError.value = "";
 }
 
+function handleAccountImportTabChange(name: string | number) {
+  if (name === "excel" || name === "json" || name === "fixed") {
+    switchAccountImportMode(name);
+  }
+}
+
 function triggerAccountImportFile() {
   accountImportFileInput.value?.click();
 }
@@ -2861,12 +3328,14 @@ async function loadHostOverview(options: { forceRefresh?: boolean } = {}) {
         inventory: hostInventory,
         host,
         summary: null,
+        resourceCapacity: null,
         status: "loading" as const,
       }));
       replaceHostOverviewRows(item.id, rows.length ? rows : [createFallbackOverviewRow(item, "error", "未读取到物理机")]);
       for (const row of rows) {
         void loadHostOverviewSummary(row, requestId, options.forceRefresh);
       }
+      if (hostInventory.refreshing) scheduleHostOverviewRevalidation(item, requestId, 1);
     } catch (error) {
       if (requestId !== hostOverviewRequestSeq) return;
       updateHostOverviewRow(item.id, {
@@ -2894,60 +3363,118 @@ async function loadHostOverview(options: { forceRefresh?: boolean } = {}) {
     });
 }
 
-async function ensureVmSearchCacheForKeyword(keyword: string, force = false) {
-  if (!shouldSearchVmIp(keyword)) return;
-  const requestId = ++vmSearchRequestSeq;
-  const rows = hostOverviewRows.value.filter(hasOverviewInventory);
-  await runLimited(rows, 3, async (row) => {
-    if (requestId !== vmSearchRequestSeq) return;
-    await loadHostVmSearchCache(row, force);
+function scheduleHostOverviewRevalidation(connectionItem: StoredConnectionSummary, requestId: number, attempt: number) {
+  scheduleInventorySnapshotRevalidation(async () => {
+    if (requestId !== hostOverviewRequestSeq) return;
+    try {
+      const result = await postJson<HostsResponse>("/api/inventory/hosts", buildConnectionPayloadFromSummary(connectionItem));
+      if (requestId !== hostOverviewRequestSeq) return;
+      hostOverviewRows.value = hostOverviewRows.value.map((row) => {
+        if (row.connection.id !== connectionItem.id) return row;
+        const refreshedHost = result.hosts.find((host) => host.providerId === row.host.providerId || host.id === row.host.id);
+        return refreshedHost ? { ...row, host: refreshedHost, inventory: result } : row;
+      });
+      if (result.refreshing && attempt < INVENTORY_SNAPSHOT_REVALIDATE_MAX_ATTEMPTS) {
+        scheduleHostOverviewRevalidation(connectionItem, requestId, attempt + 1);
+      }
+    } catch {
+      // Stale rows remain usable; a manual refresh or later SSE event can retry.
+    }
   });
 }
 
-async function loadHostVmSearchCache(row: HostOverviewRow, force = false) {
-  const existing = vmSearchCache.value[row.key];
-  if (!force && existing && Date.now() - existing.updatedAt < VM_SEARCH_CACHE_TTL_MS) return;
-  if (existing?.loading) return;
+async function ensureVmSearchCacheForKeyword(keyword: string, force = false) {
+  if (!shouldSearchVmIp(keyword)) return;
+  const requestId = ++vmSearchRequestSeq;
+  const rowsByConnection = new Map<string, HostOverviewRow[]>();
+  for (const row of hostOverviewRows.value.filter(hasOverviewInventory)) {
+    const rows = rowsByConnection.get(row.connection.id) ?? [];
+    rows.push(row);
+    rowsByConnection.set(row.connection.id, rows);
+  }
+  await runLimited(Array.from(rowsByConnection.values()), 3, async (rows) => {
+    if (requestId !== vmSearchRequestSeq) return;
+    await loadHostVmSearchCache(rows, force);
+  });
+}
 
-  vmSearchCache.value = {
-    ...vmSearchCache.value,
-    [row.key]: {
-      items: existing?.items ?? [],
-      updatedAt: existing?.updatedAt ?? 0,
-      loading: true,
-    },
-  };
-
-  try {
-    const connectionPayload = buildConnectionPayloadFromSummary(row.connection);
-    const result = await postJson<VmsResponse>("/api/inventory/vms", {
-      ...connectionPayload,
-      hostId: row.host.providerId,
-      page: 1,
-      pageSize: 500,
-    });
-    vmSearchCache.value = {
-      ...vmSearchCache.value,
-      [row.key]: {
-        items: result.items,
-        updatedAt: Date.now(),
-        loading: false,
-      },
-    };
-  } catch (error) {
+async function loadHostVmSearchCache(rows: HostOverviewRow[], force = false, revalidateAttempt = 0) {
+  if (!rows.length) return;
+  const hasFreshCache = rows.every((row) => {
+    const cache = vmSearchCache.value[row.key];
+    return !force && cache && Date.now() - cache.updatedAt < VM_SEARCH_CACHE_TTL_MS;
+  });
+  if (hasFreshCache && revalidateAttempt === 0) return;
+  for (const row of rows) {
+    const existing = vmSearchCache.value[row.key];
     vmSearchCache.value = {
       ...vmSearchCache.value,
       [row.key]: {
         items: existing?.items ?? [],
-        updatedAt: Date.now(),
-        loading: false,
-        error: error instanceof Error ? error.message : "VM IP 缓存失败",
+        updatedAt: existing?.updatedAt ?? 0,
+        loading: true,
       },
     };
   }
+
+  try {
+    const connectionPayload = buildConnectionPayloadFromSummary(rows[0].connection);
+    const result = await postJson<VmSearchIndexResponse>("/api/inventory/vm-search-index", {
+      ...connectionPayload,
+      forceRefresh: force,
+    });
+    const cacheUpdatedAt = Date.parse(result.cacheUpdatedAt ?? result.collectedAt);
+    const updatedAt = Number.isFinite(cacheUpdatedAt) ? cacheUpdatedAt : Date.now();
+    for (const row of rows) {
+      const items = result.items.filter((item) => {
+        if (item.hostId) return item.hostId === row.host.providerId || item.hostId === row.host.id;
+        return rows.length === 1;
+      });
+      vmSearchCache.value = {
+        ...vmSearchCache.value,
+        [row.key]: { items, updatedAt, loading: false },
+      };
+    }
+    if (result.refreshing && revalidateAttempt < VM_SEARCH_REVALIDATE_MAX_ATTEMPTS) {
+      scheduleVmSearchRevalidation(rows, revalidateAttempt + 1);
+    }
+  } catch (error) {
+    for (const row of rows) {
+      const existing = vmSearchCache.value[row.key];
+      vmSearchCache.value = {
+        ...vmSearchCache.value,
+        [row.key]: {
+          items: existing?.items ?? [],
+          updatedAt: Date.now(),
+          loading: false,
+          error: error instanceof Error ? error.message : "VM IP 缓存失败",
+        },
+      };
+    }
+  }
 }
 
-async function loadHostOverviewSummary(row: HostOverviewRow, requestId = hostOverviewRequestSeq, forceRefresh = false) {
+function scheduleVmSearchRevalidation(rows: HostOverviewRow[], attempt: number) {
+  const rowKeys = new Set(rows.map((row) => row.key));
+  const timer = setTimeout(() => {
+    vmSearchRefreshTimers.delete(timer);
+    if (!overviewNeedsVmSearch.value) return;
+    const currentRows = hostOverviewRows.value.filter((row) => rowKeys.has(row.key));
+    if (!currentRows.length) return;
+    void loadHostVmSearchCache(currentRows, false, attempt);
+  }, VM_SEARCH_REVALIDATE_INTERVAL_MS);
+  vmSearchRefreshTimers.add(timer);
+}
+
+function scheduleInventorySnapshotRevalidation(callback: () => void | Promise<void>) {
+  const timer = setTimeout(() => {
+    inventorySnapshotRefreshTimers.delete(timer);
+    void callback();
+  }, INVENTORY_SNAPSHOT_REVALIDATE_INTERVAL_MS);
+  inventorySnapshotRefreshTimers.add(timer);
+}
+
+async function loadHostOverviewSummary(row: HostOverviewRow, requestId = hostOverviewRequestSeq, forceRefresh = false, revalidateAttempt = 0) {
   if (!hasOverviewInventory(row)) return;
   try {
     const connectionPayload = buildConnectionPayloadFromSummary(row.connection);
@@ -2961,8 +3488,15 @@ async function loadHostOverviewSummary(row: HostOverviewRow, requestId = hostOve
     if (requestId !== hostOverviewRequestSeq) return;
     updateHostOverviewRow(row.key, {
       summary: result.summary,
+      resourceCapacity: result.resourceCapacity ?? null,
       status: "ready",
     });
+    if (result.refreshing && revalidateAttempt < INVENTORY_SNAPSHOT_REVALIDATE_MAX_ATTEMPTS) {
+      scheduleInventorySnapshotRevalidation(() => {
+        const currentRow = hostOverviewRows.value.find((item) => item.key === row.key);
+        if (currentRow) void loadHostOverviewSummary(currentRow, requestId, false, revalidateAttempt + 1);
+      });
+    }
   } catch (error) {
     if (requestId !== hostOverviewRequestSeq) return;
     updateHostOverviewRow(row.key, {
@@ -3005,8 +3539,7 @@ async function testConnection() {
 async function openHostOverview(row: HostOverviewRow) {
   if (!hasOverviewInventory(row)) return;
   resetVmOperationState();
-  const overviewKeyword = overviewSearchKeyword.value;
-  search.value = overviewKeyword && vmSearchMatches(row).length > 0 ? overviewKeyword : "";
+  search.value = overviewVmSearchMatchedKeywords(row).join(" ");
   vmDetailVisible.value = true;
   selectedHostOverviewKey.value = row.key;
   selectedConnectionId.value = row.connection.id;
@@ -3023,6 +3556,7 @@ async function openHostOverview(row: HostOverviewRow) {
   selectedHostId.value = row.host.providerId;
   resetIsoImages();
   vmSummary.value = row.summary;
+  selectedResourceCapacity.value = row.resourceCapacity;
   vms.value = null;
   loadingVms.value = true;
   pushActivity("打开物理机", {
@@ -3030,6 +3564,7 @@ async function openHostOverview(row: HostOverviewRow) {
     detail: `${providerLabel(row.connection.providerType)} · ${row.host.address}`,
     status: "info",
   });
+  void loadVmSummary({ silent: true });
   void loadVms({ silent: true });
 }
 
@@ -3081,8 +3616,11 @@ async function selectHost(hostId: string) {
 }
 
 function prepareVmPanelForHostLoad(hasHost: boolean) {
+  vmSummaryRequestSeq += 1;
+  vmListRequestSeq += 1;
   vms.value = null;
   vmSummary.value = null;
+  selectedResourceCapacity.value = null;
   resetVmOperationState();
   loadingVms.value = hasHost;
   if (!hasHost) loadingVmSummary.value = false;
@@ -3107,27 +3645,39 @@ function resetIsoImages() {
   loadingIsoImages.value = false;
 }
 
-async function loadVmSummary(options: { silent?: boolean; forceRefresh?: boolean } = {}) {
+async function loadVmSummary(options: { silent?: boolean; forceRefresh?: boolean; revalidateAttempt?: number } = {}) {
   const payload = buildConnectionPayload();
   if (!payload || !selectedHost.value) return;
+  const hostId = selectedHost.value.providerId;
+  const requestId = ++vmSummaryRequestSeq;
   loadingVmSummary.value = true;
   if (!options.silent) clearMessages();
 
   try {
     const result = await postJson<VmSummaryResponse>("/api/inventory/vm-summary", {
       ...payload,
-      hostId: selectedHost.value.providerId,
+      hostId,
       page: 1,
       pageSize: 500,
       forceRefresh: options.forceRefresh,
     });
+    if (requestId !== vmSummaryRequestSeq || selectedHost.value?.providerId !== hostId) return;
     vmSummary.value = result.summary;
+    selectedResourceCapacity.value = result.resourceCapacity ?? null;
     pushActivity("加载 VM 汇总", {
       target: selectedHost.value.name,
       detail: `运行 ${result.summary.running} / 共 ${result.summary.total} 台`,
       status: "success",
     });
+    const revalidateAttempt = options.revalidateAttempt ?? 0;
+    if (result.refreshing && revalidateAttempt < INVENTORY_SNAPSHOT_REVALIDATE_MAX_ATTEMPTS) {
+      scheduleInventorySnapshotRevalidation(() => {
+        if (requestId !== vmSummaryRequestSeq || selectedHost.value?.providerId !== hostId) return;
+        void loadVmSummary({ silent: true, revalidateAttempt: revalidateAttempt + 1 });
+      });
+    }
   } catch (error) {
+    if (requestId !== vmSummaryRequestSeq || selectedHost.value?.providerId !== hostId) return;
     setErrorMessage(error instanceof Error ? error.message : "读取 VM 汇总失败");
     pushActivity("读取 VM 汇总失败", {
       target: selectedHost.value.name,
@@ -3135,28 +3685,34 @@ async function loadVmSummary(options: { silent?: boolean; forceRefresh?: boolean
       status: "error",
     });
   } finally {
-    loadingVmSummary.value = false;
+    if (requestId === vmSummaryRequestSeq) loadingVmSummary.value = false;
   }
 }
 
-async function loadVms(options: { silent?: boolean; background?: boolean; forceRefresh?: boolean } = {}) {
+async function loadVms(
+  options: { silent?: boolean; background?: boolean; forceRefresh?: boolean; revalidateAttempt?: number } = {},
+) {
   const payload = buildConnectionPayload();
   if (!payload || !selectedHost.value) return;
+  const hostId = selectedHost.value.providerId;
+  const requestId = ++vmListRequestSeq;
   const showLoading = !options.background || !vms.value?.items.length;
   if (showLoading) loadingVms.value = true;
   if (!options.silent) clearMessages();
-  const keyword = search.value.trim();
-  const serverKeyword = shouldSearchVmIp(keyword.toLowerCase()) ? undefined : keyword || undefined;
+  const keywords = parseSearchKeywords(search.value);
+  const serverKeyword = keywords.length === 1 && !shouldSearchVmIp(keywords[0]) ? keywords[0] : undefined;
 
   try {
-    vms.value = await postJson<VmsResponse>("/api/inventory/vms", {
+    const result = await postJson<VmsResponse>("/api/inventory/vms", {
       ...payload,
-      hostId: selectedHost.value.providerId,
+      hostId,
       page: 1,
       pageSize: serverKeyword ? 200 : 500,
       keyword: serverKeyword,
       forceRefresh: options.forceRefresh,
     });
+    if (requestId !== vmListRequestSeq || selectedHost.value?.providerId !== hostId) return;
+    vms.value = result;
     vmSummary.value = summarizeVms(vms.value.items, vms.value.total);
     if (!options.silent) {
       successMessage.value = `VM 清单已加载：${vms.value.items.length} / ${vms.value.total} 台。`;
@@ -3169,7 +3725,15 @@ async function loadVms(options: { silent?: boolean; background?: boolean; forceR
       });
     }
     syncSelectedVmSearchCacheFromCurrentList();
+    const revalidateAttempt = options.revalidateAttempt ?? 0;
+    if (result.refreshing && revalidateAttempt < INVENTORY_SNAPSHOT_REVALIDATE_MAX_ATTEMPTS) {
+      scheduleInventorySnapshotRevalidation(() => {
+        if (requestId !== vmListRequestSeq || selectedHost.value?.providerId !== hostId) return;
+        void loadVms({ silent: true, background: true, revalidateAttempt: revalidateAttempt + 1 });
+      });
+    }
   } catch (error) {
+    if (requestId !== vmListRequestSeq || selectedHost.value?.providerId !== hostId) return;
     setErrorMessage(error instanceof Error ? error.message : "读取 VM 失败");
     pushActivity("读取 VM 失败", {
       target: selectedHost.value.name,
@@ -3177,8 +3741,15 @@ async function loadVms(options: { silent?: boolean; background?: boolean; forceR
       status: "error",
     });
   } finally {
-    if (showLoading) loadingVms.value = false;
+    if (showLoading && requestId === vmListRequestSeq) loadingVms.value = false;
   }
+}
+
+async function refreshVmPanelResources() {
+  await Promise.all([
+    loadVmSummary({ silent: true, forceRefresh: true }),
+    loadVms({ forceRefresh: true }),
+  ]);
 }
 
 function syncSelectedVmSearchCacheFromCurrentList() {
@@ -3220,6 +3791,7 @@ async function loadIsoImages(force = false) {
       forceRefresh: force,
     });
     isoImages.value = result.images;
+    isoImagesEmptyState.value = result.emptyState;
     pushActivity(result.source === "cache" ? "系统镜像缓存已加载" : "系统镜像读取完成", {
       target: selectedHost.value.name,
       detail: result.refreshing ? `${result.images.length} 个 ISO · 后台刷新中` : `${result.images.length} 个 ISO`,
@@ -3248,13 +3820,17 @@ function isoLocationText(image: IsoImage) {
 
 function isoEmptyText() {
   if (isoSearch.value.trim()) return `没有命中：${isoSearch.value.trim()}`;
-  if (connection.providerType === "xenserver") return "未读取到本机 DVD 或 XenServer ISO 库，请检查物理光驱介质及 NFS/SMB ISO Library。";
-  if (connection.providerType === "vmware") return "未在 Datastore Browser 中搜索到 ISO，请确认数据存储权限和镜像目录。";
-  if (connection.providerType === "proxmox") return "未读取到 PVE content=iso 的存储内容，请确认存储启用了 ISO 镜像内容类型。";
-  return "当前平台没有返回 ISO 清单，或账号没有存储内容读取权限。";
+  const emptyState = isoImagesEmptyState.value;
+  if (!emptyState) return "当前平台没有返回 ISO 清单，或账号没有存储内容读取权限。";
+  return [emptyState.message, emptyState.actionHint].filter(Boolean).join("。") + "。";
 }
 
 async function openProvisioningDialog() {
+  const capability = selectedProviderDescriptor.value?.capabilities.vmCreate;
+  if (!capability?.supported) {
+    showToast("warning", capability?.message || "当前平台暂不支持创建虚拟机");
+    return;
+  }
   resetProvisioningDialogView(false);
   provisioningDialogSession.value += 1;
   provisioningVisible.value = true;
@@ -3278,40 +3854,6 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
   const target = selectedHost.value?.name || payload.hostId || connection.host;
   const detail = `${providerLabel(payload.providerType)} · ${payload.sourceType === "iso" ? "ISO" : "克隆源"} · ${payload.count} 台`;
   let keepSubmittingForTask = false;
-  const installModeText =
-    payload.providerType === "xenserver"
-      ? "将创建 VM、虚拟硬盘、网卡，挂载系统 ISO，写入无人值守安装参数，并开机打开控制台。"
-      : payload.providerType === "vmware" && payload.sourceType === "iso"
-        ? "将创建 VMware VM、虚拟硬盘和网卡，挂载 ESXi 原版 ISO 与任务级 Kickstart ISO，并启动无人值守安装。"
-      : payload.sourceType === "template"
-        ? "将按克隆源生成 VM，写入 CPU、内存、磁盘和静态 IP，并启动打开控制台。"
-        : "将创建 VM 并挂载 ISO。该模式不会自动装好系统。";
-  try {
-    await confirmVrcAction({
-      heading: "创建虚拟机",
-      tone: "资源校验",
-      summary: `${target} · ${payload.count} 台`,
-      detail: `${installModeText}\n确认后会先执行资源预检。`,
-      confirmButtonText: "确认创建",
-    });
-  } catch (error) {
-    if (error !== "cancel" && error !== "close") {
-      setErrorMessage(error instanceof Error ? error.message : "创建确认失败");
-      pushActivity("创建确认失败", {
-        target,
-        detail: errorMessage.value,
-        status: "error",
-      });
-    } else {
-      pushActivity("取消创建虚拟机", {
-        target,
-        detail,
-        status: "warning",
-      });
-    }
-    return;
-  }
-
   clearMessages();
   activeProvisionTask.value = null;
   provisioningProgress.value = {
@@ -3320,11 +3862,12 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
     status: "running",
   };
   provisioningSubmitting.value = true;
+  let preflight: ProvisionPreflightResponse;
   try {
-    const preflight = await postJson<ProvisionPreflightResponse>("/api/provisioning/preflight", payload);
-    const blockingChecks = preflight.checks.filter((check) => check.status === "error");
-    if (blockingChecks.length) {
-      const detailText = formatProvisionPreflightChecks(blockingChecks);
+    preflight = await postJson<ProvisionPreflightResponse>("/api/provisioning/preflight", payload);
+    const blockingIssues = preflight.issues.filter((issue) => issue.severity === "blocking");
+    if (blockingIssues.length) {
+      const detailText = blockingIssues.map((issue) => `${issue.label}：${issue.message}`).join("；");
       setErrorMessage(detailText);
       pushActivity("创建预检未通过", {
         target,
@@ -3355,11 +3898,18 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
     return;
   }
 
+  provisioningSubmitting.value = false;
+  provisioningProgress.value = {
+    title: "创建预检通过",
+    message: preflight.operationSummary,
+    status: "success",
+  };
   provisioningProgress.value = {
     title: "提交创建任务",
     message: "正在向虚拟化平台提交创建请求",
     status: "running",
   };
+  provisioningSubmitting.value = true;
   try {
     const response = await postJson<VmProvisionResponse>("/api/provisioning/vms", {
       ...payload,
@@ -3411,10 +3961,6 @@ async function handleProvisioningSubmit(payload: VmCreateRequest) {
   }
 }
 
-function formatProvisionPreflightChecks(checks: ProvisionPreflightCheck[]) {
-  return checks.map((check) => `${check.label}：${check.message}`).join("；");
-}
-
 function connectInventoryEvents() {
   if (typeof EventSource === "undefined" || inventoryEventSource) return;
   const source = new EventSource("/api/inventory/events");
@@ -3445,6 +3991,7 @@ function applyInventoryEvent(event: InventoryEvent) {
     patchSummaryFromInventoryEvent(event);
     return;
   }
+  patchVmSearchCacheFromInventoryEvent(event);
   if (!inventoryEventMatchesSelectedHost(event)) return;
   if (event.type === "vm.patch") {
     patchVmRowById(event.vmId, event.patch);
@@ -3487,16 +4034,57 @@ function patchHostFromInventoryEvent(event: Extract<InventoryEvent, { type: "hos
 function patchSummaryFromInventoryEvent(event: Extract<InventoryEvent, { type: "summary.patch" }>) {
   if (inventoryEventMatchesSelectedHost(event)) {
     vmSummary.value = event.summary;
+    if (event.resourceCapacity) selectedResourceCapacity.value = event.resourceCapacity;
   }
   hostOverviewRows.value = hostOverviewRows.value.map((row) =>
     overviewRowMatchesEvent(row, event)
       ? {
           ...row,
           summary: event.summary,
+          resourceCapacity: event.resourceCapacity ?? row.resourceCapacity,
           status: "ready",
         }
       : row,
   );
+}
+
+function patchVmSearchCacheFromInventoryEvent(
+  event: Extract<InventoryEvent, { type: "vm.patch" | "vm.upsert" | "vm.delete" }>,
+) {
+  const nextCache = { ...vmSearchCache.value };
+  let changed = false;
+  for (const row of hostOverviewRows.value) {
+    if (!overviewConnectionMatchesEvent(row, event)) continue;
+    const cache = nextCache[row.key];
+    if (!cache) continue;
+    const vmId = event.type === "vm.upsert" ? event.vm.providerId || event.vm.id : event.vmId;
+    let items = cache.items.filter((item) => item.providerId !== vmId);
+    if (event.type === "vm.upsert" && overviewRowMatchesEvent(row, event)) {
+      items = [
+        ...items,
+        {
+          providerId: event.vm.providerId,
+          hostId: event.vm.hostId ?? event.hostId,
+          name: event.vm.name,
+          ipAddresses: event.vm.ipAddresses,
+        },
+      ];
+    } else if (event.type === "vm.patch") {
+      const existing = cache.items.find((item) => item.providerId === vmId);
+      if (existing) {
+        const patched = {
+          ...existing,
+          hostId: event.patch.hostId ?? existing.hostId,
+          name: event.patch.name ?? existing.name,
+          ipAddresses: event.patch.ipAddresses ?? existing.ipAddresses,
+        };
+        if (!patched.hostId || patched.hostId === row.host.providerId || patched.hostId === row.host.id) items = [...items, patched];
+      }
+    }
+    nextCache[row.key] = { ...cache, items, updatedAt: Date.now(), loading: false };
+    changed = true;
+  }
+  if (changed) vmSearchCache.value = nextCache;
 }
 
 function hostMatchesEvent(host: HostNodeItem, event: Pick<InventoryEvent, "hostId">) {
@@ -3504,9 +4092,13 @@ function hostMatchesEvent(host: HostNodeItem, event: Pick<InventoryEvent, "hostI
 }
 
 function overviewRowMatchesEvent(row: HostOverviewRow, event: Pick<InventoryEvent, "connectionId" | "providerType" | "hostId">) {
-  if (event.connectionId && row.connection.id !== event.connectionId) return false;
-  if (row.connection.providerType !== event.providerType) return false;
+  if (!overviewConnectionMatchesEvent(row, event)) return false;
   return !event.hostId || row.host.providerId === event.hostId || row.host.id === event.hostId;
+}
+
+function overviewConnectionMatchesEvent(row: HostOverviewRow, event: Pick<InventoryEvent, "connectionId" | "providerType">) {
+  if (event.connectionId && row.connection.id !== event.connectionId) return false;
+  return row.connection.providerType === event.providerType;
 }
 
 async function pollProvisioningTask(taskId: string) {
@@ -3613,9 +4205,20 @@ async function applyProvisioningTaskUpdate(task: ProvisionTask) {
     syncSelectedOverviewRowAfterVmChange();
   }
   if (task.status === "failed") {
+    if (provisionTasksStoppedByVmDelete.delete(task.id)) {
+      provisioningSubmitting.value = false;
+      provisioningTaskPayloads.delete(task.id);
+      return;
+    }
     setErrorMessage(task.message);
     provisioningSubmitting.value = false;
     provisioningTaskPayloads.delete(task.id);
+  }
+}
+
+function rememberProvisionTasksStoppedByVmDelete(response: Pick<VmActionResponse, "stoppedProvisionTaskIds">) {
+  for (const taskId of response.stoppedProvisionTaskIds ?? []) {
+    provisionTasksStoppedByVmDelete.add(taskId);
   }
 }
 
@@ -3660,6 +4263,7 @@ function openCreatedVmConsole(created: VmProvisionCreatedVm) {
       connectionId: selectedConnectionId.value,
       hostId: selectedHost.value?.providerId,
       providerId: created.providerId,
+      consoleRef: created.providerId,
       name: created.name,
       powerState: created.powerState,
       cpuCount: 0,
@@ -3668,7 +4272,6 @@ function openCreatedVmConsole(created: VmProvisionCreatedVm) {
       toolsStatus: "unknown",
       reclaimLevel: "KEEP",
       reclaimReason: "新建虚拟机",
-      metadata: connection.providerType === "vmware" ? { managedObjectId: created.providerId } : undefined,
     };
   const target = resolveVmConsoleTarget({
     connection: {
@@ -3704,6 +4307,7 @@ function resolveProvisionTaskVmConsoleTarget(taskVm: ProvisionTask["vms"][number
       connectionId: selectedConnectionId.value,
       hostId: selectedHost.value?.providerId,
       providerId,
+      consoleRef: providerId,
       name: taskVm.name,
       powerState: inferredPowerState,
       cpuCount: 0,
@@ -3712,9 +4316,8 @@ function resolveProvisionTaskVmConsoleTarget(taskVm: ProvisionTask["vms"][number
       toolsStatus: "unknown",
       reclaimLevel: "KEEP",
       reclaimReason: "新建虚拟机",
-      metadata: connection.providerType === "vmware" ? { managedObjectId: providerId } : undefined,
     };
-  return resolveVmConsoleTarget({
+  const context = {
     connection: {
       id: selectedConnectionId.value,
       providerType: connection.providerType,
@@ -3726,7 +4329,15 @@ function resolveProvisionTaskVmConsoleTarget(taskVm: ProvisionTask["vms"][number
     vm: consoleVm,
     hostName: selectedHost.value?.name,
     hostAddress: selectedHost.value?.address,
-  });
+  };
+  return shouldUseProvisionGraphConsole(taskVm)
+    ? resolveVmGraphConsoleTarget(context) ?? resolveVmConsoleTarget(context)
+    : resolveVmConsoleTarget(context);
+}
+
+function shouldUseProvisionGraphConsole(taskVm: ProvisionTask["vms"][number]) {
+  if (taskVm.status === "success" && taskVm.currentStep === "complete") return false;
+  return taskVm.status === "pending" || taskVm.status === "running" || taskVm.status === "failed" || taskVm.currentStep !== "complete";
 }
 
 function openProvisionTaskConsole(task: ProvisionTask, notifyIfUnavailable = true) {
@@ -3826,8 +4437,9 @@ function openVmScheduleCreate(rows: VmNode[]) {
 }
 
 function openVmRename(vm: VmNode) {
-  if (connection.providerType === "libvirt") {
-    showToast("warning", "KVM/libvirt 当前版本暂不支持虚拟机改名");
+  const capability = selectedProviderDescriptor.value?.capabilities.vmRename;
+  if (!capability?.supported) {
+    showToast("warning", capability?.message || "当前平台暂不支持虚拟机改名");
     return;
   }
   vmRenameTarget.value = vm;
@@ -3882,7 +4494,15 @@ async function handleVmRename(payload: { vm: VmNode; newName: string }) {
 }
 
 function openVmResize(vm: VmNode) {
-  if (connection.providerType === "libvirt") return;
+  const capability = selectedProviderDescriptor.value?.capabilities.vmResize;
+  if (!capability?.supported) {
+    showToast("warning", capability?.message || "当前平台暂不支持虚拟机扩容");
+    return;
+  }
+  if (vm.powerState !== "running") {
+    showToast("warning", "虚拟机已关机，请先开机后再扩容");
+    return;
+  }
   vmResizeTarget.value = vm;
   vmResizeDisks.value = [];
   vmResizeGuestStorage.value = null;
@@ -3911,29 +4531,26 @@ async function loadVmResizeDisks(vm: VmNode) {
   }
 }
 
-async function loadVmResizeGuestStorage(vm: VmNode) {
+async function loadVmResizeGuestStorage(vm: VmNode, systemCredentials?: VmSystemCredentials, rememberSystemCredentials = false) {
   const connectionPayload = buildConnectionPayload();
   if (!connectionPayload) return;
-  const vmIp = vm.ipAddresses.find((ip) => isIpv4(ip));
   vmResizeGuestStorage.value = null;
   vmResizeGuestStorageError.value = "";
-  if (!vmIp) {
-    vmResizeGuestStorageError.value = "未读取到 Guest IPv4，无法自动扩展分区和文件系统";
-    return;
-  }
   vmResizeLoadingGuestStorage.value = true;
   try {
     const response = await postJson<GuestStorageResponse>("/api/inventory/vm-guest-storage", {
       ...connectionPayload,
       vmId: vm.providerId,
-      vmIp,
+      systemCredentials,
+      rememberSystemCredentials,
     });
     if (vmResizeTarget.value?.providerId === vm.providerId) {
       vmResizeGuestStorage.value = response.inventory;
+      vmResizeGuestStorageError.value = response.inventory.supported ? "" : response.inventory.message;
     }
   } catch (error) {
     if (vmResizeTarget.value?.providerId === vm.providerId) {
-      vmResizeGuestStorageError.value = error instanceof Error ? error.message : "读取 Guest 磁盘与目录失败";
+      vmResizeGuestStorageError.value = error instanceof Error ? error.message : "读取虚拟机系统磁盘与目录失败";
     }
   } finally {
     vmResizeLoadingGuestStorage.value = false;
@@ -3950,12 +4567,12 @@ async function handleVmResize(request: VmResizeRequest) {
   try {
     await confirmVrcAction({
       heading: "确认扩容",
-      tone: request.allowShutdown ? "停机变更" : "在线变更",
+      tone: "资源变更",
       summary: target,
       detail: [
         ...changes,
-        request.allowShutdown ? "执行顺序：正常关机 → 修改配置 → 自动开机 → 回读状态" : "执行期间虚拟机保持运行，并持续回读平台状态。",
-        request.guestStorage ? `Guest 自动生效：${request.guestStorage.mountPath}` : "本次不包含 Guest 文件系统调整。",
+        "后端将按平台能力选择在线执行，或正常关机后修改并自动恢复运行。",
+        request.storageTarget ? `系统内容量生效目录：${request.storageTarget.mountPath}` : "本次不包含操作系统文件系统调整。",
         "扩容只允许增加，磁盘与文件系统扩展后不能通过 VRC 缩小。",
       ].join("\n"),
       confirmButtonText: "确认扩容",
@@ -3994,15 +4611,15 @@ async function handleVmResize(request: VmResizeRequest) {
       powerState: response.result.restarted ? "running" : vm.powerState,
     });
     vmResizeDisks.value = response.result.disks;
-    const guestStorageFailed = response.result.guestStorage?.status === "failed";
-    showToast(guestStorageFailed ? "warning" : "success", response.result.message);
-    void loadVms({ silent: true, background: true, forceRefresh: true });
-    pushActivity(guestStorageFailed ? "虚拟硬件已扩容，Guest 生效失败" : "虚拟机扩容完成", {
+    const storageFailed = response.result.storage?.status === "failed";
+    showToast(storageFailed ? "warning" : "success", response.result.message);
+    void refreshVmRowQuietly(updatedVm, { attempts: 2, intervalMs: 800 });
+    pushActivity(storageFailed ? "虚拟硬件已扩容，系统内容量生效失败" : "虚拟机扩容完成", {
       target,
-      detail: `${changes.join("；")}；${response.result.guestStorage?.message || (response.result.restarted ? "已自动开机" : "在线完成")}`,
-      status: guestStorageFailed ? "error" : "success",
+      detail: `${changes.join("；")}；${response.result.storage?.message || (response.result.restarted ? "已自动开机" : "在线完成")}`,
+      status: storageFailed ? "error" : "success",
     });
-    if (guestStorageFailed) {
+    if (storageFailed) {
       await Promise.all([loadVmResizeDisks(vm), loadVmResizeGuestStorage(vm)]);
       return;
     }
@@ -4034,7 +4651,7 @@ function describeVmResizeChanges(vm: VmNode, request: VmResizeRequest) {
       changes.push(`磁盘：新增 ${formatBytes(request.disk.sizeBytes)}`);
     }
   }
-  if (request.guestStorage) changes.push(`Guest：自动生效至 ${request.guestStorage.mountPath}`);
+  if (request.storageTarget) changes.push(`操作系统：自动生效至 ${request.storageTarget.mountPath}`);
   return changes;
 }
 
@@ -4115,6 +4732,7 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
     status: "pending",
   });
   try {
+    let changedVm: VmNode | null = null;
     const response = await postJson<VmActionResponse>("/api/vms/action", {
       ...payload,
       vmId: vm.providerId,
@@ -4125,16 +4743,22 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
     if (!response.result.accepted) {
       throw new Error(response.result.message || `VM ${meta.label}请求未被平台接受`);
     }
+    if (action === "delete") {
+      rememberProvisionTasksStoppedByVmDelete(response);
+    }
     if (action === "start") {
       const runningVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+      changedVm = runningVm;
       setVmActionState(runningVm, { action, status: "success", message: "已开机" });
       openConsoleAfterStart(runningVm);
     } else if (action === "forceReboot") {
       const runningVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+      changedVm = runningVm;
       setVmActionState(runningVm, { action, status: "success", message: "已重启" });
       openConsoleAfterForceReboot(runningVm);
     } else if (action === "shutdown") {
       const haltedVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+      changedVm = haltedVm;
       setVmActionState(haltedVm, { action, status: "success", message: "已关机" });
     } else {
       successMessage.value = response.result.message;
@@ -4143,7 +4767,9 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
     }
     await refreshSelectedHostResources(action, resourceBaseline);
     resetVmOperationState();
-    await loadVms({ silent: true, background: true, forceRefresh: true });
+    if (changedVm) {
+      void refreshVmRowQuietly(changedVm, { expectedPowerState: expectedPowerStateForAction(action), attempts: 3, intervalMs: 800 });
+    }
     pushActivity(`${meta.label}完成`, {
       target: vmTarget,
       detail: vmActionCompleteMessage(action),
@@ -4237,6 +4863,7 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
   });
 
   const failed: string[] = [];
+  const changedVms: VmNode[] = [];
   let successCount = 0;
   for (const vm of actionableRows) {
     try {
@@ -4255,14 +4882,20 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
       if (!response.result.accepted) {
         throw new Error(response.result.message || `VM ${meta.label}请求未被平台接受`);
       }
+      if (action === "delete") {
+        rememberProvisionTasksStoppedByVmDelete(response);
+      }
       if (action === "start") {
         const runningVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+        changedVms.push(runningVm);
         setVmActionState(runningVm, { action, status: "success", message: "已开机" });
       } else if (action === "forceReboot") {
         const runningVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+        changedVms.push(runningVm);
         setVmActionState(runningVm, { action, status: "success", message: "已重启" });
       } else if (action === "shutdown") {
         const haltedVm = patchVmRow(vm, vmPowerActionRowPatch(action, response.operatedAt));
+        changedVms.push(haltedVm);
         setVmActionState(haltedVm, { action, status: "success", message: "已关机" });
       } else {
         removeVmRow(vm);
@@ -4286,7 +4919,9 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
   if (successCount > 0) {
     await refreshSelectedHostResources(action, resourceBaseline);
     resetVmOperationState();
-    await loadVms({ silent: true, background: true, forceRefresh: true });
+    if (action !== "delete") {
+      void Promise.all(changedVms.map((vm) => refreshVmRowQuietly(vm, { expectedPowerState: expectedPowerStateForAction(action), attempts: 2, intervalMs: 900 })));
+    }
   }
 
   const summary = `批量${meta.label}完成：成功 ${successCount} 台，失败 ${failed.length} 台`;
@@ -4449,6 +5084,18 @@ async function refreshVmRow(vm: VmNode, options: RefreshVmRowOptions = {}): Prom
   return vm;
 }
 
+async function refreshVmRowQuietly(vm: VmNode, options: RefreshVmRowOptions = {}) {
+  try {
+    await refreshVmRow(vm, options);
+  } catch (error) {
+    pushActivity("VM 行刷新未完成", {
+      target: vm.name,
+      detail: error instanceof Error ? error.message : "请手动刷新列表核对最新状态",
+      status: "warning",
+    });
+  }
+}
+
 function isSameVm(left: VmNode, right: VmNode) {
   return left.providerId === right.providerId || left.id === right.id;
 }
@@ -4463,6 +5110,12 @@ function powerStateDoneLabel(state: PowerState) {
   if (state === "halted" || state === "stopped") return "关机";
   if (state === "suspended") return "暂停";
   return "目标状态";
+}
+
+function expectedPowerStateForAction(action: VmPowerAction): PowerState | undefined {
+  if (action === "start" || action === "forceReboot") return "running";
+  if (action === "shutdown") return "halted";
+  return undefined;
 }
 
 function vmActionCompleteMessage(action: VmPowerAction) {
@@ -4603,6 +5256,7 @@ async function refreshSelectedHostResources(action: VmPowerAction, baseline: Hos
 
       inventory.value = hostInventory;
       vmSummary.value = summaryResult.summary;
+      selectedResourceCapacity.value = summaryResult.resourceCapacity ?? null;
       const overviewConnectionId = selectedConnectionId.value;
       hostOverviewRows.value = hostOverviewRows.value.map((row) => {
         const sameConnection = !overviewConnectionId || row.connection.id === overviewConnectionId;
@@ -4670,6 +5324,7 @@ function createFallbackOverviewRow(connectionItem: StoredConnectionSummary, stat
     },
     host,
     summary: null,
+    resourceCapacity: null,
     status,
     error,
   };
@@ -4881,10 +5536,14 @@ function normalizeOverviewSearchInput(value: string) {
     .toLowerCase();
 }
 
-function parseOverviewSearchKeywords(value: string) {
+function parseSearchKeywords(value: string) {
   const normalized = normalizeOverviewSearchInput(value);
   if (!normalized) return [];
   return Array.from(new Set(normalized.split(" ").filter(Boolean)));
+}
+
+function parseOverviewSearchKeywords(value: string) {
+  return parseSearchKeywords(value);
 }
 
 function normalizeHostOverviewSearch() {
@@ -4914,6 +5573,14 @@ function vmSearchMatches(row: HostOverviewRow) {
   return cache.items.filter((vm) => keywords.some((keyword) => vmMatchesOverviewKeyword(vm, row, keyword)));
 }
 
+function overviewVmSearchMatchedKeywords(row: HostOverviewRow) {
+  const keywords = overviewSearchKeywords.value.filter(shouldSearchVmIp);
+  if (!keywords.length) return [];
+  const cache = vmSearchCache.value[row.key];
+  if (!cache?.items.length) return [];
+  return keywords.filter((keyword) => cache.items.some((vm) => vmMatchesOverviewKeyword(vm, row, keyword)));
+}
+
 function vmSearchMatchSummary(row: HostOverviewRow) {
   const matches = vmSearchMatches(row);
   if (!matches.length) return "";
@@ -4923,22 +5590,22 @@ function vmSearchMatchSummary(row: HostOverviewRow) {
   return `VM 命中：${ip} · ${first.name}${more}`;
 }
 
-function vmMatchesOverviewKeyword(vm: VmNode, row: HostOverviewRow, keyword: string) {
+function vmMatchesOverviewKeyword(vm: VmSearchIndexItem, row: HostOverviewRow, keyword: string) {
   return vmMatchesKeyword(vm, row.host.address, keyword);
 }
 
 function hostMatchesKeyword(row: HostOverviewRow, keyword: string) {
-  const textFields = [row.connection.name, row.host.name].join(" ").toLowerCase();
-  if (textFields.includes(keyword)) return true;
+  const textFields = [row.connection.name, row.host.name].map((item) => item.toLowerCase()).filter(Boolean);
+  if (hostOverviewMatchMode.value === "exact" ? textFields.includes(keyword) : textFields.some((item) => item.includes(keyword))) return true;
   const hostIps = [row.connection.host, row.host.address].map((item) => item.toLowerCase()).filter(Boolean);
   return hostOverviewMatchMode.value === "exact" ? hostIps.includes(keyword) : hostIps.some((ip) => ip.includes(keyword));
 }
 
-function vmMatchesKeyword(vm: VmNode, hostIp: string | undefined, keyword: string) {
-  const textFields = [vm.name, vm.providerId, vm.guestOs ?? ""].join(" ").toLowerCase();
-  if (textFields.includes(keyword)) return true;
+function vmMatchesKeyword(vm: { name: string; providerId: string; guestOs?: string; ipAddresses: string[] }, hostIp: string | undefined, keyword: string, matchMode: "exact" | "fuzzy" = hostOverviewMatchMode.value) {
+  const textFields = [vm.name, vm.providerId, vm.guestOs ?? ""].map((item) => item.toLowerCase()).filter(Boolean);
+  if (matchMode === "exact" ? textFields.includes(keyword) : textFields.some((item) => item.includes(keyword))) return true;
   const ips = vm.ipAddresses.map((item) => item.toLowerCase()).filter(Boolean);
-  return hostOverviewMatchMode.value === "exact" ? ips.includes(keyword) : ips.some((ip) => ip.includes(keyword));
+  return matchMode === "exact" ? ips.includes(keyword) : ips.some((ip) => ip.includes(keyword));
 }
 
 function shouldSearchVmIp(keyword: string) {
@@ -5096,43 +5763,6 @@ function setConnectionSuccessMessage(message: string) {
   setSuccessMessage(message);
 }
 
-interface VrcConfirmActionOptions {
-  heading: string;
-  tone: string;
-  summary?: string;
-  detail?: string;
-  confirmButtonText: string;
-  cancelButtonText?: string;
-  customClass?: string;
-}
-
-function confirmVrcAction(options: VrcConfirmActionOptions) {
-  return ElMessageBox.confirm(renderVrcConfirmAction(options), "", {
-    confirmButtonText: options.confirmButtonText,
-    cancelButtonText: options.cancelButtonText ?? "取消",
-    customClass: normalizeVrcConfirmClass(options.customClass),
-    distinguishCancelAndClose: true,
-    closeOnClickModal: false,
-    showClose: false,
-  });
-}
-
-function normalizeVrcConfirmClass(customClass?: string) {
-  const classes = (customClass ?? "").split(/\s+/).filter(Boolean);
-  if (!classes.includes("vrc-confirm-message-box")) {
-    classes.unshift("vrc-confirm-message-box");
-  }
-  return classes.join(" ");
-}
-
-function renderVrcConfirmAction(options: VrcConfirmActionOptions) {
-  return h("section", { class: "vrc-confirm-card" }, [
-    h("div", { class: "vrc-confirm-head" }, [h("strong", options.heading), h("span", options.tone)]),
-    options.summary ? h("p", { class: "vrc-confirm-summary" }, options.summary) : null,
-    options.detail ? h("p", { class: "vrc-confirm-detail" }, options.detail) : null,
-  ]);
-}
-
 function showToast(type: "success" | "error" | "warning" | "info", message: string) {
   ElMessage[type]({
     message,
@@ -5204,6 +5834,39 @@ function formatActivityTime() {
   return new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }
 
+function maintenanceIsoDecisionLabel(item: MaintenanceGeneratedIsoEntry) {
+  if (item.decision === "eligible") return "可清理";
+  if (item.decision === "retained") return "暂保留";
+  if (item.decision === "cleaned") return "已清理";
+  if (item.decision === "failed") return "清理失败";
+  return item.reason.includes("任务仍在执行") ? "任务进行中" : "需检查";
+}
+
+function maintenanceIsoStatusLabel(status: MaintenanceGeneratedIsoEntry["status"]) {
+  const labels: Record<MaintenanceGeneratedIsoEntry["status"], string> = {
+    creating: "创建中",
+    uploaded: "已上传",
+    attached: "已挂载",
+    installed: "安装完成",
+    failed: "任务失败",
+    deleted: "已删除",
+  };
+  return labels[status];
+}
+
+function formatMaintenanceIsoDate(value: string) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "-";
+  return date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
 function activityStatusLabel(status: ActivityEntry["status"] | "all") {
   const labels = {
     all: "全部",
@@ -5250,7 +5913,7 @@ function displayVmIp(vm: VmNode) {
   return displayVmIpForHost(vm, selectedHost.value?.address);
 }
 
-function displayVmIpForHost(vm: VmNode, hostIp?: string) {
+function displayVmIpForHost(vm: { ipAddresses: string[] }, hostIp?: string) {
   return vm.ipAddresses[0] || "-";
 }
 
@@ -5301,10 +5964,7 @@ function canRunVmAction(action: VmPowerAction, vm: VmNode) {
 }
 
 function providerLabel(value: ProviderType) {
-  if (value === "xenserver") return "XenServer";
-  if (value === "vmware") return "VMware";
-  if (value === "proxmox") return "Proxmox VE";
-  return "KVM/libvirt";
+  return providerDescriptorFor(value)?.label ?? getProviderBrand(value).resourceName;
 }
 
 function vmActionMeta(action: VmPowerAction) {
@@ -5372,8 +6032,11 @@ function isIpv4(value: string | undefined) {
 }
 
 function defaultPortForProvider(value: ProviderType) {
-  if (value === "proxmox") return 8006;
-  return value === "vmware" ? 443 : 22;
+  return providerBootstrapPorts[value];
+}
+
+function providerDescriptorFor(value: ProviderType) {
+  return providerDescriptors.value.find((item) => item.type === value);
 }
 
 function normalizePort(value: unknown, providerType: ProviderType) {
@@ -5398,6 +6061,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
         </div>
         <button class="icon-button settings-entry-button" :class="{ active: isSettingsNavActive }" title="设置" aria-label="设置" @click="openSettingsWorkspace">
           <el-icon><Setting /></el-icon>
+          <i v-if="hasPendingDesktopUpdate" class="settings-update-dot" aria-hidden="true"></i>
         </button>
       </div>
 
@@ -5408,7 +6072,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
       <div class="connection-groups">
         <section v-if="filteredStoredConnections.length" class="connection-group overview-group">
           <button class="overview-entry" :class="{ active: isOverviewNavActive }" @click="loadHostOverview()">
-            <span class="overview-entry-icon">↗</span>
+            <span class="overview-entry-icon" aria-hidden="true"><VrcToolbarIcon name="overview" /></span>
             <span class="overview-entry-main">
               <strong>资源总览</strong>
               <small>查看全部物理机</small>
@@ -5434,6 +6098,9 @@ function normalizePort(value: unknown, providerType: ProviderType) {
             <span class="connection-port">{{ item.port }}</span>
           </button>
         </section>
+        <div v-if="storedConnections.length && connectionSearch.trim() && !filteredStoredConnections.length" class="sidebar-search-empty" role="status">
+          未找到匹配连接
+        </div>
         <div v-if="!storedConnections.length" class="sidebar-empty">
           <strong>还没有连接</strong>
           <span>在右侧填写账号后保存，之后可直接加载资源清单。</span>
@@ -5449,13 +6116,14 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           </span>
         </div>
         <div class="activity-list">
-          <div
+          <button
             v-for="item in activityEntries"
             :key="item.id"
+            type="button"
             class="activity-line"
             :class="`status-${item.status}`"
             :title="activityFullText(item)"
-            @dblclick="activityLogVisible = true"
+            @click="activityLogVisible = true"
           >
             <div class="activity-line-main">
               <time>{{ item.time }}</time>
@@ -5465,7 +6133,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               <span v-if="item.target">{{ item.target }}</span>
               <span v-if="item.detail">{{ item.detail }}</span>
             </div>
-          </div>
+          </button>
         </div>
       </section>
       <button v-else class="activity-toggle" title="查看操作记录" @click="showActivityPanel = true">
@@ -5482,9 +6150,18 @@ function normalizePort(value: unknown, providerType: ProviderType) {
       :class="{
         'is-settings-mode': workspaceMode === 'settings',
         'has-custom-background': uiPreferences.backgroundMode !== 'default',
+        'has-security-watermark': uiPreferences.consoleWatermarkEnabled && uiPreferences.consoleWatermarkScope === 'workspace',
       }"
       :style="workspaceAppearanceStyle"
     >
+      <div
+        v-if="uiPreferences.consoleWatermarkEnabled && uiPreferences.consoleWatermarkScope === 'workspace'"
+        class="workspace-security-watermark"
+        :style="{ '--workspace-watermark-opacity': String(uiPreferences.consoleWatermarkOpacity / 100) }"
+        aria-hidden="true"
+      >
+        <span v-for="index in consoleWatermarkCopies" :key="index">{{ consoleWatermarkText }}</span>
+      </div>
 
       <section v-if="workspaceMode === 'connection' && loadingHosts && !inventory && !hostOverviewRows.length && !loadingHostOverview" class="panel loading-panel">
         <div class="resource-loading-card" :class="`platform-${selectedConnectionBrand.type}`">
@@ -5509,11 +6186,11 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           v-model:search="search"
           v-model:power-filter="vmPowerFilter"
           :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username, password: persistentConnectionsEnabled ? undefined : connection.password }"
+          :provider-descriptor="selectedProviderDescriptor"
           :host="selectedHost"
           :network-count="selectedHostNetworks.length"
           :resource-summary="resourceSummary"
-          :host-memory-percent="hostUsage.memoryPercent"
-          :storage-totals="storageTotals"
+          :resource-capacity="selectedResourceCapacity"
           :vm-totals="vmTotals"
           :has-vm-summary="!!vmSummary"
           :loading-vm-summary="loadingVmSummary"
@@ -5521,13 +6198,14 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           :vms-total="vms?.total ?? 0"
           :selected-vm-ids="selectedVmIds"
           :vm-action-states="vmActionStates"
+          :provisioning-console-vm-ids="activeProvisioningConsoleVmIds"
           :loading-vms="loadingVms"
-          :allow-vm-rename="connection.providerType !== 'libvirt'"
+          :show-icon-tooltips="uiPreferences.showIconTooltips"
           variant="page"
           table-height="100%"
           table-panel-class="single-table-panel"
           @search-change="loadVms"
-          @refresh="loadVms({ forceRefresh: true })"
+          @refresh="refreshVmPanelResources"
           @export="exportCsv"
           @host-detail="hostDetailVisible = true"
           @storage-detail="storageDetailVisible = true"
@@ -5588,7 +6266,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
             />
           </div>
           <div class="overview-action-group" aria-label="总览列表动作">
-            <el-tooltip content="定时任务：跨物理机搜索并选择虚拟机" placement="top">
+            <el-tooltip content="定时任务：跨物理机搜索并选择虚拟机" placement="top" :disabled="!uiPreferences.showIconTooltips">
               <span class="toolbar-tooltip-target">
                 <button
                   type="button"
@@ -5600,7 +6278,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 </button>
               </span>
             </el-tooltip>
-            <el-tooltip content="导出物理机总览：下载当前筛选结果 CSV" placement="top">
+            <el-tooltip content="导出物理机总览：下载当前筛选结果 CSV" placement="top" :disabled="!uiPreferences.showIconTooltips">
               <span class="toolbar-tooltip-target">
                 <button
                   type="button"
@@ -5613,7 +6291,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 </button>
               </span>
             </el-tooltip>
-            <el-tooltip content="刷新总览：重新读取全部保存连接的物理机资源" placement="top">
+            <el-tooltip content="刷新总览：重新读取全部保存连接的物理机资源" placement="top" :disabled="!uiPreferences.showIconTooltips">
               <span class="toolbar-tooltip-target">
                 <button
                   type="button"
@@ -5774,6 +6452,11 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               <el-icon><Setting /></el-icon>
               <span>Chrome 插件</span>
             </button>
+            <button type="button" :class="{ active: settingsPanel === 'updates' }" @click="settingsPanel = 'updates'">
+              <el-icon><Download /></el-icon>
+              <span>更新</span>
+              <i v-if="hasPendingDesktopUpdate" class="settings-update-dot nav-dot" aria-hidden="true"></i>
+            </button>
             <button type="button" :class="{ active: settingsPanel === 'maintenance' }" @click="settingsPanel = 'maintenance'">
               <el-icon><Setting /></el-icon>
               <span>维护</span>
@@ -5785,32 +6468,59 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           </aside>
 
           <section v-if="settingsPanel === 'appearance'" class="settings-workspace-content">
-            <section class="settings-card">
+            <section class="settings-card appearance-theme-card">
               <div class="settings-card-head">
                 <div>
-                  <strong>主题</strong>
+                  <strong>框架主题</strong>
                   <span>选择后全局应用，背景、surface、表格、弹窗、loading、toast 和图表都跟随主题。</span>
                 </div>
               </div>
-              <div class="settings-theme-card-grid">
-                <button
-                  v-for="theme in themeOptions"
-                  :key="theme.value"
-                  type="button"
-                  class="settings-theme-card"
-                  :class="{ active: currentTheme === theme.value }"
-                  :aria-pressed="currentTheme === theme.value"
-                  @click="applyTheme(theme.value)"
-                >
-                  <span class="settings-theme-card-head">
-                    <strong>{{ theme.name }}</strong>
-                    <small>{{ theme.tone }}</small>
-                  </span>
-                  <span class="theme-swatch" aria-hidden="true">
-                    <i v-for="color in theme.colors" :key="color" :style="{ background: color }"></i>
-                  </span>
-                  <span>{{ theme.description }}</span>
-                </button>
+              <div class="appearance-theme-layout">
+                <div class="settings-theme-card-grid appearance-theme-card-grid">
+                  <button
+                    v-for="theme in themeOptions"
+                    :key="theme.value"
+                    type="button"
+                    class="settings-theme-card"
+                    :class="{ active: currentTheme === theme.value }"
+                    :aria-pressed="currentTheme === theme.value"
+                    @click="applyTheme(theme.value)"
+                  >
+                    <span class="settings-theme-card-head">
+                      <strong>{{ theme.name }}</strong>
+                      <small>{{ currentTheme === theme.value ? "当前" : theme.tone }}</small>
+                    </span>
+                    <span class="theme-swatch" aria-hidden="true">
+                      <i v-for="color in theme.colors" :key="color" :style="{ background: color }"></i>
+                    </span>
+                    <span>{{ theme.description }}</span>
+                  </button>
+                </div>
+
+                <aside class="appearance-theme-summary" aria-label="当前外观摘要">
+                  <div class="appearance-theme-summary-head">
+                    <span>当前方案</span>
+                    <strong>{{ currentAppearanceTheme.name }}</strong>
+                    <small>{{ currentAppearanceTheme.description }}</small>
+                  </div>
+                  <div class="appearance-theme-summary-swatches" aria-hidden="true">
+                    <i v-for="color in currentAppearanceTheme.colors" :key="color" :style="{ background: color }"></i>
+                  </div>
+                  <dl class="appearance-theme-summary-meta">
+                    <div>
+                      <dt>明暗模式</dt>
+                      <dd>{{ appearanceToneText }}</dd>
+                    </div>
+                    <div>
+                      <dt>工作区背景</dt>
+                      <dd>{{ appearanceBackgroundText }}</dd>
+                    </div>
+                    <div>
+                      <dt>强调色</dt>
+                      <dd>{{ uiPreferences.accentColor }}</dd>
+                    </div>
+                  </dl>
+                </aside>
               </div>
             </section>
 
@@ -5932,70 +6642,265 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </div>
             </section>
 
-            <section class="settings-tile-grid" aria-label="外观偏好">
+            <section class="settings-card appearance-reading-card">
+              <div class="settings-card-head">
+                <div>
+                  <strong>文字与阅读</strong>
+                  <span>统一界面文字层级，并保留适合高密度资源列表的稳定布局。</span>
+                </div>
+              </div>
+              <div class="appearance-reading-grid">
+                <div class="appearance-reading-controls">
+                  <div class="appearance-setting-row">
+                    <div><strong>界面字体</strong><span>使用本机已安装字体，缺失时自动回退系统字体。</span></div>
+                    <el-select
+                      v-model="uiPreferences.uiFontPreset"
+                      class="appearance-control-medium"
+                      aria-label="界面字体"
+                      @change="persistAppearancePreference('uiFontPreset')"
+                    >
+                      <el-option v-for="font in uiFontOptions" :key="font.value" :label="font.label" :value="font.value" />
+                    </el-select>
+                  </div>
+                  <div class="appearance-setting-row">
+                    <div><strong>文字大小</strong><span>只调整界面正文，表格与按钮尺寸保持规范。</span></div>
+                    <el-segmented
+                      v-model="uiPreferences.uiFontSize"
+                      class="appearance-size-segmented"
+                      :options="[{ label: '11', value: 11 }, { label: '12', value: 12 }, { label: '13', value: 13 }]"
+                      size="small"
+                      @change="updateUiPreference('uiFontSize', Number($event))"
+                    />
+                  </div>
+                  <div class="appearance-setting-row">
+                    <div><strong>减少动效</strong><span>降低弹窗、loading 和页面切换动画。</span></div>
+                    <el-switch
+                      :model-value="uiPreferences.reduceMotion"
+                      aria-label="减少界面动效"
+                      @change="updateUiPreference('reduceMotion', Boolean($event))"
+                    />
+                  </div>
+                </div>
+                <div class="appearance-reading-sample" :style="{ fontFamily: currentUiFont.family, fontSize: `${uiPreferences.uiFontSize}px` }">
+                  <span>资源列表预览</span>
+                  <strong>pve-production-01</strong>
+                  <small>CPU 24% · 内存 18.6 / 32 GiB · 运行中</small>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-card appearance-console-settings">
+              <div class="settings-card-head appearance-console-head">
+                <div>
+                  <strong>控制台外观</strong>
+                  <span>打开控制台时由目标策略选择 noVNC 或 xterm；这里预览并配置两类画面。</span>
+                </div>
+                <div class="appearance-console-head-actions">
+                  <el-segmented
+                    v-model="appearanceConsolePreviewMode"
+                    :options="[{ label: '图形控制台', value: 'graphical' }, { label: 'Linux CLI', value: 'cli' }]"
+                    size="small"
+                    aria-label="控制台预览对象"
+                  />
+                  <span class="appearance-preview-tag">{{ appearanceConsolePreviewMode === "cli" ? "xterm" : "noVNC / WebMKS" }}</span>
+                </div>
+              </div>
+
+              <div v-if="appearanceConsolePreviewMode === 'cli'" class="appearance-console-layout" :style="appearanceConsolePreviewStyle">
+                <div class="appearance-console-controls">
+                  <section class="appearance-setting-group">
+                    <div class="appearance-group-title"><strong>终端文字</strong><span>xterm.js · SSH / 串口通道</span></div>
+                    <div class="appearance-setting-row">
+                      <div><strong>字体</strong><span>使用系统或本机字体，不额外打包字体文件。</span></div>
+                      <el-select
+                        v-model="uiPreferences.consoleFontPreset"
+                        class="appearance-control-medium"
+                        aria-label="控制台字体"
+                        @change="persistAppearancePreference('consoleFontPreset')"
+                      >
+                        <el-option v-for="font in consoleFontOptions" :key="font.value" :label="font.label" :value="font.value" />
+                      </el-select>
+                    </div>
+                    <div class="appearance-setting-row">
+                      <div><strong>字号与行高</strong><span>{{ uiPreferences.consoleFontSize }}px / {{ uiPreferences.consoleLineHeight.toFixed(1) }}</span></div>
+                      <div class="appearance-number-pair">
+                        <el-input-number v-model="uiPreferences.consoleFontSize" :min="11" :max="18" controls-position="right" aria-label="控制台字号" @change="persistAppearanceNumber('consoleFontSize')" />
+                        <el-input-number v-model="uiPreferences.consoleLineHeight" :min="1.05" :max="1.6" :step="0.05" :precision="2" controls-position="right" aria-label="控制台行高" @change="persistAppearancePreference('consoleLineHeight')" />
+                      </div>
+                    </div>
+                    <div class="appearance-setting-row">
+                      <div><strong>光标</strong><span>{{ uiPreferences.consoleCursorBlink ? "闪烁" : "常亮" }}</span></div>
+                      <div class="appearance-console-cursor-control">
+                        <el-segmented
+                          v-model="uiPreferences.consoleCursorStyle"
+                          class="appearance-console-cursor-segmented"
+                          :options="[{ label: '块', value: 'block' }, { label: '线', value: 'bar' }, { label: '下划线', value: 'underline' }]"
+                          size="small"
+                          @change="persistAppearancePreference('consoleCursorStyle')"
+                        />
+                        <el-switch :model-value="uiPreferences.consoleCursorBlink" aria-label="控制台光标闪烁" @change="updateUiPreference('consoleCursorBlink', Boolean($event))" />
+                      </div>
+                    </div>
+                    <div class="appearance-palette-field">
+                      <div class="appearance-palette-field-head">
+                        <div><strong>终端配色</strong><span>配色只作用于 xterm，终端背景保持纯色。</span></div>
+                      </div>
+                      <div class="appearance-console-palettes" role="group" aria-label="控制台配色">
+                        <button
+                          v-for="theme in consoleThemeOptions"
+                          :key="theme.value"
+                          type="button"
+                          :class="{ active: uiPreferences.consoleTheme === theme.value }"
+                          :aria-label="`使用 ${theme.label} 控制台配色`"
+                          :aria-pressed="uiPreferences.consoleTheme === theme.value"
+                          @click="updateUiPreference('consoleTheme', theme.value)"
+                        >
+                          <span class="appearance-palette-gradient" :style="{ background: `linear-gradient(115deg, ${theme.swatches.join(', ')})` }"></span>
+                          <span class="appearance-palette-name"><strong>{{ theme.label }}</strong><small>{{ theme.source }}</small></span>
+                        </button>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section class="appearance-setting-group appearance-watermark-group">
+                    <div class="appearance-group-title"><strong>安全水印</strong><span>{{ uiPreferences.consoleWatermarkEnabled ? "已启用" : "未启用" }}</span></div>
+                    <div class="appearance-setting-row">
+                      <div><strong>显示水印</strong><span>操作用户、来源地址与时间。</span></div>
+                      <el-switch :model-value="uiPreferences.consoleWatermarkEnabled" aria-label="显示安全水印" @change="updateUiPreference('consoleWatermarkEnabled', Boolean($event))" />
+                    </div>
+                    <div v-if="uiPreferences.consoleWatermarkEnabled" class="appearance-setting-row">
+                      <div><strong>作用范围</strong><span>控制台或整个工作区。</span></div>
+                      <el-segmented
+                        v-model="uiPreferences.consoleWatermarkScope"
+                        :options="[{ label: '控制台', value: 'console' }, { label: '工作区', value: 'workspace' }]"
+                        size="small"
+                        @change="persistAppearancePreference('consoleWatermarkScope')"
+                      />
+                    </div>
+                    <div v-if="uiPreferences.consoleWatermarkEnabled" class="appearance-setting-row">
+                      <div><strong>密度</strong><span>避免遮挡关键内容。</span></div>
+                      <el-segmented
+                        v-model="uiPreferences.consoleWatermarkDensity"
+                        class="appearance-watermark-density-segmented"
+                        :options="[{ label: '疏', value: 'sparse' }, { label: '标准', value: 'standard' }, { label: '密', value: 'dense' }]"
+                        size="small"
+                        @change="persistAppearancePreference('consoleWatermarkDensity')"
+                      />
+                    </div>
+                    <div v-if="uiPreferences.consoleWatermarkEnabled" class="appearance-watermark-slider">
+                      <span>透明度</span>
+                      <el-slider v-model="uiPreferences.consoleWatermarkOpacity" :min="6" :max="24" :show-tooltip="false" @change="persistAppearanceNumber('consoleWatermarkOpacity')" />
+                      <strong>{{ uiPreferences.consoleWatermarkOpacity }}%</strong>
+                    </div>
+                  </section>
+                </div>
+
+                <div class="appearance-console-preview" aria-label="Linux CLI 样式预览">
+                  <div class="appearance-console-preview-toolbar"><span>centos-stream-9</span><small>xterm · 策略命中后使用</small></div>
+                  <div class="appearance-terminal-content">
+                    <span class="muted">Last login: Tue Jul 22 01:16:42 from 192.168.2.18</span>
+                    <span><em>[root@vrc-node ~]#</em> systemctl status qemu-guest-agent</span>
+                    <span class="success">● qemu-guest-agent.service - QEMU Guest Agent</span>
+                    <span class="muted">&nbsp;&nbsp;&nbsp;Active: active (running) since Tue 2026-07-22 00:42:08 CST</span>
+                    <span><em>[root@vrc-node ~]#</em> <i class="appearance-terminal-cursor" :class="[uiPreferences.consoleCursorStyle, { blink: uiPreferences.consoleCursorBlink }]">&nbsp;</i></span>
+                  </div>
+                  <div v-if="uiPreferences.consoleWatermarkEnabled" class="appearance-watermark-layer" aria-hidden="true">
+                    <span v-for="index in consoleWatermarkCopies" :key="index">{{ consoleWatermarkText }}</span>
+                  </div>
+                  <div class="appearance-console-status"><span>{{ uiPreferences.consoleWatermarkScope === "console" ? "终端水印" : "工作区水印" }}</span><span>{{ uiPreferences.consoleFontSize }}px · {{ currentConsoleTheme.label }}</span></div>
+                </div>
+              </div>
+
+              <div v-else class="appearance-console-layout appearance-graphical-layout" :style="appearanceConsolePreviewStyle">
+                <div class="appearance-console-controls">
+                  <section class="appearance-setting-group">
+                    <div class="appearance-group-title"><strong>图形画面</strong><span>noVNC / WebMKS / PVE VNC</span></div>
+                    <div class="appearance-setting-row">
+                      <div><strong>缩放方式</strong><span>保持远端画面比例，不裁切桌面边缘。</span></div>
+                      <el-segmented
+                        v-model="uiPreferences.consoleScaleMode"
+                        :options="[{ label: '本地缩放', value: 'local' }, { label: '远端调整', value: 'remote' }]"
+                        size="small"
+                        @change="persistAppearancePreference('consoleScaleMode')"
+                      />
+                    </div>
+                    <div class="appearance-setting-row">
+                      <div><strong>画面质量</strong><span>仅调整图像传输，不改变 Guest 分辨率。</span></div>
+                      <el-select v-model="uiPreferences.consoleQuality" class="appearance-control-medium" aria-label="图形控制台画面质量" @change="persistAppearancePreference('consoleQuality')">
+                        <el-option label="自动" value="auto" />
+                        <el-option label="清晰" value="high" />
+                        <el-option label="流畅" value="smooth" />
+                      </el-select>
+                    </div>
+                    <div class="appearance-setting-row">
+                      <div><strong>显示水印</strong><span>与 CLI 共用用户、来源地址与时间规则。</span></div>
+                      <el-switch :model-value="uiPreferences.consoleWatermarkEnabled" aria-label="图形控制台显示安全水印" @change="updateUiPreference('consoleWatermarkEnabled', Boolean($event))" />
+                    </div>
+                    <div class="appearance-setting-row">
+                      <div><strong>拖拽中节流刷新</strong><span>调整控制台窗口大小时减少频繁重绘。</span></div>
+                      <el-switch :model-value="uiPreferences.throttleConsoleResize" aria-label="控制台拖拽中节流刷新" @change="updateUiPreference('throttleConsoleResize', Boolean($event))" />
+                    </div>
+                  </section>
+                  <p class="appearance-console-note">字体、字号、ANSI 颜色和光标只作用于 xterm；noVNC 保留远端原始画面。</p>
+                </div>
+                <div class="appearance-graphical-preview">
+                  <div class="appearance-console-preview-toolbar"><span>centos-stream-9</span><small>noVNC · 已连接</small></div>
+                  <div class="appearance-graphical-screen">
+                    <div class="appearance-login-mark">CentOS Stream 9</div>
+                    <div class="appearance-login-copy"><span>vrc-node login:</span><i></i></div>
+                  </div>
+                  <div v-if="uiPreferences.consoleWatermarkEnabled" class="appearance-watermark-layer" aria-hidden="true">
+                    <span v-for="index in consoleWatermarkCopies" :key="index">{{ consoleWatermarkText }}</span>
+                  </div>
+                  <div class="appearance-console-status"><span>{{ uiPreferences.consoleScaleMode === "local" ? "本地缩放" : "远端调整" }}</span><span>{{ uiPreferences.consoleQuality === "auto" ? "自动质量" : uiPreferences.consoleQuality === "high" ? "清晰" : "流畅" }}</span></div>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-tile-grid" aria-label="交互偏好">
               <article class="settings-tile">
                 <div class="settings-row">
-                  <strong>按钮密度</strong>
-                  <span>28px 工具栏 / 24px 行内</span>
+                  <strong>操作提示</strong>
+                  <span>工具栏与行内按钮</span>
                 </div>
                 <div class="settings-row">
                   <span>图标按钮显示 tooltip</span>
-                  <button
-                    type="button"
-                    class="settings-switch"
-                    :class="{ active: uiPreferences.showIconTooltips }"
-                    :aria-pressed="uiPreferences.showIconTooltips"
-                    @click="updateUiPreference('showIconTooltips', !uiPreferences.showIconTooltips)"
-                  >
-                    <i></i>
-                  </button>
+                  <el-switch
+                    :model-value="uiPreferences.showIconTooltips"
+                    size="small"
+                    aria-label="图标按钮显示提示"
+                    @change="updateUiPreference('showIconTooltips', Boolean($event))"
+                  />
                 </div>
               </article>
               <article class="settings-tile">
                 <div class="settings-row">
-                  <strong>表格密度</strong>
+                  <strong>资源列表</strong>
                   <span>44-48px 行高</span>
                 </div>
                 <div class="settings-row">
                   <span>长名称单行省略</span>
-                  <button
-                    type="button"
-                    class="settings-switch"
-                    :class="{ active: uiPreferences.truncateLongNames }"
-                    :aria-pressed="uiPreferences.truncateLongNames"
-                    @click="updateUiPreference('truncateLongNames', !uiPreferences.truncateLongNames)"
-                  >
-                    <i></i>
-                  </button>
+                  <el-switch
+                    :model-value="uiPreferences.truncateLongNames"
+                    size="small"
+                    aria-label="长名称单行省略"
+                    @change="updateUiPreference('truncateLongNames', Boolean($event))"
+                  />
                 </div>
               </article>
               <article class="settings-tile">
                 <div class="settings-row">
-                  <strong>状态色</strong>
-                  <span>成功 / 警告 / 危险</span>
-                </div>
-                <span class="settings-status-swatches" aria-hidden="true">
-                  <i class="success"></i>
-                  <i class="warning"></i>
-                  <i class="danger"></i>
-                </span>
-              </article>
-              <article class="settings-tile">
-                <div class="settings-row">
-                  <strong>控制台</strong>
-                  <span>默认中尺寸</span>
+                  <strong>控制台缩放</strong>
+                  <span>减少画面抖动</span>
                 </div>
                 <div class="settings-row">
                   <span>拖拽中节流刷新</span>
-                  <button
-                    type="button"
-                    class="settings-switch"
-                    :class="{ active: uiPreferences.throttleConsoleResize }"
-                    :aria-pressed="uiPreferences.throttleConsoleResize"
-                    @click="updateUiPreference('throttleConsoleResize', !uiPreferences.throttleConsoleResize)"
-                  >
-                    <i></i>
-                  </button>
+                  <el-switch
+                    :model-value="uiPreferences.throttleConsoleResize"
+                    size="small"
+                    aria-label="控制台拖拽中节流刷新"
+                    @change="updateUiPreference('throttleConsoleResize', Boolean($event))"
+                  />
                 </div>
               </article>
             </section>
@@ -6052,7 +6957,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 <el-button @click="startNewConnection">新连接</el-button>
                 <el-button :loading="testing" @click="testConnection">{{ testing ? "测试中" : "测试" }}</el-button>
                 <el-button @click="openAccountImportDialog">导入账号</el-button>
-                <el-tooltip :content="persistentConnectionsEnabled ? '加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单' : '加载资源：使用当前表单账号读取物理机、存储、网络和 VM 清单，不在服务器保存账号密码'" placement="top">
+                <el-tooltip :content="persistentConnectionsEnabled ? '加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单' : '加载资源：使用当前表单账号读取物理机、存储、网络和 VM 清单，不在服务器保存账号密码'" placement="top" :disabled="!uiPreferences.showIconTooltips">
                   <el-button :loading="loadingHosts" :disabled="!selectedConnectionId && !canLoadDirectConnection" @click="loadSelectedConnectionResources">
                     {{ loadingHosts ? "加载中" : "加载资源" }}
                   </el-button>
@@ -6086,7 +6991,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   </span>
                   <i>{{ selectedConnectionId === item.id ? "已选" : "选择" }}</i>
                 </button>
-                <div v-if="!storedConnections.length" class="settings-empty-note">
+                <div v-if="!storedConnections.length" class="settings-table-empty" role="status">
                   {{ persistentConnectionsEnabled ? "还没有保存连接，请先填写上方连接信息。" : "当前浏览器还没有保存连接，请填写上方连接信息并保存到本机。" }}
                 </div>
               </div>
@@ -6139,7 +7044,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                         <small>网关 {{ pool.gateway }}</small>
                       </span>
                     </button>
-                    <div v-if="!filteredIpPoolItems.length" class="settings-empty-note">
+                    <div v-if="!filteredIpPoolItems.length" class="settings-table-empty" role="status">
                       {{ ipPoolLoading ? "正在读取 IP 池配置" : "没有可展示的 IP 池，请导入或新增后保存。" }}
                     </div>
                   </div>
@@ -6226,77 +7131,78 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   <span>设置入口统一，但该配置只作用于 Chrome 插件，不影响 Web、macOS、Windows 客户端。</span>
                 </div>
               </div>
-              <div class="chrome-extension-tab-row">
-                <div class="chrome-extension-tabs" role="tablist" aria-label="Chrome 插件配置项">
-                  <button type="button" role="tab" :aria-selected="chromeExtensionActiveTab === 'service'" :class="{ active: chromeExtensionActiveTab === 'service' }" @click="chromeExtensionActiveTab = 'service'">服务地址</button>
-                  <button type="button" role="tab" :aria-selected="chromeExtensionActiveTab === 'vault'" :class="{ active: chromeExtensionActiveTab === 'vault' }" @click="chromeExtensionActiveTab = 'vault'">本地连接库</button>
-                </div>
-              </div>
-
-              <div v-if="chromeExtensionActiveTab === 'service'" class="chrome-extension-service-layout">
-                <section class="chrome-extension-inner-panel">
-                  <div class="chrome-extension-inner-head">
-                    <div>
-                      <strong>VRC API 服务</strong>
-                      <span>插件只保存入口地址，资源能力仍由后台执行。</span>
-                    </div>
-                    <div class="chrome-extension-action-group">
-                      <div class="chrome-extension-segmented">
-                        <button type="button" :class="{ active: chromeExtensionService.mode === 'intranet' }" @click="setChromeExtensionServiceMode('intranet')">内网</button>
-                        <button type="button" :class="{ active: chromeExtensionService.mode === 'local' }" @click="setChromeExtensionServiceMode('local')">本机</button>
-                      </div>
+              <el-tabs v-model="chromeExtensionActiveTab" class="chrome-extension-tabs" aria-label="Chrome 插件配置项">
+                <el-tab-pane label="服务地址" name="service">
+                  <div class="chrome-extension-service-layout">
+                    <section class="chrome-extension-inner-panel">
+                      <div class="chrome-extension-inner-head">
+                        <div>
+                          <strong>VRC API 服务</strong>
+                          <span>插件只保存入口地址，资源能力仍由后台执行。</span>
+                        </div>
+                        <div class="chrome-extension-action-group">
+                          <el-segmented
+                            :model-value="chromeExtensionService.mode"
+                            class="chrome-extension-service-mode"
+                            :options="chromeExtensionServiceModeOptions"
+                            aria-label="Chrome 插件服务位置"
+                            @change="handleChromeExtensionServiceModeChange"
+                          />
                       <el-button class="chrome-extension-command-button secondary" @click="testChromeExtensionService">检测</el-button>
                       <el-button class="chrome-extension-command-button primary" @click="persistChromeExtensionServiceSettings()">保存地址</el-button>
-                    </div>
-                  </div>
-                  <div class="chrome-extension-service-form">
-                    <label class="settings-field">
-                      <span>协议</span>
-                      <el-select v-model="chromeExtensionService.scheme">
-                        <el-option label="http" value="http" />
-                        <el-option label="https" value="https" />
-                      </el-select>
-                    </label>
-                    <label class="settings-field">
-                      <span>服务地址</span>
-                      <el-input v-model="chromeExtensionService.host" placeholder="vrc-server" autocomplete="off" />
-                    </label>
-                    <label class="settings-field">
-                      <span>端口</span>
-                      <el-input-number v-model="chromeExtensionService.port" :min="1" :max="65535" controls-position="right" />
-                    </label>
-                    <label class="settings-field is-full">
-                      <span>完整 Base URL</span>
-                      <el-input :model-value="chromeExtensionBaseUrl" readonly />
-                    </label>
-                  </div>
-                </section>
-                <aside class="chrome-extension-side-stack">
-                  <section class="settings-empty-note chrome-extension-note">
-                    <strong>nginx 边界</strong>
-                    <span>nginx 只做 HTTPS、反向代理和访问控制；Chrome 插件只保存入口地址，连接账号留在浏览器本地连接库。</span>
-                  </section>
-                  <pre class="chrome-extension-code">GET  /api/health
+                        </div>
+                      </div>
+                      <div class="chrome-extension-service-form">
+                        <label class="settings-field">
+                          <span>协议</span>
+                          <el-select v-model="chromeExtensionService.scheme">
+                            <el-option label="http" value="http" />
+                            <el-option label="https" value="https" />
+                          </el-select>
+                        </label>
+                        <label class="settings-field">
+                          <span>服务地址</span>
+                          <el-input v-model="chromeExtensionService.host" placeholder="vrc-server" autocomplete="off" />
+                        </label>
+                        <label class="settings-field">
+                          <span>端口</span>
+                          <el-input-number v-model="chromeExtensionService.port" :min="1" :max="65535" controls-position="right" />
+                        </label>
+                        <label class="settings-field is-full">
+                          <span>完整 Base URL</span>
+                          <el-input :model-value="chromeExtensionBaseUrl" readonly />
+                        </label>
+                      </div>
+                    </section>
+                    <aside class="chrome-extension-side-stack">
+                      <section class="settings-empty-note chrome-extension-note">
+                        <strong>nginx 边界</strong>
+                        <span>nginx 只做 HTTPS、反向代理和访问控制；Chrome 插件只保存入口地址，连接账号留在浏览器本地连接库。</span>
+                      </section>
+                      <pre class="chrome-extension-code">GET  /api/health
 GET  /api/inventory/*
 WS   /api/console/*
 
 connectionStore: chrome.storage.local
 serverStore: disabled</pre>
-                </aside>
-              </div>
+                    </aside>
+                  </div>
+                </el-tab-pane>
 
-              <div v-else-if="chromeExtensionActiveTab === 'vault'" class="chrome-extension-service-layout">
-                <section class="chrome-extension-inner-panel">
+                <el-tab-pane label="本地连接库" name="vault">
+                  <div class="chrome-extension-service-layout chrome-extension-vault-layout">
+                <section class="chrome-extension-inner-panel chrome-extension-vault-panel">
                   <div class="chrome-extension-inner-head">
                     <div>
                       <strong>本地连接库</strong>
                       <span>连接信息只在当前浏览器本地保存，后续接 WebCrypto 加密。</span>
                     </div>
                   </div>
-                  <div class="chrome-extension-table-wrap">
+                  <div class="chrome-extension-table-wrap vrc-scroll-container">
                     <el-table
                       class="chrome-extension-table"
                       :data="chromeExtensionLocalConnections"
+                      height="100%"
                       row-key="id"
                       empty-text=" "
                       stripe
@@ -6382,17 +7288,23 @@ serverStore: disabled</pre>
                     <strong>存储口径</strong>
                     <span>使用 chrome.storage.local；禁止 chrome.storage.sync；密文可以导出，明文不能写文件。</span>
                   </section>
-                </aside>
-              </div>
+                    </aside>
+                  </div>
+                </el-tab-pane>
+              </el-tabs>
             </section>
+          </section>
+
+          <section v-else-if="settingsPanel === 'updates'" class="settings-workspace-content">
+            <UpdateCenterPanel :runtime-mode="apiRuntimeMode" />
           </section>
 
           <section v-else-if="settingsPanel === 'maintenance'" class="settings-workspace-content maintenance-settings">
             <section class="settings-card maintenance-card">
               <div class="settings-card-head maintenance-card-head">
                 <div>
-                  <strong>任务临时介质</strong>
-                  <span>只清理 VRC 登记的任务级 ISO 和临时介质；原始系统 ISO 与镜像缓存不在此处删除。</span>
+                  <strong>安装临时介质</strong>
+                  <span>无人值守任务结束后会自动删除 vrc-*.iso；这里只处理自动清理失败或暂时保留的介质。</span>
                 </div>
                 <div class="maintenance-head-actions">
                   <el-button class="ip-pool-command-button" size="small" :loading="maintenanceIsoLoading" @click="loadMaintenanceGeneratedIsos()">
@@ -6409,6 +7321,9 @@ serverStore: disabled</pre>
                   </el-button>
                 </div>
               </div>
+              <div v-if="maintenanceIsoStatus" class="maintenance-iso-status">
+                {{ maintenanceIsoStatus }}
+              </div>
 
               <div class="maintenance-summary-grid">
                 <article>
@@ -6420,8 +7335,8 @@ serverStore: disabled</pre>
                   <strong>{{ maintenanceIsoSummary.retained }}</strong>
                 </article>
                 <article>
-                  <span>已清理</span>
-                  <strong>{{ maintenanceIsoSummary.cleaned }}</strong>
+                  <span>需检查</span>
+                  <strong>{{ maintenanceIsoSummary.failed + maintenanceIsoSummary.skipped }}</strong>
                 </article>
                 <article>
                   <span>本地占用</span>
@@ -6435,21 +7350,36 @@ serverStore: disabled</pre>
               <div v-else-if="maintenanceIsoError" class="settings-empty-note maintenance-empty error">
                 {{ maintenanceIsoError }}
               </div>
-              <div v-else-if="!maintenanceIsoReport || !maintenanceIsoReport.items.length" class="settings-empty-note maintenance-empty">
-                暂未发现 VRC 任务级临时介质记录。
+              <div v-else-if="!maintenanceIsoReport || !maintenanceIsoActiveItems.length" class="settings-empty-note maintenance-empty">
+                没有待处理的安装临时介质。
               </div>
               <div v-else class="maintenance-iso-list">
                 <div class="maintenance-iso-list-head">
-                  <strong>残留记录</strong>
+                  <strong>待处理介质</strong>
                   <span>
                     {{ maintenanceIsoScannedAt ? `最后扫描 ${maintenanceIsoScannedAt} · ` : "" }}显示
-                    {{ maintenanceIsoVisibleItems.length }} / {{ maintenanceIsoReport.items.length }} 条
+                    {{ maintenanceIsoVisibleItems.length }} / {{ maintenanceIsoActiveItems.length }} 条
                   </span>
+                </div>
+                <div class="maintenance-iso-columns maintenance-iso-columns-head" aria-hidden="true">
+                  <span>介质</span>
+                  <span>清理状态</span>
+                  <span>创建时间</span>
+                  <span>平台 / 目标</span>
+                  <span>占用</span>
                 </div>
                 <article v-for="item in maintenanceIsoVisibleItems" :key="item.id" class="maintenance-iso-row" :class="`state-${item.decision}`">
                   <span class="maintenance-iso-main">
                     <strong :title="item.isoName">{{ item.isoName }}</strong>
                     <small :title="item.reason">{{ item.reason }}</small>
+                  </span>
+                  <span class="maintenance-iso-state">
+                    <strong>{{ maintenanceIsoDecisionLabel(item) }}</strong>
+                    <small>{{ maintenanceIsoStatusLabel(item.status) }}</small>
+                  </span>
+                  <span class="maintenance-iso-created">
+                    <strong>{{ formatMaintenanceIsoDate(item.createdAt) }}</strong>
+                    <small>创建时间</small>
                   </span>
                   <span class="maintenance-iso-meta">
                     <small>{{ providerLabel(item.providerType) }}</small>
@@ -6496,11 +7426,11 @@ serverStore: disabled</pre>
           v-model:search="search"
           v-model:power-filter="vmPowerFilter"
           :connection="{ id: selectedConnectionId, providerType: connection.providerType, host: connection.host, port: connection.port, username: connection.username, password: persistentConnectionsEnabled ? undefined : connection.password }"
+          :provider-descriptor="selectedProviderDescriptor"
           :host="selectedHost"
           :network-count="selectedHostNetworks.length"
           :resource-summary="resourceSummary"
-          :host-memory-percent="hostUsage.memoryPercent"
-          :storage-totals="storageTotals"
+          :resource-capacity="selectedResourceCapacity"
           :vm-totals="vmTotals"
           :has-vm-summary="!!vmSummary"
           :loading-vm-summary="loadingVmSummary"
@@ -6508,14 +7438,15 @@ serverStore: disabled</pre>
           :vms-total="vms?.total ?? 0"
           :selected-vm-ids="selectedVmIds"
           :vm-action-states="vmActionStates"
+          :provisioning-console-vm-ids="activeProvisioningConsoleVmIds"
           :loading-vms="loadingVms"
-          :allow-vm-rename="connection.providerType !== 'libvirt'"
+          :show-icon-tooltips="uiPreferences.showIconTooltips"
           variant="dialog"
           table-height="100%"
           metric-grid-class="dialog-metric-grid"
           table-panel-class="dialog-table-panel"
           @search-change="loadVms"
-          @refresh="loadVms({ forceRefresh: true })"
+          @refresh="refreshVmPanelResources"
           @export="exportCsv"
           @host-detail="hostDetailVisible = true"
           @storage-detail="storageDetailVisible = true"
@@ -6534,7 +7465,7 @@ serverStore: disabled</pre>
       <VmRenameDialog
         v-model="vmRenameVisible"
         :vm="vmRenameTarget"
-        :provider-type="connection.providerType"
+        :provider-descriptor="selectedProviderDescriptor"
         :existing-names="(vms?.items ?? []).filter((item) => item.providerId !== vmRenameTarget?.providerId).map((item) => item.name)"
         :saving="vmRenameSaving"
         @submit="handleVmRename"
@@ -6544,7 +7475,7 @@ serverStore: disabled</pre>
         v-model="vmResizeVisible"
         :vm="vmResizeTarget"
         :host="selectedHost"
-        :provider-type="connection.providerType"
+        :provider-descriptor="selectedProviderDescriptor"
         :disks="vmResizeDisks"
         :loading-disks="vmResizeLoadingDisks"
         :guest-storage="vmResizeGuestStorage"
@@ -6565,6 +7496,20 @@ serverStore: disabled</pre>
         :target="consoleTarget"
         :provision-task="activeConsoleProvisionTask"
         :provision-targets="provisionConsoleTargets"
+        :terminal-font-family="currentConsoleFont.family"
+        :terminal-font-size="uiPreferences.consoleFontSize"
+        :terminal-line-height="uiPreferences.consoleLineHeight"
+        :terminal-cursor-style="uiPreferences.consoleCursorStyle"
+        :terminal-cursor-blink="uiPreferences.consoleCursorBlink"
+        :terminal-theme="consoleTerminalTheme"
+        :display-scale-mode="uiPreferences.consoleScaleMode"
+        :display-quality="uiPreferences.consoleQuality"
+        :throttle-resize="uiPreferences.throttleConsoleResize"
+        :watermark-enabled="uiPreferences.consoleWatermarkEnabled && uiPreferences.consoleWatermarkScope === 'console'"
+        :watermark-density="uiPreferences.consoleWatermarkDensity"
+        :watermark-opacity="uiPreferences.consoleWatermarkOpacity"
+        :watermark-text="consoleWatermarkText"
+        :show-icon-tooltips="uiPreferences.showIconTooltips"
         @select-provision-target="handleSelectProvisionConsoleTarget"
         @upload-result="handleConsoleUploadResult"
       />
@@ -6575,17 +7520,12 @@ serverStore: disabled</pre>
             <el-input v-model="activitySearch" class="activity-search" :prefix-icon="Search" placeholder="搜索动作 / 对象 / 详情" clearable />
             <span class="activity-log-count">{{ filteredActivityEntries.length }} / {{ activityEntries.length }}</span>
           </div>
-          <div class="activity-status-filter">
-            <button
-              v-for="status in activityStatusOptions"
-              :key="status"
-              type="button"
-              :class="{ active: activityStatusFilter === status }"
-              @click="activityStatusFilter = status"
-            >
-              {{ activityStatusLabel(status) }}
-            </button>
-          </div>
+          <el-segmented
+            v-model="activityStatusFilter"
+            class="activity-status-filter"
+            :options="activityStatusSegmentOptions"
+            aria-label="操作记录状态筛选"
+          />
         </div>
         <div class="activity-log-list">
           <article v-for="item in filteredActivityEntries" :key="item.id" class="activity-log-item" :class="`status-${item.status}`">
@@ -6693,7 +7633,7 @@ serverStore: disabled</pre>
                 <el-button :icon="Plus" @click="startNewConnection">新连接</el-button>
                 <el-button :icon="Connection" :loading="testing" @click="testConnection">{{ testing ? "测试中" : "测试" }}</el-button>
                 <el-button :icon="Upload" @click="openAccountImportDialog">导入账号</el-button>
-                <el-tooltip :content="persistentConnectionsEnabled ? '加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单' : '加载资源：使用当前表单账号读取物理机、存储、网络和 VM 清单，不在服务器保存账号密码'" placement="top">
+                <el-tooltip :content="persistentConnectionsEnabled ? '加载资源：使用已保存账号读取物理机、存储、网络和 VM 清单' : '加载资源：使用当前表单账号读取物理机、存储、网络和 VM 清单，不在服务器保存账号密码'" placement="top" :disabled="!uiPreferences.showIconTooltips">
                   <el-button :icon="Refresh" :loading="loadingHosts" :disabled="!selectedConnectionId && !canLoadDirectConnection" @click="loadSelectedConnectionResources">
                     {{ loadingHosts ? "加载中" : "加载资源" }}
                   </el-button>
@@ -6729,11 +7669,11 @@ serverStore: disabled</pre>
         <section class="settings-card account-import-card">
           <div class="account-import-layout">
             <section class="import-drop-panel">
-              <div class="import-mode-tabs" role="tablist" aria-label="导入方式">
-                <button type="button" :class="{ active: accountImportMode === 'excel' }" @click="switchAccountImportMode('excel')">Excel 文件</button>
-                <button type="button" :class="{ active: accountImportMode === 'json' }" @click="switchAccountImportMode('json')">JSON 串</button>
-                <button type="button" :class="{ active: accountImportMode === 'fixed' }" @click="switchAccountImportMode('fixed')">固定格式</button>
-              </div>
+              <el-tabs :model-value="accountImportMode" class="import-mode-tabs" aria-label="导入方式" @tab-change="handleAccountImportTabChange">
+                <el-tab-pane label="Excel 文件" name="excel" />
+                <el-tab-pane label="JSON 串" name="json" />
+                <el-tab-pane label="固定格式" name="fixed" />
+              </el-tabs>
 
               <input ref="accountImportFileInput" class="account-import-file-input" type="file" accept=".xlsx,.xls,.csv" @change="handleAccountImportFileChange" />
 
@@ -6777,7 +7717,7 @@ serverStore: disabled</pre>
                 <span class="import-summary-tile"><span>错误</span><strong>{{ accountImportSummary.error }}</strong></span>
               </div>
 
-              <div class="import-preview-table">
+              <div class="import-preview-table vrc-scroll-container">
                 <div class="import-preview-row header">
                   <span>平台</span>
                   <span>服务器名称</span>
@@ -6808,19 +7748,22 @@ serverStore: disabled</pre>
               </div>
 
               <span class="import-preview-note">预览只展示掩码后的密码；点击导入后会先逐条测试连接，全部通过才保存；保存时按“平台 + 主机 + 端口”识别重复连接，重复项默认更新名称、账号和密码，不自动加载资源。</span>
-              <div class="button-row account-import-buttons">
-                <button type="button" class="btn" @click="accountImportVisible = false">取消</button>
-                <button type="button" class="btn" :disabled="!accountImportCanConfirm || accountImportSummary.update === accountImportSummary.importable" @click="accountImportDrafts = accountImportDrafts.filter((row) => row.status === 'new')">只导入新增</button>
-                <button type="button" class="btn primary" :disabled="!accountImportCanConfirm" @click="confirmAccountImport">
-                  {{ importingAccounts ? "测试中" : `测试并导入 ${accountImportSummary.importable} 条` }}
-                </button>
-              </div>
             </section>
           </div>
         </section>
+        <template #footer>
+          <div class="account-import-footer">
+            <el-button @click="accountImportVisible = false">取消</el-button>
+            <el-button :disabled="!accountImportCanConfirm || accountImportSummary.update === accountImportSummary.importable" @click="accountImportDrafts = accountImportDrafts.filter((row) => row.status === 'new')">只导入新增</el-button>
+            <el-button type="primary" :loading="importingAccounts" :disabled="!accountImportCanConfirm" @click="confirmAccountImport">
+              {{ importingAccounts ? "测试中" : `测试并导入 ${accountImportSummary.importable} 条` }}
+            </el-button>
+          </div>
+        </template>
       </el-dialog>
 
       <el-dialog v-model="hostDetailVisible" title="物理机详情" width="760px" class="resource-detail-dialog host-resource-detail-dialog" :close-on-click-modal="false">
+        <div class="resource-detail-body vrc-scroll-container">
         <div v-if="selectedHost" class="resource-detail-summary">
           <div>
             <span>物理机</span>
@@ -6853,49 +7796,59 @@ serverStore: disabled</pre>
             <template #default="{ row }">{{ row.attached ? "是" : "否" }}</template>
           </el-table-column>
         </el-table>
+        </div>
       </el-dialog>
 
-      <el-dialog v-model="storageDetailVisible" title="SR 详情" width="860px" class="resource-detail-dialog storage-resource-detail-dialog" :close-on-click-modal="false">
-        <div class="resource-detail-summary">
+      <el-dialog v-model="storageDetailVisible" title="存储池详情" width="1080px" class="resource-detail-dialog storage-resource-detail-dialog" :close-on-click-modal="false">
+        <div class="resource-detail-body vrc-scroll-container">
+        <div class="resource-detail-summary storage-detail-summary">
           <div>
-            <span>SR 数量</span>
+            <span>存储池数量</span>
             <strong>{{ storage.length }} 个</strong>
           </div>
           <div>
-            <span>已用比例</span>
-            <strong>{{ storageTotals.usagePercent }}%</strong>
+            <span>物理已使用</span>
+            <strong>{{ formatNumber(storageTotals.usedGiB) }} GiB</strong>
           </div>
           <div>
-            <span>容量</span>
-            <strong>{{ formatNumber(storageTotals.usedGiB) }} / {{ formatNumber(storageTotals.physicalGiB) }} GiB</strong>
-            <small>虚拟分配 {{ formatNumber(storageTotals.virtualGiB) }} GiB</small>
+            <span>物理总量</span>
+            <strong>{{ formatNumber(storageTotals.physicalGiB) }} GiB</strong>
+          </div>
+          <div>
+            <span>VM 已配置</span>
+            <strong>{{ selectedResourceCapacity ? `${formatNumber(selectedResourceCapacity.storage.vmConfiguredGiB)} GiB` : "--" }}</strong>
           </div>
         </div>
         <div class="dialog-section-title">
-          <strong>存储资源</strong>
-          <span>区分物理容量、已用容量和虚拟分配容量</span>
+          <strong>存储池</strong>
+          <span>每行是一个逻辑存储池，不是物理硬盘，也不是某台 VM 的虚拟磁盘</span>
         </div>
-        <el-table class="resource-detail-table storage-resource-detail-table" :data="storage" :max-height="360" row-key="name" stripe empty-text="暂无 SR 数据">
-          <el-table-column prop="name" label="存储名称" min-width="175" align="left" show-overflow-tooltip />
-          <el-table-column prop="type" label="类型" width="70" align="center" />
-          <el-table-column label="共享" width="64" align="center">
-            <template #default="{ row }">{{ row.shared ? "是" : "否" }}</template>
+        <el-table class="resource-detail-table storage-resource-detail-table" :data="storage" :max-height="420" row-key="name" stripe empty-text="暂无存储池数据">
+          <el-table-column prop="name" label="存储池名称" min-width="190" align="left" show-overflow-tooltip />
+          <el-table-column prop="purposeLabel" label="用途" width="100" align="center" />
+          <el-table-column label="存储类型" width="132" align="left">
+            <template #default="{ row }">
+              <div class="storage-type-cell">
+                <strong>{{ row.typeLabel }}</strong>
+                <small>{{ row.type }}</small>
+              </div>
+            </template>
           </el-table-column>
-          <el-table-column label="使用率" width="142" align="center">
+          <el-table-column prop="scopeLabel" label="范围" width="86" align="center" />
+          <el-table-column prop="mediaLabel" label="介质" width="100" align="center" />
+          <el-table-column label="使用率" width="132" align="center">
             <template #default="{ row }">
               <el-progress :percentage="percent(positive(row.usedGiB), positive(row.physicalGiB))" :stroke-width="4" />
             </template>
           </el-table-column>
-          <el-table-column label="容量" width="100" align="right">
+          <el-table-column label="物理总量" width="112" align="right">
             <template #default="{ row }">{{ formatNumber(row.physicalGiB) }} GiB</template>
           </el-table-column>
-          <el-table-column label="已用" width="100" align="right">
+          <el-table-column label="物理已使用" width="112" align="right">
             <template #default="{ row }">{{ formatNumber(row.usedGiB) }} GiB</template>
           </el-table-column>
-          <el-table-column label="虚拟分配" width="110" align="right">
-            <template #default="{ row }">{{ formatNumber(row.virtualGiB) }} GiB</template>
-          </el-table-column>
         </el-table>
+        </div>
       </el-dialog>
 
       <el-dialog v-model="isoDetailVisible" title="系统镜像" width="920px" class="iso-dialog" top="8vh" :close-on-click-modal="false">
@@ -6904,17 +7857,22 @@ serverStore: disabled</pre>
             <strong>{{ isoTotals.count }} 个 ISO · {{ formatBytes(isoTotals.totalBytes) }}</strong>
             <span>{{ selectedHost?.name || connection.host }} · {{ isoTotals.storageCount }} 个存储库</span>
           </div>
-          <div class="iso-dialog-actions">
+          <div class="iso-dialog-query-group" aria-label="系统镜像筛选">
             <el-input v-model="isoSearch" class="iso-search-input" :prefix-icon="Search" placeholder="搜索镜像 / ISO 库 / 路径" clearable />
-            <button class="cache-refresh-link" :disabled="loadingIsoImages" title="刷新系统镜像" @click="loadIsoImages(true)">
-              <el-icon v-if="loadingIsoImages" class="inline-loading"><Loading /></el-icon>
-              <el-icon v-else><Refresh /></el-icon>
-              <span>刷新</span>
-            </button>
+          </div>
+          <div class="iso-dialog-action-group" aria-label="系统镜像列表动作">
+            <el-tooltip content="刷新系统镜像" placement="top" :disabled="!uiPreferences.showIconTooltips">
+              <span class="toolbar-tooltip-target">
+                <button type="button" class="toolbar-action-button" :disabled="loadingIsoImages" aria-label="刷新系统镜像" @click="loadIsoImages(true)">
+                  <el-icon v-if="loadingIsoImages" class="inline-loading"><Loading /></el-icon>
+                  <VrcToolbarIcon v-else name="refresh" />
+                </button>
+              </span>
+            </el-tooltip>
           </div>
         </div>
         <div class="iso-table-wrap" :class="{ loading: loadingIsoImages }">
-          <el-table :data="filteredIsoImages" height="420" row-key="id" stripe empty-text=" ">
+          <el-table :data="filteredIsoImages" :max-height="ISO_TABLE_MAX_HEIGHT" row-key="id" stripe empty-text=" ">
             <template #empty>
               <div class="overview-empty-state iso-empty-state">
                 <div v-if="loadingIsoImages" class="resource-loading-card resource-table-loading overview-empty-loading">
@@ -6980,6 +7938,19 @@ serverStore: disabled</pre>
         :console-available="activeProvisionConsoleAvailable"
         :console-target="provisionInlineConsoleTarget"
         :provision-console-targets="activeProvisionConsoleTargets"
+        :terminal-font-family="currentConsoleFont.family"
+        :terminal-font-size="uiPreferences.consoleFontSize"
+        :terminal-line-height="uiPreferences.consoleLineHeight"
+        :terminal-cursor-style="uiPreferences.consoleCursorStyle"
+        :terminal-cursor-blink="uiPreferences.consoleCursorBlink"
+        :terminal-theme="consoleTerminalTheme"
+        :display-scale-mode="uiPreferences.consoleScaleMode"
+        :display-quality="uiPreferences.consoleQuality"
+        :throttle-resize="uiPreferences.throttleConsoleResize"
+        :watermark-enabled="uiPreferences.consoleWatermarkEnabled && uiPreferences.consoleWatermarkScope === 'console'"
+        :watermark-density="uiPreferences.consoleWatermarkDensity"
+        :watermark-opacity="uiPreferences.consoleWatermarkOpacity"
+        :watermark-text="consoleWatermarkText"
         @activity="pushActivity($event.title, { target: $event.target, detail: $event.detail, status: $event.status })"
         @open-iso-detail="openIsoDetail"
         @select-console-target="handleSelectProvisionInlineConsoleTarget"
@@ -6992,6 +7963,7 @@ serverStore: disabled</pre>
         :host="selectedHost"
         :available-vms="vms?.items ?? []"
         :selected-vms="vmScheduleSelectedVms"
+        :show-icon-tooltips="uiPreferences.showIconTooltips"
         @changed="handleVmScheduleChanged"
       />
     </section>

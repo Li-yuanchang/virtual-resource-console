@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ArrowRight, CircleCheck, Coin, Cpu, Files, FolderOpened, Minus, Plus, Warning } from "@element-plus/icons-vue";
 import { computed, ref, watch } from "vue";
-import type { GuestStorageInventory, HostNode, ProviderType, VmDisk, VmNode, VmResizeRequest } from "../types";
+import type { GuestStorageInventory, HostNode, ProviderDescriptor, VmDisk, VmNode, VmResizeRequest, VmSystemCredentials } from "../types";
 
 type ResourceKey = "cpu" | "memory" | "disk";
 
@@ -10,7 +10,7 @@ const props = withDefaults(
     modelValue: boolean;
     vm: VmNode | null;
     host: HostNode | null;
-    providerType: ProviderType;
+    providerDescriptor?: ProviderDescriptor;
     disks?: VmDisk[];
     loadingDisks?: boolean;
     guestStorage?: GuestStorageInventory | null;
@@ -39,7 +39,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   "update:modelValue": [value: boolean];
   "load-disks": [vm: VmNode];
-  "load-guest-storage": [vm: VmNode];
+  "load-guest-storage": [vm: VmNode, systemCredentials?: VmSystemCredentials, rememberSystemCredentials?: boolean];
   submit: [request: VmResizeRequest];
 }>();
 
@@ -51,13 +51,14 @@ const diskMode = ref<"extend" | "add">("extend");
 const selectedDiskId = ref("");
 const selectedMountPath = ref("");
 const newMountPath = ref("/data");
-
-const providerLabels: Record<ProviderType, string> = {
-  xenserver: "XenServer",
-  vmware: "VMware",
-  proxmox: "PVE",
-  libvirt: "KVM/libvirt",
-};
+const systemLogin = ref("root");
+const systemPassword = ref("");
+const useJumpServer = ref(false);
+const jumpHost = ref("");
+const jumpPort = ref(22);
+const jumpLogin = ref("root");
+const jumpPassword = ref("");
+const rememberSystemCredentials = ref(false);
 
 const cpuDeltaInput = normalizedModel(cpuDelta);
 const memoryDeltaInput = normalizedModel(memoryDelta);
@@ -83,23 +84,24 @@ const targetDiskTotalGiB = computed(() => currentDiskTotalGiB.value + diskDelta.
 const targetSelectedDiskGiB = computed(() => formatGiB(selectedDisk.value?.virtualSizeBytes ?? 0) + diskDelta.value);
 const diskCount = computed(() => props.disks.length + (diskMode.value === "add" ? 1 : 0));
 const changedCount = computed(() => Number(cpuDelta.value > 0) + Number(memoryDelta.value > 0) + Number(diskChangeActive.value));
-const supported = computed(() => props.providerType !== "libvirt");
-const diskRequiresShutdown = computed(() =>
-  props.vm?.powerState === "running" &&
-  diskDelta.value > 0 &&
-  diskMode.value === "extend" &&
-  props.providerType === "xenserver" &&
-  selectedDisk.value?.onlineResizeSupported !== true,
-);
-const requiresShutdown = computed(() =>
-  props.vm?.powerState === "running" && (cpuDelta.value > 0 || memoryDelta.value > 0 || diskRequiresShutdown.value),
-);
+const supported = computed(() => props.providerDescriptor?.capabilities.vmResize.supported === true);
 const guestAutoApplyAvailable = computed(() => props.guestStorage?.supported === true);
+const guestOffline = computed(() => props.guestStorage?.reasonCode === "GUEST_OFFLINE");
+const systemExecutionUnavailable = computed(() => props.guestStorage?.reasonCode === "SYSTEM_EXECUTION_UNAVAILABLE");
+const systemAuthenticationRequired = computed(() =>
+  props.guestStorage?.reasonCode === "SYSTEM_AUTHENTICATION_REQUIRED" || systemExecutionUnavailable.value,
+);
+const canRetrySystemLogin = computed(() => Boolean(
+  systemLogin.value.trim()
+  && systemPassword.value
+  && !props.loadingGuestStorage
+  && (!useJumpServer.value || (jumpHost.value.trim() && jumpPort.value > 0 && jumpLogin.value.trim() && jumpPassword.value)),
+));
 const diskAutoApplyBlocked = computed(() => diskDelta.value > 0 && !props.loadingGuestStorage && !guestAutoApplyAvailable.value);
 const guestStorageValidationError = computed(() => {
   if (!diskChangeActive.value) return "";
   if (props.loadingGuestStorage || !guestAutoApplyAvailable.value) return "";
-  if (diskMode.value === "extend" && !selectedGuestMount.value) return "所选虚拟磁盘没有匹配到可扩容的 Guest 目录";
+  if (diskMode.value === "extend" && !selectedGuestMount.value) return "所选虚拟磁盘没有匹配到可扩容的系统目录";
   if (diskMode.value === "add" && !isAllowedNewMountPath(newMountPath.value)) return "新磁盘挂载目录仅允许位于 /data、/mnt、/srv 或 /opt 下";
   return "";
 });
@@ -139,7 +141,8 @@ const diskAction = computed({
 watch(
   () => props.modelValue,
   (visible) => {
-    if (!visible || !props.vm) return;
+    if (!visible) return;
+    if (!props.vm) return;
     resetForm();
     emit("load-disks", props.vm);
     emit("load-guest-storage", props.vm);
@@ -186,6 +189,14 @@ function resetForm() {
   selectedDiskId.value = props.disks[0]?.id ?? "";
   selectedMountPath.value = "";
   newMountPath.value = "/data";
+  systemLogin.value = "root";
+  systemPassword.value = "";
+  useJumpServer.value = false;
+  jumpHost.value = "";
+  jumpPort.value = 22;
+  jumpLogin.value = "root";
+  jumpPassword.value = "";
+  rememberSystemCredentials.value = false;
 }
 
 function adjust(resource: ResourceKey, direction: number) {
@@ -199,14 +210,37 @@ function close() {
   emit("update:modelValue", false);
 }
 
+function retrySystemLogin() {
+  if (!canRetrySystemLogin.value || !props.vm) return;
+  emit("load-guest-storage", props.vm, buildSystemCredentials(), rememberSystemCredentials.value);
+}
+
+function buildSystemCredentials(): VmSystemCredentials {
+  return {
+    username: systemLogin.value.trim(),
+    password: systemPassword.value,
+    ...(useJumpServer.value
+      ? {
+          jump: {
+            host: jumpHost.value.trim(),
+            port: jumpPort.value,
+            username: jumpLogin.value.trim(),
+            password: jumpPassword.value,
+          },
+        }
+      : {}),
+  };
+}
+
 function submit() {
   if (!canSubmit.value || !props.vm) return;
   const request: VmResizeRequest = {
     cpuCount: cpuDelta.value > 0 ? targetCpu.value : undefined,
     memoryBytes: memoryDelta.value > 0 ? targetMemoryGiB.value * gib : undefined,
-    allowShutdown: requiresShutdown.value,
+    allowShutdown: true,
     restartAfterResize: true,
   };
+  if (systemPassword.value) request.systemCredentials = buildSystemCredentials();
   if (diskChangeActive.value) {
     request.disk =
       diskMode.value === "extend"
@@ -223,13 +257,15 @@ function submit() {
           };
     if (guestAutoApplyAvailable.value) {
       const guestMount = diskMode.value === "extend" ? selectedGuestMount.value : null;
-      request.guestStorage = {
-        vmIp: props.guestStorage?.vmIp ?? "",
+      request.storageTarget = {
         mountPath: diskMode.value === "extend" ? guestMount?.mountPath ?? "" : normalizeMountPath(newMountPath.value),
-        guestDiskPath: guestMount?.guestDiskPath,
-        guestPartitionPath: guestMount?.guestPartitionPath,
-        filesystem: guestMount?.filesystem || "xfs",
       };
+      if (systemPassword.value) {
+        request.systemCredentials = {
+          username: systemLogin.value.trim(),
+          password: systemPassword.value,
+        };
+      }
     }
   }
   emit("submit", request);
@@ -240,8 +276,7 @@ function formatGiB(value: number) {
 }
 
 function diskDeviceLabel(disk: VmDisk) {
-  if (props.providerType === "xenserver" && /^\d+$/.test(disk.device)) return `磁盘 ${disk.device}`;
-  return disk.device || disk.name || "虚拟硬盘";
+  return disk.displayName || disk.device || disk.name || "虚拟硬盘";
 }
 
 function formatNumber(value: number) {
@@ -273,12 +308,12 @@ function isAllowedNewMountPath(value: string) {
   >
     <template #header>
       <div class="vm-resize-title">
-        <div><h2>扩容虚拟机</h2><span>{{ providerLabels[providerType] }}</span></div>
+        <div><h2>扩容虚拟机</h2><span>{{ providerDescriptor?.label || "虚拟化平台" }}</span></div>
         <p v-if="vm"><strong>{{ vm.name }}</strong><i></i><span>{{ host?.name }}</span><i></i><span>{{ host?.address }}</span><i></i><span>{{ vm.powerState === "running" ? "运行中" : "已关机" }}</span></p>
       </div>
     </template>
 
-    <div v-if="vm" class="vm-resize-content">
+    <div v-if="vm" class="vm-resize-content vrc-scroll-container">
       <div class="vm-resize-capacity">
         <span>宿主机可用</span>
         <dl><div><dt>CPU</dt><dd :class="{ warning: cpuOvercommitted }">{{ cpuCapacityText }}</dd></div><div><dt>内存</dt><dd>{{ formatNumber(memoryFreeGiB) }} GiB</dd></div><div><dt>存储</dt><dd>{{ formatNumber(storageFreeGiB) }} GiB</dd></div></dl>
@@ -290,27 +325,27 @@ function isAllowedNewMountPath(value: string) {
 
           <div class="vm-resize-row">
             <span class="vm-resize-resource"><el-icon><Cpu /></el-icon><strong>处理器</strong></span>
-            <span class="vm-resize-value"><strong>{{ vm.cpuCount }}</strong><small>vCPU</small></span>
-            <div class="vm-resize-stepper"><button type="button" aria-label="减少处理器" @click="adjust('cpu', -1)"><el-icon><Minus /></el-icon></button><label><input v-model.number="cpuDeltaInput" type="number" min="0" step="1" aria-label="处理器增加量" /></label><button type="button" aria-label="增加处理器" @click="adjust('cpu', 1)"><el-icon><Plus /></el-icon></button></div>
-            <span class="vm-resize-value target"><strong>{{ targetCpu }}</strong><small>vCPU</small></span>
-            <span class="vm-resize-state" :class="requiresShutdown && cpuDelta ? 'warning' : 'success'">{{ requiresShutdown && cpuDelta ? "需关机" : "可在线" }}</span>
+            <span class="vm-resize-value current" data-label="当前配置"><strong>{{ vm.cpuCount }}</strong><small>vCPU</small></span>
+            <div class="vm-resize-stepper" data-label="增加"><button type="button" :disabled="cpuDelta <= 0" aria-label="减少处理器" @click="adjust('cpu', -1)"><el-icon><Minus /></el-icon></button><label><input v-model.number="cpuDeltaInput" type="number" min="0" step="1" aria-label="处理器增加量" /></label><button type="button" aria-label="增加处理器" @click="adjust('cpu', 1)"><el-icon><Plus /></el-icon></button></div>
+            <span class="vm-resize-value target" data-label="扩容后"><strong>{{ targetCpu }}</strong><small>vCPU</small></span>
+            <span class="vm-resize-state" :class="cpuDelta ? 'warning' : 'success'">{{ cpuDelta ? "后端规划" : "未变更" }}</span>
           </div>
 
           <div class="vm-resize-row">
             <span class="vm-resize-resource"><el-icon><Coin /></el-icon><strong>内存</strong></span>
-            <span class="vm-resize-value"><strong>{{ currentMemoryGiB }}</strong><small>GiB</small></span>
-            <div class="vm-resize-stepper"><button type="button" aria-label="减少内存" @click="adjust('memory', -1)"><el-icon><Minus /></el-icon></button><label><input v-model.number="memoryDeltaInput" type="number" min="0" step="2" aria-label="内存增加量" /></label><button type="button" aria-label="增加内存" @click="adjust('memory', 1)"><el-icon><Plus /></el-icon></button></div>
-            <span class="vm-resize-value target"><strong>{{ targetMemoryGiB }}</strong><small>GiB</small></span>
-            <span class="vm-resize-state" :class="requiresShutdown && memoryDelta ? 'warning' : 'success'">{{ requiresShutdown && memoryDelta ? "需关机" : "可在线" }}</span>
+            <span class="vm-resize-value current" data-label="当前配置"><strong>{{ currentMemoryGiB }}</strong><small>GiB</small></span>
+            <div class="vm-resize-stepper" data-label="增加"><button type="button" :disabled="memoryDelta <= 0" aria-label="减少内存" @click="adjust('memory', -1)"><el-icon><Minus /></el-icon></button><label><input v-model.number="memoryDeltaInput" type="number" min="0" step="2" aria-label="内存增加量" /></label><button type="button" aria-label="增加内存" @click="adjust('memory', 1)"><el-icon><Plus /></el-icon></button></div>
+            <span class="vm-resize-value target" data-label="扩容后"><strong>{{ targetMemoryGiB }}</strong><small>GiB</small></span>
+            <span class="vm-resize-state" :class="memoryDelta ? 'warning' : 'success'">{{ memoryDelta ? "后端规划" : "未变更" }}</span>
           </div>
 
           <section class="vm-resize-disk-group">
             <div class="vm-resize-row vm-resize-disk-row">
               <span class="vm-resize-resource"><el-icon><Files /></el-icon><strong>虚拟硬盘</strong></span>
-              <span class="vm-resize-value disk"><span><strong>{{ currentDiskTotalGiB }}</strong><small>GiB</small></span><em>{{ disks.length }} 块 · {{ diskSizeSummary || "读取中" }}<template v-if="diskSizeSummary"> GiB</template></em></span>
-              <div class="vm-resize-stepper disk"><button type="button" aria-label="减少磁盘" @click="adjust('disk', -1)"><el-icon><Minus /></el-icon></button><label><input v-model.number="diskDeltaInput" type="number" min="0" step="20" aria-label="磁盘增加量" /></label><button type="button" aria-label="增加磁盘" @click="adjust('disk', 1)"><el-icon><Plus /></el-icon></button></div>
-              <span class="vm-resize-value disk target"><span><strong>{{ targetDiskTotalGiB }}</strong><small>GiB</small></span><em v-if="diskMode === 'extend' && selectedDisk">{{ diskDeviceLabel(selectedDisk) }} {{ formatGiB(selectedDisk.virtualSizeBytes) }} → {{ targetSelectedDiskGiB }}</em><em v-else>新增 {{ diskDelta }} GiB · 共 {{ diskCount }} 块</em></span>
-              <span class="vm-resize-state" :class="diskRequiresShutdown || reconcileExistingCapacity ? 'warning' : 'success'">{{ diskRequiresShutdown ? "需关机" : reconcileExistingCapacity ? "待生效" : "可在线" }}</span>
+              <span class="vm-resize-value disk current" data-label="当前配置"><span><strong>{{ currentDiskTotalGiB }}</strong><small>GiB</small></span><em>{{ disks.length }} 块 · {{ diskSizeSummary || "读取中" }}<template v-if="diskSizeSummary"> GiB</template></em></span>
+              <div class="vm-resize-stepper disk" data-label="增加"><button type="button" :disabled="diskDelta <= 0" aria-label="减少磁盘" @click="adjust('disk', -1)"><el-icon><Minus /></el-icon></button><label><input v-model.number="diskDeltaInput" type="number" min="0" step="20" aria-label="磁盘增加量" /></label><button type="button" aria-label="增加磁盘" @click="adjust('disk', 1)"><el-icon><Plus /></el-icon></button></div>
+              <span class="vm-resize-value disk target" data-label="扩容后"><span><strong>{{ targetDiskTotalGiB }}</strong><small>GiB</small></span><em v-if="diskMode === 'extend' && selectedDisk">{{ diskDeviceLabel(selectedDisk) }} {{ formatGiB(selectedDisk.virtualSizeBytes) }} → {{ targetSelectedDiskGiB }}</em><em v-else>新增 {{ diskDelta }} GiB · 共 {{ diskCount }} 块</em></span>
+              <span class="vm-resize-state" :class="diskChangeActive ? 'warning' : 'success'">{{ reconcileExistingCapacity ? "待生效" : diskDelta ? "后端规划" : "未变更" }}</span>
             </div>
 
             <section class="vm-resize-guest">
@@ -329,9 +364,32 @@ function isAllowedNewMountPath(value: string) {
             </header>
 
             <div v-if="loadingGuestStorage" class="vm-resize-guest-state"><span class="vm-resize-state-loader"></span><strong>正在识别真实磁盘、分区和目录</strong></div>
-            <div v-else-if="!guestStorage?.supported" class="vm-resize-guest-state platform-only" :title="guestStorageError">
-              <el-icon><Warning /></el-icon>
-              <div><strong>{{ diskMode === "add" ? "仅创建虚拟磁盘" : "仅扩展虚拟硬盘" }}</strong><small>{{ diskMode === "add" ? "初始化与挂载需在系统内完成" : "分区与文件系统需在系统内完成" }}</small></div>
+            <div v-else-if="systemAuthenticationRequired" class="vm-resize-system-login">
+              <div class="vm-resize-system-login-copy">
+                <el-icon aria-hidden="true"><Warning /></el-icon>
+                <span><strong>{{ systemExecutionUnavailable ? "系统执行通道不可用" : "需要虚拟机系统账号" }}</strong><small>{{ systemExecutionUnavailable ? "请提供系统账号；只能经 JumpServer 访问时同时填写跳板连接。" : "默认凭据无法登录，请提供本次扩容使用的登录账号和密码。" }}</small></span>
+              </div>
+              <div class="vm-resize-system-login-fields">
+                <el-input v-model="systemLogin" aria-label="系统登录账号" autocomplete="username" name="vrc-resize-system-login" placeholder="登录账号" />
+                <el-input v-model="systemPassword" aria-label="系统登录密码" type="password" show-password autocomplete="current-password" name="vrc-resize-system-password" placeholder="登录密码" @keyup.enter="retrySystemLogin" />
+                <el-button :loading="loadingGuestStorage" :disabled="!canRetrySystemLogin" @click="retrySystemLogin">验证并读取</el-button>
+                <el-checkbox v-model="rememberSystemCredentials" class="vm-resize-system-login-remember">保存到本机（加密）</el-checkbox>
+                <el-checkbox v-model="useJumpServer" class="vm-resize-system-login-jump">通过 JumpServer 连接</el-checkbox>
+              </div>
+              <div v-if="useJumpServer" class="vm-resize-jump-fields">
+                <el-input v-model="jumpHost" aria-label="JumpServer 地址" name="vrc-resize-jump-host" placeholder="JumpServer Host" />
+                <el-input-number v-model="jumpPort" aria-label="JumpServer 端口" :min="1" :max="65535" :controls="false" />
+                <el-input v-model="jumpLogin" aria-label="JumpServer 登录账号" autocomplete="username" name="vrc-resize-jump-login" placeholder="Jump Login" />
+                <el-input v-model="jumpPassword" aria-label="JumpServer 登录密码" type="password" show-password autocomplete="current-password" name="vrc-resize-jump-password" placeholder="Jump Password" @keyup.enter="retrySystemLogin" />
+              </div>
+            </div>
+            <div v-else-if="guestOffline" class="vm-resize-guest-state unavailable" :title="guestStorage?.message || guestStorageError">
+              <el-icon aria-hidden="true"><Warning /></el-icon>
+              <div><strong>虚拟机当前已关机</strong><small>{{ guestStorage?.message || "无法读取操作系统磁盘与目录；请先开机后再按目录扩容。" }}</small></div>
+            </div>
+            <div v-else-if="!guestStorage?.supported" class="vm-resize-guest-state unavailable" :title="guestStorage?.message || guestStorageError">
+              <el-icon aria-hidden="true"><Warning /></el-icon>
+              <div><strong>系统执行通道不可用</strong><small>{{ guestStorage?.message || guestStorageError || "磁盘扩容需先完成系统磁盘与目录检测" }}</small></div>
             </div>
 
             <template v-else-if="diskMode === 'extend'">
@@ -356,7 +414,7 @@ function isAllowedNewMountPath(value: string) {
             <template v-else>
               <div class="vm-resize-new-mount">
                 <label class="vm-resize-directory-field">
-                  <span>空目录 / 新目录 <i>{{ detectedNewMountDirectory ? "Guest 空目录" : "将自动创建" }}</i></span>
+                  <span>空目录 / 新目录 <i>{{ detectedNewMountDirectory ? "系统空目录" : "将自动创建" }}</i></span>
                   <el-select v-model="newMountPath" aria-label="新磁盘挂载目录" filterable allow-create default-first-option placeholder="选择或输入目录">
                     <el-option-group label="可安全挂载">
                       <el-option v-if="!guestStorage.directories.some((directory) => directory.path === '/data')" label="/data" value="/data">
@@ -379,7 +437,7 @@ function isAllowedNewMountPath(value: string) {
               </div>
               <div class="vm-resize-chain">
                 <span><small>虚拟磁盘</small><strong>新增 {{ diskDelta }} GiB</strong></span><el-icon><ArrowRight /></el-icon>
-                <span><small>Guest 设备</small><strong>自动识别</strong></span><el-icon><ArrowRight /></el-icon>
+                <span><small>系统设备</small><strong>自动识别</strong></span><el-icon><ArrowRight /></el-icon>
                 <span><small>文件系统</small><strong>XFS 格式化</strong></span><el-icon><ArrowRight /></el-icon>
                 <span><small>自动挂载</small><strong>{{ normalizeMountPath(newMountPath) }}</strong></span>
               </div>
@@ -392,7 +450,7 @@ function isAllowedNewMountPath(value: string) {
           <div class="vm-resize-impact-head"><span>资源影响</span><strong>{{ changedCount }} 项变更</strong></div>
           <dl><div><dt>CPU 容量</dt><dd v-if="cpuOvercommitted">已超配 → <strong>平台校验</strong></dd><dd v-else>{{ formatNumber(cpuFree) }} → <strong>{{ cpuDelta ? "平台校验" : `${formatNumber(cpuFree)} 核` }}</strong></dd></div><div><dt>内存余量</dt><dd>{{ formatNumber(memoryFreeGiB) }} → <strong>{{ formatNumber(memoryFreeGiB - memoryDelta) }} GiB</strong></dd></div><div><dt>存储余量</dt><dd>{{ formatNumber(storageFreeGiB) }} → <strong>{{ formatNumber(storageFreeGiB - diskDelta) }} GiB</strong></dd></div></dl>
           <div class="vm-resize-divider"></div>
-          <div class="vm-resize-execution" :class="{ warning: requiresShutdown || diskAutoApplyBlocked }"><el-icon><Warning v-if="requiresShutdown || diskAutoApplyBlocked" /><CircleCheck v-else /></el-icon><div><strong>{{ requiresShutdown ? "需要短暂停机" : diskAutoApplyBlocked ? "自动生效不可用" : reconcileExistingCapacity ? "完成未生效容量" : "支持在线执行" }}</strong><p>{{ requiresShutdown ? "系统先正常关机，修改配置后自动开机并回读状态。" : diskAutoApplyBlocked ? "未读取到系统磁盘，暂不允许只扩虚拟硬件。" : reconcileExistingCapacity ? "无需再次增加虚拟磁盘，直接扩展所选目录并回读容量。" : "提交后持续回读平台和系统内容量。" }}</p></div></div>
+          <div class="vm-resize-execution" :class="{ warning: diskAutoApplyBlocked }"><el-icon><Warning v-if="diskAutoApplyBlocked" /><CircleCheck v-else /></el-icon><div><strong>{{ diskAutoApplyBlocked ? "自动生效不可用" : reconcileExistingCapacity ? "完成未生效容量" : "后端统一编排" }}</strong><p>{{ diskAutoApplyBlocked ? "未读取到系统磁盘，暂不允许只扩虚拟硬件。" : reconcileExistingCapacity ? "无需再次增加虚拟磁盘，直接扩展所选目录并回读容量。" : "后端根据平台能力选择在线或停机策略，并持续回读平台和系统内容量。" }}</p></div></div>
         </aside>
       </div>
       <p v-if="capacityError" class="vm-resize-error">{{ capacityError }}</p>
@@ -400,7 +458,7 @@ function isAllowedNewMountPath(value: string) {
 
     <template #footer>
       <div class="vm-resize-footer">
-        <div><strong>{{ changedCount }} 项资源变更</strong><span>{{ requiresShutdown ? "包含停机操作" : diskAutoApplyBlocked ? "等待系统连接" : "自动生效并回读" }}</span></div>
+        <div><strong>{{ changedCount }} 项资源变更</strong><span>{{ diskAutoApplyBlocked ? "等待系统连接" : "后端编排并回读" }}</span></div>
         <div><el-button :disabled="saving" @click="close">取消</el-button><el-button type="primary" :loading="saving" :disabled="!canSubmit" @click="submit">{{ reconcileExistingCapacity ? "完成扩容" : "确认扩容" }}</el-button></div>
       </div>
     </template>
@@ -408,18 +466,19 @@ function isAllowedNewMountPath(value: string) {
 </template>
 
 <style scoped>
+:global(html:has(.vm-resize-dialog)) { overflow: hidden; }
 :global(.vm-resize-dialog) { max-width: calc(100vw - 32px); padding: 0; border-radius: 8px; }
 :global(.vm-resize-dialog .el-dialog__header) { min-height: 68px; padding: 13px 46px 11px 16px; margin: 0; border-bottom: 1px solid var(--vrc-border); }
 :global(.vm-resize-dialog .el-dialog__headerbtn) { top: 7px; right: 7px; width: 32px; height: 32px; }
 :global(.vm-resize-dialog .el-dialog__body), :global(.vm-resize-dialog .el-dialog__footer) { padding: 0; }
 .vm-resize-title > div, .vm-resize-title p, .vm-resize-capacity, .vm-resize-capacity dl, .vm-resize-capacity dl div, .vm-resize-value, .vm-resize-value > span { display: flex; align-items: center; }
 .vm-resize-title > div { gap: 8px; }
-.vm-resize-title h2 { margin: 0; font-size: 18px; font-weight: 400; line-height: 24px; }
+.vm-resize-title h2 { margin: 0; font-size: var(--vrc-font-size-dialog-title); font-weight: var(--vrc-font-weight-heading); line-height: 24px; }
 .vm-resize-title > div > span { padding: 1px 6px; color: var(--vrc-accent); font-size: 10px; line-height: 18px; background: var(--vrc-accent-soft); border-radius: 3px; }
 .vm-resize-title p { gap: 7px; margin: 4px 0 0; color: var(--vrc-text-subtle); font-size: 11px; }
 .vm-resize-title p strong { max-width: 280px; overflow: hidden; color: var(--vrc-text-muted); font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
 .vm-resize-title p i { width: 2px; height: 2px; background: var(--vrc-text-subtle); border-radius: 50%; }
-.vm-resize-content { padding: 14px 16px 16px; }
+.vm-resize-content { max-height: calc(88vh - 124px); overflow: auto; overscroll-behavior: contain; scrollbar-gutter: auto; padding: 14px 16px 16px; }
 .vm-resize-capacity { justify-content: space-between; min-height: 24px; padding: 0 4px; margin-bottom: 4px; color: var(--vrc-text-muted); font-size: 11px; background: transparent; }
 .vm-resize-capacity > span, .vm-resize-capacity dt { color: var(--vrc-text-subtle); }
 .vm-resize-capacity dl { gap: 12px; margin: 0; }
@@ -447,9 +506,10 @@ function isAllowedNewMountPath(value: string) {
 .vm-resize-stepper button { display: grid; place-items: center; width: 30px; height: 28px; padding: 0; color: var(--vrc-text-muted); background: var(--vrc-surface); border: 0; cursor: pointer; }
 .vm-resize-stepper button:first-child { border-right: 1px solid var(--vrc-border); }
 .vm-resize-stepper button:last-child { border-left: 1px solid var(--vrc-border); }
-.vm-resize-stepper button:hover { color: var(--vrc-accent); background: var(--vrc-accent-soft); }
+.vm-resize-stepper button:hover:not(:disabled) { color: var(--vrc-accent); background: var(--vrc-accent-soft); }
+.vm-resize-stepper button:disabled { color: var(--vrc-text-subtle); background: var(--vrc-surface-muted); cursor: not-allowed; }
 .vm-resize-stepper label { display: flex; align-items: center; justify-content: center; gap: 2px; min-width: 0; height: 28px; background: var(--vrc-surface); }
-.vm-resize-stepper label:focus-within { box-shadow: inset 0 0 0 1px var(--vrc-border-strong); }
+.vm-resize-stepper:focus-within { border-color: var(--vrc-border-strong); box-shadow: none; }
 .vm-resize-stepper input { width: 36px; min-width: 0; height: 26px; padding: 0; color: var(--vrc-text); font: inherit; text-align: center; background: transparent; border: 0; outline: 0; appearance: textfield; }
 .vm-resize-stepper input::-webkit-inner-spin-button, .vm-resize-stepper input::-webkit-outer-spin-button { margin: 0; appearance: none; }
 .vm-resize-stepper.disk { width: 156px; grid-template-columns: 30px minmax(58px, 1fr) 30px; }
@@ -470,8 +530,10 @@ function isAllowedNewMountPath(value: string) {
 .vm-resize-guest > header small { color: var(--vrc-text-subtle); font-size: 11px; font-weight: 400; }
 .vm-resize-guest-tools { gap: 12px; }
 .vm-resize-disk-picker { gap: 6px; color: var(--vrc-text-subtle); font-size: 11px; font-weight: 400; }
-.vm-resize-disk-picker > .el-select { width: 174px; --el-component-size: 28px; }
-.vm-resize-disk-picker :deep(.el-select__wrapper) { min-height: 28px; height: 28px; padding: 0 8px; border-radius: 4px; }
+.vm-resize-disk-picker > .el-select { width: 174px; --el-component-size: var(--vrc-control-height); }
+.vm-resize-disk-picker :deep(.el-select__wrapper) { min-height: var(--vrc-control-height); height: var(--vrc-control-height); padding: 0 8px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: var(--vrc-control-radius); box-shadow: none; }
+.vm-resize-disk-picker :deep(.el-select__wrapper:hover) { border-color: var(--vrc-border-strong); box-shadow: none; }
+.vm-resize-disk-picker :deep(.el-select__wrapper.is-focused) { border-color: var(--vrc-border-strong); box-shadow: none; }
 .vm-resize-disk-picker :deep(.el-select__selected-item) { font-size: 12px; font-weight: 400; }
 .vm-resize-disk-option { display: flex; align-items: center; justify-content: space-between; width: 100%; gap: 20px; }
 .vm-resize-disk-option strong { font-size: 12px; font-weight: 400; }
@@ -481,14 +543,41 @@ function isAllowedNewMountPath(value: string) {
 .vm-resize-guest-state { display: flex; align-items: center; justify-content: center; gap: 7px; min-height: 58px; color: var(--vrc-text-muted); font-size: 11px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; }
 .vm-resize-guest-state strong { font-weight: 400; }
 .vm-resize-guest-state.error { color: var(--vrc-warning); }
-.vm-resize-guest-state.platform-only { color: var(--vrc-warning); }
-.vm-resize-guest-state.platform-only > div { display: grid; gap: 2px; }
-.vm-resize-guest-state.platform-only strong { color: var(--vrc-text); font-size: 12px; }
-.vm-resize-guest-state.platform-only small { color: var(--vrc-text-muted); font-size: 11px; }
+.vm-resize-guest-state.unavailable { color: var(--vrc-warning); }
+.vm-resize-guest-state.unavailable > div { display: grid; gap: 2px; }
+.vm-resize-guest-state.unavailable strong { color: var(--vrc-text); font-size: 12px; }
+.vm-resize-guest-state.unavailable small { color: var(--vrc-text-muted); font-size: 11px; }
+.vm-resize-system-login { display: grid; gap: 8px; min-height: 0; padding: 8px 9px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; }
+.vm-resize-system-login-copy { display: flex; align-items: center; gap: 7px; color: var(--vrc-warning); }
+.vm-resize-system-login-copy > span { display: grid; gap: 2px; }
+.vm-resize-system-login-copy strong { color: var(--vrc-text); font-size: 12px; font-weight: 400; line-height: 18px; }
+.vm-resize-system-login-copy small { color: var(--vrc-text-muted); font-size: 11px; font-weight: 400; line-height: 16px; }
+.vm-resize-system-login-fields { display: grid; grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1.2fr) 104px; gap: 8px; }
+.vm-resize-system-login-fields :deep(.el-input), .vm-resize-system-login-fields :deep(.el-button) { height: var(--vrc-command-height); min-height: var(--vrc-command-height); }
+.vm-resize-system-login-fields :deep(.el-input__wrapper) { height: var(--vrc-command-height); min-height: var(--vrc-command-height); padding: 0 8px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: var(--vrc-command-radius); box-shadow: none; }
+.vm-resize-system-login-fields :deep(.el-input__wrapper:hover) { border-color: var(--vrc-border-strong); background: var(--vrc-surface); box-shadow: none; }
+.vm-resize-system-login-fields :deep(.el-input__wrapper.is-focus) { border-color: var(--vrc-border-strong); background: var(--vrc-surface); box-shadow: none; }
+.vm-resize-system-login-fields :deep(.el-input__inner) { height: calc(var(--vrc-command-height) - 2px); color: var(--vrc-text); font-size: var(--vrc-font-size-body); font-weight: var(--vrc-font-weight-regular); line-height: calc(var(--vrc-command-height) - 2px); }
+.vm-resize-system-login-fields :deep(.el-input__inner::placeholder) { color: var(--vrc-text-subtle); font-size: var(--vrc-font-size-label); font-weight: var(--vrc-font-weight-regular); opacity: 1; }
+.vm-resize-system-login-fields :deep(.el-button) { padding: 0 10px; color: var(--vrc-text-muted); font-size: var(--vrc-font-size-body); font-weight: var(--vrc-font-weight-regular); background: var(--vrc-surface); border-color: var(--vrc-border); border-radius: var(--vrc-command-radius); }
+.vm-resize-system-login-fields :deep(.el-button:hover:not(.is-disabled)) { color: var(--vrc-accent); background: var(--vrc-accent-soft); border-color: var(--vrc-border-strong); }
+.vm-resize-system-login-fields :deep(.el-button:focus-visible) { color: var(--vrc-accent); border-color: var(--vrc-accent); box-shadow: var(--vrc-focus-ring); }
+.vm-resize-system-login-fields :deep(.el-button.is-disabled), .vm-resize-system-login-fields :deep(.el-button.is-disabled:hover) { color: var(--vrc-text-subtle); background: var(--vrc-surface-muted); border-color: var(--vrc-border); }
+.vm-resize-system-login-remember, .vm-resize-system-login-jump { width: max-content; height: 18px; margin: 0; }
+.vm-resize-system-login-remember { grid-column: 1 / 2; }
+.vm-resize-system-login-jump { grid-column: 2 / -1; }
+.vm-resize-system-login-remember :deep(.el-checkbox__label), .vm-resize-system-login-jump :deep(.el-checkbox__label) { padding-left: 6px; color: var(--vrc-text-muted); font-size: 12px; font-weight: 400; line-height: 18px; }
+.vm-resize-jump-fields { display: grid; grid-template-columns: minmax(150px, 1.2fr) 84px minmax(130px, 0.9fr) minmax(180px, 1.2fr); gap: 8px; padding-top: 8px; border-top: 1px solid var(--vrc-border); }
+.vm-resize-jump-fields :deep(.el-input), .vm-resize-jump-fields :deep(.el-input-number) { width: 100%; height: var(--vrc-command-height); }
+.vm-resize-jump-fields :deep(.el-input__wrapper), .vm-resize-jump-fields :deep(.el-input-number .el-input__wrapper) { height: var(--vrc-command-height); min-height: var(--vrc-command-height); padding: 0 8px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: var(--vrc-command-radius); box-shadow: none; }
+.vm-resize-jump-fields :deep(.el-input__wrapper:hover) { border-color: var(--vrc-border-strong); }
+.vm-resize-jump-fields :deep(.el-input__wrapper.is-focus) { border-color: var(--vrc-border-strong); box-shadow: none; }
+.vm-resize-jump-fields :deep(.el-input__inner) { color: var(--vrc-text); font-size: var(--vrc-font-size-body); font-weight: var(--vrc-font-weight-regular); }
 .vm-resize-state-loader { width: 14px; height: 14px; border: 2px solid var(--vrc-border); border-top-color: var(--vrc-accent); border-radius: 50%; animation: vm-resize-spin 0.8s linear infinite; }
 .vm-resize-mounts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .vm-resize-mounts button { display: grid; grid-template-columns: 14px minmax(0, 1fr) 52px 14px 58px; gap: 7px; align-items: center; min-width: 0; min-height: 50px; padding: 6px 9px; color: var(--vrc-text); text-align: left; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; cursor: pointer; }
 .vm-resize-mounts button.active { background: var(--vrc-surface); border-color: color-mix(in srgb, var(--vrc-accent) 55%, var(--vrc-border)); }
+.vm-resize-mounts button:focus-visible { outline: none; border-color: var(--vrc-active-border); box-shadow: var(--vrc-focus-ring); }
 .vm-resize-radio { width: 12px; height: 12px; border: 1px solid var(--vrc-border-strong); border-radius: 50%; }
 .vm-resize-mounts button.active .vm-resize-radio { background: var(--vrc-accent); border: 3px solid var(--vrc-surface); box-shadow: 0 0 0 1px var(--vrc-accent); }
 .vm-resize-mount-copy, .vm-resize-mount-size { display: grid; gap: 2px; min-width: 0; }
@@ -527,12 +616,29 @@ function isAllowedNewMountPath(value: string) {
 .vm-resize-execution strong { font-size: 12px; font-weight: 500; }
 .vm-resize-execution p { margin: 4px 0 0; color: var(--vrc-text-muted); font-size: 11px; line-height: 16px; }
 .vm-resize-error { margin: 8px 0 0; color: var(--vrc-danger); background: var(--vrc-status-danger-soft); }
-.vm-resize-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 56px; padding: 10px 16px; background: var(--vrc-surface-raised); border-top: 1px solid var(--vrc-border); }
+.vm-resize-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 56px; padding: 10px 16px; background: var(--vrc-surface); }
 .vm-resize-footer > div { display: flex; align-items: center; gap: 8px; }
 .vm-resize-footer strong { font-size: 12px; font-weight: 500; }
 .vm-resize-footer span { color: var(--vrc-warning); font-size: 11px; }
-.vm-resize-footer :deep(.el-button) { min-width: 82px; height: 32px; margin: 0; font-weight: 400; border-radius: 4px; }
+.vm-resize-footer :deep(.el-button) { min-width: 82px; height: var(--vrc-command-height); margin: 0; font-weight: var(--vrc-font-weight-regular); border-radius: var(--vrc-command-radius); }
 @media (max-width: 1080px) { .vm-resize-layout { grid-template-columns: 1fr; } .vm-resize-impact { border-top: 1px solid var(--vrc-border); border-left: 0; } }
-@media (max-width: 760px) { .vm-resize-mounts { grid-template-columns: 1fr; } .vm-resize-new-mount { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 760px) { .vm-resize-mounts { grid-template-columns: 1fr; } .vm-resize-new-mount, .vm-resize-system-login-fields, .vm-resize-jump-fields { grid-template-columns: 1fr; } .vm-resize-system-login-remember, .vm-resize-system-login-jump { grid-column: 1; } }
+@media (max-width: 700px) {
+  .vm-resize-head { display: none; }
+  .vm-resize-row:not(.vm-resize-head) { grid-template-columns: minmax(64px, .8fr) minmax(156px, 1.4fr) minmax(64px, .8fr); grid-template-areas: "resource resource state" "current increase target"; gap: 8px; min-height: 104px; padding: 10px 12px 12px; }
+  .vm-resize-resource { grid-area: resource; min-width: 0; }
+  .vm-resize-state { grid-area: state; justify-self: end; }
+  .vm-resize-value.current { grid-area: current; }
+  .vm-resize-stepper { grid-area: increase; width: min(156px, 100%); }
+  .vm-resize-value.target { grid-area: target; }
+  .vm-resize-value.current, .vm-resize-value.target, .vm-resize-stepper { position: relative; margin-top: 16px; }
+  .vm-resize-value.current::before, .vm-resize-value.target::before, .vm-resize-stepper::before { position: absolute; top: -17px; right: 0; left: 0; color: var(--vrc-text-subtle); font-size: 10px; font-weight: 400; line-height: 14px; text-align: center; content: attr(data-label); }
+  .vm-resize-value.disk { width: 100%; min-width: 0; }
+  .vm-resize-value.disk em { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+@media (max-width: 460px) {
+  .vm-resize-row:not(.vm-resize-head) { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-areas: "resource state" "current target" "increase increase"; min-height: 148px; }
+  .vm-resize-stepper { margin-top: 18px; }
+}
 @keyframes vm-resize-spin { to { transform: rotate(360deg); } }
 </style>
