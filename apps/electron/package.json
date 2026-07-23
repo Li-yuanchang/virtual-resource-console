@@ -1,6 +1,6 @@
 {
   "name": "@vrc/electron",
-  "version": "0.1.37",
+  "version": "0.1.47",
   "private": true,
   "description": "Desktop shell for Virtual Resource Console.",
   "main": "main.cjs",
@@ -10,7 +10,7 @@
     "pack": "electron-builder --dir",
     "predist:mac": "node ../../scripts/prepare-electron-runtime.mjs darwin-arm64 && node ../../scripts/prepare-electron-api-runtime.mjs",
     "dist:mac": "electron-builder --mac",
-    "predist:win": "node ../../scripts/prepare-electron-runtime.mjs win-x64 && node ../../scripts/prepare-electron-api-runtime.mjs",
+    "predist:win": "node ../../scripts/clean-electron-windows-output.mjs && node ../../scripts/prepare-electron-runtime.mjs win-x64 && node ../../scripts/prepare-electron-api-runtime.mjs",
     "dist:win": "electron-builder --win --x64"
   },
   "devDependencies": {
@@ -21,12 +21,24 @@
     "appId": "com.virtualresource.console",
     "electronVersion": "38.2.2",
     "productName": "VRC",
+    "afterPack": "../../scripts/ensure-macos-app-signature.cjs",
     "directories": {
       "output": "dist"
     },
     "compression": "normal",
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "http://192.168.2.26:3988/desktop-updates"
+      }
+    ],
+    "releaseInfo": {
+      "releaseNotesFile": "release-notes.md"
+    },
     "files": [
       "main.cjs",
+      "preload.cjs",
+      "release-notes.md",
       "startup.html",
       "assets/**",
       "package.json"
@@ -114,5 +126,8 @@
       "createStartMenuShortcut": true,
       "shortcutName": "VRC"
     }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
   }
 }

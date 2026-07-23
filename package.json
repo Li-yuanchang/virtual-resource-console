@@ -22,6 +22,7 @@
     "pack:extension": "npm run build:extension && node scripts/pack-chrome-extension.mjs",
     "dist:mac": "npm run build && npm --workspace apps/electron run dist:mac",
     "dist:win": "npm run build && npm --workspace apps/electron run dist:win",
+    "release:update": "node scripts/prepare-online-update-release.mjs",
     "start:server": "npm --workspace apps/api run start",
     "typecheck": "npm --workspace apps/api run typecheck && npm --workspace apps/web run typecheck"
   },
