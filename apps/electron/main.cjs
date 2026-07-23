@@ -1,4 +1,5 @@
-const { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, nativeTheme, shell } = require("electron");
+const { app, BrowserWindow, Menu, Tray, WebContentsView, ipcMain, nativeImage, nativeTheme, shell } = require("electron");
+const { autoUpdater } = require("electron-updater");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const net = require("node:net");
@@ -8,10 +9,12 @@ const APP_DISPLAY_NAME = "VRC";
 const MAIN_PROCESS_STARTED_AT = Date.now();
 const WINDOWS_APP_USER_MODEL_ID = "com.virtualresource.console";
 const WINDOWS_SINGLE_INSTANCE_PIPE = "\\\\.\\pipe\\vrc-desktop-single-instance";
-const MIN_STARTUP_VISIBLE_MS = 650;
+const MIN_STARTUP_VISIBLE_MS = 1800;
 const STARTUP_READY_STATUS_MS = 60;
-const STARTUP_EXIT_ANIMATION_MS = 260;
+const STARTUP_EXIT_ANIMATION_MS = 460;
 const RENDERER_READY_TIMEOUT_MS = 5000;
+const DESKTOP_UPDATE_FEED_URL = process.env.VRC_UPDATE_URL || "http://192.168.2.26:3988/desktop-updates";
+const DESKTOP_UPDATE_DISTRIBUTION = resolveDesktopUpdateDistribution();
 
 if (app && app.setName) {
   app.setName(APP_DISPLAY_NAME);
@@ -43,6 +46,29 @@ let isQuitting = false;
 let logStreamsClosing = false;
 let pendingShowMainWindow = false;
 let windowsSingleInstanceServer;
+let desktopUpdateState = {
+  stage: "idle",
+  currentVersion: typeof app.getVersion === "function" ? app.getVersion() : "0.0.0",
+  availableVersion: typeof app.getVersion === "function" ? app.getVersion() : "0.0.0",
+  progress: 0,
+  transferred: 0,
+  total: 0,
+  releaseNotes: readBundledReleaseNotes(),
+  message:
+    DESKTOP_UPDATE_DISTRIBUTION === "portable"
+      ? "免安装版不支持自动安装更新，请下载新版 ZIP 后替换当前目录"
+      : "尚未检查更新",
+  checkedAt: "",
+  supported:
+    app.isPackaged &&
+    (process.platform === "darwin" || (process.platform === "win32" && DESKTOP_UPDATE_DISTRIBUTION === "installed")),
+  distribution: DESKTOP_UPDATE_DISTRIBUTION,
+  platform: process.platform,
+};
+let desktopUpdaterConfigured = false;
+let desktopUpdateOperation = "";
+
+configureDesktopUpdater();
 
 appendMainLog("startup phase", buildStartupDetail("main process started", {
   platform: process.platform,
@@ -89,6 +115,7 @@ async function createWindow() {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      preload: path.join(__dirname, "preload.cjs"),
     },
   });
   appendMainLog("startup phase", buildStartupDetail("browser window created"));
@@ -415,6 +442,210 @@ function isHexColor(value) {
   return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
 }
 
+function configureDesktopUpdater() {
+  if (desktopUpdaterConfigured) return;
+  desktopUpdaterConfigured = true;
+
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowPrerelease = false;
+  ensureDesktopUpdaterConfig();
+  autoUpdater.setFeedURL({ provider: "generic", url: DESKTOP_UPDATE_FEED_URL, channel: "latest" });
+
+  autoUpdater.on("checking-for-update", () => {
+    updateDesktopUpdateState({ stage: "checking", message: "正在检查更新", progress: 0 });
+  });
+  autoUpdater.on("update-available", (info) => {
+    updateDesktopUpdateState({
+      stage: "available",
+      availableVersion: info.version || "",
+      releaseNotes: normalizeReleaseNotes(info.releaseNotes),
+      message: `发现 VRC ${info.version || "新版本"}`,
+      progress: 0,
+      checkedAt: new Date().toISOString(),
+    });
+  });
+  autoUpdater.on("update-not-available", () => {
+    updateDesktopUpdateState({
+      stage: "up-to-date",
+      availableVersion: desktopUpdateState.currentVersion,
+      releaseNotes: readBundledReleaseNotes(),
+      message: "当前已是最新版本",
+      progress: 0,
+      checkedAt: new Date().toISOString(),
+    });
+  });
+  autoUpdater.on("download-progress", (progress) => {
+    updateDesktopUpdateState({
+      stage: "downloading",
+      progress: normalizePercent(progress.percent),
+      transferred: Number(progress.transferred) || 0,
+      total: Number(progress.total) || 0,
+      message: "正在下载更新",
+    });
+  });
+  autoUpdater.on("update-downloaded", (info) => {
+    updateDesktopUpdateState({
+      stage: "ready",
+      availableVersion: info.version || desktopUpdateState.availableVersion,
+      releaseNotes: normalizeReleaseNotes(info.releaseNotes) || desktopUpdateState.releaseNotes,
+      progress: 100,
+      message: "更新已准备完成，重启客户端后生效",
+    });
+  });
+  autoUpdater.on("error", (error) => {
+    settleDesktopUpdateFailure(error, desktopUpdateOperation);
+    appendMainLog("desktop update failed", { message: error instanceof Error ? error.message : String(error) });
+  });
+
+  ipcMain.handle("vrc:update:get-state", () => ({ ...desktopUpdateState }));
+  ipcMain.handle("vrc:update:check", async () => {
+    assertDesktopUpdateSupported();
+    desktopUpdateOperation = "check";
+    try {
+      await autoUpdater.checkForUpdates();
+    } catch (error) {
+      settleDesktopUpdateFailure(error, "check");
+    } finally {
+      if (desktopUpdateOperation === "check") desktopUpdateOperation = "";
+    }
+    return { ...desktopUpdateState };
+  });
+  ipcMain.handle("vrc:update:download", async () => {
+    assertDesktopUpdateSupported();
+    if (desktopUpdateState.stage !== "available") {
+      return { ...desktopUpdateState };
+    }
+    desktopUpdateOperation = "download";
+    updateDesktopUpdateState({ stage: "downloading", progress: 0, transferred: 0, total: 0, message: "正在下载更新" });
+    try {
+      await autoUpdater.downloadUpdate();
+    } catch (error) {
+      settleDesktopUpdateFailure(error, "download");
+    } finally {
+      if (desktopUpdateOperation === "download") desktopUpdateOperation = "";
+    }
+    return { ...desktopUpdateState };
+  });
+  ipcMain.handle("vrc:update:install", async () => {
+    assertDesktopUpdateSupported();
+    if (desktopUpdateState.stage !== "ready") throw new Error("更新包尚未准备完成");
+    await showUpdateRestartView();
+    isQuitting = true;
+    setImmediate(() => autoUpdater.quitAndInstall(false, true));
+    return { accepted: true };
+  });
+}
+
+async function showUpdateRestartView() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!startupView) {
+    startupOverlayReady = false;
+    await attachStartupView(readStartupAppearance());
+    startupOverlayReady = true;
+  }
+  await setStartupStatus("正在应用更新，客户端即将重启");
+  mainWindow.show();
+  mainWindow.focus();
+  await delay(320);
+}
+
+function updateDesktopUpdateState(patch) {
+  desktopUpdateState = { ...desktopUpdateState, ...patch };
+  const payload = { ...desktopUpdateState };
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send("vrc:update:state", payload);
+  }
+}
+
+function assertDesktopUpdateSupported() {
+  if (!desktopUpdateState.supported) {
+    if (desktopUpdateState.distribution === "portable") {
+      throw new Error("免安装版不支持自动安装更新，请下载新版 ZIP 后替换当前目录");
+    }
+    throw new Error("桌面更新仅在已安装的 macOS 或 Windows 客户端中可用");
+  }
+}
+
+function resolveDesktopUpdateDistribution() {
+  if (process.platform === "darwin") return "installed";
+  if (process.platform !== "win32") return "unsupported";
+  if (process.env.PORTABLE_EXECUTABLE_FILE || process.env.PORTABLE_EXECUTABLE_DIR) return "portable";
+  const uninstallPath = path.join(path.dirname(process.execPath), `Uninstall ${APP_DISPLAY_NAME}.exe`);
+  return fs.existsSync(uninstallPath) ? "installed" : "portable";
+}
+
+function ensureDesktopUpdaterConfig() {
+  const packagedConfigPath = path.join(process.resourcesPath, "app-update.yml");
+  if (fs.existsSync(packagedConfigPath)) {
+    autoUpdater.updateConfigPath = packagedConfigPath;
+    return;
+  }
+
+  const fallbackConfigPath = path.join(app.getPath("userData"), "app-update.yml");
+  const fallbackConfig = [
+    "provider: generic",
+    `url: ${JSON.stringify(DESKTOP_UPDATE_FEED_URL)}`,
+    "updaterCacheDirName: vrc-updater",
+    "",
+  ].join("\n");
+  fs.mkdirSync(path.dirname(fallbackConfigPath), { recursive: true });
+  if (!fs.existsSync(fallbackConfigPath) || fs.readFileSync(fallbackConfigPath, "utf8") !== fallbackConfig) {
+    fs.writeFileSync(fallbackConfigPath, fallbackConfig, "utf8");
+  }
+  autoUpdater.updateConfigPath = fallbackConfigPath;
+}
+
+function settleDesktopUpdateFailure(error, operation) {
+  if (operation === "check") {
+    updateDesktopUpdateState({
+      stage: "unavailable",
+      message: "暂未检测到可用更新",
+      checkedAt: new Date().toISOString(),
+    });
+    return;
+  }
+  if (desktopUpdateState.stage === "error") return;
+  updateDesktopUpdateState({
+    stage: "error",
+    message: readableDesktopUpdateError(error),
+    checkedAt: new Date().toISOString(),
+  });
+}
+
+function normalizePercent(value) {
+  const percent = Number(value);
+  if (!Number.isFinite(percent)) return 0;
+  return Math.max(0, Math.min(100, Math.round(percent * 10) / 10));
+}
+
+function normalizeReleaseNotes(value) {
+  if (typeof value === "string") return value.trim();
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((item) => (typeof item === "string" ? item : item?.note))
+    .filter((item) => typeof item === "string" && item.trim())
+    .join("\n")
+    .trim();
+}
+
+function readBundledReleaseNotes() {
+  try {
+    return fs.readFileSync(path.join(__dirname, "release-notes.md"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function readableDesktopUpdateError(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (/app-update\.ya?ml|ENOENT/i.test(message)) return "更新组件配置异常，请重新启动客户端后再试";
+  if (/404|latest.*ya?ml/i.test(message)) return "更新源暂未发布当前平台版本";
+  if (/network|ECONN|ENOTFOUND|ETIMEDOUT|fetch/i.test(message)) return "无法连接更新服务，请检查网络后重试";
+  if (/signature|code sign|sha512|checksum/i.test(message)) return "更新包校验失败，已停止安装";
+  return message ? `更新失败：${message}` : "更新失败，请稍后重试";
+}
+
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -475,7 +706,13 @@ async function startBundledApi() {
 }
 
 function getVrcDataDir() {
-  return process.env.VRC_DATA_DIR?.trim() || path.join(app.getPath("home"), ".virtual-resource-console");
+  const configured = process.env.VRC_DATA_DIR?.trim();
+  if (configured) return path.resolve(configured);
+
+  const packagedDataDir = path.join(app.getPath("userData"), "data");
+  const legacyDataDir = path.join(app.getPath("home"), ".virtual-resource-console");
+  if (!fs.existsSync(packagedDataDir) && fs.existsSync(legacyDataDir)) return legacyDataDir;
+  return packagedDataDir;
 }
 
 function createTray() {
