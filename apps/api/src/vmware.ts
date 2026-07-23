@@ -5,6 +5,8 @@ import { assessVmReclaim } from "./analysis/reclaimStateMachine.js";
 import { getGeneratedIso, markGeneratedIsoStatus, markGeneratedIsoUploaded, registerGeneratedIso } from "./generatedIsoStore.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
 import { inferIpv4FromName, isManagedIpv4 } from "./runtimePolicy.js";
+import { normalizeStorageCapacity } from "./storageCapacity.js";
+import { describeStorageRepository } from "./storageRepositoryProfile.js";
 import { ensureVmwareCentosBootFiles, generateVmwareCentosKickstartIso, removeLocalVmwareKickstartIso } from "./vmwareUnattendedIso.js";
 import type {
   HostNode,
@@ -28,7 +30,7 @@ import type {
   VmProvisionResult,
   VmQuery,
   VmRenameResult,
-  VmResizeRequest,
+  VmResizeExecutionRequest,
   VmResizeResult,
   VmSnapshot,
   XenConnectionInput,
@@ -272,9 +274,14 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
       providerId: disk.id,
       name: disk.name,
       device: disk.device,
+      displayName: disk.device || disk.name || "虚拟硬盘",
       virtualSizeBytes: disk.virtualSizeBytes,
       storageRepositoryId: disk.storageRepository,
       storageRepository: disk.storageRepository,
+      onlineResizeSupported: true,
+      canOnlineResize: true,
+      requiresShutdown: false,
+      allowedModes: ["extend", "add"],
     }));
   }
 
@@ -429,7 +436,7 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
     }
   }
 
-  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeRequest): Promise<VmResizeResult> {
+  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeExecutionRequest): Promise<VmResizeResult> {
     const session = await VmwareSoapSession.login(input);
     let stopped = false;
     let restarted = false;
@@ -480,7 +487,7 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
         if (!storage) throw new Error("VMware 新增磁盘需要选择 Datastore。");
         specParts.push(vmwareAddDiskSpec(currentDisks, storage, request.disk.sizeBytes, request.disk.name));
       }
-      if (!specParts.length && !request.guestStorage) throw new Error("没有需要执行的 VMware 扩容变更。");
+      if (!specParts.length && !request.allowNoop) throw new Error("没有需要执行的 VMware 扩容变更。");
       if (specParts.length) await session.reconfigureVm(vmObject.ref.value, specParts.join(""));
 
       if (stopped && request.restartAfterResize) {
@@ -1652,13 +1659,14 @@ function toStorageRepository(item: PropertyObject): StorageRepository {
   const capacity = numberOf(item.props.get("summary.capacity"));
   const free = numberOf(item.props.get("summary.freeSpace"));
   const used = Math.max(capacity - free, 0);
+  const type = textOf(item.props.get("summary.type"));
+  const shared = textOf(item.props.get("summary.multipleHostAccess")) === "true";
   return {
     name: textOf(item.props.get("name")),
-    type: textOf(item.props.get("summary.type")),
-    physicalGiB: bytesToGib(capacity),
-    usedGiB: bytesToGib(used),
-    virtualGiB: bytesToGib(used),
-    shared: textOf(item.props.get("summary.multipleHostAccess")) === "true",
+    type,
+    ...describeStorageRepository("vmware", { type, shared }),
+    ...normalizeStorageCapacity({ physicalGiB: bytesToGib(capacity), usedGiB: bytesToGib(used) }),
+    shared,
   };
 }
 
@@ -1678,6 +1686,7 @@ function toVmNode(item: PropertyObject, connectionId: string): VmNode {
     id: `${connectionId}:vm:${providerId}`,
     connectionId,
     providerId,
+    consoleRef: item.ref.value,
     name,
     powerState: normalizePowerState(textOf(item.props.get("runtime.powerState"))),
     cpuCount: numberOf(item.props.get("config.hardware.numCPU")),

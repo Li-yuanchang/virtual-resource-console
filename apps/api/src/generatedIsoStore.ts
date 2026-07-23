@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getVrcDataDir } from "./appPaths.js";
 import type { ProviderType } from "./types.js";
 
-const storeDir = join(homedir(), ".virtual-resource-console");
+const storeDir = getVrcDataDir();
 const storeFile = join(storeDir, "generated-isos.json");
 const failedGeneratedIsoRetentionMs = 7 * 24 * 60 * 60 * 1000;
 

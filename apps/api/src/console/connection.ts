@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { resolveStoredConnection } from "../connectionStore.js";
+import { defaultPortForProvider, providerLabel } from "../providerCatalog.js";
 import type { ProviderType, XenConnectionInput } from "../types.js";
 
 export interface ConsoleConnectionInput {
@@ -66,7 +67,7 @@ export function resolveConsoleConnection(payload: ConsoleConnectionPayload, expe
       providerType,
       connection: {
         host: connection.host,
-        port: connection.port ?? defaultProviderPort(providerType),
+        port: connection.port ?? defaultPortForProvider(providerType),
         username: connection.username,
         password: connection.password,
       },
@@ -89,17 +90,4 @@ export function resolveConsoleConnection(payload: ConsoleConnectionPayload, expe
       password: stored.password,
     },
   };
-}
-
-function defaultProviderPort(providerType: ProviderType): number {
-  if (providerType === "proxmox") return 8006;
-  if (providerType === "vmware") return 443;
-  return 22;
-}
-
-function providerLabel(providerType: ProviderType): string {
-  if (providerType === "proxmox") return "Proxmox VE";
-  if (providerType === "vmware") return "VMware";
-  if (providerType === "xenserver") return "XenServer";
-  return providerType;
 }

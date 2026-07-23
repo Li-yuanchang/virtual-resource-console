@@ -13,18 +13,19 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { Client } from "ssh2";
 import type { ConnectConfig, SFTPWrapper } from "ssh2";
 import { buildCentosLvmPartitioning, buildCentosPackageSelection } from "./centosKickstart.js";
+import { getVrcDataFile } from "./appPaths.js";
 import { getGeneratedIso, markGeneratedIsoStatus, markGeneratedIsoUploaded, registerGeneratedIso } from "./generatedIsoStore.js";
+import type { GeneratedIsoRecord } from "./generatedIsoStore.js";
 import type { IpPoolConfig, VmProvisionInstallSourceRef, VmProvisionPlanItem, XenConnectionInput } from "./types.js";
 
 const execFileAsync = promisify(execFile);
-const cacheDir = join(homedir(), ".virtual-resource-console", "iso-cache");
-const generatedDir = join(homedir(), ".virtual-resource-console", "generated-isos");
+const cacheDir = getVrcDataFile("iso-cache");
+const generatedDir = getVrcDataFile("generated-isos");
 const centosBootIsoLabel = "VRCCENTOS7";
 const centosKickstartIsoLabel = "VRCKS";
 const windowsUnattendedIsoLabel = "VRCWIN";
@@ -46,6 +47,7 @@ export interface XenUnattendedIsoInput {
   taskId?: string;
   sourceIsoId: string;
   sourceIsoName: string;
+  installProfile?: "server" | "desktop";
   hostId?: string;
   vm: VmProvisionPlanItem;
   ipPool: IpPoolConfig;
@@ -292,7 +294,27 @@ export function buildWindowsAutounattend(input: XenUnattendedIsoInput): string {
   const prefixLength = cidrPrefixLength(input.ipPool.cidr);
   if (prefixLength == null) throw new Error("Windows 无人值守安装缺少有效 CIDR 前缀长度。");
   const bootstrapCommand = buildWindowsSpecializeBootstrapCommand();
+  const remoteAccessCommands = buildWindowsSpecializeRemoteAccessCommands();
   const firstLogonCommands = buildWindowsFirstLogonCommands(input);
+  const specializeCommands = [
+    ...remoteAccessCommands.map((path, index) => ({
+      order: index + 1,
+      description: `Enable VRC remote access ${index + 1}`,
+      path,
+    })),
+    {
+      order: remoteAccessCommands.length + 1,
+      description: "Stage VRC guest initialization",
+      path: bootstrapCommand,
+    },
+  ];
+  const specializeCommandXml = specializeCommands
+    .map(
+      (command) => `<RunSynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+        <Order>${command.order}</Order><Description>${xmlEscape(command.description)}</Description><Path>${xmlEscape(command.path)}</Path><WillReboot>Never</WillReboot>
+      </RunSynchronousCommand>`,
+    )
+    .join("");
   const component = (name: string) => `processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" name="${name}"`;
   return `<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -303,7 +325,7 @@ export function buildWindowsAutounattend(input: XenUnattendedIsoInput): string {
     </component>
     <component ${component("Microsoft-Windows-Setup")}>
       <DiskConfiguration><Disk wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><DiskID>0</DiskID><WillWipeDisk>true</WillWipeDisk><CreatePartitions><CreatePartition wcm:action="add"><Order>1</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition></CreatePartitions><ModifyPartitions><ModifyPartition wcm:action="add"><Active>true</Active><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter><Order>1</Order><PartitionID>1</PartitionID></ModifyPartition></ModifyPartitions></Disk></DiskConfiguration>
-      <ImageInstall><OSImage><InstallFrom><MetaData wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><Key>/IMAGE/INDEX</Key><Value>${resolveWindowsImageIndex(input.sourceIsoName)}</Value></MetaData></InstallFrom><InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo><WillShowUI>OnError</WillShowUI></OSImage></ImageInstall>
+      <ImageInstall><OSImage><InstallFrom><MetaData wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><Key>/IMAGE/INDEX</Key><Value>${resolveWindowsImageIndex(input.sourceIsoName, input.installProfile)}</Value></MetaData></InstallFrom><InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo><WillShowUI>OnError</WillShowUI></OSImage></ImageInstall>
       <UserData><AcceptEula>true</AcceptEula><FullName>VRC</FullName><Organization>VRC</Organization></UserData>
     </component>
   </settings>
@@ -325,9 +347,7 @@ export function buildWindowsAutounattend(input: XenUnattendedIsoInput): string {
       </Interface></Interfaces>
     </component>
     <component ${component("Microsoft-Windows-Deployment")}>
-      <RunSynchronous><RunSynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-        <Order>1</Order><Description>Stage VRC guest initialization</Description><Path>${xmlEscape(bootstrapCommand)}</Path><WillReboot>Never</WillReboot>
-      </RunSynchronousCommand></RunSynchronous>
+      <RunSynchronous>${specializeCommandXml}</RunSynchronous>
     </component>
   </settings>
   <settings pass="oobeSystem">
@@ -337,8 +357,10 @@ export function buildWindowsAutounattend(input: XenUnattendedIsoInput): string {
       <UserAccounts><AdministratorPassword><Value>${encodeWindowsUnattendPassword(password, "AdministratorPassword")}</Value><PlainText>false</PlainText></AdministratorPassword></UserAccounts>
       <OOBE><HideEULAPage>true</HideEULAPage><NetworkLocation>Work</NetworkLocation><ProtectYourPC>3</ProtectYourPC><SkipMachineOOBE>true</SkipMachineOOBE><SkipUserOOBE>true</SkipUserOOBE></OOBE>
       <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><Order>1</Order><Description>Configure VRC network and remote management</Description><CommandLine>${xmlEscape(firstLogonCommands.configure)}</CommandLine></SynchronousCommand>
-        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><Order>2</Order><Description>Remove VRC answer file</Description><CommandLine>${xmlEscape(firstLogonCommands.cleanup)}</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><Order>1</Order><Description>Enable VRC network access fallback</Description><CommandLine>${xmlEscape(firstLogonCommands.remoteAccess)}</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><Order>2</Order><Description>Configure VRC network and remote management</Description><CommandLine>${xmlEscape(firstLogonCommands.configure)}</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><Order>3</Order><Description>Retry VRC guest initialization</Description><CommandLine>${xmlEscape(firstLogonCommands.launch)}</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"><Order>4</Order><Description>Remove VRC answer file</Description><CommandLine>${xmlEscape(firstLogonCommands.cleanup)}</CommandLine></SynchronousCommand>
       </FirstLogonCommands>
     </component>
   </settings>
@@ -347,7 +369,9 @@ export function buildWindowsAutounattend(input: XenUnattendedIsoInput): string {
 }
 
 export interface WindowsFirstLogonCommands {
+  remoteAccess: string;
   configure: string;
+  launch: string;
   cleanup: string;
 }
 
@@ -358,6 +382,32 @@ export interface WindowsFirstLogonCommands {
  */
 export function buildWindowsSpecializeBootstrapCommand(): string {
   return 'cmd.exe /c for %d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist "%d:\\VrcBootstrap.cmd" call "%d:\\VrcBootstrap.cmd"';
+}
+
+/**
+ * Builds the specialize-pass command that exposes only the remote services required by VRC.
+ *
+ * This command does not depend on the task configuration CD or PowerShell bootstrap. Keeping
+ * it in the answer file ensures ICMP, WinRM, and RDP are available even when guest bootstrap
+ * staging fails and lets the verifier report the actual later failure instead of waiting forever.
+ */
+export function buildWindowsSpecializeRemoteAccessCommands(): string[] {
+  const commands = [
+    "cmd.exe /d /c netsh advfirewall set allprofiles state off",
+    "cmd.exe /d /c netsh advfirewall firewall add rule name=VRC-ICMPv4-Echo dir=in action=allow protocol=icmpv4:8,any remoteip=any profile=any",
+    "cmd.exe /d /c sc.exe config WinRM start= auto & net start WinRM & winrm.cmd quickconfig -quiet",
+    "cmd.exe /d /c netsh advfirewall firewall add rule name=VRC-WinRM dir=in action=allow protocol=TCP localport=5985 remoteip=any profile=any",
+    'cmd.exe /d /c reg.exe add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f',
+    "cmd.exe /d /c netsh advfirewall firewall add rule name=VRC-RDP dir=in action=allow protocol=TCP localport=3389 remoteip=any profile=any",
+  ];
+  assertWindowsSpecializeCommandLengths(commands);
+  return commands;
+}
+
+/** Ensures every specialize command stays within Windows Server 2008 R2's Path limit. */
+function assertWindowsSpecializeCommandLengths(commands: string[]): void {
+  const overlong = commands.find((command) => command.length >= 260);
+  if (overlong) throw new Error(`Windows Server 2008 R2 specialize 命令超过 259 字符限制：${overlong.length}`);
 }
 
 /**
@@ -374,9 +424,8 @@ export function buildWindowsBootstrapScript(): string {
     'copy /y "%~dp0VrcSetup.ps1" "%VRC_STATE%\\VrcSetup.ps1" >nul',
     "if errorlevel 1 exit /b 10",
     'schtasks.exe /Create /TN "VRC-Guest-Setup" /SC ONSTART /RU SYSTEM /RL HIGHEST /TR "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\ProgramData\\VRC\\VrcSetup.ps1" /F >nul',
-    "if errorlevel 1 exit /b 11",
-    'schtasks.exe /Run /TN "VRC-Guest-Setup" >nul',
-    "exit /b %errorlevel%",
+    'start "" /b powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%VRC_STATE%\\VrcSetup.ps1"',
+    "exit /b 0",
     "",
   ].join("\r\n");
 }
@@ -400,8 +449,14 @@ $taskName = 'VRC-Guest-Setup'
 $stateDir = Join-Path $env:ProgramData 'VRC'
 $toolsMarker = Join-Path $stateDir 'xen-tools-installed'
 $completeMarker = Join-Path $stateDir 'guest-setup-complete'
+$lockPath = Join-Path $stateDir 'guest-setup.lock'
 $log = Join-Path $env:WINDIR 'Temp\vrc-setup.log'
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+try {
+  $lock = [System.IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
+} catch {
+  exit 0
+}
 Start-Transcript -Path $log -Append | Out-Null
 $mac = '${powershellQuote(macAddress)}'
 $networkReady = $false
@@ -422,27 +477,43 @@ do {
   if (-not $networkReady) { Start-Sleep -Seconds 5 }
 } while (-not $networkReady -and (Get-Date) -lt $networkDeadline)
 
+& netsh advfirewall set allprofiles state off | Out-Null
+Set-Service WinRM -StartupType Automatic
+Start-Service WinRM
+& winrm quickconfig -quiet
+
 if ($networkReady) {
   New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force | Out-Null
   Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name ForceGuest -Value 0
-  Set-Service WinRM -StartupType Automatic
-  Start-Service WinRM
-  & winrm quickconfig -quiet
-  & netsh advfirewall firewall add rule name=VRC-WinRM dir=in action=allow protocol=TCP localport=5985 | Out-Null
-  & netsh advfirewall firewall add rule name=VRC-ICMPv4-Echo dir=in action=allow protocol=icmpv4:8,any | Out-Null
+  & netsh advfirewall firewall delete rule name=VRC-WinRM | Out-Null
+  & netsh advfirewall firewall add rule name=VRC-WinRM dir=in action=allow protocol=TCP localport=5985 remoteip=any profile=any | Out-Null
+  & netsh advfirewall firewall delete rule name=VRC-ICMPv4-Echo | Out-Null
+  & netsh advfirewall firewall add rule name=VRC-ICMPv4-Echo dir=in action=allow protocol=icmpv4:8,any remoteip=any profile=any | Out-Null
+  Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+  & netsh advfirewall firewall delete rule name=VRC-RDP | Out-Null
+  & netsh advfirewall firewall add rule name=VRC-RDP dir=in action=allow protocol=TCP localport=3389 remoteip=any profile=any | Out-Null
 }
 
 if (-not (Test-Path $toolsMarker)) {
+  $netFx = Start-Process dism.exe -ArgumentList @('/online', '/Enable-Feature', '/FeatureName:NetFx3', '/NoRestart') -PassThru -Wait
+  if ($netFx.ExitCode -eq 3010) {
+    Stop-Transcript | Out-Null
+    & shutdown.exe /r /t 5 /c 'VRC enabled .NET Framework 3.5 for XenServer Tools'
+    exit 0
+  }
+  if ($netFx.ExitCode -ne 0) {
+    throw ('Enabling .NET Framework 3.5 failed with exit code ' + $netFx.ExitCode)
+  }
   $toolsDeadline = (Get-Date).AddMinutes(15)
   do {
-    $installer = Get-WmiObject Win32_LogicalDisk -Filter 'DriveType=5' | ForEach-Object {
+    $installer = Get-WmiObject Win32_LogicalDisk -Filter 'DriveType=5' | Where-Object { $_.VolumeName } | ForEach-Object {
       $candidate = Join-Path ($_.DeviceID + '\') 'installwizard.msi'
       if (Test-Path $candidate) { Get-Item $candidate }
     } | Select-Object -First 1
     if ($installer) {
       $msiLog = Join-Path $env:WINDIR 'Temp\vrc-xen-tools-msi.log'
       # XenServer 6.5's launcher only starts its real installer at passive UI level; quiet UI is a no-op.
-      $arguments = @('/i', ('"' + $installer.FullName + '"'), '/passive', 'REBOOT=ReallySuppress', '/L*v', ('"' + $msiLog + '"'))
+      $arguments = @('/i', ('"' + $installer.FullName + '"'), '/passive', '/norestart', 'REBOOT=ReallySuppress', '/L*v', ('"' + $msiLog + '"'))
       $process = Start-Process msiexec.exe -ArgumentList $arguments -PassThru
       if (-not $process.WaitForExit(1200000)) {
         $process.Kill()
@@ -466,6 +537,7 @@ if ((Test-Path $toolsMarker) -and $networkReady) {
   Remove-Item 'C:\Windows\Panther\Unattend.xml','C:\Windows\Panther\Unattend\Unattend.xml' -Force -ErrorAction SilentlyContinue
 }
 Stop-Transcript | Out-Null
+$lock.Dispose()
 `;
 }
 
@@ -487,12 +559,15 @@ function writeWindowsSetupScripts(sourceTree: string, input: XenUnattendedIsoInp
  */
 export function buildWindowsFirstLogonCommands(input: XenUnattendedIsoInput): WindowsFirstLogonCommands {
   void input;
-  const configure = `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "if(!(Test-Path C:\\ProgramData\\VRC\\VrcSetup.ps1)){$p=Get-WmiObject Win32_LogicalDisk -Filter 'DriveType=5'|%{Join-Path ($_.DeviceID+'\\') 'VrcBootstrap.cmd'}|?{Test-Path $_}|select -First 1;if($p){& $p}}"`;
+  const remoteAccess = "cmd.exe /d /c netsh advfirewall set allprofiles state off & sc.exe config WinRM start= auto & net start WinRM & winrm.cmd quickconfig -quiet";
+  const configure = buildWindowsSpecializeBootstrapCommand();
+  const launch = 'cmd.exe /d /c if exist C:\\ProgramData\\VRC\\VrcSetup.ps1 start "" /b powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\ProgramData\\VRC\\VrcSetup.ps1';
   const cleanup = "cmd.exe /c del /f /q C:\\Windows\\Panther\\Unattend.xml C:\\Windows\\Panther\\Unattend\\Unattend.xml 2>nul";
-  if (configure.length > 1024 || cleanup.length > 1024) {
-    throw new Error("Windows Server 2008 R2 首次登录命令超过 1024 字符限制。");
+  const overlong = [remoteAccess, configure, launch, cleanup].find((command) => command.length >= 1024);
+  if (overlong) {
+    throw new Error(`Windows Server 2008 R2 首次登录命令超过 1023 字符限制：${overlong.length}`);
   }
-  return { configure, cleanup };
+  return { remoteAccess, configure, launch, cleanup };
 }
 
 function cidrPrefixLength(cidr: string): number | undefined {
@@ -502,8 +577,11 @@ function cidrPrefixLength(cidr: string): number | undefined {
   return prefix >= 0 && prefix <= 32 ? prefix : undefined;
 }
 
-export function resolveWindowsImageIndex(isoName: string): number {
-  return /2012[_ -]?r2/i.test(isoName) ? 2 : 1;
+export function resolveWindowsImageIndex(isoName: string, installProfile: "server" | "desktop" = "desktop"): number {
+  const desktop = installProfile === "desktop";
+  if (/2012[_ -]?r2/i.test(isoName)) return desktop ? 2 : 1;
+  if (/2008[_ -]?r2/i.test(isoName)) return desktop ? 1 : 2;
+  return 1;
 }
 
 export function encodeWindowsUnattendPassword(password: string, elementName: "Password" | "AdministratorPassword"): string {
@@ -515,27 +593,52 @@ export async function cleanupRegisteredXenGeneratedIso(connection: XenConnection
   if (!record) throw new Error(`未找到生成 ISO 登记记录：${registryId}`);
   if (record.providerType !== "xenserver") throw new Error(`生成 ISO 不是 XenServer 类型：${registryId}`);
   if (!record.isoVdiUuid) throw new Error(`生成 ISO 尚未登记 VDI UUID：${registryId}`);
-  await runRemoteCommand(
-    connection,
-    [
-      `iso_uuid='${escapeShellValue(record.isoVdiUuid)}'`,
-      `expected_name='${escapeShellValue(record.isoName)}'`,
-      `expected_registry='${escapeShellValue(record.id)}'`,
-      `expected_task='${escapeShellValue(record.taskId)}'`,
-      'actual_name="$(xe vdi-param-get uuid="$iso_uuid" param-name=name-label 2>/dev/null)"',
-      'actual_generated="$(xe vdi-param-get uuid="$iso_uuid" param-name=other-config param-key=vrc-generated 2>/dev/null)"',
-      'actual_registry="$(xe vdi-param-get uuid="$iso_uuid" param-name=other-config param-key=vrc-registry-id 2>/dev/null)"',
-      'actual_task="$(xe vdi-param-get uuid="$iso_uuid" param-name=other-config param-key=vrc-task-id 2>/dev/null)"',
-      '[ "$actual_name" = "$expected_name" ] || { echo "生成 ISO 名称不匹配，拒绝删除" >&2; exit 8; }',
-      '[ "$actual_generated" = "true" ] || { echo "VDI 缺少 vrc-generated 标记，拒绝删除" >&2; exit 8; }',
-      '[ "$actual_registry" = "$expected_registry" ] || { echo "VDI registry 标记不匹配，拒绝删除" >&2; exit 8; }',
-      '[ "$actual_task" = "$expected_task" ] || { echo "VDI task 标记不匹配，拒绝删除" >&2; exit 8; }',
-      'attached="$(xe vbd-list vdi-uuid="$iso_uuid" currently-attached=true --minimal 2>/dev/null)"',
-      '[ -z "$attached" ] || { echo "生成 ISO 仍被 VM 挂载，拒绝删除" >&2; exit 8; }',
-      'xe vdi-destroy uuid="$iso_uuid"',
-    ].join("\n"),
-  );
+  const output = await runRemoteCommand(connection, buildXenGeneratedIsoCleanupScript(record));
+  if (output.includes("VRC_REMOTE_VDI_MISSING")) {
+    markGeneratedIsoStatus(registryId, "deleted", "远端 VDI 已不存在，已同步清理登记");
+    return;
+  }
+  if (!output.includes("VRC_REMOTE_VDI_DELETED")) {
+    throw new Error("XenServer 未返回生成 ISO 删除确认，拒绝更新本地登记状态");
+  }
   markGeneratedIsoStatus(registryId, "deleted", "生成 ISO 已按登记记录清理");
+}
+
+export function buildXenGeneratedIsoCleanupScript(record: GeneratedIsoRecord): string {
+  if (!record.isoVdiUuid) throw new Error(`生成 ISO 尚未登记 VDI UUID：${record.id}`);
+  return [
+    `iso_uuid='${escapeShellValue(record.isoVdiUuid)}'`,
+    `expected_name='${escapeShellValue(record.isoName)}'`,
+    `expected_path='${escapeShellValue(record.isoPath)}'`,
+    `expected_registry='${escapeShellValue(record.id)}'`,
+    `expected_task='${escapeShellValue(record.taskId)}'`,
+    'vdi_uuid="$(xe vdi-list uuid="$iso_uuid" --minimal 2>/dev/null || true)"',
+    'if [ -z "$vdi_uuid" ]; then printf "VRC_REMOTE_VDI_MISSING\\n"; exit 0; fi',
+    'actual_name="$(xe vdi-param-get uuid="$iso_uuid" param-name=name-label 2>/dev/null)"',
+    'actual_generated="$(xe vdi-param-get uuid="$iso_uuid" param-name=other-config param-key=vrc-generated 2>/dev/null)"',
+    'actual_registry="$(xe vdi-param-get uuid="$iso_uuid" param-name=other-config param-key=vrc-registry-id 2>/dev/null)"',
+    'actual_task="$(xe vdi-param-get uuid="$iso_uuid" param-name=other-config param-key=vrc-task-id 2>/dev/null)"',
+    'actual_sr="$(xe vdi-param-get uuid="$iso_uuid" param-name=sr-uuid 2>/dev/null)"',
+    'actual_location="$(xe vdi-param-get uuid="$iso_uuid" param-name=location 2>/dev/null)"',
+    'actual_path="/var/run/sr-mount/$actual_sr/$actual_location"',
+    '[ "$actual_name" = "$expected_name" ] || { echo "生成 ISO 名称不匹配，拒绝删除" >&2; exit 8; }',
+    '[ "$actual_generated" = "true" ] || { echo "VDI 缺少 vrc-generated 标记，拒绝删除" >&2; exit 8; }',
+    '[ "$actual_registry" = "$expected_registry" ] || { echo "VDI registry 标记不匹配，拒绝删除" >&2; exit 8; }',
+    '[ "$actual_task" = "$expected_task" ] || { echo "VDI task 标记不匹配，拒绝删除" >&2; exit 8; }',
+    '[ "$actual_path" = "$expected_path" ] || { echo "生成 ISO 远端路径不匹配，拒绝删除" >&2; exit 8; }',
+    'attached="$(xe vbd-list vdi-uuid="$iso_uuid" currently-attached=true --minimal 2>/dev/null)"',
+    '[ -z "$attached" ] || { echo "生成 ISO 仍被 VM 挂载，拒绝删除" >&2; exit 8; }',
+    'xe vdi-destroy uuid="$iso_uuid"',
+    '# 部分旧版 ISO SR 只注销 VDI；身份和完整路径均校验后再删除同一任务文件。',
+    '[ ! -e "$actual_path" ] || rm -f -- "$actual_path"',
+    'xe sr-scan uuid="$actual_sr" >/dev/null 2>&1 || true',
+    'remaining_uuid="$(xe vdi-list uuid="$iso_uuid" --minimal 2>/dev/null || true)"',
+    'remaining_name="$(xe vdi-list sr-uuid="$actual_sr" name-label="$expected_name" --minimal 2>/dev/null || true)"',
+    '[ -z "$remaining_uuid" ] || { echo "删除后原 VDI UUID 仍存在" >&2; exit 9; }',
+    '[ -z "$remaining_name" ] || { echo "删除后同名生成 ISO 仍存在" >&2; exit 9; }',
+    '[ ! -e "$actual_path" ] || { echo "删除后生成 ISO 文件仍存在" >&2; exit 9; }',
+    'printf "VRC_REMOTE_VDI_DELETED\\n"',
+  ].join("\n");
 }
 
 async function readSourceIsoInfo(connection: XenConnectionInput, sourceIsoId: string, mountForBootFiles: boolean): Promise<SourceIsoInfo> {

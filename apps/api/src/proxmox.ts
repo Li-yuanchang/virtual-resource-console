@@ -9,6 +9,8 @@ import {
   resolveProxmoxArmDistribution,
 } from "./proxmoxUnattended.js";
 import { inferIpv4FromName, isManagedIpv4 } from "./runtimePolicy.js";
+import { normalizeStorageCapacity } from "./storageCapacity.js";
+import { describeStorageRepository } from "./storageRepositoryProfile.js";
 import type {
   HostNode,
   IsoImage,
@@ -31,7 +33,7 @@ import type {
   VmProvisionResult,
   VmQuery,
   VmRenameResult,
-  VmResizeRequest,
+  VmResizeExecutionRequest,
   VmResizeResult,
   VmSnapshot,
   XenConnectionInput,
@@ -132,6 +134,12 @@ interface ProxmoxGuestAgentFsInfoResponse {
   result?: ProxmoxGuestAgentFsInfo[];
 }
 
+interface ProxmoxGuestAgentInfoResponse {
+  result?: {
+    supported_commands?: Array<{ name?: string; enabled?: boolean }>;
+  };
+}
+
 type ProxmoxVmConfig = Record<string, string | number | boolean | undefined>;
 
 interface ProxmoxStorageContent {
@@ -208,6 +216,44 @@ const defaultProxmoxStrategyBySource = new Map<VmProvisionRequest["sourceType"],
 
 export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInput> {
   readonly type = "proxmox" as const;
+
+  /**
+   * Executes a guest command through QEMU Guest Agent. This is the preferred
+   * PVE path for storage inspection and filesystem expansion because it uses
+   * the already authenticated PVE API session rather than VM SSH credentials.
+   *
+   * @param input PVE API connection, including host, port and API credentials.
+   * @param vmId Provider VM id in `proxmox:<node>:<vmid>` format.
+   * @param command Shell command to execute inside the guest; must be supplied by the storage workflow.
+   * @param timeoutMs Maximum execution and polling time in milliseconds.
+   * @return Captured standard output. Rejects when the guest agent is unavailable, exits non-zero, or times out.
+   */
+  async executeGuestCommand(input: XenConnectionInput, vmId: string, command: string, timeoutMs: number): Promise<string> {
+    const [node, id] = parseVmProviderId(vmId);
+    if (!node || !id) throw new Error(`无法解析 PVE 虚拟机标识：${vmId}`);
+    const client = await ProxmoxClient.login(input);
+    const vmPath = `/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}`;
+    const agentInfo = await client.get<ProxmoxGuestAgentInfoResponse>(`${vmPath}/agent/info`);
+    const guestExec = agentInfo.result?.supported_commands?.find((item) => item.name === "guest-exec");
+    if (!guestExec?.enabled) {
+      throw new Error("PVE QEMU Guest Agent 已连接，但 guest-exec 未启用，无法执行虚拟机系统命令。");
+    }
+    const started = await client.post<{ pid?: number }>(`${vmPath}/agent/exec`, buildProxmoxGuestExecBody(command));
+    const pid = Number(started?.pid);
+    if (!Number.isFinite(pid) || pid <= 0) throw new Error("PVE QEMU Guest Agent 未返回命令进程号，请确认 Agent 已安装并运行。");
+    const deadline = Date.now() + timeoutMs;
+    let lastStatus: { exited?: boolean; exitcode?: number; "out-data"?: string; "err-data"?: string } = {};
+    while (Date.now() < deadline) {
+      lastStatus = await client.get<typeof lastStatus>(`${vmPath}/agent/exec-status?pid=${encodeURIComponent(String(pid))}`);
+      if (lastStatus.exited) {
+        const exitCode = Number(lastStatus.exitcode ?? 0);
+        if (exitCode !== 0) throw new Error(lastStatus["err-data"]?.trim() || `PVE Guest Agent 命令退出：${exitCode}`);
+        return lastStatus["out-data"] ?? "";
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error(`PVE Guest Agent 命令执行超时（${Math.ceil(timeoutMs / 1000)} 秒）。`);
+  }
   private readonly provisionStrategies = new ProxmoxProvisionStrategyRegistry();
 
   constructor() {
@@ -430,7 +476,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     };
   }
 
-  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeRequest): Promise<VmResizeResult> {
+  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeExecutionRequest): Promise<VmResizeResult> {
     const [node, id] = parseVmProviderId(vmId);
     if (!node || !id) throw new Error(`Proxmox VE VM ID 不完整：${vmId}`);
     const client = await ProxmoxClient.login(input);
@@ -725,6 +771,13 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
       networks: Array.from(inventory.networksByNode.entries()).flatMap(([node, networks]) => toNetworkInterfaces(node, networks)),
     };
   }
+}
+
+/** Builds the PVE form body for the array-typed QEMU Guest Agent command parameter. */
+export function buildProxmoxGuestExecBody(command: string): URLSearchParams {
+  return new URLSearchParams({
+    command: JSON.stringify(["sh", "-lc", command]),
+  });
 }
 
 export async function cleanupRegisteredProxmoxGeneratedIso(input: XenConnectionInput, registryId: string): Promise<void> {
@@ -1106,15 +1159,16 @@ function cidrToNetmask(cidr: string): string {
 function toStorageRepository(item: ProxmoxStorage, hostId: string): StorageRepository {
   const total = item.total ?? 0;
   const used = item.used ?? 0;
+  const shared = item.shared === 1;
+  const content = item.content?.split(",").map((value) => value.trim()).filter(Boolean);
   return {
     name: item.storage,
     type: item.type ?? "",
-    physicalGiB: bytesToGib(total),
-    usedGiB: bytesToGib(used),
-    virtualGiB: bytesToGib(used),
-    shared: item.shared === 1,
+    ...describeStorageRepository("proxmox", { type: item.type ?? "", shared, content }),
+    ...normalizeStorageCapacity({ physicalGiB: bytesToGib(total), usedGiB: bytesToGib(used) }),
+    shared,
     hostId,
-    content: item.content?.split(",").map((value) => value.trim()).filter(Boolean),
+    content,
   };
 }
 
@@ -1146,6 +1200,7 @@ function toVmNode(vm: ProxmoxVm, node: string, connectionId: string, config?: Pr
     id: `${connectionId}:vm:${providerId}`,
     connectionId,
     providerId,
+    consoleRef: providerId,
     hostId: node,
     name,
     powerState: vm.status === "running" ? "running" : vm.status === "stopped" ? "halted" : "unknown",
@@ -1199,9 +1254,14 @@ export function parseProxmoxVmDisks(config: ProxmoxVmConfig, vmId: string): VmDi
         providerId: `${vmId}:${device}`,
         name: device,
         device,
+        displayName: device,
         virtualSizeBytes: size,
         storageRepositoryId: text.split(":")[0] || undefined,
         storageRepository: text.split(":")[0] || undefined,
+        onlineResizeSupported: true,
+        canOnlineResize: true,
+        requiresShutdown: false,
+        allowedModes: ["extend", "add"] as VmDisk["allowedModes"],
       };
     })
     .filter((disk) => disk.virtualSizeBytes > 0)

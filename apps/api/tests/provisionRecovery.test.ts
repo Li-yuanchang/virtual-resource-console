@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveProvisionRecoveryVms } from "../src/provisionRecovery.js";
+import { ProvisionRecoveryVmMissingError, resolveProvisionRecoveryVms } from "../src/provisionRecovery.js";
 import type { VirtualizationProvider } from "../src/providers/provider.js";
 import type { ProvisionTask, VmProvisionRequest, XenConnectionInput } from "../src/types.js";
 
@@ -52,7 +52,7 @@ function provider(listVms: VirtualizationProvider<XenConnectionInput>["listVms"]
   } as VirtualizationProvider<XenConnectionInput>;
 }
 
-test("recovery uses a saved VM UUID without querying or creating", async () => {
+test("recovery validates a saved VM UUID against live inventory", async () => {
   let listCalls = 0;
   const recovered = await resolveProvisionRecoveryVms({
     task: task("vm-1"),
@@ -60,11 +60,57 @@ test("recovery uses a saved VM UUID without querying or creating", async () => {
     connection,
     provider: provider(async () => {
       listCalls += 1;
-      throw new Error("listVms must not run when UUID is saved");
+      return {
+        page: 1,
+        pageSize: 1000,
+        total: 1,
+        items: [{
+          id: "provider:vm-1",
+          connectionId: "connection-1",
+          providerId: "vm-1",
+          name: "127.31_test",
+          powerState: "running",
+          cpuCount: 4,
+          memoryBytes: 8 * 1024 ** 3,
+          ipAddresses: ["192.168.127.31"],
+          toolsStatus: "unknown",
+          reclaimLevel: "P3",
+          reclaimReason: "test",
+        }],
+      };
     }),
   });
-  assert.equal(listCalls, 0);
+  assert.equal(listCalls, 1);
   assert.equal(recovered[0].providerId, "vm-1");
+});
+
+test("recovery rejects a missing saved UUID instead of adopting a same-name replacement", async () => {
+  await assert.rejects(
+    resolveProvisionRecoveryVms({
+      task: task("deleted-vm"),
+      context: { request },
+      connection,
+      provider: provider(async () => ({
+        page: 1,
+        pageSize: 1000,
+        total: 1,
+        items: [{
+          id: "provider:new-vm",
+          connectionId: "connection-1",
+          providerId: "new-vm",
+          name: "127.31_test",
+          powerState: "running",
+          cpuCount: 4,
+          memoryBytes: 8 * 1024 ** 3,
+          ipAddresses: ["192.168.127.31"],
+          toolsStatus: "unknown",
+          reclaimLevel: "P3",
+          reclaimReason: "test",
+        }],
+      })),
+    }),
+    ProvisionRecoveryVmMissingError,
+  );
 });
 
 test("recovery accepts only one exact VM name match", async () => {

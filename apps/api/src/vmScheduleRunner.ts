@@ -1,13 +1,13 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
+import { getVrcDataFile } from "./appPaths.js";
 import { markConnectionUsed, resolveStoredConnection } from "./connectionStore.js";
 import type { ProviderRegistry } from "./providers/provider.js";
 import type { VmNode, VmSchedule, VmScheduleLastRun, VmScheduleRunnerStatus, VmScheduleTarget, XenConnectionInput } from "./types.js";
 import { claimVmScheduleRun, finishVmScheduleRun, listDueVmSchedules } from "./vmScheduleStore.js";
 
-const leaseFile = join(homedir(), ".virtual-resource-console", "vm-schedule-runner.lock");
+const leaseFile = getVrcDataFile("vm-schedule-runner.lock");
 const leaseHeartbeatMs = 10_000;
 const leaseStaleMs = 35_000;
 const missedRunGraceMs = 5 * 60_000;

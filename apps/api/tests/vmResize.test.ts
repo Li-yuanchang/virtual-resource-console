@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseProxmoxVmDisks } from "../src/proxmox.js";
+import { buildProxmoxGuestExecBody, parseProxmoxVmDisks } from "../src/proxmox.js";
 import { vmwareAddDiskSpec, vmwareEditDiskSpec, type VmwareDiskInfo } from "../src/vmware.js";
 import { assertXenResizeApplied } from "../src/xenserver.js";
 import type { VmDisk, VmResizeResult } from "../src/types.js";
@@ -59,6 +59,13 @@ test("PVE resize inventory excludes install media and cloud-init disks", () => {
       { device: "scsi1", sizeGiB: 20 },
     ],
   );
+});
+
+test("PVE Guest Agent encodes command as the documented command array", () => {
+  const body = buildProxmoxGuestExecBody("printf '%s' ok");
+  assert.deepEqual(JSON.parse(body.get("command") || "null"), ["sh", "-lc", "printf '%s' ok"]);
+  assert.equal(body.has("command[0]"), false);
+  assert.equal(body.has("args[0]"), false);
 });
 
 test("VMware original disk resize preserves device placement and uses KiB capacity", () => {

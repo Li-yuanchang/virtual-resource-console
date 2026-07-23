@@ -3,12 +3,14 @@ import type { Duplex } from "node:stream";
 import { Client } from "ssh2";
 import type { Algorithms } from "ssh2";
 import { runCommand as runWinRmCommand } from "winrm-client";
-import type { ProviderType, VmProvisionCreatedVm, VmProvisionPlanItem, VmProvisionRequest, XenConnectionInput } from "./types.js";
+import type { ProviderType, ProvisionTaskStepKey, VmProvisionCreatedVm, VmProvisionPlanItem, VmProvisionRequest, XenConnectionInput } from "./types.js";
 import { startProxmoxVmFromDiskIfStopped } from "./proxmox.js";
 import { enableAndVerifyProxmoxGuestAgent } from "./proxmox.js";
 import { verifyVmwareGuestTools } from "./vmware.js";
 import { prepareXenVmForInstalledBoot } from "./installSourceService.js";
 import { resolveGuestMonitoringPolicy } from "./guestMonitoringPolicy.js";
+import { resolveProvisioningReadinessStrategy } from "./provisioningReadinessStrategy.js";
+import type { ProvisioningReadinessResult } from "./provisioningReadinessStrategy.js";
 import {
   finishProvisionTask,
   getProvisionTask,
@@ -24,7 +26,7 @@ interface RunProvisioningVerifierInput {
   request: VmProvisionRequest;
   created: VmProvisionCreatedVm[];
   onTiming?: (phase: string, elapsedMs: number, details?: Record<string, unknown>) => void;
-  onComplete?: (outcome: { status: "success" | "failed" }) => void | Promise<void>;
+  onComplete?: (outcome: { status: "success" | "warning" | "failed" }) => void | Promise<void>;
 }
 
 interface GuestVerifyResult {
@@ -32,6 +34,8 @@ interface GuestVerifyResult {
   vm?: VmProvisionCreatedVm;
   ok: boolean;
   message: string;
+  reasonCode?: string;
+  readiness?: Pick<ProvisioningReadinessResult, "state" | "networkVisible" | "ready">;
 }
 
 interface GuestTransport {
@@ -47,6 +51,7 @@ const sshLoginRetryIntervalMs = 20 * 1000;
 const guestToolsMetricsSoftWaitMs = 6 * 60 * 1000;
 const guestToolsMetricsProbeIntervalMs = 10 * 1000;
 const windowsInstallWaitMs = 2 * 60 * 60 * 1000;
+const windowsRemoteInitializationWaitMs = 15 * 60 * 1000;
 const windowsWinRmPort = 5985;
 const windowsWinRmReadyConfirmations = 3;
 
@@ -68,13 +73,14 @@ export function runProvisioningVerifier(input: RunProvisioningVerifierInput): vo
       finishProvisionTask(input.taskId, "failed", error instanceof Error ? error.message : "创建验收失败");
     })
     .finally(() => {
-      const status = getProvisionTask(input.taskId)?.status === "success" ? "success" : "failed";
+      const taskStatus = getProvisionTask(input.taskId)?.status;
+      const status = taskStatus === "success" || taskStatus === "warning" ? taskStatus : "failed";
       void input.onComplete?.({ status });
     });
 }
 
 async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<void> {
-  markProvisionTaskStep(input.taskId, "boot", "running", "VM 已创建，等待系统启动");
+  markProvisionTaskStepIfUnfinished(input.taskId, "boot", "running", "VM 已创建，等待系统启动");
   updateProvisionTaskVms(
     input.taskId,
     input.request.planItems.map((item) => {
@@ -106,7 +112,7 @@ async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<
     return;
   }
 
-  markProvisionTaskStep(input.taskId, "boot", "success", "VM 已启动");
+  markProvisionTaskStepIfUnfinished(input.taskId, "boot", "success", "VM 已启动");
   beginGuestInstallTracking(input);
   if (!input.request.planItems.some((item) => item.installSource) && input.request.sourceType !== "iso") {
     markProvisionTaskStep(input.taskId, "wait-network", "running", isWindowsUnattended(input.request) ? "等待 Windows 网络和 WinRM 就绪" : "等待 VM 网络和 SSH 端口就绪");
@@ -126,13 +132,27 @@ async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<
       providerId: input.created.find((vm) => vm.name === result.item.name)?.providerId,
       name: result.item.name,
       ip: result.item.ip,
-      status: result.ok ? "running" : "failed",
+      status: result.ok ? "running" : result.readiness?.networkVisible ? "warning" : "failed",
       currentStep: "wait-network",
       message: result.message,
+      reasonCode: result.reasonCode,
+      readiness: result.readiness,
     })),
   );
   if (failedNetwork.length) {
     if (input.request.sourceType === "iso") {
+      const windowsRemoteAcceptanceWarning = isWindowsUnattended(input.request)
+        && failedNetwork.every((result) => result.readiness?.networkVisible);
+      if (windowsRemoteAcceptanceWarning) {
+        const warningMessage = failedNetwork.map((item) => item.message).join("；");
+        markProvisionTaskStepIfUnfinished(input.taskId, "install-guest", "success", "Windows 已安装并启动");
+        markProvisionTaskStep(input.taskId, "wait-network", "warning", warningMessage);
+        markProvisionTaskStepIfUnfinished(input.taskId, "verify-login", "skipped", "远程管理未就绪，未执行登录验收");
+        markProvisionTaskStepIfUnfinished(input.taskId, "finalize", "skipped", "远程管理未就绪，未执行启动收尾");
+        markProvisionTaskStepIfUnfinished(input.taskId, "guest-tools", "skipped", "远程管理未就绪，未执行监控工具验收");
+        finishProvisionTask(input.taskId, "warning", `Windows 已安装并进入系统，但远程管理验收未完成：${warningMessage}`);
+        return;
+      }
       markProvisionTaskStepIfUnfinished(input.taskId, "install-guest", "failed", failedNetwork.map((item) => item.message).join("；"));
       markProvisionTaskStepIfUnfinished(input.taskId, "wait-network", "skipped", "系统安装未完成，未进入网络验收");
       finishProvisionTask(input.taskId, "failed", isWindowsUnattended(input.request) ? "Windows 安装后未等到 WinRM 服务就绪。" : "系统安装后未等到 SSH 服务就绪。");
@@ -146,8 +166,9 @@ async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<
   completeGuestInstallTracking(input);
   markProvisionTaskStep(input.taskId, "wait-network", "running", isWindowsUnattended(input.request) ? "Windows 已启动，确认 WinRM 服务状态" : "系统已启动，确认 SSH 服务状态");
   markProvisionTaskStep(input.taskId, "wait-network", "success", isWindowsUnattended(input.request) ? "Windows WinRM 服务已就绪" : "VM SSH 端口已就绪");
-  const windowsXenLocalSetup = isWindowsUnattended(input.request) && input.request.providerType === "xenserver";
-  if (windowsXenLocalSetup) {
+  const readinessStrategy = resolveProvisioningReadinessStrategy(input.request.providerType);
+  const windowsHostMetricsSetup = isWindowsUnattended(input.request) && readinessStrategy.windowsLoginMode === "host-metrics";
+  if (windowsHostMetricsSetup) {
     markProvisionTaskStep(input.taskId, "verify-login", "skipped", "Windows 账户由本地 SetupComplete 写入，改由宿主机指标验收");
     updateProvisionTaskVms(
       input.taskId,
@@ -161,14 +182,14 @@ async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<
           powerState: "running",
           status: "running",
           currentStep: "finalize",
-          message: "Windows 网络已就绪，准备挂载 XenServer Tools",
+          message: `Windows 网络已就绪，准备安装 ${resolveGuestMonitoringPolicy(input.request.providerType).label}`,
         };
       }),
     );
   } else {
     markProvisionTaskStep(input.taskId, "verify-login", "running", "验证系统账号密码和启动状态");
     const verifyLoginStartedAt = Date.now();
-    const jumpHost = input.request.providerType === "xenserver" ? input.connection : undefined;
+    const jumpHost = readinessStrategy.resolveJumpHost(input.connection);
     const loginResults = await Promise.all(input.request.planItems.map((item) =>
       isWindowsUnattended(input.request)
         ? verifyWindowsGuestLoginWithRetry(input.taskId, item, input.request.ipPool.gateway)
@@ -205,14 +226,14 @@ async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<
 
   markProvisionTaskStep(input.taskId, "finalize", "running", "收尾启动配置");
   const finalizeStartedAt = Date.now();
-  if (windowsXenLocalSetup) {
+  if (windowsHostMetricsSetup) {
     await Promise.all(input.request.planItems.map((item) => prepareXenVmForInstalledBoot(input.connection, item.name)));
   }
   await finalizeVmBoot(input);
   input.onTiming?.("verify-finalize", Date.now() - finalizeStartedAt, {
     vmCount: input.request.planItems.length,
   });
-  markProvisionTaskStep(input.taskId, "finalize", "success", finalizeSuccessMessage(input.request.providerType));
+  markProvisionTaskStep(input.taskId, "finalize", "success", readinessStrategy.finalizeSuccessMessage());
   markProvisionTaskStep(input.taskId, "guest-tools", "running", guestToolsMessage(input.request.providerType));
   const guestToolsStartedAt = Date.now();
   const guestToolsResults = await installGuestTools(input);
@@ -276,7 +297,10 @@ async function waitForGuestNetwork(input: RunProvisioningVerifierInput): Promise
   const deadline = hardWaitDeadline(startedAt);
   const pending = new Map(input.request.planItems.map((item) => [item.name, item]));
   const readyStreaks = new Map<string, number>();
+  const windowsNetworkStreaks = new Map<string, number>();
+  const windowsNetworkVisibleSince = new Map<string, number>();
   const results: GuestVerifyResult[] = [];
+  const readinessStrategy = resolveProvisioningReadinessStrategy(input.request.providerType);
   let attempt = 0;
   while (pending.size && Date.now() < deadline) {
     if (isProvisionTaskTerminal(input.taskId)) {
@@ -287,7 +311,7 @@ async function waitForGuestNetwork(input: RunProvisioningVerifierInput): Promise
     const installingVms = await refreshXenHostInstallProgress(input).catch(() => new Set<string>());
     for (const item of Array.from(pending.values())) {
       const waitingOverlong = Date.now() >= softDeadline;
-      const tracksIsoInstall = input.request.sourceType === "iso";
+      const tracksIsoInstall = input.request.sourceType === "iso" && !isProvisionStepSuccessful(input.taskId, "install-guest");
       updateProvisionTaskVm(input.taskId, item.name, {
         status: "running",
         currentStep: tracksIsoInstall || installingVms.has(item.name) ? "install-guest" : "wait-network",
@@ -299,21 +323,83 @@ async function waitForGuestNetwork(input: RunProvisioningVerifierInput): Promise
           ? "安装器已关机，正在从系统盘启动"
           : tracksIsoInstall || installingVms.has(item.name)
             ? `${isWindowsUnattended(input.request) ? "Windows" : "系统"}安装中，等待${isWindowsUnattended(input.request) ? " WinRM" : " SSH"}就绪 ${attempt}`
-            : `SSH 探测中 ${attempt}`,
+            : isWindowsUnattended(input.request)
+              ? `Windows 网络与 WinRM 探测中 ${attempt}`
+              : `SSH 探测中 ${attempt}`,
       });
       // 网络阶段只确认目标服务响应；账号密码单独验收，避免把认证失败误报为网络超时。
       const windows = isWindowsUnattended(input.request);
-      const jumpHost = input.request.providerType === "xenserver" ? input.connection : undefined;
-      const serviceReady = windows
+      const jumpHost = readinessStrategy.resolveJumpHost(input.connection);
+      const protocolReady = windows
         ? await canReadWinRmHttpResponse(item.ip, windowsWinRmPort, sshVerifyTimeoutMs, jumpHost)
         : await canReadGuestSshBanner(item.ip, 22, sshVerifyTimeoutMs, jumpHost);
+      const arpVisible = windows && readinessStrategy.supportsHostArp && jumpHost && !protocolReady
+        ? await canResolveGuestArpFromXenHost(item.ip, jumpHost)
+        : false;
+      const hostPingReady = windows && readinessStrategy.requiresWindowsHostPing && protocolReady && jumpHost
+        ? await canPingGuestFromXenHost(item.ip, sshVerifyTimeoutMs, jumpHost)
+        : false;
+      const readiness = readinessStrategy.evaluate({ windows, protocolReady, arpVisible, hostPingReady });
+      const windowsNetworkVisible = windows && readiness.networkVisible;
+      const networkStreak = windowsNetworkVisible ? (windowsNetworkStreaks.get(item.name) ?? 0) + 1 : 0;
+      windowsNetworkStreaks.set(item.name, networkStreak);
+      if (windowsNetworkVisible && !windowsNetworkVisibleSince.has(item.name)) {
+        windowsNetworkVisibleSince.set(item.name, resolvePersistedWindowsNetworkVisibleAt(input.taskId) ?? Date.now());
+      } else if (!windowsNetworkVisible) {
+        windowsNetworkVisibleSince.delete(item.name);
+      }
+      if (windows && networkStreak >= 2) {
+        // ARP only proves that Windows has brought up its network stack. Setup can still be
+        // rendering the installer, so do not close the install step until WinRM responds.
+        const windowsSetupReady = readiness.state === "protocol-ready" || readiness.state === "ready";
+        if (windowsSetupReady) {
+          markProvisionTaskStepIfUnfinished(input.taskId, "install-guest", "success", "Windows 已完成安装阶段并开放 WinRM");
+        }
+        markProvisionTaskStepIfUnfinished(
+          input.taskId,
+          "wait-network",
+          "running",
+          windowsSetupReady ? "Windows IP 已上线，等待宿主机 Ping 验收" : "Windows 网络已上线，仍在等待安装完成并开放 WinRM",
+        );
+        updateProvisionTaskVm(input.taskId, item.name, {
+          status: "running",
+          currentStep: windowsSetupReady ? "wait-network" : "install-guest",
+          message: windowsSetupReady ? `Windows 安装阶段已完成，等待宿主机 Ping 验收 ${attempt}` : `Windows 安装中，网络已上线，等待 WinRM 初始化 ${attempt}`,
+          reasonCode: readiness.reasonCode,
+          readiness: toTaskReadiness(readiness),
+        });
+      }
+      const serviceReady = readiness.ready;
+      if (windows && readiness.state === "protocol-ready") {
+        updateProvisionTaskVm(input.taskId, item.name, {
+          status: "running",
+          currentStep: "wait-network",
+          message: "WinRM 已响应，等待宿主机 ping 验证",
+          reasonCode: readiness.reasonCode,
+          readiness: toTaskReadiness(readiness),
+        });
+      }
+      const networkVisibleAt = windowsNetworkVisibleSince.get(item.name);
+      if (windows && !serviceReady && readiness.state === "protocol-ready" && networkStreak >= 2 && hasWindowsRemoteInitializationTimedOut(networkVisibleAt)) {
+        results.push({
+          item,
+          ok: false,
+          message: `${item.name} (${item.ip}) WinRM 已响应，但宿主机 Ping 持续失败，请检查 Windows 防火墙 ICMP 规则`,
+          reasonCode: "WINDOWS_ICMP_BLOCKED",
+          readiness: toTaskReadiness(readiness),
+        });
+        pending.delete(item.name);
+        continue;
+      }
       const readyStreak = serviceReady ? (readyStreaks.get(item.name) ?? 0) + 1 : 0;
       readyStreaks.set(item.name, readyStreak);
       if (windows && serviceReady && readyStreak < windowsWinRmReadyConfirmations) {
         updateProvisionTaskVm(input.taskId, item.name, {
           status: "running",
-          currentStep: "install-guest",
+          currentStep: "wait-network",
           message: `WinRM 已响应，继续确认服务稳定 ${readyStreak}/${windowsWinRmReadyConfirmations}`,
+          reasonCode: readiness.reasonCode,
+          readiness: toTaskReadiness(readiness),
         });
         continue;
       }
@@ -322,6 +408,8 @@ async function waitForGuestNetwork(input: RunProvisioningVerifierInput): Promise
           item,
           ok: true,
           message: windows ? "Windows WinRM 服务已就绪" : "VM SSH 服务已就绪",
+          reasonCode: readiness.reasonCode,
+          readiness: toTaskReadiness(readiness),
         });
         pending.delete(item.name);
       }
@@ -333,9 +421,41 @@ async function waitForGuestNetwork(input: RunProvisioningVerifierInput): Promise
       item,
       ok: false,
       message: `${item.name} (${item.ip}) 超时未响应${isWindowsUnattended(input.request) ? " WinRM 服务" : " SSH 服务"}`,
+      reasonCode: "GUEST_OFFLINE",
+      readiness: { state: "offline", networkVisible: false, ready: false },
     });
   }
   return results;
+}
+
+function toTaskReadiness(readiness: ProvisioningReadinessResult): GuestVerifyResult["readiness"] {
+  return {
+    state: readiness.state,
+    networkVisible: readiness.networkVisible,
+    ready: readiness.ready,
+  };
+}
+
+function resolvePersistedWindowsNetworkVisibleAt(taskId: string): number | undefined {
+  const installStep = getProvisionTask(taskId)?.steps.find((step) => step.key === "install-guest");
+  if (installStep?.status !== "success" || !installStep.finishedAt) return undefined;
+  const timestamp = Date.parse(installStep.finishedAt);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function isProvisionStepSuccessful(taskId: string, stepKey: ProvisionTaskStepKey): boolean {
+  return getProvisionTask(taskId)?.steps.some((step) => step.key === stepKey && step.status === "success") ?? false;
+}
+
+/**
+ * Decides whether an online Windows guest has exceeded the remote initialization window.
+ *
+ * @param networkVisibleAt timestamp when XenServer first confirmed the guest IP through ARP
+ * @param now current timestamp used for deterministic tests
+ * @return true when Ping/WinRM should be reported as a terminal initialization failure
+ */
+export function hasWindowsRemoteInitializationTimedOut(networkVisibleAt: number | undefined, now = Date.now()): boolean {
+  return networkVisibleAt != null && now - networkVisibleAt >= windowsRemoteInitializationWaitMs;
 }
 
 async function startPoweredOffProxmoxGuests(input: RunProvisioningVerifierInput): Promise<Set<string>> {
@@ -719,6 +839,13 @@ async function installPackageGuestMonitoringTools(input: RunProvisioningVerifier
   return results;
 }
 
+/**
+ * Mounts the host-specific Tools media and verifies the Guest-reported platform metrics.
+ *
+ * Windows Server 2008 R2 local-account NTLM behavior varies by WinRM implementation. The
+ * task-scoped SYSTEM bootstrap is therefore the only Tools installer; WinRM remains a readiness
+ * signal and must not become a second installation path that can terminate verification early.
+ */
 async function installWindowsXenTools(
   input: RunProvisioningVerifierInput,
   item: VmProvisionPlanItem,
@@ -726,13 +853,19 @@ async function installWindowsXenTools(
 ): Promise<GuestVerifyResult> {
   const vmId = vm.id || vm.providerId;
   try {
-    if (!(await isXenGuestToolsReadyOnHost(input.connection, vmId))) {
+    const hostToolsReady = await isXenGuestToolsReadyOnHost(input.connection, vmId);
+    if (!hostToolsReady) {
       updateProvisionTaskVm(input.taskId, item.name, {
         status: "running",
         currentStep: "guest-tools",
-        message: "已挂载 XenServer Tools，等待 Windows 本地安装并重启",
+        message: "正在挂载 XenServer Tools，等待系统内任务静默安装并重启",
       });
       await attachXenToolsIso(input.connection, vmId);
+      updateProvisionTaskVm(input.taskId, item.name, {
+        status: "running",
+        currentStep: "guest-tools",
+        message: "XenServer Tools 已挂载，等待系统内任务完成安装和重启",
+      });
     }
     await verifyXenGuestToolsOnHost(input.taskId, item, input.connection, vmId, 45 * 60 * 1000);
     await ejectVmCdrom(input.connection, vmId);
@@ -904,8 +1037,8 @@ async function verifyXenGuestToolsOnHost(
       currentStep: "guest-tools",
       message:
         Date.now() - startedAt >= guestToolsMetricsSoftWaitMs
-          ? `Guest Tools 服务正常，平台指标回报较慢，后台继续核验 ${attempt}`
-          : `Guest Tools 服务已启动，等待 XenServer 回报指标 ${attempt}`,
+          ? `XenServer Tools 已挂载，平台指标回报较慢，后台继续核验 ${attempt}`
+          : `等待 XenServer Tools 回报平台指标 ${attempt}`,
     });
     await delay(guestToolsMetricsProbeIntervalMs);
   }
@@ -1153,6 +1286,68 @@ export async function canReadWinRmHttpResponse(host: string, port: number, timeo
   });
 }
 
+/**
+ * Verifies Windows ICMP reachability from the target XenServer host.
+ *
+ * The guest and XenServer management network may differ from the API host network, so the
+ * authoritative ping probe must run on the host that owns the VM.
+ *
+ * @param host Guest IPv4 address. Must not be empty.
+ * @param timeoutMs Maximum wait in milliseconds; rounded up to whole seconds for XenServer ping.
+ * @param jumpHost XenServer SSH connection used only to run the bounded read-only probe.
+ * @return `true` when the XenServer host receives an ICMP Echo reply; otherwise `false`.
+ */
+export async function canPingGuestFromXenHost(host: string, timeoutMs: number, jumpHost: XenConnectionInput): Promise<boolean> {
+  try {
+    await runHostCommand(jumpHost, buildXenGuestPingProbeCommand(host, timeoutMs));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Checks whether the target XenServer can resolve the Windows guest through ARP.
+ *
+ * ARP is used only as an intermediate state signal: it proves the configured guest IP is active
+ * on the local network, but it never replaces the final ICMP and WinRM checks.
+ *
+ * @param host Guest IPv4 address. Must not be empty.
+ * @param jumpHost XenServer SSH connection used to run the bounded read-only probe.
+ * @return `true` when the host receives an ARP reply; otherwise `false`.
+ */
+export async function canResolveGuestArpFromXenHost(host: string, jumpHost: XenConnectionInput): Promise<boolean> {
+  try {
+    await runHostCommand(jumpHost, buildXenGuestArpProbeCommand(host));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Builds a bounded ARP probe using the route-selected XenServer interface.
+ *
+ * @param host Guest IPv4 address. Shell quoting prevents the address from becoming command syntax.
+ * @return Shell command that succeeds only when the local XenServer network receives an ARP reply.
+ */
+export function buildXenGuestArpProbeCommand(host: string): string {
+  const escapedHost = escapeShellArg(host);
+  return `iface=$(ip route get ${escapedHost} 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -1); [ -n "$iface" ] && arping -c 1 -w 2 -I "$iface" ${escapedHost} >/dev/null 2>&1`;
+}
+
+/**
+ * Builds the bounded XenServer-side ICMP readiness probe.
+ *
+ * @param host Guest IPv4 address. Shell quoting prevents the address from becoming command syntax.
+ * @param timeoutMs Maximum wait in milliseconds; values below one second use one second.
+ * @return Shell command that succeeds only after one ICMP Echo reply.
+ */
+export function buildXenGuestPingProbeCommand(host: string, timeoutMs: number): string {
+  const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+  return `ping -c 1 -W ${timeoutSeconds} ${escapeShellArg(host)} >/dev/null 2>&1`;
+}
+
 function openGuestTransport(host: string, port: number, jumpHost?: XenConnectionInput): Promise<GuestTransport> {
   if (!jumpHost) return openDirectGuestTransport(host, port);
   return openDirectGuestTransport(host, port).catch(() => openJumpGuestTransport(host, port, jumpHost));
@@ -1250,10 +1445,6 @@ function windowsComputerName(item: VmProvisionPlanItem): string {
   return `${normalized || "VRC"}-${suffix}`.slice(0, 15);
 }
 
-function windowsNtLmUsername(item: VmProvisionPlanItem): string {
-  return `${windowsComputerName(item)}\\${item.loginUsername || "Administrator"}`;
-}
-
 function windowsCmdArg(value: string): string {
   return value.replace(/[^0-9A-Za-z.:-]/g, "");
 }
@@ -1264,12 +1455,6 @@ function guestToolsMessage(providerType: ProviderType): string {
 
 function guestToolsSuccessMessage(providerType: ProviderType): string {
   return `${resolveGuestMonitoringPolicy(providerType).label} 已安装并通过平台验证`;
-}
-
-function finalizeSuccessMessage(providerType: string): string {
-  if (providerType === "xenserver") return "已固定硬盘启动并清理安装介质";
-  if (providerType === "vmware") return "系统已从硬盘启动，安装介质将在任务收尾阶段清理";
-  return "启动收尾配置已完成";
 }
 
 function delay(ms: number): Promise<void> {

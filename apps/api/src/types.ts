@@ -7,6 +7,36 @@ export interface XenConnectionInput {
 
 export type ProviderType = "xenserver" | "vmware" | "proxmox" | "libvirt";
 
+export interface ProviderOperationCapability {
+  supported: boolean;
+  reasonCode?: string;
+  message?: string;
+}
+
+export interface ProviderRenameCapability extends ProviderOperationCapability {
+  maxLength: number;
+  pattern?: string;
+  patternMessage?: string;
+  duplicateScope: string;
+  effect: string;
+}
+
+export interface ProviderDescriptor {
+  type: ProviderType;
+  label: string;
+  defaultPort: number;
+  networkInterfaceLabel: string;
+  capabilities: {
+    inventory: ProviderOperationCapability;
+    isoLibrary: ProviderOperationCapability & { emptyMessage: string; actionHint?: string };
+    vmCreate: ProviderOperationCapability;
+    vmRename: ProviderRenameCapability;
+    vmResize: ProviderOperationCapability;
+    vmConsole: ProviderOperationCapability;
+    provisioningNetworkProbe: ProviderOperationCapability;
+  };
+}
+
 export type ResourceStatus = "online" | "offline" | "maintenance" | "unknown";
 
 export type PowerState = "running" | "halted" | "stopped" | "suspended" | "unknown";
@@ -63,6 +93,7 @@ export interface VmNode {
   connectionId: string;
   hostId?: string;
   providerId: string;
+  consoleRef?: string;
   name: string;
   powerState: PowerState;
   cpuCount: number;
@@ -79,6 +110,14 @@ export interface VmNode {
   reclaimLevel: ReclaimLevel;
   reclaimReason: string;
   metadata?: Record<string, unknown>;
+}
+
+/** Lightweight VM identity used by cross-host IP/name search. */
+export interface VmSearchIndexItem {
+  providerId: string;
+  hostId?: string;
+  name: string;
+  ipAddresses: string[];
 }
 
 export interface VmInventorySummary {
@@ -98,10 +137,14 @@ export interface VmDisk {
   providerId: string;
   name: string;
   device: string;
+  displayName?: string;
   virtualSizeBytes: number;
   storageRepositoryId?: string;
   storageRepository?: string;
   onlineResizeSupported?: boolean;
+  canOnlineResize?: boolean;
+  requiresShutdown?: boolean;
+  allowedModes?: Array<"extend" | "add">;
 }
 
 export interface GuestStorageMount {
@@ -135,6 +178,7 @@ export interface GuestStorageInventory {
   vmIp: string;
   supported: boolean;
   message: string;
+  reasonCode?: "GUEST_OFFLINE" | "SYSTEM_EXECUTION_UNAVAILABLE" | "SYSTEM_AUTHENTICATION_REQUIRED";
   disks: GuestStorageDisk[];
   mounts: GuestStorageMount[];
   directories: GuestStorageDirectory[];
@@ -164,6 +208,7 @@ export interface IsoImage {
   sizeBytes?: number;
   hostId?: string;
   shared?: boolean;
+  installProfileHint?: IsoInstallProfileHint;
   metadata?: {
     srDescription?: string;
     physicalUtilisationBytes?: number;
@@ -172,6 +217,12 @@ export interface IsoImage {
     ctime?: number;
     [key: string]: unknown;
   };
+}
+
+export interface IsoInstallProfileHint {
+  available: Array<"server" | "desktop">;
+  recommended: "server" | "desktop";
+  source: "media-name" | "template" | "default";
 }
 
 export interface ProvisioningSpecTemplate {
@@ -266,26 +317,40 @@ export interface VmResizeDiskRequest {
   name?: string;
 }
 
-export interface VmResizeGuestStorageRequest {
-  vmIp: string;
-  username?: string;
-  password?: string;
+export interface VmResizeStorageTarget {
   mountPath: string;
-  guestDiskPath?: string;
-  guestPartitionPath?: string;
-  filesystem?: string;
+}
+
+export interface VmSystemCredentials {
+  username: string;
+  password: string;
+  jump?: {
+    host: string;
+    port: number;
+    username: string;
+    password: string;
+  };
 }
 
 export interface VmResizeRequest {
   cpuCount?: number;
   memoryBytes?: number;
   disk?: VmResizeDiskRequest;
-  guestStorage?: VmResizeGuestStorageRequest;
+  storageTarget?: VmResizeStorageTarget;
   allowShutdown: boolean;
   restartAfterResize: boolean;
 }
 
-export interface VmResizeGuestStorageResult {
+export interface VmResizeExecutionRequest {
+  cpuCount?: number;
+  memoryBytes?: number;
+  disk?: VmResizeDiskRequest;
+  allowShutdown: boolean;
+  restartAfterResize: boolean;
+  allowNoop?: boolean;
+}
+
+export interface VmResizeStorageResult {
   status: "completed" | "failed";
   mountPath: string;
   sizeBytes?: number;
@@ -303,7 +368,7 @@ export interface VmResizeResult {
   disks: VmDisk[];
   stopped: boolean;
   restarted: boolean;
-  guestStorage?: VmResizeGuestStorageResult;
+  storage?: VmResizeStorageResult;
   message: string;
 }
 
@@ -400,6 +465,7 @@ export interface VmProvisionRequest {
   installStrategy?: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso";
   installProfile?: "server" | "desktop";
   connectionId?: string;
+  scopeKey?: string;
   providerType: ProviderType;
   hostId?: string;
   environmentTemplateId?: string;
@@ -471,6 +537,13 @@ export interface ProvisionTaskVm {
   installPackageTotal?: number;
   installPackageDone?: number;
   message?: string;
+  reasonCode?: string;
+  readiness?: {
+    state: "offline" | "network-visible" | "protocol-ready" | "ready";
+    networkVisible: boolean;
+    ready: boolean;
+  };
+  actionHints?: string[];
 }
 
 export interface ProvisionTask {
@@ -569,12 +642,43 @@ export interface HostSummary {
 export interface StorageRepository {
   name: string;
   type: string;
+  typeLabel: string;
+  purposeLabel: string;
+  scopeLabel: string;
+  mediaLabel: string;
   physicalGiB: number;
   usedGiB: number;
-  virtualGiB: number;
+  /** Provider-native provisioned capacity. Null when the platform does not expose an equivalent metric. */
+  virtualGiB: number | null;
   shared: boolean;
   hostId?: string;
   content?: string[];
+}
+
+export interface CapacityBreakdown {
+  physicalTotalGiB: number;
+  physicalUsedGiB: number;
+  physicalFreeGiB: number;
+  physicalStatus: "normal" | "warning" | "danger";
+  vmConfiguredGiB: number;
+  vmConfigurableGiB: number;
+  vmOverconfiguredGiB: number;
+  vmStatus: "within-capacity" | "overconfigured";
+  /** Platform policy result retained for compatibility with capacity consumers. */
+  allocatableGiB: number;
+}
+
+export interface MemoryCapacityBreakdown extends CapacityBreakdown {
+  runningConfiguredGiB: number;
+  haltedConfiguredGiB: number;
+  guaranteedHeadroomGiB: number;
+  startupDeficitGiB: number;
+  startupStatus: "guaranteed" | "at-risk";
+}
+
+export interface ResourceCapacitySummary {
+  memory: MemoryCapacityBreakdown;
+  storage: CapacityBreakdown;
 }
 
 export interface NetworkInterface {

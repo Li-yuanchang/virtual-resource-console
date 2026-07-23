@@ -1,4 +1,4 @@
-import type { HostNode, ProviderType, VmInventorySummary, VmNode } from "./types.js";
+import type { HostNode, ProviderType, ResourceCapacitySummary, VmInventorySummary, VmNode } from "./types.js";
 
 interface InventoryEventBase {
   type: "vm.patch" | "vm.upsert" | "vm.delete" | "host.patch" | "summary.patch";
@@ -30,6 +30,7 @@ export type InventoryEvent =
   | (InventoryEventBase & {
       type: "summary.patch";
       summary: VmInventorySummary;
+      resourceCapacity?: ResourceCapacitySummary;
     });
 
 type InventoryEventInput =

@@ -1,14 +1,19 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { getVrcDataFile } from "./appPaths.js";
+import { readLocalJsonConfig, writeLocalJsonConfig } from "./localConfigFile.js";
 import type { ProviderType } from "./types.js";
+import { defaultPortForProvider } from "./providerCatalog.js";
 
-const preferenceFile = join(homedir(), ".virtual-resource-console", "preferences.json");
-const uiBackgroundImageFile = join(homedir(), ".virtual-resource-console", "appearance-background");
+const preferenceFile = getVrcDataFile("preferences.json");
+const uiBackgroundImageFile = getVrcDataFile("appearance-background");
 
-export type UiThemePreference = "graphite-sage" | "basalt-copper" | "mist-teal";
+export type UiThemePreference = "graphite-sage" | "basalt-copper" | "mist-teal" | "prism-frost" | "aurora-mint" | "neon-carbon";
 export type UiTonePreference = "system" | "light" | "dark";
 export type UiBackgroundPreference = "default" | "solid" | "image";
+export type UiFontPreference = "system" | "humanist" | "compact";
+export type ConsoleThemePreference = "vrc" | "tokyo-night" | "catppuccin" | "dracula" | "nord" | "rose-pine" | "solarized" | "light";
+export type ConsoleFontPreference = "system-mono" | "jetbrains" | "cascadia" | "menlo";
 
 export interface UiPreferences {
   theme: UiThemePreference;
@@ -28,6 +33,21 @@ export interface UiPreferences {
   showIconTooltips: boolean;
   truncateLongNames: boolean;
   throttleConsoleResize: boolean;
+  uiFontPreset: UiFontPreference;
+  uiFontSize: number;
+  reduceMotion: boolean;
+  consoleTheme: ConsoleThemePreference;
+  consoleFontPreset: ConsoleFontPreference;
+  consoleFontSize: number;
+  consoleLineHeight: number;
+  consoleCursorStyle: "block" | "underline" | "bar";
+  consoleCursorBlink: boolean;
+  consoleScaleMode: "local" | "remote";
+  consoleQuality: "auto" | "high" | "smooth";
+  consoleWatermarkEnabled: boolean;
+  consoleWatermarkScope: "console" | "workspace";
+  consoleWatermarkDensity: "sparse" | "standard" | "dense";
+  consoleWatermarkOpacity: number;
 }
 
 export interface ConnectionPreferences {
@@ -68,6 +88,21 @@ const defaultUiPreferences: UiPreferences = {
   showIconTooltips: true,
   truncateLongNames: true,
   throttleConsoleResize: true,
+  uiFontPreset: "system",
+  uiFontSize: 12,
+  reduceMotion: false,
+  consoleTheme: "vrc",
+  consoleFontPreset: "system-mono",
+  consoleFontSize: 13,
+  consoleLineHeight: 1.2,
+  consoleCursorStyle: "block",
+  consoleCursorBlink: true,
+  consoleScaleMode: "local",
+  consoleQuality: "auto",
+  consoleWatermarkEnabled: true,
+  consoleWatermarkScope: "console",
+  consoleWatermarkDensity: "standard",
+  consoleWatermarkOpacity: 12,
 };
 
 const defaultConnectionPreferences: ConnectionPreferences = {
@@ -153,25 +188,25 @@ export function deleteUiBackgroundImage(): void {
 }
 
 function readPreferenceFile(): PreferenceFile {
-  ensurePreferenceDir();
-  if (!existsSync(preferenceFile)) {
-    return { version: 1, ui: defaultUiPreferences, connection: defaultConnectionPreferences };
-  }
-  try {
-    const parsed = JSON.parse(readFileSync(preferenceFile, "utf8")) as Partial<PreferenceFile>;
-    return {
-      version: 1,
-      ui: normalizeUiPreferences(parsed.ui ?? {}),
-      connection: normalizeConnectionPreferences(parsed.connection ?? {}),
-    };
-  } catch {
-    return { version: 1, ui: defaultUiPreferences, connection: defaultConnectionPreferences };
-  }
+  const fallback = (): PreferenceFile => ({ version: 1, ui: defaultUiPreferences, connection: defaultConnectionPreferences });
+  return readLocalJsonConfig({
+    filePath: preferenceFile,
+    label: "界面偏好配置",
+    normalize: (input) => {
+      const parsed = input as Partial<PreferenceFile>;
+      return {
+        version: 1,
+        ui: normalizeUiPreferences(parsed.ui ?? {}),
+        connection: normalizeConnectionPreferences(parsed.connection ?? {}),
+      };
+    },
+    onMissing: fallback,
+    onInvalid: fallback,
+  });
 }
 
 function writePreferenceFile(file: PreferenceFile): void {
-  ensurePreferenceDir();
-  writeFileSync(preferenceFile, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  writeLocalJsonConfig(preferenceFile, file);
 }
 
 function ensurePreferenceDir(): void {
@@ -179,7 +214,7 @@ function ensurePreferenceDir(): void {
 }
 
 function normalizeUiPreferences(input: Partial<UiPreferences>): UiPreferences {
-  const theme = input.theme === "basalt-copper" || input.theme === "mist-teal" || input.theme === "graphite-sage" ? input.theme : defaultUiPreferences.theme;
+  const theme = normalizeTheme(input.theme);
   const themeColors = semanticColorsForTheme(theme);
   return {
     theme,
@@ -202,10 +237,44 @@ function normalizeUiPreferences(input: Partial<UiPreferences>): UiPreferences {
     showIconTooltips: typeof input.showIconTooltips === "boolean" ? input.showIconTooltips : defaultUiPreferences.showIconTooltips,
     truncateLongNames: typeof input.truncateLongNames === "boolean" ? input.truncateLongNames : defaultUiPreferences.truncateLongNames,
     throttleConsoleResize: typeof input.throttleConsoleResize === "boolean" ? input.throttleConsoleResize : defaultUiPreferences.throttleConsoleResize,
+    uiFontPreset: normalizeUiFontPreset(input.uiFontPreset),
+    uiFontSize: normalizeNumber(input.uiFontSize, 11, 13, defaultUiPreferences.uiFontSize),
+    reduceMotion: typeof input.reduceMotion === "boolean" ? input.reduceMotion : defaultUiPreferences.reduceMotion,
+    consoleTheme: normalizeConsoleTheme(input.consoleTheme),
+    consoleFontPreset: normalizeConsoleFontPreset(input.consoleFontPreset),
+    consoleFontSize: normalizeNumber(input.consoleFontSize, 11, 18, defaultUiPreferences.consoleFontSize),
+    consoleLineHeight: normalizeDecimal(input.consoleLineHeight, 1.05, 1.6, defaultUiPreferences.consoleLineHeight),
+    consoleCursorStyle:
+      input.consoleCursorStyle === "underline" || input.consoleCursorStyle === "bar" || input.consoleCursorStyle === "block"
+        ? input.consoleCursorStyle
+        : defaultUiPreferences.consoleCursorStyle,
+    consoleCursorBlink: typeof input.consoleCursorBlink === "boolean" ? input.consoleCursorBlink : defaultUiPreferences.consoleCursorBlink,
+    consoleScaleMode: input.consoleScaleMode === "remote" ? "remote" : "local",
+    consoleQuality: input.consoleQuality === "high" || input.consoleQuality === "smooth" ? input.consoleQuality : "auto",
+    consoleWatermarkEnabled:
+      typeof input.consoleWatermarkEnabled === "boolean" ? input.consoleWatermarkEnabled : defaultUiPreferences.consoleWatermarkEnabled,
+    consoleWatermarkScope: input.consoleWatermarkScope === "workspace" ? "workspace" : "console",
+    consoleWatermarkDensity:
+      input.consoleWatermarkDensity === "sparse" || input.consoleWatermarkDensity === "dense" ? input.consoleWatermarkDensity : "standard",
+    consoleWatermarkOpacity: normalizeNumber(
+      input.consoleWatermarkOpacity,
+      6,
+      24,
+      defaultUiPreferences.consoleWatermarkOpacity,
+    ),
   };
 }
 
 function semanticColorsForTheme(theme: UiThemePreference): Pick<UiPreferences, "accentColor" | "successColor" | "warningColor" | "dangerColor"> {
+  if (theme === "prism-frost") {
+    return { accentColor: "#527fa8", successColor: "#46856e", warningColor: "#b17a35", dangerColor: "#ad5260" };
+  }
+  if (theme === "aurora-mint") {
+    return { accentColor: "#397d78", successColor: "#4b8668", warningColor: "#b77734", dangerColor: "#b25355" };
+  }
+  if (theme === "neon-carbon") {
+    return { accentColor: "#5d9fe3", successColor: "#64bd91", warningColor: "#d49a51", dangerColor: "#d36c7b" };
+  }
   if (theme === "basalt-copper") {
     return { accentColor: "#9b5f35", successColor: "#4f7549", warningColor: "#b77935", dangerColor: "#a34f42" };
   }
@@ -215,6 +284,37 @@ function semanticColorsForTheme(theme: UiThemePreference): Pick<UiPreferences, "
   return { accentColor: "#426b57", successColor: "#477a45", warningColor: "#b77935", dangerColor: "#a5483d" };
 }
 
+function normalizeTheme(value: unknown): UiThemePreference {
+  return value === "basalt-copper" ||
+    value === "mist-teal" ||
+    value === "prism-frost" ||
+    value === "aurora-mint" ||
+    value === "neon-carbon" ||
+    value === "graphite-sage"
+    ? value
+    : defaultUiPreferences.theme;
+}
+
+function normalizeConsoleTheme(value: unknown): ConsoleThemePreference {
+  const legacyMap: Record<string, ConsoleThemePreference> = { classic: "vrc", slate: "tokyo-night", matrix: "nord", paper: "light" };
+  const normalized = typeof value === "string" ? legacyMap[value] ?? value : value;
+  return normalized === "vrc" || normalized === "tokyo-night" || normalized === "catppuccin" || normalized === "dracula" ||
+    normalized === "nord" || normalized === "rose-pine" || normalized === "solarized" || normalized === "light"
+    ? normalized
+    : defaultUiPreferences.consoleTheme;
+}
+
+function normalizeConsoleFontPreset(value: unknown): ConsoleFontPreference {
+  const normalized = value === "consolas" ? "cascadia" : value;
+  return normalized === "jetbrains" || normalized === "menlo" || normalized === "cascadia" || normalized === "system-mono"
+    ? normalized
+    : defaultUiPreferences.consoleFontPreset;
+}
+
+function normalizeUiFontPreset(value: unknown): UiFontPreference {
+  return value === "humanist" || value === "compact" || value === "system" ? value : defaultUiPreferences.uiFontPreset;
+}
+
 function normalizeHexColor(value: unknown, fallback: string): string {
   return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : fallback;
 }
@@ -222,6 +322,11 @@ function normalizeHexColor(value: unknown, fallback: string): string {
 function normalizeNumber(value: unknown, min: number, max: number, fallback: number): number {
   const number = Number(value);
   return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback;
+}
+
+function normalizeDecimal(value: unknown, min: number, max: number, fallback: number): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number * 100) / 100)) : fallback;
 }
 
 function normalizeImageMime(value: unknown): string {
@@ -243,9 +348,4 @@ function normalizeConnectionPreferences(input: Partial<ConnectionPreferences>): 
 
 function normalizeProviderType(value: unknown): ProviderType {
   return value === "vmware" || value === "proxmox" || value === "libvirt" || value === "xenserver" ? value : defaultConnectionPreferences.providerType;
-}
-
-function defaultPortForProvider(value: ProviderType): number {
-  if (value === "proxmox") return 8006;
-  return value === "vmware" ? 443 : 22;
 }

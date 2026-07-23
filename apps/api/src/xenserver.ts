@@ -2,6 +2,8 @@ import { Client } from "ssh2";
 import { assessVmReclaim } from "./analysis/reclaimStateMachine.js";
 import type { ProvisionProgressReporter, VirtualizationProvider } from "./providers/provider.js";
 import { buildXenServerPolicyEnv } from "./runtimePolicy.js";
+import { normalizeStorageCapacity } from "./storageCapacity.js";
+import { describeStorageRepository } from "./storageRepositoryProfile.js";
 import type {
   HostNode,
   IsoImage,
@@ -27,8 +29,9 @@ import type {
   VmProvisionResult,
   VmQuery,
   VmRenameResult,
-  VmResizeRequest,
+  VmResizeExecutionRequest,
   VmResizeResult,
+  VmSearchIndexItem,
   VmSnapshot,
   XenConnectionInput,
   XenOverview,
@@ -183,6 +186,84 @@ for vm in $vm_list; do
   memory_gib_total="$(awk -v a="$memory_gib_total" -v b="$mem_gib" 'BEGIN { printf "%.1f", a + b }')"
 done
 printf 'SUMMARY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$total" "$running" "$halted" "$vcpu_total" "$memory_gib_total" "$running_vcpu_total" "$running_memory_gib_total"
+`;
+
+const VM_SEARCH_INDEX_SCRIPT = String.raw`
+clean_one_line() {
+  tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+is_managed_ip() {
+  if [ -z "$VRC_MANAGED_IP_PATTERN" ]; then return 0; fi
+  printf "%s" "$1" | grep -Eq "$VRC_MANAGED_IP_PATTERN"
+}
+first_ip() {
+  grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | while read -r candidate; do
+    if is_managed_ip "$candidate"; then printf "%s" "$candidate"; break; fi
+  done
+}
+valid_host_octet() {
+  awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+$/ && n > 0 && n < 255) }'
+}
+infer_ip_from_name() {
+  name="$1"
+  ip="$(printf "%s" "$name" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)"
+  if [ -n "$ip" ]; then
+    last="$(printf "%s" "$ip" | awk -F. '{print $NF}')"
+    if valid_host_octet "$last" && is_managed_ip "$ip"; then printf "%s" "$ip"; return; fi
+  fi
+  short="$(printf "%s" "$name" | grep -Eo '(^|[^0-9])[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)' | head -1 | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}' | head -1)"
+  if [ -n "$short" ] && [ -n "$VRC_SHORT_IP_BASE_PREFIX" ]; then
+    subnet="$(printf "%s" "$short" | awk -F. '{print $1}')"
+    last="$(printf "%s" "$short" | awk -F. '{print $2}')"
+    for allowed in $VRC_SHORT_IP_THIRD_OCTETS; do
+      if [ "$subnet" = "$allowed" ] && valid_host_octet "$last"; then
+        candidate="$VRC_SHORT_IP_BASE_PREFIX.$subnet.$last"
+        if is_managed_ip "$candidate"; then printf "%s" "$candidate"; return; fi
+      fi
+    done
+  fi
+  host_only="$(printf "%s" "$name" | grep -Eo '^[0-9]{1,3}([^0-9.]|$)' | head -1 | grep -Eo '[0-9]{1,3}' | head -1)"
+  if [ -n "$host_only" ] && [ -n "$VRC_HOST_ONLY_PREFIX" ] && valid_host_octet "$host_only"; then
+    candidate="$VRC_HOST_ONLY_PREFIX.$host_only"
+    if is_managed_ip "$candidate"; then printf "%s" "$candidate"; fi
+  fi
+}
+first_search_ip() {
+  vm_uuid="$1"
+  vm_name="$2"
+  networks="$(xe vm-param-get uuid="$vm_uuid" param-name=networks 2>/dev/null | clean_one_line)"
+  ip="$(printf "%s" "$networks" | first_ip)"
+  if [ -n "$ip" ]; then printf "%s" "$ip"; return; fi
+  guest_metrics="$(xe vm-param-get uuid="$vm_uuid" param-name=guest-metrics 2>/dev/null | clean_one_line)"
+  if [ -n "$guest_metrics" ] && [ "$guest_metrics" != "<not in database>" ]; then
+    metrics_networks="$(xe vm-guest-metrics-param-get uuid="$guest_metrics" param-name=networks 2>/dev/null | clean_one_line)"
+    ip="$(printf "%s" "$metrics_networks" | first_ip)"
+    if [ -n "$ip" ]; then printf "%s" "$ip"; return; fi
+  fi
+  for key in vrc-ip ip vrc_ip; do
+    ip="$(xe vm-param-get uuid="$vm_uuid" param-name=other-config param-key="$key" 2>/dev/null | clean_one_line)"
+    if [ -n "$ip" ] && [ "$ip" != "<not in database>" ] && is_managed_ip "$ip"; then
+      printf "%s" "$ip"
+      return
+    fi
+  done
+  ip="$(xe vm-param-get uuid="$vm_uuid" param-name=xenstore-data param-key=vrc_ip 2>/dev/null | clean_one_line)"
+  if [ -n "$ip" ] && [ "$ip" != "<not in database>" ] && is_managed_ip "$ip"; then
+    printf "%s" "$ip"
+    return
+  fi
+  infer_ip_from_name "$vm_name"
+}
+vm_list="$(xe vm-list is-control-domain=false --minimal 2>/dev/null | tr ',' ' ')"
+for vm in $vm_list; do
+  resident="$(xe vm-param-get uuid="$vm" param-name=resident-on 2>/dev/null | clean_one_line)"
+  affinity="$(xe vm-param-get uuid="$vm" param-name=affinity 2>/dev/null | clean_one_line)"
+  effective_host="$resident"
+  if [ -z "$effective_host" ] || [ "$effective_host" = "<not in database>" ]; then effective_host="$affinity"; fi
+  name="$(xe vm-param-get uuid="$vm" param-name=name-label 2>/dev/null | clean_one_line)"
+  ip="$(first_search_ip "$vm" "$name")"
+  printf 'SEARCH_VM\t%s\t%s\t%s\t%s\n' "$vm" "$name" "$effective_host" "$ip"
+done
 `;
 
 const VM_LIST_SCRIPT = String.raw`
@@ -1138,7 +1219,12 @@ elif [ "$VRC_INSTALL_MEDIA_MODE" = "windows-unattended" ]; then
 elif should_use_unattended_install "$template_name"; then
   xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
   prepare_unattended_install "$vm_uuid" "$template_name"
-  attach_iso "$vm_uuid" "$VRC_ISO_UUID"
+  # http-boot/offline 策略生成的辅助 ISO 才包含自动启动参数；没有辅助 ISO 的 cdrom-http-ks 才回退原始安装盘。
+  boot_iso_uuid="$VRC_ISO_UUID"
+  if [ -n "$VRC_AUX_ISO_UUID" ]; then
+    boot_iso_uuid="$VRC_AUX_ISO_UUID"
+  fi
+  attach_iso "$vm_uuid" "$boot_iso_uuid"
   xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false >/dev/null 2>&1 || true
 else
   xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
@@ -1489,6 +1575,10 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     };
   }
 
+  async listVmSearchIndex(input: XenConnectionInput): Promise<VmSearchIndexItem[]> {
+    return parseVmSearchIndex(await runRemoteScript(input, VM_SEARCH_INDEX_SCRIPT));
+  }
+
   async listVmDisks(input: XenConnectionInput, vmId: string): Promise<VmDisk[]> {
     const output = await runRemoteScript(input, VM_DISKS_SCRIPT, {
       env: {
@@ -1576,7 +1666,7 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     };
   }
 
-  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeRequest): Promise<VmResizeResult> {
+  async resizeVm(input: XenConnectionInput, vmId: string, request: VmResizeExecutionRequest): Promise<VmResizeResult> {
     const disksBefore = request.disk ? await this.listVmDisks(input, vmId) : [];
     const targetDisk = request.disk?.mode === "extend"
       ? disksBefore.find((disk) => disk.id === request.disk?.diskId || disk.providerId === request.disk?.diskId)
@@ -1954,13 +2044,18 @@ function parseHostInventory(output: string, connectionId: string): HostInventory
     }
 
     if (tag === "SR") {
+      const type = cols[2] ?? "";
+      const shared = parseBool(cols[6]);
       storage.push({
         name: cols[1] ?? "",
-        type: cols[2] ?? "",
-        physicalGiB: parseNumber(cols[3]),
-        usedGiB: parseNumber(cols[4]),
-        virtualGiB: parseNumber(cols[5]),
-        shared: parseBool(cols[6]),
+        type,
+        ...describeStorageRepository("xenserver", { type, shared }),
+        ...normalizeStorageCapacity({
+          physicalGiB: parseNumber(cols[3]),
+          usedGiB: parseNumber(cols[4]),
+          virtualGiB: parseNumber(cols[5]),
+        }),
+        shared,
       });
     }
   }
@@ -1983,6 +2078,7 @@ function parseVmList(output: string, connectionId: string): VmNode[] {
         id: `${connectionId}:vm:${providerId}`,
         connectionId,
         providerId,
+        consoleRef: providerId,
         name: cols[2] ?? "",
         powerState: normalizePowerState(cols[3]),
         cpuCount: parseNumber(cols[4]),
@@ -2007,6 +2103,22 @@ function parseVmList(output: string, connectionId: string): VmNode[] {
       return vm;
     })
     .filter((vm) => vm.providerId);
+}
+
+function parseVmSearchIndex(output: string): VmSearchIndexItem[] {
+  return output
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("SEARCH_VM\t"))
+    .map((line) => {
+      const [, providerId = "", name = "", hostId = "", ip = ""] = line.split("\t");
+      return {
+        providerId,
+        hostId: hostId && hostId !== "<not in database>" ? hostId : undefined,
+        name,
+        ipAddresses: ip ? [ip] : [],
+      } satisfies VmSearchIndexItem;
+    })
+    .filter((item) => item.providerId);
 }
 
 function parseVmSummary(output: string): VmInventorySummary {
@@ -2040,16 +2152,21 @@ function parseVmDisks(output: string): VmDisk[] {
     .filter((line) => line.startsWith("DISK\t"))
     .map((line) => {
       const cols = line.split("\t");
+      const canOnlineResize = parseBool(cols[8]);
       return {
         id: cols[1] ?? "",
         vmId: cols[2] ?? "",
         providerId: cols[1] ?? "",
         device: cols[3] ?? "",
         name: cols[4] ?? "",
+        displayName: /^\d+$/.test(cols[3] ?? "") ? `磁盘 ${cols[3]}` : cols[3] || cols[4] || "虚拟硬盘",
         virtualSizeBytes: parseNumber(cols[5]),
         storageRepositoryId: cols[6] || undefined,
         storageRepository: cols[7] || undefined,
-        onlineResizeSupported: parseBool(cols[8]),
+        onlineResizeSupported: canOnlineResize,
+        canOnlineResize,
+        requiresShutdown: !canOnlineResize,
+        allowedModes: ["extend", "add"] as VmDisk["allowedModes"],
       };
     })
     .filter((disk) => disk.id)
@@ -2406,7 +2523,7 @@ function clampPageSize(pageSize: number | undefined): number {
   return Math.min(Math.max(pageSize, 1), 500);
 }
 
-export function assertXenResizeApplied(request: VmResizeRequest, disksBefore: VmDisk[], result: VmResizeResult): void {
+export function assertXenResizeApplied(request: VmResizeExecutionRequest, disksBefore: VmDisk[], result: VmResizeResult): void {
   if (request.cpuCount && result.cpuCount < request.cpuCount) {
     throw new Error(`CPU 扩容未生效：目标 ${request.cpuCount} vCPU，平台回读 ${result.cpuCount} vCPU`);
   }

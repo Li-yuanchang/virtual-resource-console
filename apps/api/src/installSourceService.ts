@@ -1,11 +1,11 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import { Client } from "ssh2";
 import type { ConnectConfig, SFTPWrapper } from "ssh2";
 import { buildCentosLvmPartitioning, buildCentosPackageSelection } from "./centosKickstart.js";
+import { getVrcDataFile } from "./appPaths.js";
 import { markProvisionTaskStep, updateProvisionTaskVm } from "./provisionTaskStore.js";
 import type { IpPoolConfig, ProviderType, VmProvisionInstallSourceRef, VmProvisionPlanItem, VmProvisionRequest, XenConnectionInput } from "./types.js";
 import { resolveXenInstallMediaMode, type XenInstallMediaMode } from "./xenserverUnattendedIso.js";
@@ -59,7 +59,7 @@ export interface XenProvisioningNetworkProbe {
 
 const installSourceRecords = new Map<string, InstallSourceRecord>();
 const xenHostInstallLeases = new Map<string, { connection: XenConnectionInput; port: string; sourceIds: string[]; vmCidr?: string }>();
-const cacheRoot = join(homedir(), ".virtual-resource-console", "install-source-cache");
+const cacheRoot = getVrcDataFile("install-source-cache");
 const xenHostInstallSourceStartPort = process.env.VRC_XEN_HOST_INSTALL_SOURCE_PORT?.trim() || "3988";
 const xenHostInstallSourcePortCount = Number(process.env.VRC_XEN_HOST_INSTALL_SOURCE_PORT_COUNT ?? "20");
 const xenHostInstallSourceRoot = process.env.VRC_XEN_HOST_INSTALL_SOURCE_ROOT?.trim() || "/var/run/vrc-install-source";

@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { getVrcDataDir } from "./appPaths.js";
 
-const storeDir = join(homedir(), ".virtual-resource-console");
+const storeDir = getVrcDataDir();
 const storeFile = join(storeDir, "ip-leases.json");
 
 export type IpLeaseStatus = "reserved" | "released";

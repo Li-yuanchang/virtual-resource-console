@@ -10,8 +10,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getVrcDataDir } from "./appPaths.js";
 import type {
   ProviderType,
   VmSchedule,
@@ -23,7 +23,7 @@ import type {
   VmScheduleTarget,
 } from "./types.js";
 
-const storeDir = join(homedir(), ".virtual-resource-console");
+const storeDir = getVrcDataDir();
 const storeFile = join(storeDir, "vm-schedules.json");
 const writeLockFile = join(storeDir, "vm-schedules.write.lock");
 const writeLockTimeoutMs = 2_000;

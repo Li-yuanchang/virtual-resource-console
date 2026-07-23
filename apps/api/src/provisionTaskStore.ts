@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getVrcDataDir } from "./appPaths.js";
 import type {
   ProviderType,
   ProvisionTask,
@@ -12,7 +12,7 @@ import type {
   VmProvisionPlanItem,
 } from "./types.js";
 
-const storeDir = join(homedir(), ".virtual-resource-console");
+const storeDir = getVrcDataDir();
 const storeFile = join(storeDir, "provision-tasks.json");
 const provisionStepWeights: Record<ProvisionTaskStepKey, number> = {
   plan: 5,
@@ -245,10 +245,11 @@ function writeTasks(tasks: ProvisionTask[]): void {
 }
 
 function normalizeProvisionTask(task: StoredProvisionTask): ProvisionTask {
-  const normalized = {
+  const normalized = normalizeWindowsRemoteAcceptanceWarning({
     ...task,
     eventSeq: task.eventSeq || 0,
-  };
+    progressPercent: task.progressPercent ?? 0,
+  } as ProvisionTask);
   return {
     ...normalized,
     progressPercent: calculateProvisionTaskProgress(normalized),
@@ -257,6 +258,57 @@ function normalizeProvisionTask(task: StoredProvisionTask): ProvisionTask {
       currentStep: vm.currentStep ?? normalized.currentStep,
       progressPercent: vm.progressPercent ?? (vm.status === "success" ? 100 : undefined),
     })),
+  };
+}
+
+/**
+ * Corrects tasks created by the old Windows readiness mapping.
+ *
+ * The previous mapping marked the whole create task as failed after Windows had already started
+ * whenever WinRM was not ready within the bounded acceptance window. Installation success and
+ * remote-management acceptance are separate outcomes, so these historical tasks are exposed as
+ * completed with a warning. This normalization is read-only and never resumes or changes a VM.
+ */
+export function normalizeWindowsRemoteAcceptanceWarning(task: ProvisionTask): ProvisionTask {
+  const installStep = task.steps.find((step) => step.key === "install-guest");
+  const remoteWarningVms = task.vms.filter(
+    (vm) => vm.status === "failed"
+      && vm.readiness?.networkVisible
+      && (vm.reasonCode === "WINDOWS_REMOTE_INIT_TIMEOUT" || vm.reasonCode === "WINDOWS_ICMP_BLOCKED"),
+  );
+  const hasOtherFailedVm = task.vms.some((vm) => vm.status === "failed" && !remoteWarningVms.includes(vm));
+  if (task.status !== "failed" || installStep?.status !== "success" || !remoteWarningVms.length || hasOtherFailedVm) {
+    return task;
+  }
+
+  const warningMessage = "Windows 已安装并进入系统，WinRM 远程管理尚未完成验收。";
+  return {
+    ...task,
+    status: "warning",
+    currentStep: "complete",
+    message: warningMessage,
+    progressPercent: 100,
+    steps: task.steps.map((step) => {
+      if (step.key === "wait-network") {
+        return { ...step, status: "warning", message: "Windows 网络已上线，WinRM 远程管理尚未完成验收" };
+      }
+      if (["verify-login", "finalize", "guest-tools"].includes(step.key) && step.status === "pending") {
+        return { ...step, status: "skipped", message: "远程管理未就绪，本阶段未执行" };
+      }
+      if (step.key === "complete") {
+        return { ...step, status: "warning", message: warningMessage };
+      }
+      return step;
+    }),
+    vms: task.vms.map((vm) => remoteWarningVms.includes(vm)
+      ? {
+          ...vm,
+          status: "warning",
+          currentStep: "complete",
+          progressPercent: 100,
+          message: "Windows 已安装并进入系统，WinRM 远程管理尚未完成验收",
+        }
+      : vm),
   };
 }
 

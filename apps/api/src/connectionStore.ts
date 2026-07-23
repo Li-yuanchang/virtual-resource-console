@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
+import { getVrcDataDir } from "./appPaths.js";
 import type { ProviderType, XenConnectionInput } from "./types.js";
 
-const storeDir = join(homedir(), ".virtual-resource-console");
+const storeDir = getVrcDataDir();
 const storeFile = join(storeDir, "connections.json");
 const keyFile = join(storeDir, "key.bin");
 
@@ -142,7 +142,7 @@ function getKey(): Buffer {
   }
   const key = readFileSync(keyFile);
   if (key.length !== 32) {
-    throw new Error("连接密钥文件无效，请检查 ~/.virtual-resource-console/key.bin");
+    throw new Error(`连接密钥文件无效，请检查 ${keyFile}`);
   }
   return key;
 }

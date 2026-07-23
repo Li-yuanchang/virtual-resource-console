@@ -140,6 +140,7 @@ function toIsoInput(context: XenInstallStrategyContext): XenUnattendedIsoInput {
     taskId: context.request.taskId,
     sourceIsoId: context.request.isoId || "",
     sourceIsoName: context.sourceIsoName,
+    installProfile: context.request.installProfile ?? (isWindowsImage(context.sourceIsoName) ? "desktop" : "server"),
     hostId: context.request.hostId,
     vm: context.item,
     ipPool: context.request.ipPool,

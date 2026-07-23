@@ -13,6 +13,18 @@ export interface ProvisionRecoveryContext {
 }
 
 /**
+ * Signals that a task's persisted VM UUID no longer exists on the platform.
+ * Recovery must stop in this case instead of attaching the old task to a new VM
+ * that happens to reuse the same name or IP address.
+ */
+export class ProvisionRecoveryVmMissingError extends Error {
+  constructor(taskId: string, vmName: string, providerId: string) {
+    super(`任务 ${taskId} 记录的 VM 已不存在：${vmName} (${providerId})`);
+    this.name = "ProvisionRecoveryVmMissingError";
+  }
+}
+
+/**
  * Resolves existing VMs for an interrupted task without issuing a create operation.
  * Saved UUIDs take precedence; exact-name lookup is limited to the crash window before
  * the returned UUID reached the local task store.
@@ -28,28 +40,37 @@ export async function resolveProvisionRecoveryVms(input: {
   onRecoveredVm?: (vmName: string, patch: Partial<ProvisionTaskVm>) => void;
 }): Promise<VmProvisionCreatedVm[]> {
   const created: VmProvisionCreatedVm[] = [];
+  let inventoryPromise: ReturnType<typeof input.provider.listVms> | undefined;
+  const loadInventory = () => {
+    inventoryPromise ??= input.provider.listVms(input.connection, {
+      hostId: input.context.request.hostId,
+      page: 1,
+      pageSize: 1000,
+    });
+    return inventoryPromise;
+  };
   for (const item of input.context.request.planItems) {
     const savedCreated = input.context.created?.find((vm) => vm.name === item.name);
     const taskVm = input.task.vms.find((vm) => vm.name === item.name);
     const providerId = savedCreated?.providerId || savedCreated?.id || taskVm?.providerId || taskVm?.id;
     if (providerId) {
+      const page = await loadInventory();
+      const matched = page.items.find((vm) => vm.providerId === providerId);
+      if (!matched) {
+        throw new ProvisionRecoveryVmMissingError(input.task.id, item.name, providerId);
+      }
       created.push({
         id: savedCreated?.id || providerId,
         providerId,
         name: item.name,
-        powerState: savedCreated?.powerState || taskVm?.powerState || "unknown",
+        powerState: matched.powerState,
         ip: item.ip,
         macAddress: savedCreated?.macAddress,
         generatedIsoRegistryId: savedCreated?.generatedIsoRegistryId,
       });
       continue;
     }
-    const page = await input.provider.listVms(input.connection, {
-      hostId: input.context.request.hostId,
-      page: 1,
-      pageSize: 100,
-      keyword: item.name,
-    });
+    const page = await loadInventory();
     const matches = page.items.filter((vm) => vm.name === item.name);
     if (matches.length !== 1) {
       throw new Error(

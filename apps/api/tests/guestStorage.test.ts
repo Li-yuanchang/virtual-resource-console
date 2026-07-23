@@ -2,9 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildAddFilesystemCommand,
+  buildGuestAuthenticationInventory,
+  buildGuestExecutionUnavailableInventory,
   buildExtendFilesystemCommand,
+  isGuestAuthenticationError,
+  isGuestAgentUnavailableError,
   linkGuestStorageToPlatformDisks,
   parseGuestStorageInventory,
+  resolveGuestStorageTransport,
 } from "../src/guestStorage.js";
 import type { VmDisk } from "../src/types.js";
 
@@ -85,4 +90,38 @@ test("builds separate commands for extending an LVM mount and formatting a new d
   assert.match(addCommand, /mkfs\.xfs -f "\$partition"/);
   assert.match(addCommand, /UUID=\$uuid/);
   assert.match(addCommand, /mount "\$mount_path"/);
+});
+
+test("classifies Guest authentication failures without masking unrelated SSH errors", () => {
+  const sshError = Object.assign(new Error("authentication failed"), { level: "client-authentication" });
+
+  assert.equal(isGuestAuthenticationError(sshError), true);
+  assert.equal(isGuestAuthenticationError(new Error("All configured authentication methods failed")), true);
+  assert.equal(isGuestAuthenticationError(new Error("缺少虚拟机操作系统 SSH 密码，请配置运行策略")), true);
+  assert.equal(isGuestAuthenticationError(new Error("SSH handshake timed out")), false);
+});
+
+test("requests one-time system credentials when backend default authentication fails", () => {
+  const inventory = buildGuestAuthenticationInventory("192.0.2.10");
+
+  assert.equal(inventory.supported, false);
+  assert.equal(inventory.reasonCode, "SYSTEM_AUTHENTICATION_REQUIRED");
+  assert.match(inventory.message, /Login|登录名/);
+  assert.deepEqual(inventory.mounts, []);
+});
+
+test("classifies unavailable PVE guest agent separately from SSH authentication", () => {
+  assert.equal(isGuestAgentUnavailableError(new Error("QEMU Guest Agent 未响应")), true);
+  assert.equal(isGuestAgentUnavailableError(new Error("guest-exec 未启用")), true);
+  assert.equal(isGuestAgentUnavailableError(new Error("SSH handshake timed out")), false);
+  assert.equal(buildGuestExecutionUnavailableInventory("192.0.2.10").reasonCode, "SYSTEM_EXECUTION_UNAVAILABLE");
+});
+
+test("backend selects the system storage transport by provider", () => {
+  assert.equal(resolveGuestStorageTransport("xenserver"), "platform-jump-ssh");
+  assert.equal(resolveGuestStorageTransport("proxmox"), "direct-ssh");
+  assert.equal(resolveGuestStorageTransport("vmware"), "direct-ssh");
+  assert.equal(resolveGuestStorageTransport("proxmox", true), "configured-jump-ssh");
+  assert.equal(resolveGuestStorageTransport("vmware", true), "configured-jump-ssh");
+  assert.throws(() => resolveGuestStorageTransport("libvirt"), /未配置系统存储执行策略/);
 });

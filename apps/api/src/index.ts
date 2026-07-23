@@ -13,6 +13,8 @@ import { registerProxmoxConsoleRoutes } from "./console/proxmoxConsole.js";
 import { registerConsoleUploadRoutes } from "./console/upload.js";
 import { registerVmwareConsoleRoutes } from "./console/vmwareConsole.js";
 import { registerXenServerConsoleRoutes } from "./console/xenserverConsole.js";
+import { registerTerminalRoutes } from "./terminal/routes.js";
+import { resolveDesktopUpdateFile } from "./desktopUpdateStatic.js";
 import { normalizeRuntimeMode, resolvePersistentConnectionPolicy } from "./connectionAccessPolicy.js";
 import {
   deleteStoredConnection,
@@ -30,21 +32,17 @@ import {
 } from "./ephemeralConnectionStore.js";
 import { InventoryCache } from "./inventoryCache.js";
 import type { InventoryCacheScope } from "./inventoryCache.js";
+import { InventorySnapshotStore } from "./inventorySnapshotStore.js";
+import { VmSearchIndexStore } from "./vmSearchIndexStore.js";
 import { listInventoryEventsAfter, publishInventoryEvent, subscribeInventoryEvents } from "./inventoryEvents.js";
-import { cleanupXenInstallSources, probeXenProvisioningNetwork, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
-import { isXenGuestToolsIsoName } from "./installMediaPolicy.js";
+import { cleanupXenInstallSources, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
 import { listIpLeases, releaseIpLeases, reserveIpLeases } from "./ipLeaseStore.js";
 import { getIpPoolPolicy, saveIpPoolPolicy } from "./ipPoolPolicy.js";
 import { buildIsoImageCacheKey, getIsoImageCache, saveIsoImageCache } from "./isoImageStore.js";
+import { attachIsoInstallProfileHints, defaultInstallProfileForIdentity } from "./isoInstallProfile.js";
 import { cleanupGeneratedIsoRecord, cleanupGeneratedIsoResidues, inspectGeneratedIsoResidues } from "./generatedIsoCleanupService.js";
 import { getGeneratedIso } from "./generatedIsoStore.js";
 import type { GeneratedIsoRecord } from "./generatedIsoStore.js";
-import {
-  applyGuestStorageResize,
-  inspectGuestStorage,
-  linkGuestStorageToPlatformDisks,
-  preflightGuestStorageResize,
-} from "./guestStorage.js";
 import { getProvisioningConfig, saveProvisioningConfig } from "./provisioningStore.js";
 import {
   createProvisionTask,
@@ -57,14 +55,18 @@ import {
   updateProvisionTaskVms,
 } from "./provisionTaskStore.js";
 import { provisionExecutionStore, type ProvisionExecutionContext } from "./provisionExecutionStore.js";
-import { resolveProvisionRecoveryVms } from "./provisionRecovery.js";
+import { ProvisionRecoveryVmMissingError, resolveProvisionRecoveryVms } from "./provisionRecovery.js";
 import { runProvisioningVerifier } from "./provisioningVerifier.js";
 import { buildIpLeasePreflightResult, buildIpReachabilityPreflightResult } from "./provisioningPreflight.js";
+import { resolveProvisioningNetworkProbeStrategy } from "./provisioningNetworkProbeStrategy.js";
+import { resolveProvisioningPlanPolicy, validateProvisionPlan } from "./provisioningPlanPolicy.js";
+import { defaultPortForProvider, getProviderDescriptor, listProviderDescriptors, providerLabel } from "./providerCatalog.js";
 import { ProviderRegistry } from "./providers/provider.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
 import { ProxmoxProvider } from "./proxmox.js";
 import { registerRequestCrypto } from "./requestCrypto.js";
 import { getRuntimePolicy } from "./runtimePolicy.js";
+import { summarizeResourceCapacity } from "./storageCapacity.js";
 import {
   deleteUiBackgroundImage,
   getAppPreferences,
@@ -86,6 +88,7 @@ import type {
   VirtualDisk,
   VmInventorySummary,
   VmNode,
+  VmSearchIndexItem,
   VmProvisionCreatedVm,
   VmProvisionRequest,
   VmResizeRequest,
@@ -95,6 +98,7 @@ import type {
 import { VmRenameConflictError, VmRenameValidationError } from "./vmRename.js";
 import { VmwareProvider } from "./vmware.js";
 import { VmScheduleRunner } from "./vmScheduleRunner.js";
+import { executeVmResize, inspectVmResizeStorage, VmResizeValidationError } from "./vmResizeService.js";
 import {
   createVmSchedule,
   deleteVmSchedule,
@@ -115,7 +119,7 @@ writeApiStartupLog("api module loaded", {
 
 const server = Fastify({
   logger: {
-    redact: ["req.body.password", "req.body.rootPassword", "req.body.guestStorage.password", "req.body.planItems[*].rootPassword", "req.body.leases[*].rootPassword", "password", "rootPassword"],
+    redact: ["req.body.password", "req.body.rootPassword", "req.body.systemCredentials.password", "req.body.guestStorage.password", "req.body.planItems[*].rootPassword", "req.body.leases[*].rootPassword", "password", "rootPassword"],
   },
 });
 
@@ -143,6 +147,8 @@ const runtimeMode = normalizeRuntimeMode(process.env.VRC_RUNTIME_MODE);
 const persistentConnectionPolicy = resolvePersistentConnectionPolicy(runtimeMode);
 const persistentConnectionStoreEnabled = persistentConnectionPolicy.enabled;
 const inventoryCache = new InventoryCache();
+const inventorySnapshotStore = new InventorySnapshotStore();
+const vmSearchIndexStore = new VmSearchIndexStore();
 const isoRefreshJobs = new Set<string>();
 const vmScheduleTargetCacheTtlMs = 5 * 60_000;
 const activeProvisionRecoveryTasks = new Set<string>();
@@ -156,6 +162,7 @@ registerRequestCrypto(server, { requireEncryptedSensitivePayloads: !persistentCo
 await registerXenServerConsoleRoutes(server);
 await registerProxmoxConsoleRoutes(server);
 await registerVmwareConsoleRoutes(server);
+await registerTerminalRoutes(server, { providers, inventoryCache });
 await registerConsoleUploadRoutes(server, { persistentConnectionsEnabled: persistentConnectionStoreEnabled });
 registerInstallSourceRoutes(server);
 
@@ -189,9 +196,13 @@ interface HostInventoryCapability {
   }>;
 }
 
+interface VmSearchIndexCapability {
+  listVmSearchIndex(connection: XenConnectionInput, scope?: { poolId?: string }): Promise<VmSearchIndexItem[]>;
+}
+
 const providerTypeSchema = z.enum(["xenserver", "vmware", "proxmox", "libvirt"]);
 const uiPreferencesSchema = z.object({
-  theme: z.enum(["graphite-sage", "basalt-copper", "mist-teal"]).optional(),
+  theme: z.enum(["graphite-sage", "basalt-copper", "mist-teal", "prism-frost", "aurora-mint", "neon-carbon"]).optional(),
   toneMode: z.enum(["system", "light", "dark"]).optional(),
   accentColor: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
   successColor: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
@@ -205,6 +216,21 @@ const uiPreferencesSchema = z.object({
   showIconTooltips: z.boolean().optional(),
   truncateLongNames: z.boolean().optional(),
   throttleConsoleResize: z.boolean().optional(),
+  uiFontPreset: z.enum(["system", "humanist", "compact"]).optional(),
+  uiFontSize: z.coerce.number().int().min(11).max(13).optional(),
+  reduceMotion: z.boolean().optional(),
+  consoleTheme: z.enum(["vrc", "tokyo-night", "catppuccin", "dracula", "nord", "rose-pine", "solarized", "light"]).optional(),
+  consoleFontPreset: z.enum(["system-mono", "jetbrains", "cascadia", "menlo"]).optional(),
+  consoleFontSize: z.coerce.number().min(11).max(18).optional(),
+  consoleLineHeight: z.coerce.number().min(1.05).max(1.6).optional(),
+  consoleCursorStyle: z.enum(["block", "underline", "bar"]).optional(),
+  consoleCursorBlink: z.boolean().optional(),
+  consoleScaleMode: z.enum(["local", "remote"]).optional(),
+  consoleQuality: z.enum(["auto", "high", "smooth"]).optional(),
+  consoleWatermarkEnabled: z.boolean().optional(),
+  consoleWatermarkScope: z.enum(["console", "workspace"]).optional(),
+  consoleWatermarkDensity: z.enum(["sparse", "standard", "dense"]).optional(),
+  consoleWatermarkOpacity: z.coerce.number().int().min(6).max(24).optional(),
 });
 const connectionPreferencesSchema = z.object({
   selectedConnectionId: z.string().optional(),
@@ -273,11 +299,23 @@ const vmDisksSchema = connectionSchema.extend({
   vmId: z.string().min(1),
 });
 
+const vmSystemJumpCredentialsSchema = z.object({
+  host: z.string().trim().min(1).max(255),
+  port: z.coerce.number().int().positive().max(65535).default(22),
+  username: z.string().trim().min(1).max(128),
+  password: z.string().min(1).max(1024),
+});
+
+const vmSystemCredentialsSchema = z.object({
+  username: z.string().trim().min(1).max(256),
+  password: z.string().min(1).max(1024),
+  jump: vmSystemJumpCredentialsSchema.optional(),
+});
+
 const vmGuestStorageSchema = connectionSchema.extend({
   vmId: z.string().min(1),
-  vmIp: z.ipv4(),
-  username: z.string().trim().min(1).max(64).optional(),
-  password: z.string().max(256).optional(),
+  systemCredentials: vmSystemCredentialsSchema.optional(),
+  rememberSystemCredentials: z.boolean().optional().default(false),
 });
 
 const vmActionSchema = connectionSchema.extend({
@@ -310,17 +348,12 @@ const vmResizeSchema = connectionSchema
         name: z.string().trim().max(120).optional(),
       })
       .optional(),
-    guestStorage: z
+    storageTarget: z
       .object({
-        vmIp: z.ipv4(),
-        username: z.string().trim().min(1).max(64).optional(),
-        password: z.string().max(256).optional(),
         mountPath: z.string().trim().min(1).max(240),
-        guestDiskPath: z.string().trim().max(120).optional(),
-        guestPartitionPath: z.string().trim().max(120).optional(),
-        filesystem: z.string().trim().max(32).optional(),
       })
       .optional(),
+    systemCredentials: vmSystemCredentialsSchema.optional(),
     allowShutdown: z.boolean().default(false),
     restartAfterResize: z.boolean().default(true),
     confirmToken: z.literal("CONFIRMED"),
@@ -335,8 +368,11 @@ const vmResizeSchema = connectionSchema
     if (value.disk?.mode === "add" && !value.disk.storageRepositoryId) {
       context.addIssue({ code: "custom", path: ["disk", "storageRepositoryId"], message: "新增磁盘需要选择存储 SR" });
     }
-    if (value.guestStorage && !value.disk) {
-      context.addIssue({ code: "custom", path: ["guestStorage"], message: "Guest 自动生效必须与磁盘扩容同时提交" });
+    if (value.disk && !value.storageTarget) {
+      context.addIssue({ code: "custom", path: ["storageTarget"], message: "磁盘扩容必须选择最终生效目录" });
+    }
+    if (value.storageTarget && !value.disk) {
+      context.addIssue({ code: "custom", path: ["storageTarget"], message: "生效目录必须与磁盘扩容同时提交" });
     }
   });
 
@@ -467,7 +503,7 @@ const environmentTemplateSchema = z.object({
   vmNamePrefix: z.string().min(1),
   autoStart: z.boolean().default(true),
   installStrategy: z.enum(["template-clone", "kickstart", "windows-unattended", "manual-iso"]).default("kickstart"),
-  installProfile: z.enum(["server", "desktop"]).default("server"),
+  installProfile: z.enum(["server", "desktop"]).optional(),
   description: z.string().optional(),
 });
 
@@ -527,6 +563,7 @@ const provisionVmItemSchema = z.object({
 
 const provisionVmsSchema = connectionSchema.extend({
   hostId: z.string().optional(),
+  scopeKey: z.string().optional(),
   environmentTemplateId: z.string().optional(),
   sourceType: z.enum(["iso", "template"]),
   installStrategy: z.enum(["template-clone", "kickstart", "windows-unattended", "manual-iso"]).optional(),
@@ -573,6 +610,10 @@ server.get("/api/health", async () => ({
     reason: persistentConnectionPolicy.reason,
   },
   scheduleRunner: persistentConnectionStoreEnabled ? vmScheduleRunner.status() : { ...vmScheduleRunner.status(), owner: false, disabled: true },
+}));
+
+server.get("/api/providers", async () => ({
+  providers: listProviderDescriptors(),
 }));
 
 server.get("/api/connections", async () => ({
@@ -787,25 +828,21 @@ server.post("/api/provisioning/ip-probe", async (request, reply) => {
   const leasedIps = new Set(parsed.data.leasedIps.filter(isIpv4));
   const uniqueIps = Array.from(new Set(parsed.data.ips.filter(isIpv4)));
   let network;
-  if (parsed.data.providerType === "xenserver" && parsed.data.hostId && parsed.data.network) {
-    try {
-      const resolved = resolveConnectionRequest(parsed.data);
-      network = await probeXenProvisioningNetwork({
-        connection: resolved.connection,
-        hostId: parsed.data.hostId,
-        cidr: parsed.data.network.cidr,
-        gateway: parsed.data.network.gateway,
-        sampleIp: parsed.data.network.sampleIp,
-        occupiedIps: Array.from(occupiedIps),
-      });
-    } catch (error) {
-      network = {
-        status: "unreachable" as const,
-        message: toClientErrorMessage(error, "无法从目标 XenServer 物理机校验创建网络"),
-        routeAvailable: false,
-        gatewayReachable: false,
-      };
-    }
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    network = await resolveProvisioningNetworkProbeStrategy(resolved.providerType).probe({
+      connection: resolved.connection,
+      hostId: parsed.data.hostId,
+      network: parsed.data.network,
+      occupiedIps: Array.from(occupiedIps),
+    });
+  } catch (error) {
+    network = {
+      status: "unreachable" as const,
+      message: toClientErrorMessage(error, "无法从目标物理机校验创建网络"),
+      routeAvailable: false,
+      gatewayReachable: false,
+    };
   }
   const results = await mapWithConcurrency(uniqueIps, 8, async (ip) => {
     if (occupiedIps.has(ip)) {
@@ -965,7 +1002,16 @@ server.post("/api/provisioning/preflight", async (request, reply) => {
     return {
       checkedAt: new Date().toISOString(),
       ok: !checks.some((check) => check.status === "error"),
+      operationSummary: `${providerLabel(resolved.providerType)} · ${requestData.planItems.length} 台虚拟机 · ${requestData.sourceType === "iso" ? "镜像安装" : "模板克隆"}`,
       checks,
+      issues: checks
+        .filter((check) => check.status !== "success")
+        .map((check) => ({
+          code: check.key,
+          label: check.label,
+          severity: check.status === "error" ? "blocking" as const : "warning" as const,
+          message: check.message,
+        })),
     };
   } catch (error) {
     request.log.error({ error }, "failed to run provisioning preflight");
@@ -1142,6 +1188,7 @@ async function runProvisionTaskExecution(input: {
       };
     }),
   );
+  reserveProvisionedVmIps(executableRequest, result.created);
   invalidateInventoryCache(
     {
       connectionId: executableRequest.connectionId,
@@ -1149,6 +1196,7 @@ async function runProvisionTaskExecution(input: {
       connection: input.connection,
     },
     executableRequest.hostId,
+    true,
   );
   scheduleInventoryRefresh({
     resolved: {
@@ -1159,6 +1207,7 @@ async function runProvisionTaskExecution(input: {
     hostId: executableRequest.hostId,
     changedVmIds: result.created.map((vm) => vm.providerId || vm.id).filter(Boolean),
     changedVmNames: result.created.map((vm) => vm.name).filter(Boolean),
+    refreshVmSearchIndex: true,
   });
   runProvisioningVerifier({
     taskId: input.taskId,
@@ -1279,6 +1328,14 @@ async function resumeProvisioningExecution(context: ProvisionExecutionContext): 
   } catch (error) {
     activeProvisionRecoveryTasks.delete(context.taskId);
     const message = toClientErrorMessage(error, "恢复无人值守任务失败");
+    if (error instanceof ProvisionRecoveryVmMissingError) {
+      const failureMessage = `${message}；旧验收任务已终止，不会关联同名或同 IP 的新 VM。`;
+      markProvisionTaskStep(context.taskId, task.currentStep, "failed", failureMessage);
+      finishProvisionTask(context.taskId, "failed", failureMessage);
+      provisionExecutionStore.delete(context.taskId);
+      server.log.warn({ taskId: context.taskId }, "provision recovery stopped because persisted VM no longer exists");
+      return;
+    }
     const recoveryAgeMs = Date.now() - Date.parse(context.updatedAt || context.createdAt);
     const noVmCreatedDuringCreatePhase =
       task.currentStep === "create-vm" &&
@@ -1521,6 +1578,42 @@ server.post("/api/inventory/vms", async (request, reply) => {
   }
 });
 
+server.post("/api/inventory/vm-search-index", async (request, reply) => {
+  const startedAt = Date.now();
+  const parsed = hostsSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "请填写平台连接参数",
+      issues: parsed.error.issues,
+    });
+  }
+
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const index = await loadVmSearchIndexCached(resolved, {
+      poolId: parsed.data.poolId,
+      forceRefresh: parsed.data.forceRefresh,
+    });
+    request.log.info(
+      { elapsedMs: Date.now() - startedAt, itemCount: index.value.length, source: index.source, refreshing: index.refreshing },
+      "vm search index timing",
+    );
+    return {
+      collectedAt: index.updatedAt,
+      items: index.value,
+      source: index.source,
+      cacheUpdatedAt: index.updatedAt,
+      refreshing: index.refreshing,
+    };
+  } catch (error) {
+    request.log.error({ error }, "failed to list virtualization vm search index");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "读取 VM 搜索索引失败"),
+    });
+  }
+});
+
 server.post("/api/inventory/vm-summary", async (request, reply) => {
   const parsed = vmsSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -1533,16 +1626,44 @@ server.post("/api/inventory/vm-summary", async (request, reply) => {
   try {
     const resolved = resolveConnectionRequest(parsed.data);
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
-    const summary = await loadVmSummaryCached(resolved, {
-      poolId: parsed.data.poolId,
-      hostId: parsed.data.hostId,
-      page: 1,
-      pageSize: 500,
-      forceRefresh: parsed.data.forceRefresh,
-    });
+    const [summary, hostInventory] = await Promise.all([
+      loadVmSummaryCached(resolved, {
+        poolId: parsed.data.poolId,
+        hostId: parsed.data.hostId,
+        page: 1,
+        pageSize: 500,
+        forceRefresh: parsed.data.forceRefresh,
+      }),
+      loadHostInventoryCached(resolved, {
+        poolId: parsed.data.poolId,
+        forceRefresh: parsed.data.forceRefresh,
+      }),
+    ]);
+    let diskBytes = summary.value.diskBytes;
+    if (diskBytes == null) {
+      const vmList = await loadVmsCached(resolved, {
+        poolId: parsed.data.poolId,
+        hostId: parsed.data.hostId,
+        page: 1,
+        pageSize: 500,
+        forceRefresh: parsed.data.forceRefresh,
+      });
+      diskBytes = vmList.value.items.reduce((sum, vm) => sum + Math.max(vm.diskVirtualBytes ?? 0, 0), 0);
+    }
     return {
       collectedAt: summary.updatedAt,
       summary: summary.value,
+      resourceCapacity: summarizeResourceCapacity(
+        resolved.providerType,
+        hostInventory.value.hosts,
+        hostInventory.value.storage,
+        {
+          memoryBytes: summary.value.memoryBytes,
+          runningMemoryBytes: summary.value.runningMemoryBytes,
+          storageBytes: diskBytes,
+        },
+        parsed.data.hostId,
+      ),
       source: summary.source,
       cacheUpdatedAt: summary.updatedAt,
       refreshing: summary.refreshing,
@@ -1568,9 +1689,13 @@ server.post("/api/inventory/vm-disks", async (request, reply) => {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const disks = await inventoryCache.getVmDisks(
+      buildInventoryCacheScope(resolved, { vmId: parsed.data.vmId }),
+      () => provider.listVmDisks(resolved.connection, parsed.data.vmId),
+    );
     return {
-      collectedAt: new Date().toISOString(),
-      disks: await provider.listVmDisks(resolved.connection, parsed.data.vmId),
+      collectedAt: disks.updatedAt,
+      disks: disks.value,
     };
   } catch (error) {
     request.log.error({ error }, "failed to list vm disks");
@@ -1584,7 +1709,7 @@ server.post("/api/inventory/vm-guest-storage", async (request, reply) => {
   const parsed = vmGuestStorageSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.status(400).send({
-      message: "请填写平台连接参数、VM 和有效的 Guest IP",
+      message: "请填写平台连接参数和虚拟机；使用临时系统凭据时登录名和密码必须同时提供。",
       issues: parsed.error.issues,
     });
   }
@@ -1593,24 +1718,28 @@ server.post("/api/inventory/vm-guest-storage", async (request, reply) => {
     const resolved = resolveConnectionRequest(parsed.data);
     const provider = providers.get(resolved.providerType);
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
-    const [inventory, disks] = await Promise.all([
-      inspectGuestStorage({
-        providerType: resolved.providerType,
-        platformConnection: resolved.connection,
-        vmIp: parsed.data.vmIp,
-        username: parsed.data.username,
-        password: parsed.data.password,
-      }),
-      provider.listVmDisks(resolved.connection, parsed.data.vmId),
-    ]);
+    const cacheScope = buildInventoryCacheScope(resolved, { vmId: parsed.data.vmId });
+    const platformDisks = await inventoryCache.getVmDisks(
+      cacheScope,
+      () => provider.listVmDisks(resolved.connection, parsed.data.vmId),
+    );
     return {
       collectedAt: new Date().toISOString(),
-      inventory: linkGuestStorageToPlatformDisks(inventory, disks, resolved.providerType),
+      inventory: await inspectVmResizeStorage({
+        provider,
+        connection: resolved.connection,
+        vmId: parsed.data.vmId,
+        connectionId: resolved.connectionId,
+        vmHint: inventoryCache.findVm(cacheScope, parsed.data.vmId),
+        platformDisks: platformDisks.value,
+        systemCredentials: parsed.data.systemCredentials,
+        rememberSystemCredentials: parsed.data.rememberSystemCredentials,
+      }),
     };
   } catch (error) {
     request.log.error({ error }, "failed to inspect vm guest storage");
     return reply.status(502).send({
-      message: toClientErrorMessage(error, "读取 Guest 磁盘与目录失败"),
+      message: toClientErrorMessage(error, "读取虚拟机系统磁盘与目录失败"),
     });
   }
 });
@@ -1661,6 +1790,7 @@ server.post("/api/inventory/iso-images", async (request, reply) => {
         images: [] satisfies IsoImage[],
         source: "unsupported",
         refreshing: false,
+        emptyState: buildIsoEmptyState(resolved.providerType),
       };
     }
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
@@ -1685,6 +1815,7 @@ server.post("/api/inventory/iso-images", async (request, reply) => {
         source: "cache",
         cacheUpdatedAt: cached.updatedAt,
         refreshing: true,
+        emptyState: buildIsoEmptyState(resolved.providerType, cached.images),
       };
     }
     const refreshed = await refreshIsoImages(cacheKey, resolved, scope);
@@ -1694,6 +1825,7 @@ server.post("/api/inventory/iso-images", async (request, reply) => {
       source: "live",
       cacheUpdatedAt: refreshed.updatedAt,
       refreshing: false,
+      emptyState: buildIsoEmptyState(resolved.providerType, refreshed.images),
     };
   } catch (error) {
     request.log.error({ error }, "failed to list iso images");
@@ -1742,7 +1874,9 @@ server.post("/api/vms/action", async (request, reply) => {
       recordVmStarted(powerStateScope, parsed.data.vmId, operatedAt);
     }
     if (parsed.data.action === "delete") removeVmPowerState(powerStateScope, parsed.data.vmId);
-    invalidateInventoryCache(resolved, parsed.data.hostId);
+    const stoppedProvisionTaskIds =
+      parsed.data.action === "delete" ? stopProvisionTasksForDeletedVm(parsed.data.vmId) : [];
+    invalidateInventoryCache(resolved, parsed.data.hostId, parsed.data.action === "delete");
     if (parsed.data.hostId) {
       if (parsed.data.action === "delete") {
         publishInventoryEvent({
@@ -1770,6 +1904,7 @@ server.post("/api/vms/action", async (request, reply) => {
         hostId: parsed.data.hostId,
         changedVmIds: parsed.data.action === "delete" ? [] : [parsed.data.vmId],
         deletedVmIds: parsed.data.action === "delete" ? [parsed.data.vmId] : [],
+        refreshVmSearchIndex: parsed.data.action === "delete",
       });
     }
     const releasedLeases =
@@ -1783,6 +1918,7 @@ server.post("/api/vms/action", async (request, reply) => {
       operatedAt,
       result,
       releasedLeases,
+      stoppedProvisionTaskIds,
     };
   } catch (error) {
     request.log.error({ error }, "failed to perform vm action");
@@ -1816,7 +1952,7 @@ server.post("/api/vms/rename", async (request, reply) => {
       parsed.data.currentName,
       parsed.data.newName,
     );
-    invalidateInventoryCache(resolved, parsed.data.hostId);
+    invalidateInventoryCache(resolved, parsed.data.hostId, true);
     if (parsed.data.hostId) {
       publishInventoryEvent({
         type: "vm.patch",
@@ -1833,6 +1969,7 @@ server.post("/api/vms/rename", async (request, reply) => {
         hostId: parsed.data.hostId,
         changedVmIds: [parsed.data.vmId],
         changedVmNames: [result.newName],
+        refreshVmSearchIndex: true,
       });
     }
     return {
@@ -1870,37 +2007,18 @@ server.post("/api/vms/resize", async (request, reply) => {
       cpuCount: parsed.data.cpuCount,
       memoryBytes: parsed.data.memoryBytes,
       disk: parsed.data.disk,
-      guestStorage: parsed.data.guestStorage,
+      storageTarget: parsed.data.storageTarget,
       allowShutdown: parsed.data.allowShutdown,
       restartAfterResize: parsed.data.restartAfterResize,
     };
-    const guestAccess = parsed.data.guestStorage
-      ? {
-          providerType: resolved.providerType,
-          platformConnection: resolved.connection,
-          vmIp: parsed.data.guestStorage.vmIp,
-          username: parsed.data.guestStorage.username,
-          password: parsed.data.guestStorage.password,
-        }
-      : undefined;
-    const guestPreflight = guestAccess
-      ? await preflightGuestStorageResize(
-          guestAccess,
-          resizeRequest,
-          await provider.listVmDisks(resolved.connection, parsed.data.vmId),
-        )
-      : undefined;
-    const result = await provider.resizeVm(resolved.connection, parsed.data.vmId, resizeRequest);
-    if (guestAccess && guestPreflight) {
-      result.guestStorage = await applyGuestStorageResize({
-        access: guestAccess,
-        request: resizeRequest,
-        preflight: guestPreflight,
-      });
-      result.message = result.guestStorage.status === "completed"
-        ? `${result.message}；${result.guestStorage.message}`
-        : result.guestStorage.message;
-    }
+    const result = await executeVmResize({
+      provider,
+      connection: resolved.connection,
+      vmId: parsed.data.vmId,
+      connectionId: resolved.connectionId,
+      request: resizeRequest,
+      systemCredentials: parsed.data.systemCredentials,
+    });
     const diskVirtualBytes = result.disks.reduce((sum, disk) => sum + Math.max(disk.virtualSizeBytes, 0), 0);
     if (result.restarted) recordVmStarted(buildVmPowerStateScope(resolved), parsed.data.vmId);
     invalidateInventoryCache(resolved, parsed.data.hostId);
@@ -1933,7 +2051,8 @@ server.post("/api/vms/resize", async (request, reply) => {
     };
   } catch (error) {
     request.log.error({ error }, "failed to resize vm");
-    return reply.status(502).send({
+    const statusCode = error instanceof VmResizeValidationError ? 409 : 502;
+    return reply.status(statusCode).send({
       message: toClientErrorMessage(error, "虚拟机扩容失败"),
     });
   }
@@ -2157,6 +2276,14 @@ function registerWebStaticRoutes() {
     if (request.url.startsWith("/api") || (request.method !== "GET" && request.method !== "HEAD")) {
       return reply.status(404).send({ message: "未找到接口。" });
     }
+    if (request.url.startsWith("/desktop-updates/")) {
+      const updateFile = await resolveDesktopUpdateFile(request.url);
+      if (!updateFile) return reply.status(404).send({ message: "更新资源不存在。" });
+      reply.type(updateFile.contentType);
+      reply.header("Cache-Control", updateFile.cacheControl);
+      reply.header("Content-Length", updateFile.size);
+      return request.method === "HEAD" ? reply.send() : reply.send(createReadStream(updateFile.filePath));
+    }
     const staticResponse = await resolveStaticFile(webDistDir, request.url);
     if (!staticResponse.ok) {
       return reply.status(staticResponse.status).send({ message: staticResponse.message });
@@ -2286,7 +2413,11 @@ async function refreshIsoImages(
       images: [],
     });
   }
-  const images = await provider.listIsoImages(resolved.connection, scope);
+  const images = attachIsoInstallProfileHints(
+    resolved.providerType,
+    await provider.listIsoImages(resolved.connection, scope),
+    getProvisioningConfig().environmentTemplates,
+  );
   return saveIsoImageCache({
     key: cacheKey,
     providerType: resolved.providerType,
@@ -2522,17 +2653,20 @@ function toConnection(input: z.infer<typeof connectionSchema>): XenConnectionInp
 
 function normalizeProviderPort(providerType: ProviderType, port: number | undefined): number {
   if (port) return port;
-  if (providerType === "proxmox") return 8006;
-  return providerType === "vmware" ? 443 : 22;
+  return defaultPortForProvider(providerType);
 }
 
 function hasHostInventory(provider: unknown): provider is HostInventoryCapability {
   return typeof provider === "object" && provider !== null && "collectHostInventory" in provider;
 }
 
+function hasVmSearchIndex(provider: unknown): provider is VmSearchIndexCapability {
+  return typeof provider === "object" && provider !== null && "listVmSearchIndex" in provider;
+}
+
 function buildInventoryCacheScope(
   resolved: ReturnType<typeof resolveConnectionRequest>,
-  scope: Pick<InventoryCacheScope, "poolId" | "hostId" | "page" | "pageSize" | "keyword"> = {},
+  scope: Pick<InventoryCacheScope, "poolId" | "hostId" | "page" | "pageSize" | "keyword" | "vmId"> = {},
 ): InventoryCacheScope {
   return {
     providerType: resolved.providerType,
@@ -2551,15 +2685,23 @@ function loadHostInventoryCached(
   const provider = providers.get(resolved.providerType);
   const connection = resolved.connection;
   const cacheScope = buildInventoryCacheScope(resolved, { poolId: options.poolId });
+  const persisted = inventorySnapshotStore.getHosts(cacheScope);
+  if (persisted) inventoryCache.seedHosts(cacheScope, persisted.value, persisted.updatedAtMs);
   return inventoryCache.getHosts(
     cacheScope,
     async () => {
       const inventory = hasHostInventory(provider) ? await provider.collectHostInventory(connection) : undefined;
-      return {
+      const value = {
         hosts: inventory?.hosts ?? (await provider.listHosts(connection, { poolId: options.poolId })),
         storage: inventory?.storage ?? [],
         networks: inventory?.networks ?? [],
       };
+      try {
+        inventorySnapshotStore.saveHosts(cacheScope, value);
+      } catch (error) {
+        server.log.warn({ error, connectionId: resolved.connectionId }, "failed to persist host inventory snapshot");
+      }
+      return value;
     },
     Boolean(options.forceRefresh),
   );
@@ -2577,6 +2719,11 @@ function loadVmsCached(
     pageSize: options.pageSize,
     keyword: options.keyword,
   });
+  const shouldPersist = options.page === 1 && options.pageSize === 500 && !options.keyword;
+  if (shouldPersist) {
+    const persisted = inventorySnapshotStore.getVmList(cacheScope);
+    if (persisted) inventoryCache.seedVmList(cacheScope, persisted.value, persisted.updatedAtMs);
+  }
   return inventoryCache.getVmList(
     cacheScope,
     async () => {
@@ -2587,10 +2734,56 @@ function loadVmsCached(
         pageSize: options.pageSize,
         keyword: options.keyword,
       });
-      return {
+      const value = {
         ...result,
         items: observeVmPowerStates(buildVmPowerStateScope(resolved), result.items),
       };
+      if (shouldPersist) {
+        try {
+          inventorySnapshotStore.saveVmList(cacheScope, value);
+        } catch (error) {
+          server.log.warn({ error, connectionId: resolved.connectionId }, "failed to persist vm list snapshot");
+        }
+      }
+      return value;
+    },
+    Boolean(options.forceRefresh),
+  );
+}
+
+function loadVmSearchIndexCached(
+  resolved: ReturnType<typeof resolveConnectionRequest>,
+  options: { poolId?: string; forceRefresh?: boolean } = {},
+) {
+  const provider = providers.get(resolved.providerType);
+  const cacheScope = buildInventoryCacheScope(resolved, { poolId: options.poolId });
+  const persisted = vmSearchIndexStore.get(cacheScope);
+  if (persisted) inventoryCache.seedVmSearchIndex(cacheScope, persisted.items, persisted.updatedAtMs);
+  return inventoryCache.getVmSearchIndex(
+    cacheScope,
+    async () => {
+      let items: VmSearchIndexItem[];
+      if (hasVmSearchIndex(provider)) {
+        items = await provider.listVmSearchIndex(resolved.connection, { poolId: options.poolId });
+      } else {
+        const result = await provider.listVms(resolved.connection, {
+          poolId: options.poolId,
+          page: 1,
+          pageSize: 500,
+        });
+        items = result.items.map((vm) => ({
+          providerId: vm.providerId,
+          hostId: vm.hostId,
+          name: vm.name,
+          ipAddresses: vm.ipAddresses,
+        }));
+      }
+      try {
+        vmSearchIndexStore.save(cacheScope, items);
+      } catch (error) {
+        server.log.warn({ error, connectionId: resolved.connectionId }, "failed to persist vm search index snapshot");
+      }
+      return items;
     },
     Boolean(options.forceRefresh),
   );
@@ -2611,6 +2804,8 @@ function loadVmSummaryCached(
     page: options.page,
     pageSize: options.pageSize,
   });
+  const persisted = inventorySnapshotStore.getVmSummary(cacheScope);
+  if (persisted) inventoryCache.seedVmSummary(cacheScope, persisted.value, persisted.updatedAtMs);
   return inventoryCache.getVmSummary(
     cacheScope,
     async () => {
@@ -2620,16 +2815,23 @@ function loadVmSummaryCached(
         page: options.page,
         pageSize: options.pageSize,
       };
-      return provider.summarizeVms != null
-        ? provider.summarizeVms(resolved.connection, query)
+      const value = provider.summarizeVms != null
+        ? await provider.summarizeVms(resolved.connection, query)
         : summarizeVmItems((await provider.listVms(resolved.connection, { ...query, keyword: undefined })).items);
+      try {
+        inventorySnapshotStore.saveVmSummary(cacheScope, value);
+      } catch (error) {
+        server.log.warn({ error, connectionId: resolved.connectionId }, "failed to persist vm summary snapshot");
+      }
+      return value;
     },
     Boolean(options.forceRefresh),
   );
 }
 
-function invalidateInventoryCache(resolved: ReturnType<typeof resolveConnectionRequest>, hostId?: string) {
+function invalidateInventoryCache(resolved: ReturnType<typeof resolveConnectionRequest>, hostId?: string, includeSearchIndex = false) {
   inventoryCache.invalidate(buildInventoryCacheScope(resolved, { hostId }));
+  if (includeSearchIndex) inventoryCache.invalidateVmSearchIndex(buildInventoryCacheScope(resolved));
 }
 
 function scheduleInventoryRefresh(input: {
@@ -2638,6 +2840,7 @@ function scheduleInventoryRefresh(input: {
   changedVmIds?: string[];
   changedVmNames?: string[];
   deletedVmIds?: string[];
+  refreshVmSearchIndex?: boolean;
 }) {
   if (!input.hostId) return;
   setTimeout(() => {
@@ -2653,13 +2856,15 @@ async function refreshInventoryAndPublish(input: {
   changedVmIds?: string[];
   changedVmNames?: string[];
   deletedVmIds?: string[];
+  refreshVmSearchIndex?: boolean;
 }) {
   const hostId = input.hostId;
   if (!hostId) return;
-  const [hostsResult, summaryResult, vmsResult] = await Promise.allSettled([
+  const [hostsResult, summaryResult, vmsResult, searchIndexResult] = await Promise.allSettled([
     loadHostInventoryCached(input.resolved, { forceRefresh: true }),
     loadVmSummaryCached(input.resolved, { hostId, page: 1, pageSize: 500, forceRefresh: true }),
     loadVmsCached(input.resolved, { hostId, page: 1, pageSize: 500, forceRefresh: true }),
+    input.refreshVmSearchIndex ? loadVmSearchIndexCached(input.resolved, { forceRefresh: true }) : Promise.resolve(undefined),
   ]);
   if (hostsResult.status === "fulfilled") {
     const host = hostsResult.value.value.hosts.find((item) => item.providerId === hostId || item.id === hostId);
@@ -2674,13 +2879,33 @@ async function refreshInventoryAndPublish(input: {
     }
   }
   if (summaryResult.status === "fulfilled") {
+    const memoryBytes = summaryResult.value.value.memoryBytes;
+    const diskBytes =
+      summaryResult.value.value.diskBytes ??
+      (vmsResult.status === "fulfilled"
+        ? vmsResult.value.value.items.reduce((sum, vm) => sum + Math.max(vm.diskVirtualBytes ?? 0, 0), 0)
+        : undefined);
+    const resourceCapacity =
+      hostsResult.status === "fulfilled" && memoryBytes != null && diskBytes != null
+        ? summarizeResourceCapacity(
+            input.resolved.providerType,
+            hostsResult.value.value.hosts,
+            hostsResult.value.value.storage,
+            { memoryBytes, runningMemoryBytes: summaryResult.value.value.runningMemoryBytes, storageBytes: diskBytes },
+            hostId,
+          )
+        : undefined;
     publishInventoryEvent({
       type: "summary.patch",
       connectionId: input.resolved.connectionId,
       providerType: input.resolved.providerType,
       hostId,
       summary: summaryResult.value.value,
+      resourceCapacity,
     });
+  }
+  if (searchIndexResult.status === "rejected") {
+    server.log.warn({ error: searchIndexResult.reason, hostId, connectionId: input.resolved.connectionId }, "background vm search index refresh failed");
   }
   if (vmsResult.status !== "fulfilled") return;
   const changedVmIds = new Set(input.changedVmIds ?? []);
@@ -2738,12 +2963,16 @@ function buildProvisionRequestData(
 ): VmProvisionRequest {
   return {
     connectionId,
+    scopeKey: input.scopeKey,
     providerType,
     hostId: input.hostId,
     environmentTemplateId: input.environmentTemplateId,
     sourceType: input.sourceType,
     installStrategy: input.installStrategy,
-    installProfile: input.installProfile,
+    // 旧版客户端可能不发送 installProfile；Windows 默认必须是完整桌面安装，CLI 仍由用户明确选择。
+    installProfile:
+      input.installProfile ??
+      defaultInstallProfileForIdentity(`${input.isoName ?? ""} ${input.templateName ?? ""} ${input.isoId ?? ""}`),
     isoId: input.isoId,
     isoName: input.isoName,
     templateName: input.templateName,
@@ -2757,6 +2986,35 @@ function buildProvisionRequestData(
     autoStart: input.autoStart,
     planItems: input.planItems,
   };
+}
+
+function reserveProvisionedVmIps(request: VmProvisionRequest, created: VmProvisionCreatedVm[]): void {
+  const createdNames = new Set(created.map((vm) => vm.name));
+  const leases = request.planItems
+    .filter((item) => createdNames.has(item.name))
+    .map((item) => ({
+      ip: item.ip,
+      poolId: request.ipPool.id,
+      poolName: request.ipPool.name,
+      scopeKey: request.scopeKey || `${request.providerType}::${request.connectionId || "direct"}::${request.hostId || "default"}`,
+      vmName: item.name,
+      loginUsername: item.loginUsername,
+    }));
+  if (leases.length) reserveIpLeases(leases);
+}
+
+function stopProvisionTasksForDeletedVm(vmId: string): string[] {
+  const stoppedTaskIds: string[] = [];
+  for (const task of listProvisionTasks(200)) {
+    if (!["pending", "running"].includes(task.status)) continue;
+    if (!task.vms.some((vm) => vm.providerId === vmId || vm.id === vmId)) continue;
+    const message = "目标 VM 已删除，关联的创建验收任务已自动终止。";
+    markProvisionTaskStep(task.id, task.currentStep, "failed", message);
+    finishProvisionTask(task.id, "failed", message);
+    provisionExecutionStore.delete(task.id);
+    stoppedTaskIds.push(task.id);
+  }
+  return stoppedTaskIds;
 }
 
 async function runProvisionPreflight(
@@ -2861,9 +3119,8 @@ function runProvisionResourcePreflight(
     .reduce((sum, vm) => sum + Math.max(vm.cpuCount || 0, 0), 0);
   const memoryFreeBytes = Math.max(targetHost.memoryFreeBytes ?? 0, 0);
   const targetStorage = storage.filter((item) => !item.hostId || item.hostId === targetHost.providerId || item.hostId === targetHost.id);
-  const vmStorage = request.providerType === "proxmox"
-    ? targetStorage.filter((item) => !item.content?.length || item.content.includes("images") || item.content.includes("rootdir"))
-    : targetStorage;
+  const platformPolicy = resolveProvisioningPlanPolicy(request.providerType);
+  const vmStorage = platformPolicy.selectVmStorage(targetStorage);
   const storagePhysicalGiB = vmStorage.reduce((sum, item) => sum + positiveNumber(item.physicalGiB), 0);
   const storageUsedGiB = vmStorage.reduce((sum, item) => sum + positiveNumber(item.usedGiB), 0);
   const storageFreeGiB = Math.max(storagePhysicalGiB - storageUsedGiB, 0);
@@ -2878,7 +3135,7 @@ function runProvisionResourcePreflight(
   if (memoryFreeBytes < plannedMemoryBytes) {
     errors.push(`内存余量不足：剩余 ${formatBytes(memoryFreeBytes)}，计划新增 ${formatBytes(plannedMemoryBytes)}`);
   }
-  if (request.providerType === "proxmox" && storagePhysicalGiB > 0 && largestStorageFreeGiB < plannedDiskGiB) {
+  if (platformPolicy.requiresSingleStorageCapacity && storagePhysicalGiB > 0 && largestStorageFreeGiB < plannedDiskGiB) {
     const capacity = storageFreeByRepository
       .sort((left, right) => right.freeGiB - left.freeGiB)
       .map((item) => `${item.name} ${formatNumber(item.freeGiB)} GiB`)
@@ -2943,25 +3200,26 @@ async function runProvisionIsoPreflight(
     ];
   }
   if (!provider.listIsoImages) {
+    const platformPolicy = resolveProvisioningPlanPolicy(providerType);
     return [
       {
         key: "iso",
         label: "系统镜像",
-        status: providerType === "xenserver" ? "error" : "warning",
+        status: platformPolicy.missingIsoStatus,
         message: `${providerLabel(providerType)} 当前 Provider 未提供镜像读取能力`,
       },
     ];
   }
   const images = await provider.listIsoImages(connection, { hostId: request.hostId }).catch(() => []);
   const selected = images.find((image) => image.providerId === request.isoId || image.id === request.isoId || image.name === request.isoName);
-  const selectedGuestTools = providerType === "xenserver" && selected && isXenGuestToolsIsoName(selected.name || selected.path);
+  const selectedMediaError = selected ? resolveProvisioningPlanPolicy(providerType).installMediaError(selected) : undefined;
   const checks: ProvisionPreflightCheck[] = [
     {
       key: "iso",
       label: "系统镜像",
-      status: selected && !selectedGuestTools ? "success" : "error",
-      message: selectedGuestTools
-        ? `${selected.name} 是 XenServer 监控工具盘，不能用于安装操作系统`
+      status: selected && !selectedMediaError ? "success" : "error",
+      message: selectedMediaError
+        ? selectedMediaError
         : selected
           ? `已找到镜像：${selected.name}`
           : `未找到所选镜像：${request.isoName || request.isoId || "未选择"}`,
@@ -2975,8 +3233,25 @@ async function runProvisionIsoPreflight(
         : { available: images.slice(0, 20).map((image) => image.name) },
     },
   ];
+  if (selected && request.installStrategy === "windows-unattended" && isWindowsIsoName(selected.name)) {
+    const repository = `${selected.storageRepository ?? ""} ${String(selected.metadata?.srDescription ?? "")}`;
+    if (/smb|cifs|共享|网络文件/i.test(repository)) {
+      checks.push({
+        key: "windows-media-performance",
+        label: "Windows 介质性能",
+        status: "warning",
+        message: `Windows 原版 ISO 位于 ${selected.storageRepository || "网络 ISO 库"}，安装速度受共享存储读取速度影响；建议复制到目标物理机本地 ISO SR。当前不会阻断创建。`,
+        details: {
+          sourceType: selected.sourceType,
+          storageRepository: selected.storageRepository,
+          path: selected.path,
+          recommendation: "将 Windows 原版 ISO 放到目标物理机本地 ISO SR，配置 ISO 仍按任务独立生成。",
+        },
+      });
+    }
+  }
   if (request.installStrategy === "windows-unattended") {
-    const tools = images.find((image) => isXenGuestToolsIsoName(image.name || image.path));
+    const tools = images.find((image) => image.sourceType === "tools");
     checks.push({
       key: "windows-answer-media",
       label: "Windows 应答介质",
@@ -2990,6 +3265,10 @@ async function runProvisionIsoPreflight(
     });
   }
   return checks;
+}
+
+function isWindowsIsoName(name: string): boolean {
+  return /windows|winserver/i.test(name);
 }
 
 function runProvisionVmConflictPreflight(
@@ -3044,101 +3323,6 @@ async function runProvisionIpReachabilityPreflight(request: VmProvisionRequest):
     label: "IP 探测",
     ...result,
   };
-}
-
-function validateProvisionPlan(providerType: ProviderType, request: VmProvisionRequest, raw: { templateName?: string }): string[] {
-  const errors: string[] = [];
-  if (request.environmentTemplateId) {
-    const template = getProvisioningConfig().environmentTemplates.find((item) => item.id === request.environmentTemplateId);
-    if (!template) {
-      errors.push(`系统环境不存在：${request.environmentTemplateId}`);
-    } else {
-      if (template.providerType && template.providerType !== providerType) {
-        errors.push(`系统环境与虚拟化平台不匹配：${template.name}`);
-      }
-      if (template.sourceType !== request.sourceType) {
-        errors.push(`系统环境与安装来源不匹配：${template.name}`);
-      }
-      if (request.installStrategy && template.installStrategy !== request.installStrategy) {
-        errors.push(`系统环境与安装策略不匹配：${template.name}`);
-      }
-      const requestProfile = request.installProfile === "desktop" ? "desktop" : "server";
-      if (template.installProfile !== requestProfile) {
-        errors.push(`系统环境与安装类型不匹配：${template.name}`);
-      }
-      if (template.sourceType === "iso" && template.isoNamePattern) {
-        const isoIdentity = `${request.isoName || ""} ${request.isoId || ""}`.toLowerCase();
-        if (!isoIdentity.includes(template.isoNamePattern.toLowerCase())) {
-          errors.push(`系统环境与镜像不匹配：${template.name} 需要 ${template.isoNamePattern}`);
-        }
-      }
-    }
-  }
-  if (request.count !== request.planItems.length) {
-    errors.push(`创建数量与 VM 计划不一致：数量 ${request.count}，计划 ${request.planItems.length} 台`);
-  }
-  const names = new Set<string>();
-  const ips = new Set<string>();
-  for (const item of request.planItems) {
-    const name = item.name.trim();
-    const ip = item.ip.trim();
-    if (!name) errors.push("VM 名称不能为空");
-    if (names.has(name)) errors.push(`VM 名称重复：${name}`);
-    names.add(name);
-    if (!isIpv4(ip)) errors.push(`VM IP 格式不正确：${ip || item.name}`);
-    if (ips.has(ip)) errors.push(`VM IP 重复：${ip}`);
-    ips.add(ip);
-    if (request.autoStart && !item.rootPassword?.trim()) {
-      errors.push(`缺少 ${item.name} 的登录密码，无法完成启动后的账号验收`);
-    }
-    if (request.installStrategy === "windows-unattended" && !isWindowsPasswordComplex(item.rootPassword || "")) {
-      errors.push(`${item.name} 的 Administrator 密码至少 8 位，并需包含数字、特殊字符及大小写字母中的三类`);
-    }
-  }
-  if (providerType === "xenserver") {
-    if (request.sourceType !== "iso") {
-      errors.push("XenServer 当前一键安装必须使用 ISO/Kickstart 策略");
-    }
-    if (!request.isoId?.trim()) {
-      errors.push("XenServer 一键安装必须选择系统 ISO");
-    }
-    if (!request.ipPool.gateway.trim() || !isIpv4(request.ipPool.gateway)) {
-      errors.push("XenServer 一键安装必须配置有效网关");
-    }
-    if (!request.ipPool.dns.some((item) => isIpv4(item))) {
-      errors.push("XenServer 一键安装必须配置有效 DNS");
-    }
-    if (!request.ipPool.cidr.includes("/")) {
-      errors.push("XenServer 一键安装必须配置 CIDR，用于生成静态 IP 子网掩码");
-    }
-  }
-  if (request.installStrategy === "windows-unattended") {
-    const isoIdentity = `${request.isoName || ""} ${request.isoId || ""}`.toLowerCase();
-    if (providerType !== "xenserver" || request.sourceType !== "iso") {
-      errors.push("Windows 无人值守当前只支持 XenServer ISO 安装策略");
-    }
-    if (!isoIdentity.includes("windows_server_2008_r2") && !isoIdentity.includes("windows_server_2012_r2")) {
-      errors.push("Windows 无人值守当前仅支持已校验的 Windows Server 2008 R2 / 2012 R2 原版 ISO");
-    }
-  }
-  if ((providerType === "vmware" || providerType === "proxmox") && request.sourceType === "template" && !raw.templateName?.trim()) {
-    errors.push(`${providerLabel(providerType)} 模板克隆必须选择克隆源`);
-  }
-  if (request.installProfile === "desktop") {
-    if (providerType !== "proxmox" || request.installStrategy !== "kickstart" || request.sourceType !== "iso") {
-      errors.push("桌面安装当前只支持 PVE ISO/Kickstart 策略");
-    }
-    const isoIdentity = `${request.isoName || ""} ${request.isoId || ""}`.toLowerCase();
-    if (!isoIdentity.includes("kylin") || (!isoIdentity.includes("arm64") && !isoIdentity.includes("aarch64"))) {
-      errors.push("PVE 桌面安装必须选择包含 UKUI 环境组的麒麟 ARM ISO");
-    }
-  }
-  return Array.from(new Set(errors));
-}
-
-function isWindowsPasswordComplex(password: string): boolean {
-  const categories = [/[a-z]/.test(password), /[A-Z]/.test(password), /\d/.test(password), /[^A-Za-z0-9]/.test(password)].filter(Boolean).length;
-  return password.length >= 8 && categories >= 3;
 }
 
 async function pingIp(ip: string, timeoutMs: number): Promise<boolean> {
@@ -3216,11 +3400,14 @@ function sameIpv4Subnet(left: string, right: string, prefix: number): boolean {
   return cidrContainsIp(`${left}/${prefix}`, right);
 }
 
-function providerLabel(providerType: ProviderType): string {
-  if (providerType === "xenserver") return "XenServer";
-  if (providerType === "vmware") return "VMware";
-  if (providerType === "proxmox") return "Proxmox VE";
-  return providerType;
+function buildIsoEmptyState(providerType: ProviderType, images: IsoImage[] = []) {
+  if (images.length) return undefined;
+  const descriptor = getProviderDescriptor(providerType);
+  return {
+    reasonCode: descriptor.capabilities.isoLibrary.supported ? "ISO_LIBRARY_EMPTY" : descriptor.capabilities.isoLibrary.reasonCode || "ISO_LIBRARY_UNSUPPORTED",
+    message: descriptor.capabilities.isoLibrary.emptyMessage,
+    actionHint: descriptor.capabilities.isoLibrary.actionHint,
+  };
 }
 
 function toClientErrorMessage(error: unknown, fallback: string): string {

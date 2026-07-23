@@ -1,5 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
-import { getVrcDataFile } from "./appPaths.js";
+import { readLocalJsonConfig, resolveVrcConfigPath } from "./localConfigFile.js";
 
 export interface RuntimePolicy {
   managedIpPattern?: string;
@@ -54,7 +53,7 @@ export function getRuntimePolicy(): RuntimePolicy {
 }
 
 export function getRuntimePolicyPath(): string {
-  return process.env.VRC_RUNTIME_POLICY_FILE?.trim() || getVrcDataFile("runtime-policy.json");
+  return resolveVrcConfigPath("runtime-policy.json", "VRC_RUNTIME_POLICY_FILE");
 }
 
 export function isManagedIpv4(ip: string, policy = getRuntimePolicy()): boolean {
@@ -103,13 +102,13 @@ export function buildXenServerPolicyEnv(policy = getRuntimePolicy()): Record<str
 
 function loadRuntimePolicy(): RuntimePolicy {
   const file = getRuntimePolicyPath();
-  if (!existsSync(file)) return defaultRuntimePolicy;
-  try {
-    const input = JSON.parse(readFileSync(file, "utf8")) as RuntimePolicyInput;
-    return normalizeRuntimePolicy(input);
-  } catch {
-    return defaultRuntimePolicy;
-  }
+  return readLocalJsonConfig({
+    filePath: file,
+    label: "运行策略配置",
+    normalize: (input) => normalizeRuntimePolicy(input as RuntimePolicyInput),
+    onMissing: () => defaultRuntimePolicy,
+    onInvalid: () => defaultRuntimePolicy,
+  });
 }
 
 function normalizeRuntimePolicy(input: RuntimePolicyInput): RuntimePolicy {

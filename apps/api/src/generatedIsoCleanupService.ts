@@ -1,17 +1,17 @@
 import { existsSync, rmSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getVrcDataFile } from "./appPaths.js";
 import { cleanupRegisteredProxmoxGeneratedIso } from "./proxmox.js";
 import { cleanupRegisteredVmwareGeneratedIso } from "./vmware.js";
 import { cleanupRegisteredXenGeneratedIso } from "./xenserverUnattendedIso.js";
-import { listGeneratedIsos } from "./generatedIsoStore.js";
+import { listGeneratedIsos, markGeneratedIsoStatus } from "./generatedIsoStore.js";
 import type { GeneratedIsoRecord } from "./generatedIsoStore.js";
 import { listProvisionTasks } from "./provisionTaskStore.js";
 import type { ProviderType, XenConnectionInput } from "./types.js";
 
 const defaultFailedRetentionMs = 7 * 24 * 60 * 60 * 1000;
 const recentMutableRetentionMs = 60 * 60 * 1000;
-const generatedDir = join(homedir(), ".virtual-resource-console", "generated-isos");
+const generatedDir = getVrcDataFile("generated-isos");
 
 export type GeneratedIsoCleanupDecision = "eligible" | "retained" | "skipped" | "cleaned" | "failed";
 
@@ -65,7 +65,9 @@ export async function inspectGeneratedIsoResidues(options: GeneratedIsoCleanupOp
 
 export async function cleanupGeneratedIsoResidues(options: GeneratedIsoCleanupOptions = {}): Promise<GeneratedIsoCleanupReport> {
   const now = new Date();
-  const records = (options.records ?? listGeneratedIsos()).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const records = (options.records ?? listGeneratedIsos())
+    .filter((record) => record.status !== "deleted")
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   const activeTaskIds = options.activeTaskIds ?? resolveActiveTaskIds();
   const retentionMs = options.failedRetentionMs ?? defaultFailedRetentionMs;
   const items: GeneratedIsoCleanupEntry[] = [];
@@ -114,9 +116,6 @@ function classifyGeneratedIso(
 ): GeneratedIsoCleanupEntry {
   const localBytes = localGeneratedIsoBytes(record);
   const base = toCleanupEntry(record, localBytes);
-  if (record.status === "deleted") {
-    return { ...base, decision: "skipped", reason: "登记记录已标记删除" };
-  }
   if (input.activeTaskIds.has(record.taskId)) {
     return { ...base, decision: "skipped", reason: "创建任务仍在执行，禁止清理" };
   }
@@ -135,7 +134,7 @@ function classifyGeneratedIso(
       ...base,
       cleanupAfter: cleanupAfter.toISOString(),
       decision: "retained",
-      reason: `失败任务保留到 ${formatDateTime(cleanupAfter)}，用于排查安装问题`,
+      reason: `失败任务保留到 ${formatDateTime(cleanupAfter)}，用于排查安装问题${record.message ? `：${record.message}` : ""}`,
     };
   }
   if (["creating", "uploaded", "attached"].includes(record.status) && ageMs(record.updatedAt, input.now) < recentMutableRetentionMs) {
@@ -163,10 +162,12 @@ async function cleanupOneGeneratedIso(
     cleanupLocalGeneratedIso(record);
     return { ...classified, decision: "cleaned", reason: "已按登记记录完成远端和本地临时介质清理" };
   } catch (error) {
+    const message = error instanceof Error ? error.message : "清理失败";
+    markGeneratedIsoStatus(record.id, "failed", `清理失败：${message}`);
     return {
       ...classified,
       decision: "failed",
-      reason: error instanceof Error ? error.message : "清理失败",
+      reason: message,
     };
   }
 }

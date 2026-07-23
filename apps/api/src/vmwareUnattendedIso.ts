@@ -1,14 +1,14 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
+import { getVrcDataDir } from "./appPaths.js";
 import type { IpPoolConfig, VmProvisionPlanItem } from "./types.js";
 import { buildOfflineCentosKickstart } from "./xenserverUnattendedIso.js";
 
 const execFileAsync = promisify(execFile);
-const storeDir = join(homedir(), ".virtual-resource-console");
+const storeDir = getVrcDataDir();
 const cacheDir = join(storeDir, "iso-cache");
 const generatedDir = join(storeDir, "generated-isos");
 const kickstartIsoLabel = "VRCKS";

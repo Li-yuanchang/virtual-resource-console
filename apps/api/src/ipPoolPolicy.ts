@@ -1,6 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { getVrcDataFile } from "./appPaths.js";
+import { readLocalJsonConfig, resolveVrcConfigPath, writeLocalJsonConfig } from "./localConfigFile.js";
 
 export interface RuntimeIpPoolPolicy {
   id: string;
@@ -31,29 +29,24 @@ export function getIpPoolPolicy(): IpPoolPolicy {
 
 export function saveIpPoolPolicy(input: IpPoolPolicyInput): IpPoolPolicy {
   const policy = normalizeIpPoolPolicy(input);
-  const file = getIpPoolPolicyPath();
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  writeFileSync(file, `${JSON.stringify(policy, null, 2)}\n`, { mode: 0o600 });
+  writeLocalJsonConfig(getIpPoolPolicyPath(), policy);
   return policy;
 }
 
 export function getIpPoolPolicyPath(): string {
-  return process.env.VRC_IP_POOLS_FILE?.trim() || getVrcDataFile("ip-pools.json");
+  return resolveVrcConfigPath("ip-pools.json", "VRC_IP_POOLS_FILE");
 }
 
 function loadIpPoolPolicy(): IpPoolPolicy {
   const file = getIpPoolPolicyPath();
-  if (!existsSync(file)) {
-    throw new Error(`IP 池配置文件不存在：${file}，请在设置页新增或导入 IP 池后保存`);
-  }
-  try {
-    const input = JSON.parse(readFileSync(file, "utf8")) as IpPoolPolicyInput;
-    return normalizeIpPoolPolicy(input);
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("IP 池配置文件")) throw error;
-    const detail = error instanceof Error ? error.message : "未知错误";
-    throw new Error(`IP 池配置文件格式不正确：${file}，${detail}`);
-  }
+  return readLocalJsonConfig({
+    filePath: file,
+    label: "IP 池配置",
+    normalize: (input) => normalizeIpPoolPolicy(input as IpPoolPolicyInput),
+    onMissing: () => {
+      throw new Error(`IP 池配置文件不存在：${file}，请在设置页新增或导入 IP 池后保存`);
+    },
+  });
 }
 
 function normalizeIpPoolPolicy(input: IpPoolPolicyInput): IpPoolPolicy {

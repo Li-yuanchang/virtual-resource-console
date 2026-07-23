@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getVrcDataDir } from "./appPaths.js";
 import type { ProviderType, VmProvisionCreatedVm, VmProvisionRequest } from "./types.js";
 
 export interface ProvisionExecutionContext {
@@ -36,7 +36,7 @@ export class ProvisionExecutionStore {
   private readonly storeFile: string;
   private readonly keyFile: string;
 
-  constructor(rootDir = join(homedir(), ".virtual-resource-console")) {
+  constructor(rootDir = getVrcDataDir()) {
     this.storeFile = join(rootDir, "provision-executions.json");
     this.keyFile = join(rootDir, "key.bin");
   }
@@ -141,7 +141,7 @@ export class ProvisionExecutionStore {
     this.ensureStoreDir();
     if (!existsSync(this.keyFile)) writeFileSync(this.keyFile, randomBytes(32), { mode: 0o600 });
     const key = readFileSync(this.keyFile);
-    if (key.length !== 32) throw new Error("任务恢复密钥文件无效，请检查 ~/.virtual-resource-console/key.bin");
+    if (key.length !== 32) throw new Error(`任务恢复密钥文件无效，请检查 ${this.keyFile}`);
     return key;
   }
 

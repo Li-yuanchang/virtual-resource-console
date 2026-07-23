@@ -1,4 +1,14 @@
-import type { HostNode, NetworkInterface, PagedResult, ProviderType, StorageRepository, VmInventorySummary, VmNode } from "./types.js";
+import type {
+  HostNode,
+  NetworkInterface,
+  PagedResult,
+  ProviderType,
+  StorageRepository,
+  VmDisk,
+  VmInventorySummary,
+  VmNode,
+  VmSearchIndexItem,
+} from "./types.js";
 
 export interface HostInventorySnapshot {
   hosts: HostNode[];
@@ -17,6 +27,7 @@ export interface InventoryCacheScope {
   page?: number;
   pageSize?: number;
   keyword?: string;
+  vmId?: string;
 }
 
 export interface InventoryCacheResult<T> {
@@ -36,28 +47,87 @@ interface InventoryCacheEntry<T> {
 const HOST_TTL_MS = 60_000;
 const VM_SUMMARY_TTL_MS = 30_000;
 const VM_LIST_TTL_MS = 45_000;
+const VM_DISK_TTL_MS = 30_000;
+const VM_SEARCH_INDEX_TTL_MS = 60_000;
 
 export class InventoryCache {
   private readonly hosts = new Map<string, InventoryCacheEntry<HostInventorySnapshot>>();
   private readonly vmSummaries = new Map<string, InventoryCacheEntry<VmInventorySummary>>();
   private readonly vmLists = new Map<string, InventoryCacheEntry<PagedResult<VmNode>>>();
+  private readonly vmDisks = new Map<string, InventoryCacheEntry<VmDisk[]>>();
+  private readonly vmSearchIndexes = new Map<string, InventoryCacheEntry<VmSearchIndexItem[]>>();
 
   getHosts(scope: InventoryCacheScope, loader: () => Promise<HostInventorySnapshot>, forceRefresh = false) {
     return this.getOrRefresh(this.hosts, buildInventoryCacheKey("hosts", scope), scope, HOST_TTL_MS, loader, forceRefresh);
+  }
+
+  seedHosts(scope: InventoryCacheScope, value: HostInventorySnapshot, updatedAtMs: number): void {
+    const key = buildInventoryCacheKey("hosts", scope);
+    if (this.hosts.has(key)) return;
+    this.hosts.set(key, { scope, value, updatedAtMs });
   }
 
   getVmSummary(scope: InventoryCacheScope, loader: () => Promise<VmInventorySummary>, forceRefresh = false) {
     return this.getOrRefresh(this.vmSummaries, buildInventoryCacheKey("vm-summary", scope), scope, VM_SUMMARY_TTL_MS, loader, forceRefresh);
   }
 
+  seedVmSummary(scope: InventoryCacheScope, value: VmInventorySummary, updatedAtMs: number): void {
+    const key = buildInventoryCacheKey("vm-summary", scope);
+    if (this.vmSummaries.has(key)) return;
+    this.vmSummaries.set(key, { scope, value, updatedAtMs });
+  }
+
   getVmList(scope: InventoryCacheScope, loader: () => Promise<PagedResult<VmNode>>, forceRefresh = false) {
     return this.getOrRefresh(this.vmLists, buildInventoryCacheKey("vms", scope), scope, VM_LIST_TTL_MS, loader, forceRefresh);
+  }
+
+  seedVmList(scope: InventoryCacheScope, value: PagedResult<VmNode>, updatedAtMs: number): void {
+    const key = buildInventoryCacheKey("vms", scope);
+    if (this.vmLists.has(key)) return;
+    this.vmLists.set(key, { scope, value, updatedAtMs });
+  }
+
+  getVmDisks(scope: InventoryCacheScope, loader: () => Promise<VmDisk[]>, forceRefresh = false) {
+    return this.getOrRefresh(this.vmDisks, buildInventoryCacheKey("vm-disks", scope), scope, VM_DISK_TTL_MS, loader, forceRefresh);
+  }
+
+  getVmSearchIndex(scope: InventoryCacheScope, loader: () => Promise<VmSearchIndexItem[]>, forceRefresh = false) {
+    return this.getOrRefresh(
+      this.vmSearchIndexes,
+      buildInventoryCacheKey("vm-search-index", scope),
+      scope,
+      VM_SEARCH_INDEX_TTL_MS,
+      loader,
+      forceRefresh,
+    );
+  }
+
+  seedVmSearchIndex(scope: InventoryCacheScope, value: VmSearchIndexItem[], updatedAtMs: number): void {
+    const key = buildInventoryCacheKey("vm-search-index", scope);
+    if (this.vmSearchIndexes.has(key)) return;
+    this.vmSearchIndexes.set(key, { scope, value, updatedAtMs });
+  }
+
+  findVm(scope: InventoryCacheScope, vmId: string): VmNode | undefined {
+    let matched: { vm: VmNode; updatedAtMs: number } | undefined;
+    for (const entry of this.vmLists.values()) {
+      if (!entry.value || !matchesScope(entry.scope, scope)) continue;
+      const vm = entry.value.items.find((item) => item.providerId === vmId || item.id === vmId);
+      if (vm && (!matched || entry.updatedAtMs > matched.updatedAtMs)) matched = { vm, updatedAtMs: entry.updatedAtMs };
+    }
+    return matched?.vm;
   }
 
   invalidate(scope: Partial<InventoryCacheScope>) {
     invalidateMatching(this.hosts, scope);
     invalidateMatching(this.vmSummaries, scope);
     invalidateMatching(this.vmLists, scope);
+    invalidateMatching(this.vmDisks, scope);
+    invalidateMatching(this.vmSearchIndexes, scope);
+  }
+
+  invalidateVmSearchIndex(scope: Partial<InventoryCacheScope>): void {
+    invalidateMatching(this.vmSearchIndexes, scope);
   }
 
   private async getOrRefresh<T>(
@@ -81,12 +151,14 @@ export class InventoryCache {
         };
       }
       if (!existing.pending) {
+        const staleValue = existing.value;
         existing.pending = loader()
           .then((value) => {
             existing.value = value;
             existing.updatedAtMs = Date.now();
             return value;
           })
+          .catch(() => staleValue)
           .finally(() => {
             existing.pending = undefined;
           });
@@ -166,5 +238,6 @@ function buildInventoryCacheKey(kind: string, scope: InventoryCacheScope) {
     page: scope.page,
     pageSize: scope.pageSize,
     keyword: scope.keyword,
+    vmId: scope.vmId,
   });
 }

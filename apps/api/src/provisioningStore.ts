@@ -1,8 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EnvironmentProvisioningTemplate, IpPoolConfig, ProvisioningConfig, ProvisioningSpecTemplate } from "./types.js";
 import { getVrcDataFile } from "./appPaths.js";
+import { readLocalJsonConfig, writeLocalJsonConfig } from "./localConfigFile.js";
 
 const storeFile = getVrcDataFile("provisioning.json");
 
@@ -12,7 +11,10 @@ interface ProvisioningStoreFile {
 }
 
 type ProvisioningSpecTemplateInput = Omit<ProvisioningSpecTemplate, "id"> & { id?: string };
-type EnvironmentProvisioningTemplateInput = Omit<EnvironmentProvisioningTemplate, "id"> & { id?: string };
+type EnvironmentProvisioningTemplateInput = Omit<EnvironmentProvisioningTemplate, "id" | "installProfile"> & {
+  id?: string;
+  installProfile?: EnvironmentProvisioningTemplate["installProfile"];
+};
 type IpPoolConfigInput = Omit<IpPoolConfig, "id"> & { id?: string };
 
 interface ProvisioningConfigInput {
@@ -69,6 +71,20 @@ function defaultProvisioningConfig(): ProvisioningConfig {
         description: "使用任务级 Windows 无人值守启动 ISO 和 XenServer Tools 完成自动安装与验收。",
       },
       {
+        id: "xenserver-windows-2008-r2-desktop",
+        name: "XenServer Windows 2008 R2 桌面环境",
+        providerType: "xenserver",
+        sourceType: "iso",
+        isoNamePattern: "cn_windows_server_2008_r2_standard_enterprise_datacenter_and_web_with_sp1_x64_dvd_617598.iso",
+        specId: "windows-standard",
+        ipPoolId: "",
+        vmNamePrefix: "win2008-desktop",
+        autoStart: true,
+        installStrategy: "windows-unattended",
+        installProfile: "desktop",
+        description: "安装 Windows Server 2008 R2 完整桌面体验，并执行网络与 XenServer Tools 验收。",
+      },
+      {
         id: "xenserver-windows-2012-r2-standard",
         name: "XenServer Windows Server 2012 R2 标准环境",
         providerType: "xenserver",
@@ -81,6 +97,20 @@ function defaultProvisioningConfig(): ProvisioningConfig {
         installStrategy: "windows-unattended",
         installProfile: "server",
         description: "使用任务级 Windows 无人值守启动 ISO 和 XenServer Tools 完成自动安装与验收。",
+      },
+      {
+        id: "xenserver-windows-2012-r2-desktop",
+        name: "XenServer Windows 2012 R2 桌面环境",
+        providerType: "xenserver",
+        sourceType: "iso",
+        isoNamePattern: "cn_windows_server_2012_r2_vl_with_update_x64_dvd_6052729(1).iso",
+        specId: "windows-standard",
+        ipPoolId: "",
+        vmNamePrefix: "win2012-desktop",
+        autoStart: true,
+        installStrategy: "windows-unattended",
+        installProfile: "desktop",
+        description: "安装 Windows Server 2012 R2 完整桌面体验，并执行网络与 XenServer Tools 验收。",
       },
       {
         id: "vmware-centos7-standard",
@@ -215,7 +245,10 @@ function normalizeEnvironmentTemplate(
       item.installStrategy === "template-clone" || item.installStrategy === "windows-unattended" || item.installStrategy === "manual-iso"
         ? item.installStrategy
         : "kickstart",
-    installProfile: item.installProfile === "desktop" ? "desktop" : "server",
+    installProfile:
+      item.installProfile === "desktop" || (item.installProfile == null && item.installStrategy === "windows-unattended")
+        ? "desktop"
+        : "server",
     description: item.description?.trim() || undefined,
   };
 }
@@ -258,26 +291,22 @@ function positiveInteger(value: number, fallback: number): number {
 }
 
 function readStore(): ProvisioningStoreFile {
-  ensureStoreDir();
-  if (!existsSync(storeFile)) {
-    return { version: 1, config: defaultProvisioningConfig() };
-  }
-  try {
-    const parsed = JSON.parse(readFileSync(storeFile, "utf8")) as ProvisioningStoreFile;
-    return {
-      version: 1,
-      config: normalizeProvisioningConfig(parsed.config ?? defaultProvisioningConfig()),
-    };
-  } catch {
-    return { version: 1, config: defaultProvisioningConfig() };
-  }
+  const fallback = (): ProvisioningStoreFile => ({ version: 1, config: defaultProvisioningConfig() });
+  return readLocalJsonConfig({
+    filePath: storeFile,
+    label: "创建预设配置",
+    normalize: (input) => {
+      const parsed = input as Partial<ProvisioningStoreFile>;
+      return {
+        version: 1,
+        config: normalizeProvisioningConfig(parsed.config ?? defaultProvisioningConfig()),
+      };
+    },
+    onMissing: fallback,
+    onInvalid: fallback,
+  });
 }
 
 function writeStore(store: ProvisioningStoreFile): void {
-  ensureStoreDir();
-  writeFileSync(storeFile, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
-}
-
-function ensureStoreDir(): void {
-  mkdirSync(dirname(storeFile), { recursive: true, mode: 0o700 });
+  writeLocalJsonConfig(storeFile, store);
 }

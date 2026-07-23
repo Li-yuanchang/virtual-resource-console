@@ -6,13 +6,13 @@ import type {
   GuestStorageMount,
   ProviderType,
   VmDisk,
-  VmResizeGuestStorageRequest,
-  VmResizeGuestStorageResult,
-  VmResizeRequest,
+  VmResizeDiskRequest,
+  VmResizeStorageResult,
+  VmResizeStorageTarget,
   XenConnectionInput,
 } from "./types.js";
 
-const guestReadyTimeoutMs = 15_000;
+const guestReadyTimeoutMs = 6_000;
 const guestCommandTimeoutMs = 45_000;
 const guestReconnectTimeoutMs = 120_000;
 const diskSizeToleranceBytes = 128 * 1024 ** 2;
@@ -43,12 +43,15 @@ done
 true
 `;
 
-interface GuestStorageAccess {
+export interface GuestStorageAccess {
   providerType: ProviderType;
   platformConnection: XenConnectionInput;
   vmIp: string;
   username?: string;
   password?: string;
+  jumpConnection?: XenConnectionInput;
+  executeCommand?: (command: string, timeoutMs: number) => Promise<string>;
+  allowSshFallback?: boolean;
 }
 
 interface BlockRow {
@@ -68,10 +71,67 @@ interface PhysicalVolumeRow {
   freeBytes: number;
 }
 
-interface GuestStoragePreflight {
+export interface GuestStoragePreflight {
   inventory: GuestStorageInventory;
   mount?: GuestStorageMount;
   platformDisk?: VmDisk;
+}
+
+export type GuestStorageTransport = "platform-jump-ssh" | "configured-jump-ssh" | "direct-ssh";
+
+export function resolveGuestStorageTransport(providerType: ProviderType, hasConfiguredJump = false): GuestStorageTransport {
+  if (hasConfiguredJump) return "configured-jump-ssh";
+  if (providerType === "xenserver") return "platform-jump-ssh";
+  if (providerType === "proxmox" || providerType === "vmware") return "direct-ssh";
+  throw new Error(`当前平台未配置系统存储执行策略：${providerType}`);
+}
+
+export function isGuestAuthenticationError(error: unknown): boolean {
+  if (error && typeof error === "object" && "level" in error && error.level === "client-authentication") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("All configured authentication methods failed")
+    || message.includes("缺少虚拟机操作系统 SSH 密码");
+}
+
+export function isGuestAgentUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:QEMU Guest Agent|guest agent|guest-exec).*(?:不可用|未运行|未响应|未返回|未启用|禁用|not running|not available|disabled|timeout)/i.test(message);
+}
+
+export function buildGuestAuthenticationInventory(vmIp: string): GuestStorageInventory {
+  return {
+    vmIp,
+    supported: false,
+    reasonCode: "SYSTEM_AUTHENTICATION_REQUIRED",
+    message: "后端默认凭据无法登录虚拟机操作系统，请提供系统登录名和密码；仅能通过 JumpServer 访问时请同时填写跳板连接。",
+    disks: [],
+    mounts: [],
+    directories: [],
+  };
+}
+
+export function buildGuestOfflineInventory(vmIp: string): GuestStorageInventory {
+  return {
+    vmIp,
+    supported: false,
+    reasonCode: "GUEST_OFFLINE",
+    message: "虚拟机当前已关机，无法读取操作系统磁盘与目录。平台硬件可以离线调整；按现有目录扩容请先开机后重试。",
+    disks: [],
+    mounts: [],
+    directories: [],
+  };
+}
+
+export function buildGuestExecutionUnavailableInventory(vmIp: string, detail?: string): GuestStorageInventory {
+  return {
+    vmIp,
+    supported: false,
+    reasonCode: "SYSTEM_EXECUTION_UNAVAILABLE",
+    message: detail || "系统执行通道不可用；请提供虚拟机系统账号和密码改用 SSH，仅能通过 JumpServer 访问时请同时填写跳板连接。",
+    disks: [],
+    mounts: [],
+    directories: [],
+  };
 }
 
 export async function inspectGuestStorage(access: GuestStorageAccess): Promise<GuestStorageInventory> {
@@ -109,7 +169,7 @@ export function parseGuestStorageInventory(vmIp: string, output: string): GuestS
   return {
     vmIp,
     supported: disks.length > 0,
-    message: disks.length ? `已读取 ${disks.length} 块磁盘、${mounts.length} 个可扩容目录` : "Guest 未返回可识别的块设备",
+    message: disks.length ? `已读取 ${disks.length} 块磁盘、${mounts.length} 个可扩容目录` : "虚拟机操作系统未返回可识别的块设备",
     disks,
     mounts,
     directories,
@@ -130,13 +190,10 @@ export function linkGuestStorageToPlatformDisks(
 
 export async function preflightGuestStorageResize(
   access: GuestStorageAccess,
-  request: VmResizeRequest,
+  disk: VmResizeDiskRequest,
+  target: VmResizeStorageTarget,
   platformDisks: VmDisk[],
 ): Promise<GuestStoragePreflight> {
-  const guest = request.guestStorage;
-  const disk = request.disk;
-  if (!guest || !disk) throw new Error("Guest 自动生效需要磁盘变更和挂载目录参数。");
-  if (access.vmIp !== guest.vmIp) throw new Error("Guest IP 与扩容请求不一致，请刷新后重试。");
   const inventory = linkGuestStorageToPlatformDisks(await inspectGuestStorage(access), platformDisks, access.providerType);
   if (!inventory.supported) throw new Error(inventory.message);
   if (disk.mode === "extend") {
@@ -144,15 +201,14 @@ export async function preflightGuestStorageResize(
     if (!platformDisk) throw new Error("扩展原盘失败：目标磁盘不属于当前虚拟机。");
     const mount = inventory.mounts.find(
       (item) =>
-        item.mountPath === normalizeMountPath(guest.mountPath) &&
-        item.guestDiskPath === guest.guestDiskPath &&
+        item.mountPath === normalizeMountPath(target.mountPath) &&
         item.platformDiskId === disk.diskId,
     );
-    if (!mount) throw new Error("所选目录与目标虚拟磁盘不匹配，请刷新 Guest 存储信息后重新选择。");
+    if (!mount) throw new Error("所选目录与目标虚拟磁盘不匹配，请刷新系统存储信息后重新选择。");
     await runGuestCommand(access, buildGuestToolPreflightCommand("extend", mount), guestCommandTimeoutMs);
     return { inventory, mount, platformDisk };
   }
-  const mountPath = normalizeMountPath(guest.mountPath);
+  const mountPath = normalizeMountPath(target.mountPath);
   assertSafeNewMountPath(mountPath);
   await runGuestCommand(access, buildMountPathPreflightCommand(mountPath), guestCommandTimeoutMs);
   await runGuestCommand(access, buildGuestToolPreflightCommand("add"), guestCommandTimeoutMs);
@@ -161,42 +217,41 @@ export async function preflightGuestStorageResize(
 
 export async function applyGuestStorageResize(input: {
   access: GuestStorageAccess;
-  request: VmResizeRequest;
+  disk: VmResizeDiskRequest;
+  target: VmResizeStorageTarget;
+  restartAfterResize: boolean;
   preflight: GuestStoragePreflight;
-}): Promise<VmResizeGuestStorageResult> {
-  const { access, request, preflight } = input;
-  const guest = request.guestStorage;
-  const disk = request.disk;
-  if (!guest || !disk) throw new Error("Guest 自动生效参数缺失。");
-  const mountPath = normalizeMountPath(guest.mountPath);
+}): Promise<VmResizeStorageResult> {
+  const { access, disk, target, restartAfterResize, preflight } = input;
+  const mountPath = normalizeMountPath(target.mountPath);
   try {
     await waitForGuestStorage(access);
     if (disk.mode === "extend") {
-      if (!preflight.mount) throw new Error("扩展原盘缺少 Guest 挂载信息。");
+      if (!preflight.mount) throw new Error("扩展原盘缺少系统挂载信息。");
       if (!preflight.platformDisk) throw new Error("扩展原盘缺少平台磁盘信息。");
       await waitForGuestDiskSize(access, preflight.mount.guestDiskPath, disk.sizeBytes);
       const platformIncreaseBytes = Math.max(0, disk.sizeBytes - preflight.platformDisk.virtualSizeBytes);
       const guestIncreaseBytes = platformIncreaseBytes + preflight.mount.pendingCapacityBytes;
       if (guestIncreaseBytes <= diskSizeToleranceBytes) {
-        throw new Error(`Guest 未发现可分配到 ${mountPath} 的新增容量。`);
+        throw new Error(`虚拟机操作系统未发现可分配到 ${mountPath} 的新增容量。`);
       }
-      await extendGuestFilesystem(access, preflight.mount, guestIncreaseBytes, request.restartAfterResize);
+      await extendGuestFilesystem(access, preflight.mount, guestIncreaseBytes, restartAfterResize);
     } else {
       const inventoryAfter = await rescanAndInspectGuestStorage(access, preflight.inventory.disks.length + 1);
       const newDisk = resolveNewGuestDisk(preflight.inventory, inventoryAfter, disk.sizeBytes);
-      if (!newDisk) throw new Error("Guest 未识别到本次新增的虚拟磁盘。");
+      if (!newDisk) throw new Error("虚拟机操作系统未识别到本次新增的虚拟磁盘。");
       await runGuestCommand(access, buildAddFilesystemCommand(newDisk.path, mountPath), guestCommandTimeoutMs);
     }
     const verified = await inspectGuestStorage(access);
     const mount = verified.mounts.find((item) => item.mountPath === mountPath);
-    if (!mount) throw new Error(`Guest 回读未发现挂载目录 ${mountPath}。`);
+    if (!mount) throw new Error(`操作系统回读未发现挂载目录 ${mountPath}。`);
     if (disk.mode === "extend" && preflight.mount && preflight.platformDisk) {
       const platformIncreaseBytes = Math.max(0, disk.sizeBytes - preflight.platformDisk.virtualSizeBytes);
       const expectedIncreaseBytes = platformIncreaseBytes + preflight.mount.pendingCapacityBytes;
       const expectedMinimumBytes = preflight.mount.sizeBytes + Math.max(0, expectedIncreaseBytes - filesystemSizeToleranceBytes);
       if (mount.sizeBytes < expectedMinimumBytes) {
         throw new Error(
-          `Guest 容量回读未达目标：${mountPath} 当前 ${formatGiB(mount.sizeBytes)} GiB，预期至少 ${formatGiB(expectedMinimumBytes)} GiB。`,
+          `操作系统容量回读未达目标：${mountPath} 当前 ${formatGiB(mount.sizeBytes)} GiB，预期至少 ${formatGiB(expectedMinimumBytes)} GiB。`,
         );
       }
     }
@@ -209,13 +264,13 @@ export async function applyGuestStorageResize(input: {
       status: "completed",
       mountPath,
       sizeBytes: mount.sizeBytes,
-      message: `Guest 存储已生效：${mountPath}`,
+      message: `系统内容量已生效：${mountPath}`,
     };
   } catch (error) {
     return {
       status: "failed",
       mountPath,
-      message: `虚拟硬件已扩容，但 Guest 自动生效失败：${error instanceof Error ? error.message : String(error)}`,
+      message: `虚拟硬件已扩容，但系统内容量自动生效失败：${error instanceof Error ? error.message : String(error)}`,
     };
   }
 }
@@ -403,12 +458,12 @@ function buildGuestToolPreflightCommand(mode: "extend" | "add", mount?: GuestSto
       ];
   const requiredList = required.map(shellQuote).join(" ");
   const partitionToolCheck = mode === "extend" && mount?.guestPartitionPath
-    ? "command -v growpart >/dev/null 2>&1 || command -v parted >/dev/null 2>&1 || command -v sfdisk >/dev/null 2>&1 || { echo 'Guest 缺少 growpart/parted/sfdisk' >&2; exit 35; }"
+    ? "command -v growpart >/dev/null 2>&1 || command -v parted >/dev/null 2>&1 || command -v sfdisk >/dev/null 2>&1 || { echo '操作系统缺少 growpart/parted/sfdisk' >&2; exit 35; }"
     : "true";
   return String.raw`
 set -eu
 for tool in ${requiredList}; do
-  command -v "$tool" >/dev/null 2>&1 || { echo "Guest 缺少自动存储工具：$tool" >&2; exit 34; }
+  command -v "$tool" >/dev/null 2>&1 || { echo "操作系统缺少自动存储工具：$tool" >&2; exit 34; }
 done
 ${partitionToolCheck}
 `;
@@ -467,7 +522,7 @@ if [ -n "$partition" ]; then
         exit 49
       }
     else
-      echo "Guest 缺少可用的分区扩展工具" >&2
+      echo "操作系统缺少可用的分区扩展工具" >&2
       exit 41
     fi
     partprobe "$disk" 2>/dev/null || true
@@ -506,12 +561,12 @@ async function extendGuestFilesystem(
   const firstOutput = await runGuestCommand(access, command, guestCommandTimeoutMs);
   if (!firstOutput.includes(guestPartitionRebootMarker)) return;
   if (!allowRestart) {
-    throw new Error("Guest 内核需要重启后才能识别新分区容量。请允许自动重启后重试。");
+    throw new Error("虚拟机操作系统内核需要重启后才能识别新分区容量。请允许自动重启后重试。");
   }
   await restartGuest(access);
   const secondOutput = await runGuestCommand(access, command, guestCommandTimeoutMs);
   if (secondOutput.includes(guestPartitionRebootMarker)) {
-    throw new Error("Guest 重启后仍未识别新分区容量，已停止文件系统变更。");
+    throw new Error("虚拟机操作系统重启后仍未识别新分区容量，已停止文件系统变更。");
   }
 }
 
@@ -532,7 +587,7 @@ async function restartGuest(access: GuestStorageAccess): Promise<void> {
       break;
     }
   }
-  if (!disconnected) throw new Error("Guest 已提交重启，但 SSH 在 45 秒内未中断。");
+  if (!disconnected) throw new Error("虚拟机操作系统已提交重启，但 SSH 在 45 秒内未中断。");
   await waitForGuestStorage(access);
 }
 
@@ -579,7 +634,7 @@ async function waitForGuestStorage(access: GuestStorageAccess): Promise<GuestSto
       await delay(3_000);
     }
   }
-  throw new Error(`等待 Guest SSH 恢复超时：${lastError instanceof Error ? lastError.message : "连接不可用"}`);
+  throw new Error(`等待虚拟机操作系统 SSH 恢复超时：${lastError instanceof Error ? lastError.message : "连接不可用"}`);
 }
 
 async function waitForGuestDiskSize(access: GuestStorageAccess, diskPath: string, targetBytes: number): Promise<void> {
@@ -594,7 +649,7 @@ async function waitForGuestDiskSize(access: GuestStorageAccess, diskPath: string
     if (parsePositiveNumber(output.trim().split(/\r?\n/).at(-1)) >= targetBytes - diskSizeToleranceBytes) return;
     await delay(2_000);
   }
-  throw new Error(`Guest 未回读到 ${diskPath} 的新容量。`);
+  throw new Error(`虚拟机操作系统未回读到 ${diskPath} 的新容量。`);
 }
 
 async function rescanAndInspectGuestStorage(access: GuestStorageAccess, expectedDiskCount: number): Promise<GuestStorageInventory> {
@@ -626,8 +681,20 @@ function resolveNewGuestDisk(before: GuestStorageInventory, after: GuestStorageI
 }
 
 function runGuestCommand(access: GuestStorageAccess, command: string, timeoutMs: number): Promise<string> {
+  if (access.executeCommand) {
+    return access.executeCommand(command, timeoutMs).catch((error) => {
+      // Only an explicitly supplied VM credential may opt into SSH fallback.
+      if (!access.allowSshFallback) throw error;
+      return runGuestSshCommand(access, command, timeoutMs);
+    });
+  }
+  return runGuestSshCommand(access, command, timeoutMs);
+}
+
+function runGuestSshCommand(access: GuestStorageAccess, command: string, timeoutMs: number): Promise<string> {
   const credentials = resolveGuestCredentials(access);
-  if (access.providerType !== "xenserver") {
+  const transport = resolveGuestStorageTransport(access.providerType, Boolean(access.jumpConnection));
+  if (transport === "direct-ssh") {
     return executeSshCommand(
       {
         host: access.vmIp,
@@ -641,6 +708,18 @@ function runGuestCommand(access: GuestStorageAccess, command: string, timeoutMs:
       timeoutMs,
     );
   }
+  const jumpConnection = transport === "configured-jump-ssh" ? access.jumpConnection : access.platformConnection;
+  if (!jumpConnection) throw new Error("缺少 JumpServer 连接参数。");
+  return executeJumpSshCommand(jumpConnection, access.vmIp, credentials, command, timeoutMs);
+}
+
+function executeJumpSshCommand(
+  jumpConnection: XenConnectionInput,
+  vmIp: string,
+  credentials: { username: string; password: string },
+  command: string,
+  timeoutMs: number,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const jumpClient = new Client();
     let settled = false;
@@ -653,9 +732,9 @@ function runGuestCommand(access: GuestStorageAccess, command: string, timeoutMs:
     };
     jumpClient
       .on("ready", () => {
-        jumpClient.forwardOut("127.0.0.1", 0, access.vmIp, 22, (error, stream) => {
+        jumpClient.forwardOut("127.0.0.1", 0, vmIp, 22, (error, stream) => {
           if (error) {
-            finish(error);
+            finish(new Error(`JumpServer 无法访问虚拟机 ${vmIp}:22：${error.message}`));
             return;
           }
           executeSshCommand(
@@ -671,12 +750,12 @@ function runGuestCommand(access: GuestStorageAccess, command: string, timeoutMs:
           ).then((value) => finish(undefined, value), (commandError) => finish(toError(commandError)));
         });
       })
-      .on("error", (error) => finish(error))
+      .on("error", (error) => finish(new Error(`JumpServer 连接失败：${error.message}`)))
       .connect({
-        host: access.platformConnection.host,
-        port: access.platformConnection.port,
-        username: access.platformConnection.username,
-        password: access.platformConnection.password,
+        host: jumpConnection.host,
+        port: jumpConnection.port,
+        username: jumpConnection.username,
+        password: jumpConnection.password,
         readyTimeout: guestReadyTimeoutMs,
         algorithms: guestSshAlgorithms(),
       });
@@ -689,7 +768,7 @@ function executeSshCommand(config: ConnectConfig, command: string, timeoutMs: nu
     let stdout = "";
     let stderr = "";
     let settled = false;
-    const timer = setTimeout(() => finish(new Error(`Guest 命令执行超时（${Math.ceil(timeoutMs / 1000)} 秒）`)), timeoutMs);
+    const timer = setTimeout(() => finish(new Error(`操作系统命令执行超时（${Math.ceil(timeoutMs / 1000)} 秒）`)), timeoutMs);
     const finish = (error?: Error) => {
       if (settled) return;
       settled = true;
@@ -707,7 +786,7 @@ function executeSshCommand(config: ConnectConfig, command: string, timeoutMs: nu
           }
           stream
             .on("close", (code: number) => {
-              if (code !== 0) finish(new Error(stderr.trim() || `Guest 命令退出：${code}`));
+              if (code !== 0) finish(new Error(stderr.trim() || `操作系统命令退出：${code}`));
               else finish();
             })
             .on("data", (chunk: Buffer) => {
@@ -726,7 +805,7 @@ function executeSshCommand(config: ConnectConfig, command: string, timeoutMs: nu
 function resolveGuestCredentials(access: GuestStorageAccess): { username: string; password: string } {
   const username = access.username?.trim() || "root";
   const password = access.password?.trim() || deriveRootPassword(access.vmIp);
-  if (!password) throw new Error("缺少 Guest SSH 密码，请在运行策略中配置 root 密码规则或提交临时密码。");
+  if (!password) throw new Error("缺少虚拟机操作系统 SSH 密码，请在运行策略中配置 root 密码规则或提交临时密码。");
   return { username, password };
 }
 

@@ -13,12 +13,13 @@ import type {
   VmDisk,
   VmInventorySummary,
   VmNode,
+  VmSearchIndexItem,
   VmPowerAction,
   VmProvisionRequest,
   VmProvisionResult,
   VmQuery,
   VmRenameResult,
-  VmResizeRequest,
+  VmResizeExecutionRequest,
   VmResizeResult,
   VmSnapshot,
   XenConnectionInput,
@@ -48,13 +49,19 @@ export interface VirtualizationProvider<C> {
   listHostSummary(connection: C, hostId: string): Promise<HostNode>;
   summarizeVms?(connection: C, query: VmQuery): Promise<VmInventorySummary>;
   listVms(connection: C, query: VmQuery): Promise<PagedResult<VmNode>>;
+  listVmSearchIndex?(connection: C, scope?: ProviderScope): Promise<VmSearchIndexItem[]>;
   listVmDisks(connection: C, vmId: string): Promise<VmDisk[]>;
+  /**
+   * Executes a command inside the guest through a platform-provided guest agent.
+   * The method is optional because not every provider exposes guest operations.
+   */
+  executeGuestCommand?(connection: C, vmId: string, command: string, timeoutMs: number): Promise<string>;
   listVirtualDisks(connection: C, scope?: ProviderScope): Promise<VirtualDisk[]>;
   listIsoImages?(connection: C, scope?: ProviderScope): Promise<IsoImage[]>;
   listVmSnapshots(connection: C, vmId: string): Promise<VmSnapshot[]>;
   performVmAction?(connection: C, vmId: string, action: VmPowerAction, options?: VmActionOptions): Promise<VmActionResult>;
   renameVm?(connection: C, vmId: string, currentName: string, newName: string): Promise<VmRenameResult>;
-  resizeVm?(connection: C, vmId: string, request: VmResizeRequest): Promise<VmResizeResult>;
+  resizeVm?(connection: C, vmId: string, request: VmResizeExecutionRequest): Promise<VmResizeResult>;
   createVms?(connection: C, request: VmProvisionRequest, reporter?: ProvisionProgressReporter): Promise<VmProvisionResult>;
   collectMetrics(connection: C, query: MetricQuery): Promise<MetricSample[]>;
 }
