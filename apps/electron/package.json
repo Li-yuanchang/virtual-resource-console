@@ -6,11 +6,11 @@
   "main": "main.cjs",
   "scripts": {
     "dev": "electron .",
-    "prepack": "node ../../scripts/prepare-electron-runtime.mjs && node ../../scripts/prepare-electron-api-runtime.mjs",
+    "prepack": "node ../../scripts/prepare-electron-update-config.mjs && node ../../scripts/prepare-electron-runtime.mjs && node ../../scripts/prepare-electron-api-runtime.mjs",
     "pack": "electron-builder --dir",
-    "predist:mac": "node ../../scripts/prepare-electron-runtime.mjs darwin-arm64 && node ../../scripts/prepare-electron-api-runtime.mjs",
+    "predist:mac": "node ../../scripts/prepare-electron-update-config.mjs && node ../../scripts/prepare-electron-runtime.mjs darwin-arm64 && node ../../scripts/prepare-electron-api-runtime.mjs",
     "dist:mac": "electron-builder --mac",
-    "predist:win": "node ../../scripts/clean-electron-windows-output.mjs && node ../../scripts/prepare-electron-runtime.mjs win-x64 && node ../../scripts/prepare-electron-api-runtime.mjs",
+    "predist:win": "node ../../scripts/clean-electron-windows-output.mjs && node ../../scripts/prepare-electron-update-config.mjs && node ../../scripts/prepare-electron-runtime.mjs win-x64 && node ../../scripts/prepare-electron-api-runtime.mjs",
     "dist:win": "electron-builder --win --x64"
   },
   "devDependencies": {
@@ -60,6 +60,10 @@
       {
         "from": "assets",
         "to": "assets"
+      },
+      {
+        "from": ".update-config/update-config.json",
+        "to": "update-config.json"
       },
       {
         "from": ".runtime",

@@ -416,6 +416,31 @@ npm run dev
 | `VRC_DESKTOP_UPDATE_DIR` | 桌面端更新文件目录；API 会通过 `/desktop-updates/*` 提供静态文件 |
 | `VRC_UPDATE_URL` | 桌面端在线更新源；不配置时客户端不会检查在线更新 |
 
+#### 桌面端更新源本地配置
+
+仓库不提交真实更新源地址。Electron 运行时按以下优先级读取更新源：
+
+1. 当前进程环境变量 `VRC_UPDATE_URL`
+2. `apps/electron/update-config.local.json`
+3. 根目录 `.env.local`
+4. 打包资源里的 `update-config.json`
+
+本地开发或打包可以在 `.env.local` 中配置：
+
+```bash
+VRC_UPDATE_URL=http://your-update-host:3988/desktop-updates
+```
+
+也可以使用 JSON 本地配置：
+
+```json
+{
+  "url": "http://your-update-host:3988/desktop-updates"
+}
+```
+
+`npm run pack:electron`、`npm run dist:mac` 和 `npm run dist:win` 会先执行 `scripts/prepare-electron-update-config.mjs`，把本地更新源写入 `apps/electron/.update-config/update-config.json` 并随安装包打入资源目录。`.env.local`、`apps/electron/update-config.local.json` 和 `.update-config/` 都被 Git 忽略，不要把真实内网地址写进提交。
+
 XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进入 ISO 镜像缓存；任务完成并切回硬盘启动后会按登记记录自动清理。
 
 请使用本机 shell、`.env.local` 或部署环境配置这些变量，不要把包含真实地址、账号、密码、token 的文件提交到仓库。

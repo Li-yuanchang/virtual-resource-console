@@ -23,6 +23,8 @@ apps/electron/out/
 apps/electron/dist/
 apps/electron/.runtime/
 apps/electron/.api-runtime/
+apps/electron/.update-config/
+apps/electron/update-config.local.json
 apps/electron/assets/app-icon.iconset/
 
 # Local credentials and private connection material.

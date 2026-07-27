@@ -13,7 +13,7 @@ const MIN_STARTUP_VISIBLE_MS = 1800;
 const STARTUP_READY_STATUS_MS = 60;
 const STARTUP_EXIT_ANIMATION_MS = 460;
 const RENDERER_READY_TIMEOUT_MS = 5000;
-const DESKTOP_UPDATE_FEED_URL = process.env.VRC_UPDATE_URL || "";
+const DESKTOP_UPDATE_FEED_URL = resolveDesktopUpdateFeedUrl();
 const DESKTOP_UPDATE_DISTRIBUTION = resolveDesktopUpdateDistribution();
 
 if (app && app.setName) {
@@ -581,6 +581,45 @@ function resolveDesktopUpdateDistribution() {
   if (process.env.PORTABLE_EXECUTABLE_FILE || process.env.PORTABLE_EXECUTABLE_DIR) return "portable";
   const uninstallPath = path.join(path.dirname(process.execPath), `Uninstall ${APP_DISPLAY_NAME}.exe`);
   return fs.existsSync(uninstallPath) ? "installed" : "portable";
+}
+
+function resolveDesktopUpdateFeedUrl() {
+  const envUrl = process.env.VRC_UPDATE_URL?.trim();
+  if (envUrl) return envUrl;
+
+  const configuredFile = process.env.VRC_UPDATE_CONFIG_FILE?.trim();
+  const candidates = [
+    configuredFile,
+    app.isPackaged ? path.join(process.resourcesPath, "update-config.json") : "",
+    path.join(__dirname, "update-config.local.json"),
+    path.resolve(__dirname, "..", "..", ".env.local"),
+  ].filter(Boolean);
+
+  for (const file of candidates) {
+    const url = readDesktopUpdateUrlFile(file);
+    if (url) return url;
+  }
+  return "";
+}
+
+function readDesktopUpdateUrlFile(file) {
+  try {
+    if (!fs.existsSync(file)) return "";
+    const content = fs.readFileSync(file, "utf8");
+    if (file.endsWith(".json")) {
+      const parsed = JSON.parse(content);
+      const url = typeof parsed === "string" ? parsed : parsed?.url ?? parsed?.updateUrl;
+      return typeof url === "string" ? url.trim() : "";
+    }
+    const line = content
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .find((item) => item && !item.startsWith("#") && item.startsWith("VRC_UPDATE_URL="));
+    if (!line) return "";
+    return line.slice("VRC_UPDATE_URL=".length).trim().replace(/^['"]|['"]$/g, "");
+  } catch {
+    return "";
+  }
 }
 
 function ensureDesktopUpdaterConfig() {
