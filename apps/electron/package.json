@@ -1,6 +1,6 @@
 {
   "name": "@vrc/electron",
-  "version": "0.1.47",
+  "version": "0.1.51",
   "private": true,
   "description": "Desktop shell for Virtual Resource Console.",
   "main": "main.cjs",
@@ -29,7 +29,7 @@
     "publish": [
       {
         "provider": "generic",
-        "url": "http://192.168.2.26:3988/desktop-updates"
+        "url": "http://192.0.2.26:3988/desktop-updates"
       }
     ],
     "releaseInfo": {

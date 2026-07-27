@@ -13,7 +13,7 @@ const MIN_STARTUP_VISIBLE_MS = 1800;
 const STARTUP_READY_STATUS_MS = 60;
 const STARTUP_EXIT_ANIMATION_MS = 460;
 const RENDERER_READY_TIMEOUT_MS = 5000;
-const DESKTOP_UPDATE_FEED_URL = process.env.VRC_UPDATE_URL || "http://192.168.2.26:3988/desktop-updates";
+const DESKTOP_UPDATE_FEED_URL = process.env.VRC_UPDATE_URL || "";
 const DESKTOP_UPDATE_DISTRIBUTION = resolveDesktopUpdateDistribution();
 
 if (app && app.setName) {
@@ -57,10 +57,13 @@ let desktopUpdateState = {
   message:
     DESKTOP_UPDATE_DISTRIBUTION === "portable"
       ? "免安装版不支持自动安装更新，请下载新版 ZIP 后替换当前目录"
+      : !DESKTOP_UPDATE_FEED_URL
+        ? "未配置桌面更新源，请设置 VRC_UPDATE_URL"
       : "尚未检查更新",
   checkedAt: "",
   supported:
     app.isPackaged &&
+    Boolean(DESKTOP_UPDATE_FEED_URL) &&
     (process.platform === "darwin" || (process.platform === "win32" && DESKTOP_UPDATE_DISTRIBUTION === "installed")),
   distribution: DESKTOP_UPDATE_DISTRIBUTION,
   platform: process.platform,
@@ -449,8 +452,10 @@ function configureDesktopUpdater() {
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.allowPrerelease = false;
-  ensureDesktopUpdaterConfig();
-  autoUpdater.setFeedURL({ provider: "generic", url: DESKTOP_UPDATE_FEED_URL, channel: "latest" });
+  if (DESKTOP_UPDATE_FEED_URL) {
+    ensureDesktopUpdaterConfig();
+    autoUpdater.setFeedURL({ provider: "generic", url: DESKTOP_UPDATE_FEED_URL, channel: "latest" });
+  }
 
   autoUpdater.on("checking-for-update", () => {
     updateDesktopUpdateState({ stage: "checking", message: "正在检查更新", progress: 0 });
@@ -562,6 +567,9 @@ function assertDesktopUpdateSupported() {
   if (!desktopUpdateState.supported) {
     if (desktopUpdateState.distribution === "portable") {
       throw new Error("免安装版不支持自动安装更新，请下载新版 ZIP 后替换当前目录");
+    }
+    if (!DESKTOP_UPDATE_FEED_URL) {
+      throw new Error("未配置桌面更新源，请设置 VRC_UPDATE_URL");
     }
     throw new Error("桌面更新仅在已安装的 macOS 或 Windows 客户端中可用");
   }
