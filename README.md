@@ -297,89 +297,13 @@ npm --workspace apps/api run build
 - `preferences.json`、`provisioning.json`：界面偏好和创建配置
 - `ip-leases.json`、`generated-isos.json`、ISO 缓存和创建任务记录
 - `inventory-snapshots.json`、`vm-search-index.json`：资源快照和 VM 搜索索引
-- `runtime-policy.json`：本机运行识别策略，例如 IP 白名单、VM 名称转 IP、口令模板和 XenServer 网卡映射
 - `ip-pools.json`：本机 IP 池配置，例如默认 DNS、地址池、物理机网段匹配规则和可分配主机号
 
 这些文件属于本机运行数据，不应提交到 GitHub。
 
-### 本机运行策略
-
-`runtime-policy.json` 只放运行识别和平台规则。它不随仓库提交，适合保存内网 IP 白名单、VM 名称转 IP 规则、root 初始口令模板、XenServer 网卡选择规则等本地口径。IP 池不放在这里，避免运行策略和地址池维护混在一起。
-
-默认读取路径：
-
-```text
-~/.virtual-resource-console/runtime-policy.json
-```
-
-首次使用可以复制仓库里的示例文件：
-
-```bash
-mkdir -p ~/.virtual-resource-console
-cp config/runtime-policy.example.json ~/.virtual-resource-console/runtime-policy.json
-chmod 600 ~/.virtual-resource-console/runtime-policy.json
-```
-
-也可以通过环境变量指定其它路径：
-
-```bash
-export VRC_RUNTIME_POLICY_FILE=/path/to/runtime-policy.json
-```
-
-如果配置文件不存在或读取失败，系统会使用安全默认值继续启动，不会因为缺少该文件报错；只是不会带入你的现场网段识别、口令模板或网卡映射。
-
-#### 配置示例
-
-下面是一个脱敏示例，使用文档保留网段 `192.0.2.0/24`。实际使用时请替换成自己的环境值，不要把真实配置提交到仓库。
-
-```json
-{
-  "managedIpPattern": "^192\\.0\\.2\\.[0-9]{1,3}$",
-  "ipInference": {
-    "enabled": true,
-    "shortIpBasePrefix": "192.0",
-    "shortIpThirdOctets": ["2"],
-    "hostOnlyPrefix": "192.0.2"
-  },
-  "provisioning": {
-    "rootPasswordTemplate": ""
-  },
-  "xenserver": {
-    "networkDeviceRules": [
-      {
-        "ipPrefix": "192.0.2.",
-        "device": "eth0"
-      }
-    ]
-  }
-}
-```
-
-#### 字段说明
-
-| 字段 | 说明 |
-|------|------|
-| `managedIpPattern` | 可识别和展示的 IPv4 白名单正则；为空时接受合法 IPv4 |
-| `ipInference.enabled` | 是否允许从 VM 名称推断 IP |
-| `ipInference.shortIpBasePrefix` | 短 IP 推断的前两段，例如 `192.0` |
-| `ipInference.shortIpThirdOctets` | 允许识别的第三段，例如名称里出现 `2.111` 时可推断为 `192.0.2.111` |
-| `ipInference.hostOnlyPrefix` | 只有主机号时使用的前三段，例如名称 `111-test` 可推断为 `192.0.2.111` |
-| `provisioning.rootPasswordTemplate` | 初始 root 口令模板；为空时不自动生成 root 口令 |
-| `xenserver.networkDeviceRules` | XenServer 创建 VM 时按 IP 前缀选择 PIF 设备 |
-
-`rootPasswordTemplate` 支持以下占位符：
-
-| 占位符 | 含义 |
-|--------|------|
-| `{first}` | IP 第一段 |
-| `{second}` | IP 第二段 |
-| `{third}` | IP 第三段 |
-| `{fourth}` | IP 第四段 |
-| `{ip}` | 完整 IP |
-
 ### 本机 IP 池配置
 
-`ip-pools.json` 只放地址池。创建、安装、租约等功能可以读取它，但这个文件本身不承载那些流程。
+`ip-pools.json` 是地址池和可管理网段的唯一来源。创建、安装、租约、VM 搜索索引和名称转 IP 都读取它；新增网段时先在设置页扩展 IP 池，后续资源刷新会自动使用新网段，无需再维护单独的运行策略文件。
 
 默认读取路径：
 
@@ -460,7 +384,7 @@ IP 池字段说明：
 
 #### 配置生效方式
 
-`runtime-policy.json` 和 `ip-pools.json` 都由 API 进程启动后读取。修改后建议重启本地服务：
+`ip-pools.json` 由 API 按需读取。通过设置页保存后无需重启服务，后续资源和搜索索引刷新会直接使用最新网段；手工修改文件后也可以重启本地服务确认：
 
 ```bash
 npm run local:stop
@@ -481,7 +405,6 @@ npm run dev
 | `PORT` | API 端口，默认 `3987` |
 | `VRC_DATA_DIR` | VRC 本机运行数据根目录，默认 `~/.virtual-resource-console` |
 | `VRC_IP_POOLS_FILE` | IP 池配置完整路径，优先于 `VRC_DATA_DIR` |
-| `VRC_RUNTIME_POLICY_FILE` | 自定义运行策略配置文件路径 |
 | `VRC_WEB_DIST_DIR` | 自定义 Web 静态资源目录；未设置时使用 `apps/web/dist` |
 | `VRC_RUNTIME_MODE` | 运行模式：`web`、`electron` 或 `chrome-native` |
 | `VRC_SHARED_WEB_MODE` | 设为 `true` 后禁用服务端持久化连接和依赖连接的定时任务 |
@@ -491,6 +414,7 @@ npm run dev
 | `VRC_XEN_HOST_INSTALL_SOURCE_PORT_COUNT` | XenServer 物理机安装源端口探测数量，默认 `20` |
 | `VRC_XEN_HOST_INSTALL_SOURCE_ROOT` | XenServer 物理机安装源临时目录，默认 `/var/run/vrc-install-source` |
 | `VRC_DESKTOP_UPDATE_DIR` | 桌面端更新文件目录；API 会通过 `/desktop-updates/*` 提供静态文件 |
+| `VRC_UPDATE_URL` | 桌面端在线更新源；不配置时客户端不会检查在线更新 |
 
 XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进入 ISO 镜像缓存；任务完成并切回硬盘启动后会按登记记录自动清理。
 

@@ -5,18 +5,41 @@ import {
   buildXenGuestArpProbeCommand,
   buildXenGuestMetricsProbeScript,
   buildXenGuestPingProbeCommand,
+  buildXenGuestToolsProgressProbeScript,
   canReadWinRmHttpResponse,
   hasWindowsRemoteInitializationTimedOut,
   isWinRmHttpResponse,
 } from "../src/provisioningVerifier.js";
 
-test("XenServer Guest Tools verification reads the supported guest-metrics reference", () => {
+test("XenServer Guest Tools verification requires current Guest-specific evidence", () => {
   const script = buildXenGuestMetricsProbeScript("vm-uuid");
 
   assert.match(script, /param-name=guest-metrics\b/);
   assert.doesNotMatch(script, /guest-metrics-uuid/);
+  assert.match(script, /param-name=PV-drivers-detected/);
+  assert.match(script, /if \[ "\$pv_drivers" = "true" \]/);
+  assert.match(script, /data-source=memory_internal_free/);
+  assert.match(script, /last-updated timestamp alone can be stale/);
+  assert.doesNotMatch(script, /guest_metrics_updated=.*last-updated/);
+  assert.match(
+    script,
+    /if \[ -n "\$guest_metrics" \] && \[ "\$guest_metrics" != "<not in database>" \]; then\n\s+pv_drivers=.*\n\s+if \[ "\$pv_drivers" = "true" \]; then\n\s+printf 'READY\\n'/,
+  );
+  assert.match(script, /printf 'READY\\n'/);
+});
+
+test("XenServer Guest Tools progress probe reports visible checkpoints", () => {
+  const script = buildXenGuestToolsProgressProbeScript("vm-uuid", "192.168.2.31");
+
+  assert.match(script, /printf 'POWER\\t%s\\n'/);
+  assert.match(script, /printf 'GUEST_METRICS\\t/);
+  assert.match(script, /printf 'CD\\t%s\\n'/);
+  assert.match(script, /printf 'PING\\tok\\n'/);
+  assert.match(script, /printf 'WINRM\\tok\\n'/);
   assert.match(script, /data-source=memory_internal_free/);
   assert.match(script, /printf 'READY\\n'/);
+  assert.equal(script.includes("'\\''"), false);
+  assert.equal(buildXenGuestToolsProgressProbeScript("vm'; touch /tmp/x", "192.168.2.31'; touch /tmp/y").includes("'\\''"), true);
 });
 
 test("WinRM readiness requires an HTTP response instead of a connected transport", async () => {

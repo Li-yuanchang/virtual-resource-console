@@ -353,7 +353,7 @@ export function buildWindowsAutounattend(input: XenUnattendedIsoInput): string {
   <settings pass="oobeSystem">
     <component ${component("Microsoft-Windows-International-Core")}><InputLocale>zh-CN</InputLocale><SystemLocale>zh-CN</SystemLocale><UILanguage>zh-CN</UILanguage><UserLocale>zh-CN</UserLocale></component>
     <component ${component("Microsoft-Windows-Shell-Setup")}>
-      <AutoLogon><Password><Value>${encodeWindowsUnattendPassword(password, "Password")}</Value><PlainText>false</PlainText></Password><Enabled>true</Enabled><LogonCount>1</LogonCount><Username>Administrator</Username></AutoLogon>
+      <AutoLogon><Password><Value>${encodeWindowsUnattendPassword(password, "Password")}</Value><PlainText>false</PlainText></Password><Enabled>true</Enabled><LogonCount>5</LogonCount><Username>Administrator</Username></AutoLogon>
       <UserAccounts><AdministratorPassword><Value>${encodeWindowsUnattendPassword(password, "AdministratorPassword")}</Value><PlainText>false</PlainText></AdministratorPassword></UserAccounts>
       <OOBE><HideEULAPage>true</HideEULAPage><NetworkLocation>Work</NetworkLocation><ProtectYourPC>3</ProtectYourPC><SkipMachineOOBE>true</SkipMachineOOBE><SkipUserOOBE>true</SkipUserOOBE></OOBE>
       <FirstLogonCommands>
@@ -399,6 +399,11 @@ export function buildWindowsSpecializeRemoteAccessCommands(): string[] {
     "cmd.exe /d /c netsh advfirewall firewall add rule name=VRC-WinRM dir=in action=allow protocol=TCP localport=5985 remoteip=any profile=any",
     'cmd.exe /d /c reg.exe add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f',
     "cmd.exe /d /c netsh advfirewall firewall add rule name=VRC-RDP dir=in action=allow protocol=TCP localport=3389 remoteip=any profile=any",
+    'cmd.exe /d /c reg.exe add "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" /v DisableCAD /t REG_DWORD /d 1 /f',
+    'cmd.exe /d /c reg.exe add "HKLM\\SOFTWARE\\Microsoft\\ServerManager\\Oobe" /v DoNotOpenInitialConfigurationTasksAtLogon /t REG_DWORD /d 1 /f',
+    'cmd.exe /d /c reg.exe add "HKLM\\SOFTWARE\\Microsoft\\ServerManager" /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f',
+    'cmd.exe /d /c reg.exe add "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Reliability" /v ShutdownReasonOn /t REG_DWORD /d 0 /f',
+    'cmd.exe /d /c reg.exe add "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Reliability" /v ShutdownReasonUI /t REG_DWORD /d 0 /f',
   ];
   assertWindowsSpecializeCommandLengths(commands);
   return commands;
@@ -412,8 +417,10 @@ function assertWindowsSpecializeCommandLengths(commands: string[]): void {
 
 /**
  * Builds the task-local bootstrap stored beside Autounattend.xml.
- * It stages the PowerShell state machine before the first desktop login, registers the
- * boot retry, and launches it immediately as SYSTEM during the specialize pass.
+ * It stages the PowerShell state machine before the first desktop login and registers
+ * a logon retry. XenServer Tools are intentionally not installed from the SYSTEM
+ * specialize pass because older Windows Server 2008 R2 guests can crash when PV
+ * drivers are installed before the desktop logon environment has settled.
  */
 export function buildWindowsBootstrapScript(): string {
   return [
@@ -423,8 +430,7 @@ export function buildWindowsBootstrapScript(): string {
     'if not exist "%VRC_STATE%" mkdir "%VRC_STATE%"',
     'copy /y "%~dp0VrcSetup.ps1" "%VRC_STATE%\\VrcSetup.ps1" >nul',
     "if errorlevel 1 exit /b 10",
-    'schtasks.exe /Create /TN "VRC-Guest-Setup" /SC ONSTART /RU SYSTEM /RL HIGHEST /TR "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\ProgramData\\VRC\\VrcSetup.ps1" /F >nul',
-    'start "" /b powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%VRC_STATE%\\VrcSetup.ps1"',
+    'reg add "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" /v VRC-Guest-Setup /t REG_SZ /d "powershell.exe -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\ProgramData\\VRC\\VrcSetup.ps1" /f >nul',
     "exit /b 0",
     "",
   ].join("\r\n");
@@ -445,12 +451,17 @@ export function buildWindowsSetupCompleteScript(input: XenUnattendedIsoInput): s
   const macAddress = input.macAddress?.trim().toUpperCase();
   if (!macAddress) throw new Error("Windows 无人值守安装缺少固定网卡 MAC。");
   return String.raw`$ErrorActionPreference = 'Continue'
-$taskName = 'VRC-Guest-Setup'
+$retryTaskName = 'VRC-Guest-Setup-Retry'
 $stateDir = Join-Path $env:ProgramData 'VRC'
 $toolsMarker = Join-Path $stateDir 'xen-tools-installed'
 $completeMarker = Join-Path $stateDir 'guest-setup-complete'
+$stageFile = Join-Path $stateDir 'guest-setup-stage.txt'
+$errorFile = Join-Path $stateDir 'guest-setup-error.txt'
 $lockPath = Join-Path $stateDir 'guest-setup.lock'
 $log = Join-Path $env:WINDIR 'Temp\vrc-setup.log'
+$runKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+$runValueName = 'VRC-Guest-Setup'
+$runCommand = 'powershell.exe -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\ProgramData\VRC\VrcSetup.ps1'
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 try {
   $lock = [System.IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
@@ -458,6 +469,51 @@ try {
   exit 0
 }
 Start-Transcript -Path $log -Append | Out-Null
+function Write-VrcStage([string]$message) {
+  Set-Content -Path $stageFile -Value ((Get-Date).ToString('s') + ' ' + $message) -Force
+}
+function Enable-VrcLogonRetry {
+  New-Item -Path $runKey -Force | Out-Null
+  New-ItemProperty -Path $runKey -Name $runValueName -Value $runCommand -PropertyType String -Force | Out-Null
+  & schtasks.exe /Create /TN $retryTaskName /SC MINUTE /MO 1 /TR $runCommand /F | Out-Null
+}
+function Install-VrcMsi([string]$packagePath, [string]$label, [string[]]$extraArguments) {
+  if (-not (Test-Path -LiteralPath $packagePath)) {
+    throw ('XenServer Tools package is missing: ' + $label)
+  }
+  Write-VrcStage ('installing ' + $label)
+  $msiLog = Join-Path $env:WINDIR ('Temp\vrc-' + $label + '.log')
+  $arguments = @('/i', ('"' + $packagePath + '"')) + $extraArguments + @('/norestart', 'REBOOT=ReallySuppress', '/L*v', ('"' + $msiLog + '"'))
+  $process = Start-Process msiexec.exe -ArgumentList $arguments -WindowStyle Hidden -PassThru
+  if (-not $process.WaitForExit(1200000)) {
+    $process.Kill()
+    throw ('XenServer Tools package timed out after 20 minutes: ' + $label)
+  }
+  if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+    throw ('XenServer Tools package failed: ' + $label + ', exit code ' + $process.ExitCode)
+  }
+}
+function Test-VrcToolsRoot([string]$candidateRoot) {
+  $knownInstallers = @('managementagentx64.msi', 'installwizard.msi', 'citrixxendriversx64.msi')
+  foreach ($knownInstaller in $knownInstallers) {
+    if (Test-Path -LiteralPath (Join-Path $candidateRoot $knownInstaller)) { return $true }
+  }
+  return $false
+}
+function Find-VrcToolsRoot {
+  $cdroms = Get-WmiObject Win32_CDROMDrive | Where-Object { $_.MediaLoaded -eq $true -and $_.Drive }
+  foreach ($cdrom in $cdroms) {
+    $candidateRoot = $cdrom.Drive + '\'
+    if (Test-VrcToolsRoot $candidateRoot) { return $candidateRoot }
+  }
+  $disks = Get-WmiObject Win32_LogicalDisk -Filter 'DriveType=5' | Where-Object { $_.VolumeName }
+  foreach ($disk in $disks) {
+    $candidateRoot = $disk.DeviceID + '\'
+    if (Test-VrcToolsRoot $candidateRoot) { return $candidateRoot }
+  }
+  return $null
+}
+Enable-VrcLogonRetry
 $mac = '${powershellQuote(macAddress)}'
 $networkReady = $false
 $networkDeadline = (Get-Date).AddMinutes(10)
@@ -481,6 +537,19 @@ do {
 Set-Service WinRM -StartupType Automatic
 Start-Service WinRM
 & winrm quickconfig -quiet
+New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name DisableCAD -Value 1 -PropertyType DWord -Force | Out-Null
+New-Item -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\Oobe' -Force | Out-Null
+New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\ServerManager\Oobe' -Name DoNotOpenInitialConfigurationTasksAtLogon -Value 1 -PropertyType DWord -Force | Out-Null
+New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name DoNotOpenServerManagerAtLogon -Value 1 -PropertyType DWord -Force | Out-Null
+New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Reliability' -Force | Out-Null
+New-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Reliability' -Name ShutdownReasonOn -Value 0 -PropertyType DWord -Force | Out-Null
+New-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Reliability' -Name ShutdownReasonUI -Value 0 -PropertyType DWord -Force | Out-Null
+
+# Disable optical-media AutoPlay before the host swaps in the Tools CD; VRC owns
+# installation and must not expose the media's interactive launcher to the user.
+$explorerPolicy = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+New-Item -Path $explorerPolicy -Force | Out-Null
+New-ItemProperty -Path $explorerPolicy -Name NoDriveTypeAutoRun -Value 255 -PropertyType DWord -Force | Out-Null
 
 if ($networkReady) {
   New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force | Out-Null
@@ -495,10 +564,12 @@ if ($networkReady) {
 }
 
 if (-not (Test-Path $toolsMarker)) {
-  $netFx = Start-Process dism.exe -ArgumentList @('/online', '/Enable-Feature', '/FeatureName:NetFx3', '/NoRestart') -PassThru -Wait
+  Write-VrcStage 'checking NetFx3'
+  $netFx = Start-Process dism.exe -ArgumentList @('/online', '/Enable-Feature', '/FeatureName:NetFx3', '/NoRestart') -WindowStyle Hidden -PassThru -Wait
   if ($netFx.ExitCode -eq 3010) {
+    Write-VrcStage 'NetFx3 requested reboot'
     Stop-Transcript | Out-Null
-    & shutdown.exe /r /t 5 /c 'VRC enabled .NET Framework 3.5 for XenServer Tools'
+    & shutdown.exe /r /f /t 15 /d p:4:1 /c 'VRC enabled .NET Framework 3.5 for XenServer Tools'
     exit 0
   }
   if ($netFx.ExitCode -ne 0) {
@@ -506,26 +577,35 @@ if (-not (Test-Path $toolsMarker)) {
   }
   $toolsDeadline = (Get-Date).AddMinutes(15)
   do {
-    $installer = Get-WmiObject Win32_LogicalDisk -Filter 'DriveType=5' | Where-Object { $_.VolumeName } | ForEach-Object {
-      $candidate = Join-Path ($_.DeviceID + '\') 'installwizard.msi'
-      if (Test-Path $candidate) { Get-Item $candidate }
-    } | Select-Object -First 1
-    if ($installer) {
-      $msiLog = Join-Path $env:WINDIR 'Temp\vrc-xen-tools-msi.log'
-      # XenServer 6.5's launcher only starts its real installer at passive UI level; quiet UI is a no-op.
-      $arguments = @('/i', ('"' + $installer.FullName + '"'), '/passive', '/norestart', 'REBOOT=ReallySuppress', '/L*v', ('"' + $msiLog + '"'))
-      $process = Start-Process msiexec.exe -ArgumentList $arguments -PassThru
-      if (-not $process.WaitForExit(1200000)) {
-        $process.Kill()
-        throw 'XenServer Tools installer timed out after 20 minutes.'
+    Write-VrcStage 'waiting for XenServer Tools media'
+    # XenServer Tools media may have no volume label. Use MediaLoaded first so
+    # an empty physical DVD is never probed with Test-Path.
+    $toolsRoot = Find-VrcToolsRoot
+    if ($toolsRoot) {
+      Remove-Item $errorFile -Force -ErrorAction SilentlyContinue
+      Write-VrcStage ('found Tools media at ' + $toolsRoot)
+      try {
+        $managementAgent = Join-Path $toolsRoot 'managementagentx64.msi'
+        $legacyWizard = Join-Path $toolsRoot 'installwizard.msi'
+        if (Test-Path -LiteralPath $managementAgent) {
+          Install-VrcMsi $managementAgent 'managementagentx64' @('/qn')
+        } elseif (Test-Path -LiteralPath $legacyWizard) {
+          # Older XenServer media use installwizard.msi as the supported unattended entry.
+          Install-VrcMsi $legacyWizard 'installwizard' @('/quiet')
+        } else {
+          Install-VrcMsi (Join-Path $toolsRoot 'citrixxendriversx64.msi') 'citrixxendriversx64' @('/qn')
+          Install-VrcMsi (Join-Path $toolsRoot 'citrixguestagentx64.msi') 'citrixguestagentx64' @('/qn')
+          Install-VrcMsi (Join-Path $toolsRoot 'citrixvssx64.msi') 'citrixvssx64' @('/qn')
+        }
+      } catch {
+        Set-Content -Path $errorFile -Value ($_.Exception.Message) -Force
+        throw
       }
-      if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {
-        New-Item -ItemType File -Path $toolsMarker -Force | Out-Null
-        Stop-Transcript | Out-Null
-        & shutdown.exe /r /t 5 /c 'VRC XenServer Tools installed'
-        exit 0
-      }
-      throw ('XenServer Tools installer failed with exit code ' + $process.ExitCode)
+      Write-VrcStage 'XenServer Tools installer finished'
+      New-Item -ItemType File -Path $toolsMarker -Force | Out-Null
+      Stop-Transcript | Out-Null
+      & shutdown.exe /r /f /t 15 /d p:4:1 /c 'VRC XenServer Tools installed'
+      exit 0
     }
     Start-Sleep -Seconds 5
   } while ((Get-Date) -lt $toolsDeadline)
@@ -533,8 +613,12 @@ if (-not (Test-Path $toolsMarker)) {
 
 if ((Test-Path $toolsMarker) -and $networkReady) {
   New-Item -ItemType File -Path $completeMarker -Force | Out-Null
-  & schtasks.exe /Delete /TN $taskName /F | Out-Null
+  & schtasks.exe /Delete /TN $retryTaskName /F | Out-Null
+  Remove-ItemProperty -Path $runKey -Name $runValueName -ErrorAction SilentlyContinue
+  $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+  Remove-ItemProperty -Path $winlogon -Name AutoAdminLogon,DefaultPassword,DefaultUserName,DefaultDomainName -ErrorAction SilentlyContinue
   Remove-Item 'C:\Windows\Panther\Unattend.xml','C:\Windows\Panther\Unattend\Unattend.xml' -Force -ErrorAction SilentlyContinue
+  Write-VrcStage 'guest setup complete'
 }
 Stop-Transcript | Out-Null
 $lock.Dispose()
@@ -548,7 +632,7 @@ function writeWindowsSetupScripts(sourceTree: string, input: XenUnattendedIsoInp
   writeFileSync(join(scriptsDir, "VrcSetup.ps1"), buildWindowsSetupCompleteScript(input), { encoding: "utf8", mode: 0o600 });
   writeFileSync(
     join(scriptsDir, "SetupComplete.cmd"),
-    "@echo off\r\nschtasks.exe /Create /TN \"VRC-Guest-Setup\" /SC ONSTART /RU SYSTEM /RL HIGHEST /TR \"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\Windows\\Setup\\Scripts\\VrcSetup.ps1\" /F >nul\r\nexit /b 0\r\n",
+    "@echo off\r\nif not exist \"C:\\ProgramData\\VRC\" mkdir \"C:\\ProgramData\\VRC\"\r\ncopy /y \"C:\\Windows\\Setup\\Scripts\\VrcSetup.ps1\" \"C:\\ProgramData\\VRC\\VrcSetup.ps1\" >nul\r\nreg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v VRC-Guest-Setup /t REG_SZ /d \"powershell.exe -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\ProgramData\\VRC\\VrcSetup.ps1\" /f >nul\r\nexit /b 0\r\n",
     { encoding: "ascii", mode: 0o600 },
   );
 }
@@ -560,8 +644,8 @@ function writeWindowsSetupScripts(sourceTree: string, input: XenUnattendedIsoInp
 export function buildWindowsFirstLogonCommands(input: XenUnattendedIsoInput): WindowsFirstLogonCommands {
   void input;
   const remoteAccess = "cmd.exe /d /c netsh advfirewall set allprofiles state off & sc.exe config WinRM start= auto & net start WinRM & winrm.cmd quickconfig -quiet";
-  const configure = buildWindowsSpecializeBootstrapCommand();
-  const launch = 'cmd.exe /d /c if exist C:\\ProgramData\\VRC\\VrcSetup.ps1 start "" /b powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\ProgramData\\VRC\\VrcSetup.ps1';
+  const configure = `cmd.exe /d /c start "" /min ${buildWindowsSpecializeBootstrapCommand().replace(/^cmd\.exe \/c /, "cmd.exe /c ")}`;
+  const launch = 'cmd.exe /d /c if exist C:\\ProgramData\\VRC\\VrcSetup.ps1 start "" /min powershell.exe -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\ProgramData\\VRC\\VrcSetup.ps1';
   const cleanup = "cmd.exe /c del /f /q C:\\Windows\\Panther\\Unattend.xml C:\\Windows\\Panther\\Unattend\\Unattend.xml 2>nul";
   const overlong = [remoteAccess, configure, launch, cleanup].find((command) => command.length >= 1024);
   if (overlong) {

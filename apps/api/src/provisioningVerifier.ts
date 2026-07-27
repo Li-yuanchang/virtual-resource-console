@@ -858,13 +858,13 @@ async function installWindowsXenTools(
       updateProvisionTaskVm(input.taskId, item.name, {
         status: "running",
         currentStep: "guest-tools",
-        message: "正在挂载 XenServer Tools，等待系统内任务静默安装并重启",
+        message: "正在挂载 XenServer Tools，等待 Windows 登录态脚本安装",
       });
       await attachXenToolsIso(input.connection, vmId);
       updateProvisionTaskVm(input.taskId, item.name, {
         status: "running",
         currentStep: "guest-tools",
-        message: "XenServer Tools 已挂载，等待系统内任务完成安装和重启",
+        message: "Tools 光盘已挂载，等待 Windows 登录态脚本安装并重启",
       });
     }
     await verifyXenGuestToolsOnHost(input.taskId, item, input.connection, vmId, 45 * 60 * 1000);
@@ -1027,22 +1027,98 @@ async function verifyXenGuestToolsOnHost(
   let attempt = 0;
   while (Date.now() < deadline) {
     attempt += 1;
-    const output = await runHostCommand(
-      connection,
-      buildXenGuestMetricsProbeScript(vmId),
-    );
+    const output = await runHostCommand(connection, buildXenGuestToolsProgressProbeScript(vmId, item.ip));
     if (output.split(/\r?\n/).includes("READY")) return;
+    const elapsedMs = Date.now() - startedAt;
     updateProvisionTaskVm(taskId, item.name, {
       status: "running",
       currentStep: "guest-tools",
-      message:
-        Date.now() - startedAt >= guestToolsMetricsSoftWaitMs
-          ? `XenServer Tools 已挂载，平台指标回报较慢，后台继续核验 ${attempt}`
-          : `等待 XenServer Tools 回报平台指标 ${attempt}`,
+      progressPercent: Math.min(99, 90 + Math.floor(elapsedMs / 60_000)),
+      message: summarizeXenGuestToolsProgress(output, attempt, elapsedMs),
     });
     await delay(guestToolsMetricsProbeIntervalMs);
   }
   throw new Error(maxWaitMs ? "XenServer 未在 45 分钟内回报 Windows Guest Metrics" : "XenServer 未在任务硬时限内回报 Guest Metrics");
+}
+
+export function buildXenGuestToolsProgressProbeScript(vmId: string, guestIp: string): string {
+  return String.raw`
+vm_uuid='${escapeShellValue(vmId)}'
+guest_ip='${escapeShellValue(guestIp)}'
+clean_one_line() {
+  tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+power_state="$(xe vm-param-get uuid="$vm_uuid" param-name=power-state 2>/dev/null | clean_one_line)"
+printf 'POWER\t%s\n' "$power_state"
+guest_metrics="$(xe vm-param-get uuid="$vm_uuid" param-name=guest-metrics 2>/dev/null | clean_one_line)"
+if [ -n "$guest_metrics" ] && [ "$guest_metrics" != "<not in database>" ]; then
+  pv_drivers="$(xe vm-guest-metrics-param-get uuid="$guest_metrics" param-name=PV-drivers-detected 2>/dev/null | clean_one_line)"
+  printf 'GUEST_METRICS\t%s\tPV=%s\n' "$guest_metrics" "$pv_drivers"
+  if [ "$pv_drivers" = "true" ]; then
+    printf 'READY\n'
+    exit 0
+  fi
+else
+  printf 'GUEST_METRICS\tmissing\n'
+fi
+guest_memory="$(xe vm-data-source-query uuid="$vm_uuid" data-source=memory_internal_free 2>/dev/null | clean_one_line)"
+if printf '%s' "$guest_memory" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+  printf 'DATA_SOURCE\tmemory_internal_free\n'
+  printf 'READY\n'
+  exit 0
+fi
+[ -n "$guest_memory" ] && printf 'DATA_SOURCE\t%s\n' "$guest_memory"
+cd_state="empty"
+for vbd in $(xe vbd-list vm-uuid="$vm_uuid" type=CD --minimal 2>/dev/null | tr ',' ' '); do
+  empty="$(xe vbd-param-get uuid="$vbd" param-name=empty 2>/dev/null | clean_one_line)"
+  if [ "$empty" = "false" ]; then
+    vdi="$(xe vbd-param-get uuid="$vbd" param-name=vdi-uuid 2>/dev/null | clean_one_line)"
+    label="$(xe vdi-param-get uuid="$vdi" param-name=name-label 2>/dev/null | clean_one_line)"
+    cd_state="$label"
+    break
+  fi
+done
+printf 'CD\t%s\n' "$cd_state"
+if [ -n "$guest_ip" ]; then
+  if ping -c 1 -W 2 "$guest_ip" >/dev/null 2>&1; then
+    printf 'PING\tok\n'
+  else
+    printf 'PING\tfail\n'
+  fi
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 2 "$guest_ip" 5985 >/dev/null 2>&1 && printf 'WINRM\tok\n' || printf 'WINRM\tfail\n'
+  elif command -v timeout >/dev/null 2>&1; then
+    timeout 2 bash -c "cat < /dev/null > /dev/tcp/$guest_ip/5985" >/dev/null 2>&1 && printf 'WINRM\tok\n' || printf 'WINRM\tfail\n'
+  else
+    printf 'WINRM\tunknown\n'
+  fi
+fi
+`;
+}
+
+function summarizeXenGuestToolsProgress(output: string, attempt: number, elapsedMs: number): string {
+  const state = parseProbeState(output);
+  const details: string[] = [];
+  if (state.POWER && state.POWER !== "running") details.push(`VM ${state.POWER}`);
+  details.push(state.PING === "ok" ? "系统网络可达" : state.PING === "fail" ? "等待系统网络" : "等待系统响应");
+  if (state.WINRM === "ok") details.push("WinRM 已响应");
+  else if (state.WINRM === "fail") details.push("WinRM 未响应");
+  if (state.CD && state.CD !== "empty") details.push(`${state.CD} 已挂载`);
+  else details.push("等待 Tools 光盘");
+  if (state.GUEST_METRICS?.startsWith("missing")) details.push("Guest 指标未回报");
+  else if (state.GUEST_METRICS) details.push("Guest Metrics 已创建");
+  const prefix = elapsedMs >= guestToolsMetricsSoftWaitMs ? "监控工具耗时较长，继续核验" : "监控工具安装核验中";
+  return `${prefix}：${details.join("，")}（${attempt}）`;
+}
+
+function parseProbeState(output: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const line of output.split(/\r?\n/)) {
+    const [key, ...rest] = line.split("\t");
+    if (!key || !rest.length) continue;
+    result[key] = rest.join(" ");
+  }
+  return result;
 }
 
 export function buildXenGuestMetricsProbeScript(vmId: string): string {
@@ -1051,10 +1127,15 @@ vm_uuid='${escapeShellValue(vmId)}'
 # XenServer 7.x exposes the VM_guest_metrics reference through guest-metrics.
 guest_metrics="$(xe vm-param-get uuid="$vm_uuid" param-name=guest-metrics 2>/dev/null | tr -d '\r\n')"
 if [ -n "$guest_metrics" ] && [ "$guest_metrics" != "<not in database>" ]; then
-  printf 'READY\n'
-  exit 0
+  pv_drivers="$(xe vm-guest-metrics-param-get uuid="$guest_metrics" param-name=PV-drivers-detected 2>/dev/null | tr -d '\r\n')"
+  if [ "$pv_drivers" = "true" ]; then
+    printf 'READY\n'
+    exit 0
+  fi
 fi
-# Older XenServer/Tools combinations may expose Guest data sources without a guest-metrics reference.
+# XenServer 6.5 may omit the guest-metrics reference. A current numeric
+# memory_internal_free value is the minimum Guest-specific evidence we accept;
+# the VM-level last-updated timestamp alone can be stale and is not sufficient.
 guest_memory="$(xe vm-data-source-query uuid="$vm_uuid" data-source=memory_internal_free 2>/dev/null | tr -d '\r\n')"
 if printf '%s' "$guest_memory" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
   printf 'READY\n'

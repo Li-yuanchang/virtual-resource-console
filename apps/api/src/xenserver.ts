@@ -1,7 +1,7 @@
 import { Client } from "ssh2";
 import { assessVmReclaim } from "./analysis/reclaimStateMachine.js";
 import type { ProvisionProgressReporter, VirtualizationProvider } from "./providers/provider.js";
-import { buildXenServerPolicyEnv } from "./runtimePolicy.js";
+import { buildXenServerPolicyEnv, getRuntimePolicy, inferIpv4FromName } from "./runtimePolicy.js";
 import { normalizeStorageCapacity } from "./storageCapacity.js";
 import { describeStorageRepository } from "./storageRepositoryProfile.js";
 import type {
@@ -212,15 +212,25 @@ infer_ip_from_name() {
     if valid_host_octet "$last" && is_managed_ip "$ip"; then printf "%s" "$ip"; return; fi
   fi
   short="$(printf "%s" "$name" | grep -Eo '(^|[^0-9])[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)' | head -1 | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}' | head -1)"
-  if [ -n "$short" ] && [ -n "$VRC_SHORT_IP_BASE_PREFIX" ]; then
+  if [ -n "$short" ]; then
     subnet="$(printf "%s" "$short" | awk -F. '{print $1}')"
     last="$(printf "%s" "$short" | awk -F. '{print $2}')"
-    for allowed in $VRC_SHORT_IP_THIRD_OCTETS; do
-      if [ "$subnet" = "$allowed" ] && valid_host_octet "$last"; then
+    if valid_host_octet "$last"; then
+      for prefix in $VRC_SHORT_IP_PREFIXES; do
+        prefix_subnet="$(printf "%s" "$prefix" | awk -F. '{print $3}')"
+        if [ "$subnet" = "$prefix_subnet" ]; then
+          candidate="$prefix.$last"
+          if is_managed_ip "$candidate"; then printf "%s" "$candidate"; return; fi
+        fi
+      done
+      for allowed in $VRC_SHORT_IP_THIRD_OCTETS; do
+        if [ "$subnet" != "$allowed" ] || [ -z "$VRC_SHORT_IP_BASE_PREFIX" ]; then
+          continue
+        fi
         candidate="$VRC_SHORT_IP_BASE_PREFIX.$subnet.$last"
         if is_managed_ip "$candidate"; then printf "%s" "$candidate"; return; fi
-      fi
-    done
+      done
+    fi
   fi
   host_only="$(printf "%s" "$name" | grep -Eo '^[0-9]{1,3}([^0-9.]|$)' | head -1 | grep -Eo '[0-9]{1,3}' | head -1)"
   if [ -n "$host_only" ] && [ -n "$VRC_HOST_ONLY_PREFIX" ] && valid_host_octet "$host_only"; then
@@ -315,18 +325,31 @@ infer_ip_from_name() {
     fi
   fi
   short="$(printf "%s" "$name" | grep -Eo '(^|[^0-9])[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)' | head -1 | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}' | head -1)"
-  if [ -n "$short" ] && [ -n "$VRC_SHORT_IP_BASE_PREFIX" ]; then
+  if [ -n "$short" ]; then
     subnet="$(printf "%s" "$short" | awk -F. '{print $1}')"
     last="$(printf "%s" "$short" | awk -F. '{print $2}')"
-    for allowed in $VRC_SHORT_IP_THIRD_OCTETS; do
-      if [ "$subnet" = "$allowed" ] && valid_host_octet "$last"; then
+    if valid_host_octet "$last"; then
+      for prefix in $VRC_SHORT_IP_PREFIXES; do
+        prefix_subnet="$(printf "%s" "$prefix" | awk -F. '{print $3}')"
+        if [ "$subnet" = "$prefix_subnet" ]; then
+          candidate="$prefix.$last"
+          if is_managed_ip "$candidate"; then
+            printf "%s" "$candidate"
+            return
+          fi
+        fi
+      done
+      for allowed in $VRC_SHORT_IP_THIRD_OCTETS; do
+        if [ "$subnet" != "$allowed" ] || [ -z "$VRC_SHORT_IP_BASE_PREFIX" ]; then
+          continue
+        fi
         candidate="$VRC_SHORT_IP_BASE_PREFIX.$subnet.$last"
         if is_managed_ip "$candidate"; then
           printf "%s" "$candidate"
           return
         fi
-      fi
-    done
+      done
+    fi
   fi
   host_only="$(printf "%s" "$name" | grep -Eo '^[0-9]{1,3}([^0-9.]|$)' | head -1 | grep -Eo '[0-9]{1,3}' | head -1)"
   if [ -n "$host_only" ] && [ -n "$VRC_HOST_ONLY_PREFIX" ]; then
@@ -460,6 +483,23 @@ collect_vm_disk_info() {
   done
   printf "%s\t%s\t%s" "$total" "$count" "$summary"
 }
+guest_tools_status() {
+  vm_uuid="$1"
+  guest_metrics="$(xe vm-param-get uuid="$vm_uuid" param-name=guest-metrics 2>/dev/null | clean_one_line)"
+  if [ -n "$guest_metrics" ] && [ "$guest_metrics" != "<not in database>" ]; then
+    pv_drivers="$(xe vm-guest-metrics-param-get uuid="$guest_metrics" param-name=PV-drivers-detected 2>/dev/null | clean_one_line)"
+    if [ "$pv_drivers" = "true" ]; then printf "available"; return; fi
+    if [ "$pv_drivers" = "false" ]; then printf "unavailable"; return; fi
+  fi
+  # Some XenServer/Citrix Hypervisor pools omit guest-metrics even when the guest
+  # agent reports guest-only data sources, so keep this as a version-neutral fallback.
+  guest_memory="$(xe vm-data-source-query uuid="$vm_uuid" data-source=memory_internal_free 2>/dev/null | clean_one_line)"
+  if printf "%s" "$guest_memory" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+    printf "available"
+    return
+  fi
+  printf "unknown"
+}
 host_count="$(xe host-list --minimal 2>/dev/null | tr ',' ' ' | wc -w | awk '{print $1}')"
 vm_list="$(xe vm-list is-control-domain=false --minimal 2>/dev/null | tr ',' ' ')"
 for vm in $vm_list; do
@@ -505,11 +545,12 @@ for vm in $vm_list; do
   guest_os="$(guest_os_label "$vm")"
   disk_info="$(collect_vm_disk_info "$vm")"
   console_location="$(rfb_console_location "$vm")"
+  tools_status="$(guest_tools_status "$vm")"
   effective_host="$resident"
   if [ -z "$effective_host" ] || [ "$effective_host" = "<not in database>" ]; then
     effective_host="$affinity"
   fi
-  printf 'VM\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vm" "$name" "$power" "$(num_or_zero "$vcpu_count")" "$(num_or_zero "$vcpu_start")" "$(bytes_to_gib "$mem_dyn_max")" "$disk_info" "$effective_host" "$first_guest_ip" "$guest_os" "$console_location"
+  printf 'VM\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vm" "$name" "$power" "$(num_or_zero "$vcpu_count")" "$(num_or_zero "$vcpu_start")" "$(bytes_to_gib "$mem_dyn_max")" "$disk_info" "$effective_host" "$first_guest_ip" "$guest_os" "$console_location" "$tools_status"
 done
 `;
 
@@ -1215,7 +1256,9 @@ elif [ "$VRC_INSTALL_MEDIA_MODE" = "windows-unattended" ]; then
   attach_iso_auto "$vm_uuid" "$VRC_ISO_UUID" true
   [ -n "$VRC_AUX_ISO_UUID" ] && attach_iso_auto "$vm_uuid" "$VRC_AUX_ISO_UUID" false
   # Tools 只在 WinRM 就绪后换盘挂载，避免第三张光盘挤掉任务级应答介质。
-  xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=true >/dev/null 2>&1 || true
+  # Windows PV drivers rely on the Windows device id and template CPU topology after XenServer Tools is installed.
+  # Missing Windows platform keys can put Windows Server 2008 R2 into a BSOD recovery loop after Tools reboot.
+  xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:device_id=0002 platform:viridian=true platform:cores-per-socket=1 >/dev/null 2>&1 || true
 elif should_use_unattended_install "$template_name"; then
   xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
   prepare_unattended_install "$vm_uuid" "$template_name"
@@ -2068,18 +2111,22 @@ function parseHostInventory(output: string, connectionId: string): HostInventory
 }
 
 function parseVmList(output: string, connectionId: string): VmNode[] {
+  const policy = getRuntimePolicy();
   return output
     .split(/\r?\n/)
     .filter((line) => line.startsWith("VM\t"))
     .map((line) => {
       const cols = line.split("\t");
       const providerId = cols[1] ?? "";
+      const name = cols[2] ?? "";
+      const remoteIp = cols[11]?.trim() ?? "";
+      const inferredIp = remoteIp && remoteIp !== "-" ? remoteIp : inferIpv4FromName(name, policy);
       const vm: VmNode = {
         id: `${connectionId}:vm:${providerId}`,
         connectionId,
         providerId,
         consoleRef: providerId,
-        name: cols[2] ?? "",
+        name,
         powerState: normalizePowerState(cols[3]),
         cpuCount: parseNumber(cols[4]),
         cpuStartup: parseNumber(cols[5]),
@@ -2088,9 +2135,9 @@ function parseVmList(output: string, connectionId: string): VmNode[] {
         diskCount: parseNumber(cols[8]),
         diskSizeSummary: cols[9] || undefined,
         hostId: cols[10] || undefined,
-        ipAddresses: cols[11] ? [cols[11]] : [],
+        ipAddresses: inferredIp ? [inferredIp] : [],
         guestOs: normalizeGuestOsLabel(cols[12]),
-        toolsStatus: "unknown",
+        toolsStatus: normalizeXenToolsStatus(cols[14]),
         reclaimLevel: "P3",
         reclaimReason: "",
         metadata: {
@@ -2106,16 +2153,19 @@ function parseVmList(output: string, connectionId: string): VmNode[] {
 }
 
 function parseVmSearchIndex(output: string): VmSearchIndexItem[] {
+  const policy = getRuntimePolicy();
   return output
     .split(/\r?\n/)
     .filter((line) => line.startsWith("SEARCH_VM\t"))
     .map((line) => {
       const [, providerId = "", name = "", hostId = "", ip = ""] = line.split("\t");
+      const remoteIp = ip.trim();
+      const inferredIp = remoteIp && remoteIp !== "-" ? remoteIp : inferIpv4FromName(name, policy);
       return {
         providerId,
         hostId: hostId && hostId !== "<not in database>" ? hostId : undefined,
         name,
-        ipAddresses: ip ? [ip] : [],
+        ipAddresses: inferredIp ? [inferredIp] : [],
       } satisfies VmSearchIndexItem;
     })
     .filter((item) => item.providerId);
@@ -2583,5 +2633,11 @@ function normalizePowerState(value: string | undefined): VmNode["powerState"] {
   if (value === "running") return "running";
   if (value === "halted") return "halted";
   if (value === "suspended") return "suspended";
+  return "unknown";
+}
+
+function normalizeXenToolsStatus(value: string | undefined): VmNode["toolsStatus"] {
+  if (value === "available") return "installed";
+  if (value === "unavailable") return "missing";
   return "unknown";
 }

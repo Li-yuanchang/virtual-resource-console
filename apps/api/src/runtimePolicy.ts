@@ -1,4 +1,5 @@
-import { readLocalJsonConfig, resolveVrcConfigPath } from "./localConfigFile.js";
+import { getIpPoolPolicy } from "./ipPoolPolicy.js";
+import type { IpPoolPolicy, RuntimeIpPoolPolicy } from "./ipPoolPolicy.js";
 
 export interface RuntimePolicy {
   managedIpPattern?: string;
@@ -6,6 +7,7 @@ export interface RuntimePolicy {
     enabled: boolean;
     shortIpBasePrefix?: string;
     shortIpThirdOctets: string[];
+    shortIpPrefixes: string[];
     hostOnlyPrefix?: string;
   };
   provisioning: {
@@ -19,41 +21,53 @@ export interface RuntimePolicy {
   };
 }
 
-type RuntimePolicyInput = Partial<{
-  managedIpPattern: string;
-  ipInference: Partial<RuntimePolicy["ipInference"]>;
-  provisioning: Partial<{
-    rootPasswordTemplate: string;
-  }>;
-  xenserver: Partial<RuntimePolicy["xenserver"]>;
-}>;
+const defaultRootPasswordTemplate = "root@{third}.{fourth}";
 
-const defaultRuntimePolicy: RuntimePolicy = {
-  managedIpPattern: "",
-  ipInference: {
-    enabled: true,
-    shortIpBasePrefix: "",
-    shortIpThirdOctets: [],
-    hostOnlyPrefix: "",
-  },
-  provisioning: {
-    rootPasswordTemplate: "",
-  },
-  xenserver: {
-    networkDeviceRules: [],
-  },
-};
-
-let cachedPolicy: RuntimePolicy | null = null;
-
+/**
+ * Returns the runtime policy derived from the current IP pool configuration.
+ * The policy is rebuilt on every call so IP pool edits take effect without restarting the API.
+ *
+ * @returns runtime policy used by VM IP inference and XenServer scripts
+ */
 export function getRuntimePolicy(): RuntimePolicy {
-  if (cachedPolicy) return cachedPolicy;
-  cachedPolicy = loadRuntimePolicy();
-  return cachedPolicy;
+  try {
+    return createRuntimePolicy(getIpPoolPolicy());
+  } catch {
+    return createRuntimePolicy();
+  }
 }
 
-export function getRuntimePolicyPath(): string {
-  return resolveVrcConfigPath("runtime-policy.json", "VRC_RUNTIME_POLICY_FILE");
+/**
+ * Builds a runtime policy from the authoritative IP pool configuration.
+ *
+ * @param ipPoolPolicy normalized IP pool configuration; omitted when the IP pool file is unavailable
+ * @returns runtime policy with managed ranges and short-name inference rules derived from IP pool prefixes
+ */
+export function createRuntimePolicy(ipPoolPolicy?: IpPoolPolicy): RuntimePolicy {
+  const ipPools = ipPoolPolicy?.ipPools ?? [];
+  const shortIpPrefixes = Array.from(new Set(ipPools.map((item) => item.prefix).filter(isIpv4Prefix))).sort(compareIpv4Prefixes);
+  const shortIpBasePrefix = commonBasePrefix(shortIpPrefixes);
+  const shortIpThirdOctets = shortIpBasePrefix
+    ? shortIpPrefixes
+        .filter((prefix) => prefix.startsWith(`${shortIpBasePrefix}.`))
+        .map((prefix) => prefix.split(".")[2])
+    : [];
+  return {
+    managedIpPattern: buildManagedIpPattern(shortIpPrefixes),
+    ipInference: {
+      enabled: shortIpPrefixes.length > 0,
+      shortIpBasePrefix,
+      shortIpThirdOctets,
+      shortIpPrefixes,
+      hostOnlyPrefix: selectHostOnlyPrefix(ipPools),
+    },
+    provisioning: {
+      rootPasswordTemplate: defaultRootPasswordTemplate,
+    },
+    xenserver: {
+      networkDeviceRules: [],
+    },
+  };
 }
 
 export function isManagedIpv4(ip: string, policy = getRuntimePolicy()): boolean {
@@ -71,11 +85,16 @@ export function inferIpv4FromName(name: string, policy = getRuntimePolicy()): st
   if (fullIp?.[1] && isManagedIpv4(fullIp[1], policy)) return fullIp[1];
   if (!policy.ipInference.enabled) return "";
 
-  const thirdOctets = policy.ipInference.shortIpThirdOctets.filter(Boolean).join("|");
-  const basePrefix = policy.ipInference.shortIpBasePrefix?.trim();
-  if (thirdOctets && basePrefix) {
-    const shortIp = name.match(new RegExp(`(?:^|[^0-9])((?:${thirdOctets}))[.-](\\d{1,3})(?:[^0-9]|$)`));
-    if (shortIp?.[1] && isValidHostOctet(shortIp[2])) {
+  const shortIp = name.match(/(?:^|[^0-9])(\d{1,3})[.-](\d{1,3})(?:[^0-9]|$)/);
+  if (shortIp?.[1] && isValidHostOctet(shortIp[2])) {
+    const matchingPrefix = policy.ipInference.shortIpPrefixes.find((prefix) => prefix.split(".")[2] === shortIp[1]);
+    if (matchingPrefix) {
+      const ip = `${matchingPrefix}.${shortIp[2]}`;
+      if (isManagedIpv4(ip, policy)) return ip;
+    }
+
+    const basePrefix = policy.ipInference.shortIpBasePrefix?.trim();
+    if (basePrefix && policy.ipInference.shortIpThirdOctets.includes(shortIp[1])) {
       const ip = `${basePrefix}.${shortIp[1]}.${shortIp[2]}`;
       if (isManagedIpv4(ip, policy)) return ip;
     }
@@ -95,55 +114,55 @@ export function buildXenServerPolicyEnv(policy = getRuntimePolicy()): Record<str
     VRC_MANAGED_IP_PATTERN: policy.managedIpPattern ?? "",
     VRC_SHORT_IP_BASE_PREFIX: policy.ipInference.shortIpBasePrefix ?? "",
     VRC_SHORT_IP_THIRD_OCTETS: policy.ipInference.shortIpThirdOctets.join(" "),
+    VRC_SHORT_IP_PREFIXES: policy.ipInference.shortIpPrefixes.join(" "),
     VRC_HOST_ONLY_PREFIX: policy.ipInference.hostOnlyPrefix ?? "",
-    VRC_XENSERVER_NETWORK_RULES: policy.xenserver.networkDeviceRules.map((item) => `${item.ipPrefix}|${item.device}`).join("\n"),
+    VRC_XENSERVER_NETWORK_RULES: "",
   };
 }
 
-function loadRuntimePolicy(): RuntimePolicy {
-  const file = getRuntimePolicyPath();
-  return readLocalJsonConfig({
-    filePath: file,
-    label: "运行策略配置",
-    normalize: (input) => normalizeRuntimePolicy(input as RuntimePolicyInput),
-    onMissing: () => defaultRuntimePolicy,
-    onInvalid: () => defaultRuntimePolicy,
-  });
+function buildManagedIpPattern(prefixes: string[]): string {
+  if (!prefixes.length) return "";
+  const alternatives = prefixes.map((prefix) => prefix.replaceAll(".", "\\."));
+  // XenServer 6.5 uses grep -E, which supports ordinary groups but not PCRE non-capturing groups.
+  return `^(${alternatives.join("|")})\\.[0-9]{1,3}$`;
 }
 
-function normalizeRuntimePolicy(input: RuntimePolicyInput): RuntimePolicy {
-  return {
-    managedIpPattern: typeof input.managedIpPattern === "string" ? input.managedIpPattern.trim() : defaultRuntimePolicy.managedIpPattern,
-    ipInference: {
-      enabled: input.ipInference?.enabled ?? defaultRuntimePolicy.ipInference.enabled,
-      shortIpBasePrefix: input.ipInference?.shortIpBasePrefix?.trim() ?? defaultRuntimePolicy.ipInference.shortIpBasePrefix,
-      shortIpThirdOctets: Array.isArray(input.ipInference?.shortIpThirdOctets)
-        ? input.ipInference.shortIpThirdOctets.map(String).map((item) => item.trim()).filter(Boolean)
-        : defaultRuntimePolicy.ipInference.shortIpThirdOctets,
-      hostOnlyPrefix: input.ipInference?.hostOnlyPrefix?.trim() ?? defaultRuntimePolicy.ipInference.hostOnlyPrefix,
-    },
-    provisioning: {
-      rootPasswordTemplate:
-        typeof input.provisioning?.rootPasswordTemplate === "string"
-          ? input.provisioning.rootPasswordTemplate
-          : defaultRuntimePolicy.provisioning.rootPasswordTemplate,
-    },
-    xenserver: {
-      networkDeviceRules: Array.isArray(input.xenserver?.networkDeviceRules)
-        ? input.xenserver.networkDeviceRules
-            .map((item) => ({
-              ipPrefix: String(item.ipPrefix ?? "").trim(),
-              device: String(item.device ?? "").trim(),
-            }))
-            .filter((item) => item.ipPrefix && item.device)
-        : defaultRuntimePolicy.xenserver.networkDeviceRules,
-    },
-  };
+function commonBasePrefix(prefixes: string[]): string {
+  if (!prefixes.length) return "";
+  const bases = prefixes.map((prefix) => prefix.split(".").slice(0, 2).join("."));
+  return bases.every((base) => base === bases[0]) ? bases[0] : "";
+}
+
+function selectHostOnlyPrefix(ipPools: RuntimeIpPoolPolicy[]): string {
+  const genericPool =
+    ipPools.find((item) => !item.hostPrefixes?.length && !item.networkName?.trim()) ??
+    ipPools.find((item) => !item.hostPrefixes?.length) ??
+    ipPools[0];
+  return genericPool?.prefix ?? "";
+}
+
+function compareIpv4Prefixes(left: string, right: string): number {
+  const leftParts = left.split(".").map(Number);
+  const rightParts = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = leftParts[index] - rightParts[index];
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+function isIpv4Prefix(value: string): boolean {
+  const parts = value.split(".");
+  return parts.length === 3 && parts.every(isIpv4Octet);
 }
 
 function isIpv4(value: string): boolean {
   const parts = value.split(".");
-  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+  return parts.length === 4 && parts.every(isIpv4Octet);
+}
+
+function isIpv4Octet(value: string): boolean {
+  return /^\d{1,3}$/.test(value) && Number(value) >= 0 && Number(value) <= 255;
 }
 
 function isValidHostOctet(value: string | undefined): boolean {
