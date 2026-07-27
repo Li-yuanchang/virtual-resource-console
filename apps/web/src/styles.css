@@ -2566,7 +2566,7 @@ textarea,
 }
 
 .overview-panel .el-table__empty-block {
-  min-height: clamp(220px, 40vh, 520px);
+  min-height: 0;
 }
 
 .overview-panel .el-table__empty-text {
@@ -2579,11 +2579,16 @@ textarea,
 .overview-empty-state {
   display: grid;
   place-items: center;
-  min-height: clamp(220px, 40vh, 520px);
-  padding: 28px 0;
+  min-height: clamp(220px, 34vh, 460px);
+  padding: 18px 0 24px;
 }
 
 .overview-empty-loading {
+  position: static;
+  inset: auto;
+  z-index: auto;
+  background: transparent;
+  backdrop-filter: none;
   min-width: 320px;
 }
 
@@ -6694,7 +6699,7 @@ button:focus-visible,
   align-items: center;
   justify-content: flex-start;
   gap: 0;
-  margin-bottom: 10px;
+  margin-bottom: 6px;
 }
 
 .overview-table-heading {
@@ -6744,6 +6749,11 @@ button:focus-visible,
   border: 1px solid transparent;
   border-radius: 7px;
   box-shadow: none;
+}
+
+.overview-query-group .el-input__prefix,
+.overview-query-group .el-input__suffix {
+  height: var(--vrc-control-height);
 }
 
 .overview-query-group .el-input.is-focus .el-input__wrapper {

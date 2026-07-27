@@ -98,6 +98,7 @@ function defaultRuntimePolicy(): RuntimePolicy {
       enabled: true,
       shortIpBasePrefix: "",
       shortIpThirdOctets: [],
+      shortIpPrefixes: [],
       hostOnlyPrefix: "",
     },
     provisioning: {

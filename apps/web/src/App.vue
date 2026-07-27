@@ -413,6 +413,9 @@ interface MaintenanceGeneratedIsoReport {
 }
 
 const VM_SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const OVERVIEW_SEARCH_APPLY_DEBOUNCE_MS = 180;
+const OVERVIEW_VM_SEARCH_DEBOUNCE_MS = 300;
+const OVERVIEW_VM_SEARCH_STABLE_HOLD_MS = 700;
 const VM_SEARCH_REVALIDATE_INTERVAL_MS = 2_000;
 const VM_SEARCH_REVALIDATE_MAX_ATTEMPTS = 15;
 const INVENTORY_SNAPSHOT_REVALIDATE_INTERVAL_MS = 2_000;
@@ -783,6 +786,8 @@ const chromeExtensionDraftConnection = reactive<ChromeExtensionDraftConnection>(
   password: "",
 });
 const hostOverviewSearch = ref("");
+const appliedHostOverviewSearch = ref("");
+const overviewVmSearchHolding = ref(false);
 const hostOverviewMatchMode = ref<"exact" | "fuzzy">("exact");
 const hostOverviewSort = ref<{ prop: HostOverviewSortKey; order: TableSortOrder }>({ prop: "hostName", order: "ascending" });
 const vmSearchCache = ref<Record<string, VmSearchCacheEntry>>({});
@@ -800,10 +805,14 @@ let vmListRequestSeq = 0;
 let activitySeq = 0;
 let lastErrorToast = "";
 let lastErrorToastAt = 0;
+let hostOverviewSearchApplyTimer: ReturnType<typeof setTimeout> | undefined;
+let overviewVmSearchHoldTimer: ReturnType<typeof setTimeout> | undefined;
 let vmSearchTimer: ReturnType<typeof setTimeout> | undefined;
 let connectionPreferenceSaveTimer: ReturnType<typeof setTimeout> | undefined;
 let appearanceMediaQuery: MediaQueryList | undefined;
 let inventoryEventSource: EventSource | null = null;
+let inventoryEventResourceRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+let inventoryEventResourceRefreshSeq = 0;
 let removeDesktopUpdateListener: (() => void) | undefined;
 let lastInventoryEventSeq = 0;
 const provisioningPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1213,7 +1222,7 @@ const hostOverviewMetricCards = computed(() => {
   ];
 });
 
-const overviewSearchKeywords = computed(() => parseOverviewSearchKeywords(hostOverviewSearch.value));
+const overviewSearchKeywords = computed(() => parseOverviewSearchKeywords(appliedHostOverviewSearch.value));
 const overviewSearchKeyword = computed(() => overviewSearchKeywords.value.join(" "));
 const overviewSearchLabel = computed(() => overviewSearchKeywords.value.join("、"));
 const overviewSearchBatchText = computed(() => (overviewSearchKeywords.value.length > 1 ? `批量 ${overviewSearchKeywords.value.length} 项 · ` : ""));
@@ -1222,11 +1231,9 @@ const filteredHostOverviewRows = computed(() => {
   const keywords = overviewSearchKeywords.value;
   if (!keywords.length) return hostOverviewRows.value;
   const waitingForVmIndex = keywords.some(shouldSearchVmIp) && hostOverviewRows.value.some((row) => hasOverviewInventory(row) && !hasSettledVmSearchCache(row));
-  if (waitingForVmIndex) {
-    // Keep unresolved rows visible while connections refresh; an empty table makes a slow connection look like a failed search.
-    return hostOverviewRows.value.filter(
-      (row) => !hasOverviewInventory(row) || !hasSettledVmSearchCache(row) || keywords.some((keyword) => hostMatchesKeyword(row, keyword)),
-    );
+  if (waitingForVmIndex && overviewVmSearchHolding.value) {
+    // Keep a short stable window so VM-IP search does not shrink the table one row at a time.
+    return hostOverviewRows.value;
   }
   return hostOverviewRows.value.filter((row) => rowMatchesOverviewKeywords(row, keywords));
 });
@@ -1275,7 +1282,8 @@ const vmSearchStatusText = computed(() => {
   if (!overviewNeedsVmSearch.value) return `${overviewSearchBatchText.value}本地匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台`;
   const total = hostOverviewRows.value.filter(hasOverviewInventory).length;
   const cached = vmSearchSettledCount.value;
-  if (overviewVmSearchLoading.value) return `${overviewSearchBatchText.value}VM IP 缓存 ${cached} / ${total} · 已展示待查询连接`;
+  if (overviewVmSearchLoading.value && overviewVmSearchHolding.value) return `${overviewSearchBatchText.value}VM IP 缓存 ${cached} / ${total} · 稳定结果中`;
+  if (overviewVmSearchLoading.value) return `${overviewSearchBatchText.value}VM IP 匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台 · 后台补齐 ${cached} / ${total}`;
   return `${overviewSearchBatchText.value}VM IP 匹配 ${filteredHostOverviewRows.value.length} / ${hostOverviewRows.value.length} 台 · 缓存 ${cached} / ${total}`;
 });
 const resolvedAppearanceDark = computed(() => uiPreferences.toneMode === "dark" || (uiPreferences.toneMode === "system" && systemDark.value));
@@ -1425,6 +1433,8 @@ onBeforeUnmount(() => {
   removeDesktopUpdateListener = undefined;
   appearanceMediaQuery?.removeEventListener("change", handleAppearanceMediaChange);
   if (connectionPreferenceSaveTimer) clearTimeout(connectionPreferenceSaveTimer);
+  if (inventoryEventResourceRefreshTimer) clearTimeout(inventoryEventResourceRefreshTimer);
+  inventoryEventResourceRefreshTimer = undefined;
   for (const timer of provisioningPollTimers.values()) clearTimeout(timer);
   provisioningPollTimers.clear();
   for (const timer of vmSearchRefreshTimers) clearTimeout(timer);
@@ -1435,15 +1445,19 @@ onBeforeUnmount(() => {
   provisioningEventSources.clear();
   inventoryEventSource?.close();
   inventoryEventSource = null;
+  if (hostOverviewSearchApplyTimer) clearTimeout(hostOverviewSearchApplyTimer);
+  hostOverviewSearchApplyTimer = undefined;
+  if (overviewVmSearchHoldTimer) clearTimeout(overviewVmSearchHoldTimer);
+  overviewVmSearchHoldTimer = undefined;
+  overviewVmSearchHolding.value = false;
+  if (vmSearchTimer) clearTimeout(vmSearchTimer);
+  vmSearchTimer = undefined;
 });
 
 watch(hostOverviewSearch, (value) => {
-  if (vmSearchTimer) clearTimeout(vmSearchTimer);
-  const keywords = parseOverviewSearchKeywords(value);
-  if (!keywords.some(shouldSearchVmIp)) return;
-  vmSearchTimer = setTimeout(() => {
-    void ensureVmSearchCacheForKeyword(keywords.join(" "));
-  }, 350);
+  scheduleOverviewVmSearchStableHold(value);
+  scheduleOverviewSearchApply(value);
+  scheduleOverviewVmSearchCacheLoad(value);
 });
 
 watch(vmDetailVisible, (visible) => {
@@ -3332,6 +3346,7 @@ async function loadHostOverview(options: { forceRefresh?: boolean } = {}) {
         status: "loading" as const,
       }));
       replaceHostOverviewRows(item.id, rows.length ? rows : [createFallbackOverviewRow(item, "error", "未读取到物理机")]);
+      scheduleOverviewVmSearchCacheLoad();
       for (const row of rows) {
         void loadHostOverviewSummary(row, requestId, options.forceRefresh);
       }
@@ -3398,6 +3413,21 @@ async function ensureVmSearchCacheForKeyword(keyword: string, force = false) {
   });
 }
 
+function scheduleOverviewVmSearchCacheLoad(value = hostOverviewSearch.value) {
+  if (vmSearchTimer) clearTimeout(vmSearchTimer);
+  const keywords = parseOverviewSearchKeywords(value);
+  if (!keywords.some(shouldSearchVmIp)) {
+    vmSearchTimer = undefined;
+    return;
+  }
+  vmSearchTimer = setTimeout(() => {
+    vmSearchTimer = undefined;
+    const latestKeywords = parseOverviewSearchKeywords(hostOverviewSearch.value);
+    if (!latestKeywords.some(shouldSearchVmIp)) return;
+    void ensureVmSearchCacheForKeyword(latestKeywords.join(" "));
+  }, OVERVIEW_VM_SEARCH_DEBOUNCE_MS);
+}
+
 async function loadHostVmSearchCache(rows: HostOverviewRow[], force = false, revalidateAttempt = 0) {
   if (!rows.length) return;
   const hasFreshCache = rows.every((row) => {
@@ -3407,12 +3437,13 @@ async function loadHostVmSearchCache(rows: HostOverviewRow[], force = false, rev
   if (hasFreshCache && revalidateAttempt === 0) return;
   for (const row of rows) {
     const existing = vmSearchCache.value[row.key];
+    const showLoading = revalidateAttempt === 0 || force;
     vmSearchCache.value = {
       ...vmSearchCache.value,
       [row.key]: {
         items: existing?.items ?? [],
         updatedAt: existing?.updatedAt ?? 0,
-        loading: true,
+        loading: showLoading,
       },
     };
   }
@@ -3664,6 +3695,13 @@ async function loadVmSummary(options: { silent?: boolean; forceRefresh?: boolean
     if (requestId !== vmSummaryRequestSeq || selectedHost.value?.providerId !== hostId) return;
     vmSummary.value = result.summary;
     selectedResourceCapacity.value = result.resourceCapacity ?? null;
+    if (selectedHostOverviewKey.value) {
+      updateHostOverviewRow(selectedHostOverviewKey.value, {
+        summary: result.summary,
+        resourceCapacity: result.resourceCapacity ?? null,
+        status: "ready",
+      });
+    }
     pushActivity("加载 VM 汇总", {
       target: selectedHost.value.name,
       detail: `运行 ${result.summary.running} / 共 ${result.summary.total} 台`,
@@ -4000,6 +4038,18 @@ function applyInventoryEvent(event: InventoryEvent) {
   } else if (event.type === "vm.delete") {
     removeVmRowById(event.vmId);
   }
+  scheduleInventoryEventResourceRefresh();
+}
+
+function scheduleInventoryEventResourceRefresh() {
+  const refreshSeq = ++inventoryEventResourceRefreshSeq;
+  if (inventoryEventResourceRefreshTimer) clearTimeout(inventoryEventResourceRefreshTimer);
+  inventoryEventResourceRefreshTimer = setTimeout(() => {
+    inventoryEventResourceRefreshTimer = undefined;
+    if (refreshSeq !== inventoryEventResourceRefreshSeq || !selectedHost.value) return;
+    // VM 删除/创建后的物理内存回收可能晚于 VM 行事件，延迟一次汇总读取以校正容量卡片。
+    void loadVmSummary({ silent: true, forceRefresh: true });
+  }, 1_800);
 }
 
 function inventoryEventMatchesSelectedHost(event: InventoryEvent) {
@@ -4141,6 +4191,9 @@ function listenProvisioningTask(taskId: string) {
   if (provisioningEventSources.has(taskId) || provisioningPollTimers.has(taskId)) return;
   const source = new EventSource(`/api/provisioning/tasks/${encodeURIComponent(taskId)}/events`);
   provisioningEventSources.set(taskId, source);
+  // SSE can miss the terminal event when the API process restarts during a long install.
+  // Keep a lightweight poller as the source of truth for terminal state reconciliation.
+  pollProvisioningTask(taskId);
   const closeSource = () => {
     source.close();
     provisioningEventSources.delete(taskId);
@@ -4386,36 +4439,114 @@ function exportCsv(orderedVms: VmNode[] = filteredVms.value) {
   URL.revokeObjectURL(url);
 }
 
-function exportHostOverviewCsv() {
-  const rows = sortedHostOverviewRows.value.map((row) => {
+async function exportHostOverviewWorkbook() {
+  const overviewRows = sortedHostOverviewRows.value;
+  if (!overviewRows.length) return;
+
+  const hostRows = overviewRows.map((row) => {
     const recommendation = hostRecommendation(row);
-    return [
-      providerLabel(row.connection.providerType),
-      row.connection.name,
-      row.host.name,
-      row.host.address,
-      overviewStatusLabel(row),
-      overviewCpuMain(row),
-      overviewCpuSubline(row),
-      overviewMemoryMain(row),
-      overviewMemorySubline(row),
-      overviewStorageMain(row),
-      overviewStorageSubline(row),
-      row.summary ? `${row.summary.running} / ${row.summary.total}` : "-",
-      recommendation.label,
-      recommendation.reason,
-      row.error ?? "",
-    ];
+    return {
+      平台: providerLabel(row.connection.providerType),
+      连接: row.connection.name,
+      物理机: row.host.name,
+      "管理 IP": row.host.address,
+      状态: overviewStatusLabel(row),
+      CPU: overviewCpuMain(row),
+      "CPU 运行情况": overviewCpuSubline(row),
+      内存: overviewMemoryMain(row),
+      "内存余量": overviewMemorySubline(row),
+      存储: overviewStorageMain(row),
+      "存储余量": overviewStorageSubline(row),
+      "运行 VM / 总 VM": row.summary ? `${row.summary.running} / ${row.summary.total}` : "-",
+      创建评估: recommendation.label,
+      评估原因: recommendation.reason,
+      错误: row.error ?? "",
+    };
   });
-  const header = ["平台", "连接", "物理机", "管理 IP", "状态", "CPU", "CPU 运行情况", "内存", "内存余量", "存储", "存储余量", "运行 VM / 总 VM", "创建评估", "评估原因", "错误"];
-  const csv = [header, ...rows].map((row) => row.map((cell) => `"${String(cell).replaceAll("\"", "\"\"")}"`).join(",")).join("\n");
-  const blob = new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `vrc-host-overview-${new Date().toISOString().slice(0, 10)}.csv`;
-  link.click();
-  URL.revokeObjectURL(url);
+
+  const vmRows: Array<Record<string, string>> = [];
+  let vmItemCount = 0;
+  const rowsByConnection = new Map<string, HostOverviewRow[]>();
+  for (const row of overviewRows) {
+    const rows = rowsByConnection.get(row.connection.id) ?? [];
+    rows.push(row);
+    rowsByConnection.set(row.connection.id, rows);
+  }
+
+  // The search-index endpoint is backed by VRC's persisted VM cache, so export does not
+  // require opening each physical host or issuing a state-changing XenServer request.
+  const indexesByConnection = new Map<string, VmSearchIndexItem[]>();
+  const indexErrors = new Map<string, string>();
+  await runLimited(Array.from(rowsByConnection.values()), 3, async (rows) => {
+    const connection = rows[0]?.connection;
+    if (!connection) return;
+    try {
+      const result = await postJson<VmSearchIndexResponse>("/api/inventory/vm-search-index", {
+        ...buildConnectionPayloadFromSummary(connection),
+      });
+      indexesByConnection.set(connection.id, result.items);
+    } catch (error) {
+      indexErrors.set(connection.id, error instanceof Error ? error.message : "VM 缓存读取失败");
+    }
+  });
+
+  for (const [connectionId, rows] of rowsByConnection) {
+    const connection = rows[0]?.connection;
+    if (!connection) continue;
+    const items = indexesByConnection.get(connectionId) ?? [];
+    for (const item of items) {
+      vmItemCount += 1;
+      const matchingRows = rows.filter((row) => item.hostId && (item.hostId === row.host.providerId || item.hostId === row.host.id));
+      const hostRow = matchingRows.length === 1 ? matchingRows[0] : rows.length === 1 && !item.hostId ? rows[0] : undefined;
+      vmRows.push({
+        平台: providerLabel(connection.providerType),
+        连接: connection.name,
+        物理机名称: hostRow?.host.name ?? "",
+        "物理机 IP": hostRow?.host.address ?? "",
+        虚拟机名称: item.name,
+        "虚拟机 IP": item.ipAddresses.join(" / ") || "-",
+        "VM ID": item.providerId,
+        匹配状态: hostRow ? "已匹配" : "未匹配物理机",
+      });
+    }
+    const error = indexErrors.get(connectionId);
+    if (error) {
+      vmRows.push({
+        平台: providerLabel(connection.providerType),
+        连接: connection.name,
+        物理机名称: "",
+        "物理机 IP": "",
+        虚拟机名称: "",
+        "虚拟机 IP": "",
+        "VM ID": "",
+        匹配状态: `VM 缓存读取失败：${error}`,
+      });
+    }
+  }
+
+  const XLSX = await import("xlsx");
+  const workbook = XLSX.utils.book_new();
+  const hostSheet = XLSX.utils.json_to_sheet(hostRows);
+  const vmSheet = XLSX.utils.json_to_sheet(vmRows, {
+    header: ["平台", "连接", "物理机名称", "物理机 IP", "虚拟机名称", "虚拟机 IP", "VM ID", "匹配状态"],
+  });
+  hostSheet["!cols"] = [
+    { wch: 12 }, { wch: 22 }, { wch: 24 }, { wch: 18 }, { wch: 12 },
+    { wch: 18 }, { wch: 22 }, { wch: 18 }, { wch: 22 }, { wch: 18 },
+    { wch: 22 }, { wch: 18 }, { wch: 14 }, { wch: 36 }, { wch: 36 },
+  ];
+  vmSheet["!cols"] = [
+    { wch: 12 }, { wch: 22 }, { wch: 24 }, { wch: 18 },
+    { wch: 30 }, { wch: 30 }, { wch: 38 }, { wch: 24 },
+  ];
+  XLSX.utils.book_append_sheet(workbook, hostSheet, "物理机总览");
+  XLSX.utils.book_append_sheet(workbook, vmSheet, "虚拟机信息");
+  XLSX.writeFile(workbook, `vrc-host-overview-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  if (indexErrors.size) {
+    showToast("warning", `Excel 已导出，但 ${indexErrors.size} 个连接的 VM 缓存读取失败，请查看“虚拟机信息”Sheet。`);
+  } else {
+    showToast("success", `Excel 已导出：物理机 ${overviewRows.length} 台，虚拟机 ${vmItemCount} 条。`);
+  }
 }
 
 function handleVmSelectionChange(rows: VmNode[]) {
@@ -5529,6 +5660,10 @@ function overviewResourceMeterWarning(row: HostOverviewRow, type: "cpu" | "memor
 
 function normalizeOverviewSearchInput(value: string) {
   return value
+    .normalize("NFKC")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[。．｡]/g, ".")
+    .replace(/[\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, " ")
     .replace(/[，,；;、\r\n\t]+/g, " ")
     .replace(/\s*\.\s*/g, ".")
     .replace(/\s+/g, " ")
@@ -5539,7 +5674,16 @@ function normalizeOverviewSearchInput(value: string) {
 function parseSearchKeywords(value: string) {
   const normalized = normalizeOverviewSearchInput(value);
   if (!normalized) return [];
-  return Array.from(new Set(normalized.split(" ").filter(Boolean)));
+  const parts = normalized.split(" ").filter(Boolean);
+  const compactedIp = compactSpacedIpKeyword(parts);
+  return Array.from(new Set(compactedIp ? [compactedIp] : parts));
+}
+
+function compactSpacedIpKeyword(parts: string[]) {
+  if (parts.length < 2 || !parts.every((part) => /^[0-9.]+$/.test(part))) return "";
+  const compacted = parts.join("");
+  if (!/^\d{1,3}(\.\d{1,3}){1,3}$/.test(compacted)) return "";
+  return compacted;
 }
 
 function parseOverviewSearchKeywords(value: string) {
@@ -5549,6 +5693,35 @@ function parseOverviewSearchKeywords(value: string) {
 function normalizeHostOverviewSearch() {
   const normalized = normalizeOverviewSearchInput(hostOverviewSearch.value);
   if (hostOverviewSearch.value !== normalized) hostOverviewSearch.value = normalized;
+}
+
+function scheduleOverviewVmSearchStableHold(value = hostOverviewSearch.value) {
+  if (overviewVmSearchHoldTimer) clearTimeout(overviewVmSearchHoldTimer);
+  const keywords = parseOverviewSearchKeywords(value);
+  if (!keywords.some(shouldSearchVmIp)) {
+    overviewVmSearchHoldTimer = undefined;
+    overviewVmSearchHolding.value = false;
+    return;
+  }
+  overviewVmSearchHolding.value = true;
+  overviewVmSearchHoldTimer = setTimeout(() => {
+    overviewVmSearchHoldTimer = undefined;
+    overviewVmSearchHolding.value = false;
+  }, OVERVIEW_VM_SEARCH_STABLE_HOLD_MS);
+}
+
+function scheduleOverviewSearchApply(value = hostOverviewSearch.value) {
+  if (hostOverviewSearchApplyTimer) clearTimeout(hostOverviewSearchApplyTimer);
+  const normalized = normalizeOverviewSearchInput(value);
+  if (!normalized) {
+    hostOverviewSearchApplyTimer = undefined;
+    appliedHostOverviewSearch.value = "";
+    return;
+  }
+  hostOverviewSearchApplyTimer = setTimeout(() => {
+    hostOverviewSearchApplyTimer = undefined;
+    appliedHostOverviewSearch.value = normalizeOverviewSearchInput(hostOverviewSearch.value);
+  }, OVERVIEW_SEARCH_APPLY_DEBOUNCE_MS);
 }
 
 function rowMatchesOverviewKeyword(row: HostOverviewRow, keyword: string) {
@@ -5598,14 +5771,24 @@ function hostMatchesKeyword(row: HostOverviewRow, keyword: string) {
   const textFields = [row.connection.name, row.host.name].map((item) => item.toLowerCase()).filter(Boolean);
   if (hostOverviewMatchMode.value === "exact" ? textFields.includes(keyword) : textFields.some((item) => item.includes(keyword))) return true;
   const hostIps = [row.connection.host, row.host.address].map((item) => item.toLowerCase()).filter(Boolean);
-  return hostOverviewMatchMode.value === "exact" ? hostIps.includes(keyword) : hostIps.some((ip) => ip.includes(keyword));
+  return hostIps.some((ip) => ipMatchesKeyword(ip, keyword, hostOverviewMatchMode.value));
 }
 
 function vmMatchesKeyword(vm: { name: string; providerId: string; guestOs?: string; ipAddresses: string[] }, hostIp: string | undefined, keyword: string, matchMode: "exact" | "fuzzy" = hostOverviewMatchMode.value) {
   const textFields = [vm.name, vm.providerId, vm.guestOs ?? ""].map((item) => item.toLowerCase()).filter(Boolean);
   if (matchMode === "exact" ? textFields.includes(keyword) : textFields.some((item) => item.includes(keyword))) return true;
   const ips = vm.ipAddresses.map((item) => item.toLowerCase()).filter(Boolean);
-  return matchMode === "exact" ? ips.includes(keyword) : ips.some((ip) => ip.includes(keyword));
+  return ips.some((ip) => ipMatchesKeyword(ip, keyword, matchMode));
+}
+
+function ipMatchesKeyword(ip: string, keyword: string, matchMode: "exact" | "fuzzy") {
+  if (matchMode === "fuzzy") return ip.includes(keyword);
+  if (ip === keyword) return true;
+  return isShortIpFragment(keyword) && ip.endsWith(`.${keyword}`);
+}
+
+function isShortIpFragment(keyword: string) {
+  return /^\d{1,3}(\.\d{1,3}){1,2}$/.test(keyword);
 }
 
 function shouldSearchVmIp(keyword: string) {
@@ -6278,14 +6461,14 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                 </button>
               </span>
             </el-tooltip>
-            <el-tooltip content="导出物理机总览：下载当前筛选结果 CSV" placement="top" :disabled="!uiPreferences.showIconTooltips">
+            <el-tooltip content="导出物理机总览：Excel 含物理机和虚拟机信息" placement="top" :disabled="!uiPreferences.showIconTooltips">
               <span class="toolbar-tooltip-target">
                 <button
                   type="button"
                   class="overview-toolbar-button"
                   :disabled="!sortedHostOverviewRows.length"
                   aria-label="导出物理机总览"
-                  @click="exportHostOverviewCsv"
+                  @click="exportHostOverviewWorkbook"
                 >
                   <VrcToolbarIcon name="export" />
                 </button>

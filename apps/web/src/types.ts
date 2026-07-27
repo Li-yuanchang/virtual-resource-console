@@ -52,6 +52,7 @@ export interface RuntimePolicy {
     enabled: boolean;
     shortIpBasePrefix?: string;
     shortIpThirdOctets: string[];
+    shortIpPrefixes: string[];
     hostOnlyPrefix?: string;
   };
   provisioning: {
