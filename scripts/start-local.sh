@@ -149,6 +149,7 @@ if [[ -f "$API_LAUNCH_AGENT" ]]; then
   write_api_launch_agent
   launchctl bootstrap "$USER_DOMAIN" "$API_LAUNCH_AGENT"
   launchctl enable "$USER_DOMAIN/$API_LAUNCH_LABEL"
+  launchctl kickstart -k "$USER_DOMAIN/$API_LAUNCH_LABEL" >/dev/null 2>&1 || true
   echo "API 已交给 launchd 启动: $API_LAUNCH_LABEL"
   echo "API 日志: $LOG_DIR/api.launchd.log"
 elif is_running "$API_PID_FILE"; then
