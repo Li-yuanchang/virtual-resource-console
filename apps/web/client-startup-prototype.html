@@ -1,13 +1,91 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="graphite-sage">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
     <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./src/styles.css" />
+    <link rel="stylesheet" href="./public/prototype-base.css" />
+    <link rel="stylesheet" href="./public/client-startup-prototype.css" />
     <title>VRC 客户端启动动画原型</title>
   </head>
   <body>
-    <div id="app"></div>
-    <script type="module" src="/src/client-startup-prototype.ts"></script>
+    <main class="client-startup-prototype prototype-page" data-theme="graphite-sage">
+      <section class="client-window startup-variant-a startup-phase-0">
+        <header class="client-titlebar">
+          <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
+          <span class="window-title">VRC · 启动方案 A</span>
+          <div class="prototype-controls">
+            <div class="variant-control" role="group" aria-label="启动动画方案">
+              <button class="active" type="button" data-variant="a" title="方案 A：环形扫描">A</button>
+              <button type="button" data-variant="b" title="方案 B：边框聚焦">B</button>
+              <button type="button" data-variant="c" title="方案 C：轨道收束">C</button>
+            </div>
+            <div class="theme-control" role="group" aria-label="主题背景">
+              <button class="active" type="button" data-theme-value="graphite-sage" title="Graphite Sage"><i></i></button>
+              <button type="button" data-theme-value="basalt-copper" title="Basalt Copper"><i></i></button>
+              <button type="button" data-theme-value="mist-teal" title="Mist Teal"><i></i></button>
+            </div>
+            <button class="replay-button" type="button" aria-label="重新播放启动动画" title="重新播放启动动画">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 9a7 7 0 0 1 11.7-2.6L20 9M4 15l2.2 2.6A7 7 0 0 0 17.9 15" /></svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="console-preview" aria-hidden="true">
+          <aside class="preview-sidebar">
+            <div class="preview-brand">
+              <span class="brand-mark">
+                <svg class="vrc-logo-mark" viewBox="0 0 128 128"><defs><linearGradient id="preview-logo" x1="24" y1="16" x2="104" y2="118"><stop stop-color="#527c67"/><stop offset="1" stop-color="#2f5944"/></linearGradient></defs><rect x="17" y="17" width="94" height="94" rx="20" fill="url(#preview-logo)"/><text x="64" y="64" text-anchor="middle">VRC</text><rect x="70" y="78" width="19" height="4" rx="2"/></svg>
+              </span>
+              <div><strong>资源控制台</strong><small>3 个连接</small></div>
+              <button type="button" tabindex="-1"><svg viewBox="0 0 24 24"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm8 3.5-2.1-1.1.1-2.4-2.5-1.5-2 1.3L11.5 7 9.3 8.3 7.2 7 4.7 8.5l.1 2.4L2.7 12l2.1 1.1-.1 2.4L7.2 17l2.1-1.3 2.2 1.3 2.1-1.3 2 1.3 2.5-1.5-.1-2.4L20 12Z"/></svg></button>
+            </div>
+            <div class="preview-search"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg><span>输入名称、平台或地址</span></div>
+            <div class="preview-groups">
+              <span class="preview-group-label">资源</span>
+              <div class="preview-overview"><b>V</b><span><strong>资源总览</strong><small>3 台物理机</small></span></div>
+              <span class="preview-group-label">已保存连接</span>
+              <div class="preview-connection"><i></i><span><strong>生产资源池</strong><small>XenServer · 192.0.2.6</small></span><em>36 VM</em></div>
+              <div class="preview-connection"><i></i><span><strong>VMware 集群</strong><small>VMware · 192.0.2.27</small></span><em>12 VM</em></div>
+              <div class="preview-connection"><i></i><span><strong>PVE 运维节点</strong><small>Proxmox VE · 203.0.113.2</small></span><em>4 VM</em></div>
+            </div>
+          </aside>
+
+          <section class="preview-workspace">
+            <div class="preview-heading"><div><h1>物理机总览</h1><p>跨平台查看物理资源和虚拟机容量</p></div><span>刚刚更新</span></div>
+            <div class="preview-metrics">
+              <div><span>物理机</span><strong>3</strong><small>3 台在线</small></div>
+              <div><span>虚拟机</span><strong>52</strong><small>34 台运行中</small></div>
+              <div><span>可用 CPU</span><strong>48 核</strong><small>当前余量</small></div>
+              <div><span>可用内存</span><strong>800 GiB</strong><small>当前余量</small></div>
+            </div>
+            <div class="preview-table">
+              <div class="preview-table-toolbar"><strong>物理机资源列表</strong><span>共 3 台</span></div>
+              <div class="preview-row preview-row-head"><span>序号</span><span>平台</span><span>物理机</span><span>管理 IP</span><span>CPU 余量</span><span>内存余量</span><span>存储余量</span><span>VM</span></div>
+              <div class="preview-row"><span>1</span><span>XenServer</span><a>xenserver-3</a><span>192.0.2.6</span><span>22 核</span><span>418 GiB</span><span>3.84 TiB</span><span>36</span></div>
+              <div class="preview-row"><span>2</span><span>VMware</span><a>esxi-prod-27</a><span>192.0.2.27</span><span>18 核</span><span>286 GiB</span><span>2.12 TiB</span><span>12</span></div>
+              <div class="preview-row"><span>3</span><span>Proxmox VE</span><a>kunpeng920</a><span>203.0.113.2</span><span>8 核</span><span>96 GiB</span><span>1.76 TiB</span><span>4</span></div>
+            </div>
+          </section>
+        </div>
+
+        <section class="startup-layer" aria-live="polite">
+          <div class="startup-center">
+            <div class="startup-mark mark-a">
+              <div class="motion-a"><span class="startup-ring startup-ring-outer"></span><span class="startup-ring startup-ring-inner"></span><i class="startup-scan"></i></div>
+              <div class="motion-b"><span class="focus-corner corner-tl"></span><span class="focus-corner corner-tr"></span><span class="focus-corner corner-bl"></span><span class="focus-corner corner-br"></span><i class="focus-sweep"></i></div>
+              <div class="motion-c"><span class="startup-track track-horizontal"></span><span class="startup-track track-vertical"></span><i class="track-glow track-glow-horizontal"></i><i class="track-glow track-glow-vertical"></i></div>
+              <svg class="vrc-logo-mark startup-logo" viewBox="0 0 128 128"><defs><linearGradient id="startup-logo" x1="24" y1="16" x2="104" y2="118"><stop stop-color="#527c67"/><stop offset="1" stop-color="#2f5944"/></linearGradient><filter id="startup-shadow" x="-25%" y="-25%" width="150%" height="160%"><feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#173128" flood-opacity=".22"/></filter></defs><rect x="17" y="17" width="94" height="94" rx="20" fill="url(#startup-logo)" filter="url(#startup-shadow)"/><text x="64" y="64" text-anchor="middle">VRC</text><rect x="70" y="78" width="19" height="4" rx="2"/></svg>
+            </div>
+            <div class="startup-copy"><h1>Virtual Resource Console</h1><p>正在启动本地服务</p></div>
+            <div class="startup-progress" aria-hidden="true"><i></i></div>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="./public/client-startup-prototype.js"></script>
+    <script src="./public/prototype-base.js"></script>
   </body>
 </html>

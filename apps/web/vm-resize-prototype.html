@@ -1,13 +1,51 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="graphite-sage">
   <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="./public/favicon.svg">
+    <link rel="stylesheet" href="./src/styles.css">
+    <link rel="stylesheet" href="./public/prototype-base.css">
+    <link rel="stylesheet" href="./public/prototype-pages.css">
     <title>VRC 虚拟机扩容原型</title>
   </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/vm-resize-prototype.ts"></script>
+  <body class="static-prototype" data-prototype="vm-resize">
+    <main class="resize-prototype-static">
+      <header class="prototype-header-static"><div><span>VRC / 操作原型</span><h1>磁盘扩容自动生效</h1></div><strong>方案二 · 指定挂载目录</strong></header>
+      <section class="resize-stage-static">
+        <div class="context-table-static" aria-hidden="true"><strong>虚拟机</strong><p>21 / 21 · xenserver-11</p><p>129.21_test　运行中　CentOS 7.2　5 vCPU　10 GiB　140 GiB　192.0.2.21</p></div>
+        <div class="resize-stage-mask-static"></div>
+        <section class="resize-dialog-static" role="dialog" aria-modal="true" aria-labelledby="resize-title">
+          <header class="dialog-header-static">
+            <div><div class="dialog-title-line"><h2 id="resize-title">扩容虚拟机</h2><span class="platform-tag-static">XenServer</span></div><p class="resize-subtitle">129.21_test　·　xenserver-11　·　192.0.2.21　·　运行中</p></div>
+            <button id="close-resize" class="dialog-close-static" type="button" title="关闭" aria-label="关闭">×</button>
+          </header>
+          <div class="resize-dialog-body-static">
+            <div class="capacity-strip-static"><span>宿主机可用</span><span class="capacity-values-static"><span>CPU　已超配</span><span>内存　67.8 GiB</span><span>存储　1,834 GiB</span></span></div>
+            <div class="resize-layout-static">
+              <section>
+                <div class="resource-grid-static header"><span>资源</span><span>当前配置</span><span>增加</span><span>扩容后</span><span>执行</span></div>
+                <div class="resource-grid-static"><span class="resource-name-static"><i class="resource-glyph-static">CPU</i><strong>处理器</strong></span><span class="resource-value-static"><strong>5</strong><small>vCPU</small></span><div class="stepper-static"><button type="button" data-step="-1" aria-label="减少处理器">−</button><input id="cpu-delta" type="number" value="0" min="0" aria-label="增加处理器数量"><button type="button" data-step="1" aria-label="增加处理器">+</button></div><span class="resource-value-static target"><strong id="target-cpu">5</strong><small>vCPU</small></span><span id="cpu-state" class="execution-state-static">不变</span></div>
+                <div class="resource-grid-static"><span class="resource-name-static"><i class="resource-glyph-static">MEM</i><strong>内存</strong></span><span class="resource-value-static"><strong>10</strong><small>GiB</small></span><div class="stepper-static"><button type="button" data-step="-1" aria-label="减少内存">−</button><input id="memory-delta" type="number" value="0" min="0" aria-label="增加内存容量"><button type="button" data-step="1" aria-label="增加内存">+</button></div><span class="resource-value-static target"><strong id="target-memory">10</strong><small>GiB</small></span><span id="memory-state" class="execution-state-static">不变</span></div>
+                <div class="resource-grid-static"><span class="resource-name-static"><i class="resource-glyph-static">HDD</i><strong>虚拟硬盘</strong></span><span class="resource-value-static"><strong>140</strong><small>GiB</small></span><div class="stepper-static"><button type="button" data-step="-10" aria-label="减少磁盘">−</button><input id="disk-delta" type="number" value="60" min="0" aria-label="增加磁盘容量"><button type="button" data-step="10" aria-label="增加磁盘">+</button></div><span class="resource-value-static target"><strong id="target-disk">200</strong><small>GiB</small><small id="disk-detail" class="disk-subline">磁盘 0 140 → 200</small></span><span id="disk-state" class="execution-state-static warning">需关机</span></div>
+                <section class="allocation-static">
+                  <header class="allocation-head-static"><span class="allocation-title-static"><strong>容量分配</strong><small>选择磁盘与生效目录</small></span><label>磁盘　<select id="disk-mode" class="disk-mode-select"><option value="extend">磁盘 0 · 140 GiB</option><option value="add">新增磁盘 · 挂载空目录</option></select></label></header>
+                  <div id="extend-options" class="mount-options-static" role="radiogroup" aria-label="选择扩容目录">
+                    <button class="mount-option-static active" type="button" data-mount="root"><i class="mount-radio-static"></i><span class="mount-copy-static"><strong>根目录 <b>/</b></strong><small>centos-root · XFS · 已用 61%</small></span><span class="mount-size-static"><small>完成后</small><strong>150 GiB</strong></span></button>
+                    <button class="mount-option-static" type="button" data-mount="data"><i class="mount-radio-static"></i><span class="mount-copy-static"><strong>数据目录 <b>/home</b></strong><small>centos-home · XFS · 已用 44%</small></span><span class="mount-size-static"><small>完成后</small><strong>110 GiB</strong></span></button>
+                  </div>
+                  <div id="new-disk-options" class="new-disk-static" hidden><label><span>空目录 / 新目录</span><select id="new-mount"><option>/data</option><option>/opt/data</option><option>/srv/storage</option></select></label><div><span>文件系统</span><strong>XFS</strong></div><div><span>挂载方式</span><strong>UUID / fstab</strong></div><div><span>可用容量</span><strong>60 GiB</strong></div></div>
+                  <div class="execution-chain-static"><span><small>虚拟磁盘</small><strong id="chain-disk">140 → 200 GiB</strong></span><span><small>Guest 设备</small><strong>分区自动扩展</strong></span><span><small>文件系统</small><strong>XFS 自动扩容</strong></span><span><small id="chain-final-label">/</small><strong id="chain-final-value">90 → 150 GiB</strong></span></div>
+                </section>
+              </section>
+              <aside class="impact-panel-static"><h3>资源影响　<strong id="change-count">1</strong> 项变更</h3><dl><div><dt>存储余量</dt><dd id="impact-storage">1,774 GiB</dd></div><div><dt id="impact-mode">扩容目录</dt><dd id="impact-path">/</dd></div><div><dt>目录容量</dt><dd id="impact-size">90 → 150 GiB</dd></div><div><dt>文件系统</dt><dd>XFS</dd></div></dl><div class="impact-note-static"><strong id="resize-summary">需要短暂停机</strong><p>正常关机后扩展原盘，开机后自动完成分区、LVM 和文件系统扩容，并回读目录容量。</p></div></aside>
+            </div>
+          </div>
+          <footer class="resize-footer-static"><span class="subtle">扩容前自动检查磁盘布局与 Guest Agent 状态</span><div class="dialog-footer-actions"><button id="cancel-resize" class="button-static" type="button">取消</button><button id="confirm-resize" class="button-static primary" type="button">确认扩容</button></div></footer>
+        </section>
+      </section>
+    </main>
+    <script src="./public/prototype-base.js"></script>
+    <script src="./public/prototype-pages.js"></script>
   </body>
 </html>

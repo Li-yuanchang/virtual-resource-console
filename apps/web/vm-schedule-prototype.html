@@ -1,12 +1,55 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="mist-teal">
   <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="./public/favicon.svg">
+    <link rel="stylesheet" href="./src/styles.css">
+    <link rel="stylesheet" href="./public/prototype-base.css">
+    <link rel="stylesheet" href="./public/prototype-pages.css">
     <title>VRC 虚拟机定时开关机原型</title>
   </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/vm-schedule-prototype.ts"></script>
+  <body class="static-prototype" data-prototype="vm-schedule">
+    <main class="app-shell-static">
+      <aside class="prototype-sidebar">
+        <header class="sidebar-head-static"><div class="brand-lockup-static"><span class="vrc-mark-static">VRC</span><span class="brand-copy-static"><strong>资源控制台</strong><small>3 个连接</small></span></div><button class="icon-button-static" type="button" title="设置" data-toast="打开设置">⚙</button></header>
+        <label class="sidebar-search-static"><input type="search" placeholder="输入名称、平台或地址" aria-label="搜索连接"></label>
+        <div class="connection-scroll">
+          <section class="connection-group-static"><button class="overview-entry-static" type="button"><span>↗</span><span class="connection-main-static"><strong>资源总览</strong><small>查看全部物理机</small></span></button></section>
+          <section class="connection-group-static"><div class="group-title-static">XenServer</div><button class="connection-item-static active" type="button"><i class="status-dot-static"></i><span class="connection-main-static"><strong>xenserver-1</strong><small>192.0.2.77</small></span><span class="connection-port-static">443</span></button><button class="connection-item-static" type="button"><i class="status-dot-static"></i><span class="connection-main-static"><strong>xenserver-3</strong><small>192.0.2.79</small></span><span class="connection-port-static">443</span></button></section>
+          <section class="connection-group-static"><div class="group-title-static">VMware</div><button class="connection-item-static" type="button"><i class="status-dot-static"></i><span class="connection-main-static"><strong>vmware-17</strong><small>192.0.2.17</small></span><span class="connection-port-static">443</span></button></section>
+        </div>
+        <button class="activity-toggle-static" type="button"><span>◷ 操作记录</span><strong>8</strong></button>
+      </aside>
+      <section class="workspace-static schedule-workspace-static">
+        <header class="page-header-static"><div class="page-title-static"><h1>物理机虚拟机</h1><span>xenserver-1 · 192.0.2.77 · XenServer · 6 个 PIF</span></div><button id="open-schedule-global" class="tool-button" type="button" title="跨物理机创建定时任务" aria-label="创建定时任务">◷</button></header>
+        <section class="metric-grid-static">
+          <article class="metric-card-static"><span class="metric-label-static">物理机</span><strong>xenserver-1</strong><small>192.0.2.77 · XenServer 8.4</small></article>
+          <article class="metric-card-static"><span class="metric-label-static">CPU</span><div class="metric-main-static"><strong>56 核</strong><span>43%</span></div><small>80 运行 vCPU · 共配置 128 vCPU</small><div class="mini-meter-static"><i style="width:43%"></i></div></article>
+          <article class="metric-card-static"><span class="metric-label-static">内存</span><div class="metric-main-static"><strong>124 / 191.8 GiB</strong><span>65%</span></div><small>剩余 67.8 GiB</small><div class="mini-meter-static"><i style="width:65%"></i></div></article>
+          <article class="metric-card-static"><span class="metric-label-static">存储</span><div class="metric-main-static"><strong>13,532 / 15,366 GiB</strong><span>88%</span></div><small>剩余 1,834 GiB</small><div class="mini-meter-static warning"><i style="width:88%"></i></div></article>
+          <article class="metric-card-static"><span class="metric-label-static">VM</span><div class="metric-main-static"><strong>4 / 6</strong><span>67%</span></div><small>52 vCPU · 120 GiB 内存</small><div class="mini-meter-static"><i style="width:67%"></i></div></article>
+        </section>
+        <div class="workspace-body-static"><section class="panel-static"><div class="toolbar-row"><div class="panel-title"><h2>虚拟机</h2><span id="schedule-vm-count">6 / 6 · xenserver-1</span></div><div class="toolbar-group"><input id="schedule-search" class="search-control" type="search" placeholder="搜索名称 / UUID / IP"><div id="schedule-power" class="segmented"><button class="active" type="button" data-value="all">全部</button><button type="button" data-value="running">开机</button><button type="button" data-value="stopped">关机</button></div></div><div id="schedule-batch" class="batch-actions"><span id="schedule-selected-count">已选 3 台</span><button id="batch-start" class="row-action" title="批量开机">▶</button><button id="batch-shutdown" class="row-action" title="批量关机">⏻</button><button id="batch-delete" class="row-action danger" title="批量删除">×</button><button id="open-schedule-selected" class="row-action" title="创建定时任务">◷</button></div><div class="toolbar-group"><button class="tool-button" type="button" title="创建虚拟机" data-toast="打开创建虚拟机">＋</button><button class="tool-button" type="button" title="导出虚拟机清单" data-toast="虚拟机清单已准备导出">⇩</button><button class="tool-button" type="button" title="刷新列表" data-toast="虚拟机列表已刷新">↻</button></div></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th class="center"><input id="schedule-all-vms" type="checkbox" aria-label="全选虚拟机"></th><th class="center">序号</th><th>名称</th><th class="center">状态</th><th>系统</th><th class="center">vCPU</th><th class="center">内存</th><th class="center">磁盘</th><th class="center">IP</th><th class="center">操作</th></tr></thead><tbody id="schedule-vm-body"></tbody></table></div></section></div>
+      </section>
+    </main>
+
+    <div id="schedule-dialog-backdrop" class="dialog-backdrop-static">
+      <section class="dialog-static" role="dialog" aria-modal="true" aria-labelledby="schedule-dialog-title">
+        <header class="dialog-header-static"><span class="dialog-title-static"><strong id="schedule-dialog-title">虚拟机定时任务</strong><span>统一管理批量开机与关机计划</span></span><button class="dialog-close-static" type="button" data-close-schedule aria-label="关闭">×</button></header>
+        <nav id="schedule-dialog-tabs" class="dialog-tabs-static"><button class="active" type="button" data-value="create">创建计划</button><button id="task-count-label" type="button" data-value="tasks">任务管理 3</button></nav>
+        <div class="dialog-body-static">
+          <div id="create-plan-panel" class="schedule-create-static">
+            <section class="schedule-section-static"><div class="schedule-heading"><strong>计划设置</strong><span>时间按控制台所在时区执行</span></div><div class="form-grid-static"><label class="field-static"><span>任务名称</span><input id="schedule-name" type="text" value="工作日晚间关机" placeholder="例如：工作日晚间关机"></label><div class="field-static"><span>执行动作</span><div id="schedule-action" class="segmented"><button type="button" data-value="start">开机</button><button class="active" type="button" data-value="shutdown">关机</button></div></div><div class="field-static"><span>执行周期</span><div id="schedule-cycle" class="segmented"><button class="active" type="button" data-value="once">单次</button><button type="button" data-value="daily">每天</button><button type="button" data-value="weekly">每周</button></div></div><label id="once-field" class="field-static"><span>执行时间</span><input id="once-at" type="datetime-local" value="2026-07-29T22:30"></label><label id="repeat-time-field" class="field-static" hidden><span>执行时间</span><input id="execute-time" type="time" value="22:30"></label><label class="field-static"><span>时区</span><select><option>Asia/Shanghai (UTC+8)</option><option>Asia/Tokyo (UTC+9)</option><option>UTC (UTC+0)</option></select></label><div id="weekdays" class="weekdays-static" hidden><label><input type="checkbox" value="周一" checked>周一</label><label><input type="checkbox" value="周二" checked>周二</label><label><input type="checkbox" value="周三" checked>周三</label><label><input type="checkbox" value="周四" checked>周四</label><label><input type="checkbox" value="周五" checked>周五</label><label><input type="checkbox" value="周六">周六</label><label><input type="checkbox" value="周日">周日</label></div></div></section>
+            <section class="schedule-section-static"><div class="schedule-heading"><strong>执行策略</strong><span>任务冲突与关机失败处理</span></div><div id="shutdown-options" class="form-grid-static four"><label class="field-static"><span>冲突处理</span><select><option>阻止创建并提示冲突</option><option>跳过冲突 VM，其余继续</option><option>以当前计划覆盖旧计划</option></select></label><label class="field-static"><span>关机超时（分钟）</span><input type="number" min="2" max="60" value="10"></label><label class="field-static"><span>失败处理</span><select><option>超时后强制关机</option><option>仅记录失败</option></select></label><div class="field-static"><span>状态一致时跳过</span><label class="switch-static"><input type="checkbox" checked><i></i></label></div></div></section>
+            <section class="schedule-section-static"><div class="schedule-heading"><strong>目标虚拟机　<em id="target-count" class="subtle">已选 3 台</em></strong><span id="target-summary">6 台可选 · 已选 3 台运行中 / 0 台已关机</span></div><div class="target-filter-grid"><input id="target-search" type="search" placeholder="搜索虚拟机名称 / IP / 系统"><select id="target-host"><option value="all">全部物理机</option><option>xenserver-1</option><option>xenserver-3</option><option>esxi-17</option><option>pve-20</option></select><div id="target-power" class="segmented"><button class="active" type="button" data-value="all">全部</button><button type="button" data-value="running">运行中</button><button type="button" data-value="stopped">已关机</button></div><div class="toolbar-group"><button id="select-visible-targets" class="tool-button" type="button" title="选择当前筛选结果">✓</button><button id="clear-visible-targets" class="tool-button" type="button" title="清空当前筛选结果">×</button></div></div><div class="data-table-wrap target-table-static"><table class="data-table"><thead><tr><th class="center"><input id="target-select-all" type="checkbox" aria-label="选择当前筛选结果"></th><th class="center">序号</th><th>名称</th><th>物理机</th><th>IP 地址</th><th class="center">当前状态</th></tr></thead><tbody id="target-table-body"></tbody></table></div></section>
+          </div>
+          <section id="task-plan-panel" hidden><div class="toolbar-row"><div class="panel-title"><h2>任务列表</h2><span id="task-summary">2 个启用 · 3 个任务</span></div><button id="new-plan" class="button-static primary" type="button">新建计划</button></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th class="center">序号</th><th>任务</th><th class="center">动作</th><th>周期</th><th class="center">目标</th><th>下一次执行</th><th class="center">启用</th><th class="center">操作</th></tr></thead><tbody id="task-table-body"></tbody></table></div></section>
+        </div>
+        <footer class="dialog-footer-static"><span id="dialog-summary"><strong>关机</strong> · 2026-07-29 22:30 · 3 台 VM</span><div class="dialog-footer-actions"><button id="dialog-cancel" class="button-static" type="button" data-close-schedule>取消</button><button id="save-plan" class="button-static primary" type="button">创建计划</button></div></footer>
+      </section>
+    </div>
+    <script src="./public/prototype-base.js"></script>
+    <script src="./public/prototype-pages.js"></script>
   </body>
 </html>

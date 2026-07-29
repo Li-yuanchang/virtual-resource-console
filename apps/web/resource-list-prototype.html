@@ -1,13 +1,98 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="graphite-sage">
   <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="./public/favicon.svg">
+    <link rel="stylesheet" href="./src/styles.css">
+    <link rel="stylesheet" href="./public/prototype-base.css">
+    <link rel="stylesheet" href="./public/prototype-pages.css">
     <title>VRC 资源列表原型</title>
   </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/resource-list-prototype.ts"></script>
+  <body class="static-prototype" data-prototype="resource-list">
+    <main class="app-shell-static">
+      <aside class="prototype-sidebar">
+        <header class="sidebar-head-static">
+          <div class="brand-lockup-static"><span class="vrc-mark-static">VRC</span><span class="brand-copy-static"><strong>资源控制台</strong><small>16 个连接</small></span></div>
+          <button class="icon-button-static" type="button" title="设置" aria-label="设置" data-toast="打开设置">⚙</button>
+        </header>
+        <label class="sidebar-search-static"><input type="search" placeholder="输入名称、平台或地址" aria-label="搜索连接"></label>
+        <div class="connection-scroll">
+          <section class="connection-group-static">
+            <button class="overview-entry-static active" type="button"><span>↗</span><span class="connection-main-static"><strong>资源总览</strong><small>查看全部物理机</small></span></button>
+          </section>
+          <section class="connection-group-static">
+            <div class="group-title-static">XenServer</div>
+            <button class="connection-item-static" type="button"><i class="status-dot-static"></i><span class="connection-main-static"><strong>xenserver-01</strong><small>192.0.2.31</small></span><span class="connection-port-static">22</span></button>
+            <button class="connection-item-static" type="button"><i class="status-dot-static"></i><span class="connection-main-static"><strong>xenserver-02</strong><small>192.0.2.32</small></span><span class="connection-port-static">22</span></button>
+          </section>
+          <section class="connection-group-static">
+            <div class="group-title-static">Proxmox VE</div>
+            <button class="connection-item-static" type="button"><i class="status-dot-static"></i><span class="connection-main-static"><strong>pve-node-01</strong><small>192.0.2.41</small></span><span class="connection-port-static">8006</span></button>
+          </section>
+          <section class="connection-group-static">
+            <div class="group-title-static">VMware</div>
+            <button class="connection-item-static" type="button"><i class="status-dot-static"></i><span class="connection-main-static"><strong>esxi-prod-01</strong><small>192.0.2.51</small></span><span class="connection-port-static">443</span></button>
+          </section>
+        </div>
+        <button class="activity-toggle-static" type="button"><span>◷ 操作记录</span><strong>8</strong></button>
+      </aside>
+
+      <section id="resource-workspace" class="workspace-static sort-style-a">
+        <header class="page-header-static">
+          <div class="page-title-static"><h1>资源列表</h1><span>物理机与虚拟机常用查询和排序</span></div>
+          <div class="page-header-actions">
+            <div id="sort-style" class="segmented" aria-label="排序样式"><button class="active" type="button" data-value="a">A</button><button type="button" data-value="b">B</button><button type="button" data-value="c">C</button></div>
+            <nav id="resource-tabs" class="page-tabs" aria-label="资源类型"><button class="active" type="button" data-value="hosts">物理机总览</button><button type="button" data-value="vms">虚拟机列表</button></nav>
+          </div>
+        </header>
+
+        <div class="workspace-body-static">
+          <section id="hosts-panel" class="panel-static">
+            <div class="toolbar-row">
+              <div class="panel-title"><h2>物理机资源列表</h2><span id="host-count">9 / 9 台</span></div>
+              <div class="toolbar-group">
+                <input id="host-search" class="search-control" type="search" placeholder="搜索名称 / IP" aria-label="搜索物理机">
+                <select id="host-platform" class="select-control" aria-label="平台筛选"><option value="all">全部平台</option><option>XenServer</option><option>Proxmox VE</option><option>VMware</option></select>
+                <select id="host-state" class="select-control" aria-label="状态筛选"><option value="all">全部状态</option><option value="online">正常</option><option value="warning">预警</option><option value="offline">离线</option></select>
+                <button id="host-reset" class="tool-button" type="button" title="清空筛选" aria-label="清空物理机筛选">×</button>
+              </div>
+              <div class="toolbar-group">
+                <button id="host-export" class="tool-button" type="button" title="导出当前查询结果" aria-label="导出物理机列表">⇩</button>
+                <button id="host-refresh" class="tool-button" type="button" title="刷新物理机列表" aria-label="刷新物理机列表">↻</button>
+              </div>
+            </div>
+            <div class="data-table-wrap">
+              <table id="host-table" class="data-table">
+                <thead><tr><th class="center">序号</th><th><button class="sort-button" data-sort="name" data-order="asc">物理机</button></th><th class="center">平台</th><th class="center">状态</th><th class="right"><button class="sort-button" data-sort="cpuUsage">CPU 使用率</button></th><th class="right"><button class="sort-button" data-sort="memoryFree">内存余量</button></th><th class="right"><button class="sort-button" data-sort="storageFree">存储余量</button></th><th class="center"><button class="sort-button" data-sort="totalVms">VM</button></th><th class="center">更新</th></tr></thead>
+                <tbody id="host-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="vms-panel" class="panel-static" hidden>
+            <div class="toolbar-row">
+              <div class="panel-title"><h2>虚拟机列表</h2><span id="vm-count">12 / 12 台</span></div>
+              <div class="toolbar-group">
+                <input id="vm-search" class="search-control" type="search" placeholder="搜索名称 / IP / 系统" aria-label="搜索虚拟机">
+                <select id="vm-host" class="select-control" aria-label="物理机筛选"><option value="all">全部物理机</option><option>xenserver-01</option><option>xenserver-02</option><option>pve-node-01</option><option>pve-node-02</option><option>pve-lab-01</option><option>esxi-prod-01</option><option>esxi-prod-02</option><option>esxi-dev-01</option></select>
+                <div id="vm-power" class="segmented" aria-label="电源状态"><button class="active" type="button" data-value="all">全部</button><button type="button" data-value="running">开机</button><button type="button" data-value="stopped">关机</button></div>
+                <button id="vm-reset" class="tool-button" type="button" title="清空筛选" aria-label="清空虚拟机筛选">×</button>
+              </div>
+              <div id="batch-actions" class="batch-actions" hidden><button class="row-action" title="批量开机" data-toast="已准备批量开机">▶</button><button class="row-action" title="批量关机" data-toast="已准备批量关机">⏻</button><button class="row-action danger" title="批量删除" data-toast="删除操作仅作原型展示">×</button></div>
+              <div class="toolbar-group"><button id="vm-export" class="tool-button" type="button" title="导出当前查询结果">⇩</button><button id="vm-refresh" class="tool-button" type="button" title="刷新虚拟机列表">↻</button></div>
+            </div>
+            <div class="data-table-wrap">
+              <table id="vm-table" class="data-table">
+                <thead><tr><th class="center"><input id="vm-select-all" type="checkbox" aria-label="全选当前虚拟机"></th><th class="center">序号</th><th><button class="sort-button" data-sort="name" data-order="asc">名称</button></th><th><button class="sort-button" data-sort="host">物理机</button></th><th class="center"><button class="sort-button" data-sort="state">状态</button></th><th>系统</th><th class="center"><button class="sort-button" data-sort="vcpu">vCPU</button></th><th class="center"><button class="sort-button" data-sort="memory">内存</button></th><th class="center"><button class="sort-button" data-sort="disk">磁盘</button></th><th class="center"><button class="sort-button" data-sort="ip">IP</button></th><th class="center">操作</th></tr></thead>
+                <tbody id="vm-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+    <script src="./public/prototype-base.js"></script>
+    <script src="./public/prototype-pages.js"></script>
   </body>
 </html>

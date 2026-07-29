@@ -1,13 +1,89 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="graphite-sage">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./src/styles.css" />
+    <link rel="stylesheet" href="./public/prototype-base.css" />
+    <link rel="stylesheet" href="./public/vm-rename-prototype.css" />
     <title>VRC 虚拟机改名原型</title>
   </head>
   <body>
-    <div id="app"></div>
-    <script type="module" src="/src/vm-rename-prototype.ts"></script>
+    <svg class="symbol-library" aria-hidden="true">
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A8 8 0 0 0 15 6.2L14.7 3h-4L10.3 6a8 8 0 0 0-1.6 1L6.3 6l-2 3.4 2 1.5a7 7 0 0 0 0 2.1l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.6.9l.4 3.2h4l.4-3.2a8 8 0 0 0 1.6-1l2.4 1 2-3.4-2-1.5a7 7 0 0 0-.1-1Z"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6.1 9a7 7 0 0 1 11.7-2.6L20 9M4 15l2.2 2.6A7 7 0 0 0 17.9 15"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 20h14"/></symbol>
+      <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/></symbol>
+      <symbol id="i-edit" viewBox="0 0 24 24"><path d="m14 5 5 5M4 20l3.5-.8L19 7.7a2.1 2.1 0 0 0-3-3L4.8 16.2 4 20Z"/></symbol>
+      <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v9m5.7-6.7a9 9 0 1 1-11.4 0"/></symbol>
+    </svg>
+    <main class="app-shell vm-rename-prototype prototype-page">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div class="brand-lockup"><svg class="brand-logo" viewBox="0 0 128 128"><defs><linearGradient id="rename-logo" x1="24" y1="16" x2="104" y2="118"><stop stop-color="#527c67"/><stop offset="1" stop-color="#2f5944"/></linearGradient></defs><rect x="17" y="17" width="94" height="94" rx="20" fill="url(#rename-logo)"/><text x="64" y="64" text-anchor="middle">VRC</text><rect x="70" y="78" width="19" height="4" rx="2"/></svg><div><h1>资源控制台</h1><p>3 个连接</p></div></div>
+          <button class="icon-button" type="button" title="设置" aria-label="设置"><svg><use href="#i-settings"/></svg></button>
+        </div>
+        <div class="sidebar-search"><svg><use href="#i-search"/></svg><span>输入名称、平台或地址</span></div>
+        <div class="connection-groups">
+          <section><button class="overview-entry active" type="button"><b>V</b><span><strong>资源总览</strong><small>3 个连接 · 3 台物理机</small></span></button></section>
+          <section class="saved-connections"><div class="group-title">已保存连接</div><div id="connection-list"></div></section>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <section class="panel overview-panel">
+          <header><div><h2>物理机总览</h2><span>选择物理机查看虚拟机清单。</span></div></header>
+          <div class="host-table"><div class="host-row host-head"><span>序号</span><span>平台</span><span>物理机</span><span>管理 IP</span><span>状态</span><span>VM</span></div><div id="host-table-body"></div></div>
+        </section>
+      </section>
+
+      <div class="dialog-mask detail-mask">
+        <section class="detail-dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+          <header class="dialog-head"><h2 id="detail-title">虚拟机信息</h2><button class="dialog-close close-detail" type="button" title="关闭" aria-label="关闭"><svg><use href="#i-close"/></svg></button></header>
+          <div class="detail-body">
+            <div class="host-summary">
+              <div><span class="status-dot"></span><strong id="host-name">xenserver-12</strong><small id="host-meta">XenServer 7.1 CU1 · 192.0.2.22</small></div>
+              <dl><div><dt>物理 CPU</dt><dd id="host-cpu">48 核</dd></div><div><dt>物理内存</dt><dd id="host-memory">1,534.6 GiB</dd></div><div><dt>网络</dt><dd>5 个</dd></div><div><dt>运行状态</dt><dd class="online-text">在线</dd></div></dl>
+            </div>
+            <div class="resource-metrics">
+              <article><div><span>CPU 分配</span><strong id="cpu-metric">24 / 48 vCPU</strong></div><div class="meter"><i style="width:42%"></i></div><small id="cpu-subline">24 运行 vCPU · 共配置 24 vCPU</small></article>
+              <article><div><span>内存使用</span><strong>642 GiB</strong></div><div class="meter memory"><i style="width:63%"></i></div><small>剩余 382 GiB</small></article>
+              <article><div><span>存储使用</span><strong>11.6 TiB</strong></div><div class="meter storage"><i style="width:75%"></i></div><small>剩余 3,870 GiB · 虚拟分配 18,420 GiB</small></article>
+              <article><div><span>虚拟机</span><strong id="vm-metric">4 台</strong></div><div class="vm-state-line"><i></i><span id="running-metric">3 运行</span><b></b><span id="halted-metric">1 停机</span></div><small>列表状态实时同步</small></article>
+            </div>
+
+            <section class="vm-panel">
+              <div class="vm-toolbar">
+                <div class="vm-search"><svg><use href="#i-search"/></svg><input id="vm-search" type="search" placeholder="搜索名称、ID 或 IP" /></div>
+                <div class="power-filter" role="group" aria-label="运行状态"><button class="active" data-filter="all" type="button">全部</button><button data-filter="running" type="button">运行中</button><button data-filter="halted" type="button">已停机</button></div>
+                <span class="selection-text">已选 <b id="selection-count">0</b> 台</span>
+                <div class="toolbar-actions"><button class="command-button toast-trigger" data-message="创建虚拟机在改名原型中不执行" type="button">创建虚拟机</button><button class="icon-button refresh-vms" type="button" title="刷新列表" aria-label="刷新列表"><svg><use href="#i-refresh"/></svg></button><button class="icon-button toast-trigger" data-message="已生成导出任务" type="button" title="导出" aria-label="导出"><svg><use href="#i-download"/></svg></button></div>
+              </div>
+              <div class="vm-table-wrap"><table class="vm-table"><thead><tr><th class="check-cell"><input id="select-all" type="checkbox" aria-label="全选" /></th><th>状态</th><th>虚拟机名称</th><th>管理 IP</th><th>系统</th><th>CPU</th><th>内存</th><th>磁盘</th><th class="action-cell">操作</th></tr></thead><tbody id="vm-table-body"></tbody></table><div class="empty-state" hidden>没有符合条件的虚拟机</div></div>
+            </section>
+          </div>
+        </section>
+      </div>
+
+      <div class="dialog-mask rename-mask" hidden>
+        <section class="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-title">
+          <header class="dialog-head"><div><h2 id="rename-title">修改虚拟机名称</h2><p>名称将同步到当前虚拟化平台。</p></div><button class="dialog-close cancel-rename" type="button" title="关闭" aria-label="关闭"><svg><use href="#i-close"/></svg></button></header>
+          <form id="rename-form">
+            <div class="rename-current"><span>当前虚拟机</span><strong id="rename-current-name"></strong><small id="rename-provider"></small></div>
+            <label for="rename-input">新名称</label>
+            <input id="rename-input" type="text" maxlength="80" autocomplete="off" />
+            <div class="field-meta"><span class="field-error" id="rename-error"></span><span><b id="rename-length">0</b> / 80</span></div>
+            <div class="naming-note"><strong>命名要求</strong><span>名称不能为空，不能与同一物理机中的其他虚拟机重名。</span></div>
+            <footer><button class="text-button cancel-rename" type="button">取消</button><button class="primary-button save-rename" type="submit">确认修改</button></footer>
+          </form>
+        </section>
+      </div>
+    </main>
+    <div class="prototype-toast" role="status" aria-live="polite" hidden></div>
+    <script src="./public/vm-rename-prototype.js"></script>
+    <script src="./public/prototype-base.js"></script>
   </body>
 </html>

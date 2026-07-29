@@ -1,13 +1,162 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="graphite-sage">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./src/styles.css" />
+    <link rel="stylesheet" href="./public/prototype-base.css" />
     <title>VRC 平台图标原型</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; color: var(--vrc-text); background: var(--vrc-bg); }
+      button { font: inherit; }
+      .page { min-height: 100vh; padding: 28px 32px 36px; }
+      .page-header { max-width: 1180px; margin: 0 auto 22px; display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; }
+      .kicker { margin: 0 0 5px; color: var(--vrc-text-muted); font-size: 12px; line-height: 18px; }
+      h1 { margin: 0; font-size: 24px; line-height: 34px; font-weight: 600; letter-spacing: 0; }
+      .summary { margin: 4px 0 0; color: var(--vrc-text-muted); font-size: 13px; line-height: 20px; }
+      .status, .badge { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+      .status { min-height: var(--vrc-control-height); padding: 0 10px; border: 1px solid var(--vrc-active-border); border-radius: var(--vrc-control-radius); color: var(--vrc-accent); background: var(--vrc-surface-raised); font-size: var(--vrc-font-size-body); }
+      .check { width: 13px; height: 13px; }
+      .band { max-width: 1180px; margin: 0 auto; padding: 22px 0 24px; border-top: 1px solid var(--vrc-border); }
+      .band:first-of-type { border-top-color: var(--vrc-border-strong); }
+      .band-heading { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 11px; align-items: center; margin-bottom: 18px; }
+      .band-heading h2 { margin: 0 0 2px; font-size: 16px; line-height: 23px; font-weight: 600; }
+      .band-heading p { margin: 0; color: var(--vrc-text-muted); font-size: var(--vrc-font-size-body); line-height: 19px; }
+      .platform-mark { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--vrc-border); border-radius: var(--vrc-control-radius); background: var(--vrc-surface); }
+      .apple-mark { color: #343a36; font-size: 13px; }
+      .chrome-mark { position: relative; border: 0; border-radius: 50%; background: conic-gradient(#d95145 0 33%, #dfba3e 0 66%, #4c9660 0); }
+      .chrome-mark::before { content: ""; width: 14px; height: 14px; border: 3px solid #f7f9f7; border-radius: 50%; background: #4f80b8; }
+      .windows-mark { grid-template-columns: repeat(2, 7px); grid-template-rows: repeat(2, 7px); gap: 2px; }
+      .windows-mark i { width: 7px; height: 7px; background: #4f7ca7; }
+      .appearance-switch { display: inline-flex; padding: 2px; border: 1px solid var(--vrc-border); border-radius: var(--vrc-control-radius); background: var(--vrc-surface-muted); }
+      .appearance-switch button { min-width: 48px; height: 26px; padding: 0 10px; border: 0; border-radius: 3px; color: #707a73; background: transparent; font-size: 12px; cursor: pointer; }
+      .appearance-switch button.active { color: var(--vrc-text); background: var(--vrc-surface); box-shadow: 0 1px 2px rgb(31 44 35 / 12%); }
+      .comparison-grid { display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 14px; }
+      .comparison { min-width: 0; overflow: hidden; border: 1px solid var(--vrc-border); border-radius: var(--vrc-control-radius); background: var(--vrc-surface); }
+      .comparison.selected { border-color: var(--vrc-active-border); }
+      .comparison-label { height: 38px; padding: 0 12px; display: flex; align-items: center; gap: 8px; }
+      .comparison-label span { font-size: 12px; font-weight: 600; }
+      .comparison-label small { color: var(--vrc-text-muted); font-size: var(--vrc-font-size-label); }
+      .menubar { height: 34px; padding: 0 11px; display: flex; align-items: center; gap: 10px; color: #1f2421; background: #e8e9e7; border-top: 1px solid #d6d8d5; font-size: 11px; }
+      .menubar.dark { color: #f0f3f0; background: #262a28; border-top-color: #353a37; }
+      .menubar.reference { color: #fff; background: #777ac8; border-top-color: #696cb6; }
+      .menu-copy { font-weight: 600; }.menu-spacer { flex: 1; }.menu-clock { font-variant-numeric: tabular-nums; }
+      .connection-icon { width: 15px; height: 15px; }
+      .tray-icon, .template-icon, .knockout-icon, .weight-icon { width: 18px; height: 18px; display: block; object-fit: contain; }
+      .menubar.dark .template-icon { filter: invert(1); }
+      .details, .stroke-comparison { grid-column: 1 / -1; border-radius: 6px; }
+      .details { min-height: 74px; padding: 12px 14px; display: flex; align-items: center; gap: 24px; border: 1px dashed var(--vrc-border-strong); background: var(--vrc-surface-muted); }
+      .detail-option { min-width: 168px; display: flex; align-items: center; gap: 10px; }
+      .detail-option > span:last-child, .detail-spec { display: grid; gap: 2px; }
+      .detail-option strong, .detail-spec strong { color: var(--vrc-text); font-size: var(--vrc-font-size-body); line-height: 18px; }
+      .detail-option small, .detail-spec span { color: var(--vrc-text-muted); font-size: 10px; line-height: 15px; }
+      .template-icon.enlarged, .knockout-icon.enlarged, .weight-icon.enlarged { width: 48px; height: 48px; }
+      .knockout-stage { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 5px; color: #fff; background: #777ac8; }
+      .detail-spec { min-width: 190px; margin-left: auto; }
+      .stroke-comparison { padding: 14px; border: 1px solid var(--vrc-border); background: var(--vrc-surface); }
+      .stroke-heading { margin-bottom: 12px; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+      .stroke-heading strong { color: var(--vrc-text); font-size: var(--vrc-font-size-body); line-height: 18px; }.stroke-heading span { color: var(--vrc-text-muted); font-size: 10px; line-height: 15px; }
+      .stroke-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+      .stroke-option { min-width: 0; min-height: 76px; padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--vrc-border); border-radius: var(--vrc-control-radius); background: var(--vrc-surface-raised); }
+      .stroke-copy { display: grid; gap: 2px; }.stroke-copy strong { color: var(--vrc-text); font-size: 13px; line-height: 19px; }.stroke-copy span { color: var(--vrc-text-muted); font-size: 10px; line-height: 15px; }
+      .stroke-pair { display: flex; align-items: center; gap: 12px; color: #242a26; }
+      .real-size { width: 34px; height: 28px; display: grid; place-items: center; color: #1f2421; background: #e8e9e7; border: 1px solid #d6d8d5; border-radius: 4px; }
+      .real-size.dark { color: #f0f3f0; background: #262a28; border-color: #353a37; }
+      .badge { min-height: 25px; padding: 0 8px; border-radius: 4px; color: var(--vrc-success); background: var(--vrc-status-success-soft); font-size: var(--vrc-font-size-label); }
+      .badge.keep { color: #68736c; background: #e9ece9; }
+      .chrome-layout, .windows-layout { display: grid; grid-template-columns: minmax(420px, 1.5fr) minmax(300px, 1fr); gap: 14px; }
+      .browser-window { overflow: hidden; border: 1px solid #cbd2cd; border-radius: 7px; background: #fff; box-shadow: 0 5px 16px rgb(49 62 53 / 8%); }
+      .browser-tabbar { height: 38px; padding: 0 10px; display: flex; align-items: center; gap: 6px; background: #dde1de; }
+      .browser-dot { width: 8px; height: 8px; border-radius: 50%; }.browser-dot.red { background: #db7068; }.browser-dot.yellow { background: #d9b458; }.browser-dot.green { background: #6ba773; }
+      .browser-tab { align-self: end; width: min(235px, 45%); height: 31px; margin-left: 5px; padding: 0 11px; display: flex; align-items: center; gap: 7px; overflow: hidden; border-radius: 7px 7px 0 0; color: #4f5852; background: #f6f7f6; font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
+      .mini-site-icon { width: 12px; height: 12px; border-radius: 3px; background: #547762; }.browser-actions { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+      .browser-actions button { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 4px; background: transparent; }.browser-actions img { width: 20px; height: 20px; }
+      .browser-address { height: 38px; padding: 0 12px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid #e1e5e2; background: #f6f7f6; color: #677069; }
+      .address-field { flex: 1; height: 25px; padding: 0 12px; display: flex; align-items: center; border-radius: 13px; background: #e9ecea; font-size: 11px; }
+      .browser-body { height: 74px; padding: 13px 15px; display: flex; flex-direction: column; justify-content: center; }.browser-body strong { margin-bottom: 3px; font-size: 12px; }.browser-body span { color: #7a837d; font-size: 11px; }
+      .chrome-sizes { padding: 14px; display: grid; grid-template-columns: 92px 126px minmax(0, 1fr); gap: 10px; align-items: center; border: 1px solid #d5dcd7; border-radius: 6px; background: #fbfcfa; }
+      .size-sample { min-height: 112px; padding: 9px; display: flex; flex-direction: column; align-items: center; justify-content: center; border-radius: 5px; }.size-sample.selected { outline: 1px solid #a7b9ad; background: #eef3ef; }
+      .sample-stage { width: 48px; height: 48px; margin-bottom: 7px; display: grid; place-items: center; border-radius: 6px; background: #e2e7e3; }.sample-stage img.icon-16 { width: 16px; height: 16px; }.sample-stage img.icon-32 { width: 32px; height: 32px; }
+      .size-sample strong { font-size: 12px; }.size-sample span { color: #778079; font-size: 10px; text-align: center; }.optical-note { min-width: 0; color: #707a73; font-size: 11px; line-height: 17px; }
+      .measure-line { width: 40px; height: 1px; display: block; margin-bottom: 8px; background: #7f9c89; }
+      .web-layout { display: grid; grid-template-columns: minmax(360px, 1.2fr) minmax(300px, 1fr); gap: 14px; }
+      .web-sidebar { min-height: 92px; padding: 15px 16px; display: flex; align-items: center; border: 1px solid #d5dcd7; border-radius: 6px; background: #fbfcfa; }.web-brand { display: flex; align-items: center; gap: 10px; }.web-brand > img { width: 54px; height: 54px; }.web-brand span { display: grid; gap: 3px; }.web-brand strong { font-size: 14px; }.web-brand small { color: #7a837d; font-size: 11px; }.settings-icon { width: 17px; height: 17px; margin-left: auto; color: #79837c; }
+      .web-sizes { padding: 8px 12px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; border: 1px solid #d5dcd7; border-radius: 6px; background: #fbfcfa; }.web-size { padding: 6px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; border-radius: 5px; }.web-size.selected { outline: 1px solid #a7b9ad; background: #eef3ef; }.web-size img { object-fit: contain; }.logo-22 { width: 22px; height: 22px; }.logo-38 { width: 38px; height: 38px; }.logo-54 { width: 54px; height: 54px; }.web-size strong { font-size: 10px; }.web-size small { color: #7a837d; font-size: 9px; }
+      .desktop-compare { min-height: 132px; padding: 12px 14px; display: grid; grid-template-columns: minmax(110px, 1fr) auto; align-items: center; gap: 18px; border-radius: 6px; color: #eef4f1; background: #18132e; }.desktop-title strong, .desktop-title span { display: block; }.desktop-title strong { margin-bottom: 4px; font-size: 12px; }.desktop-title span { color: #aaa5bd; font-size: 10px; }.shortcuts { display: flex; gap: 22px; }.shortcut { width: 54px; min-height: 88px; padding: 8px 6px 5px; display: flex; flex-direction: column; align-items: center; gap: 4px; border: 1px solid transparent; font-size: 11px; }.shortcut.proposed { border-color: #7a7691; background: rgb(255 255 255 / 10%); }.shortcut small { color: #aaa5bd; font-size: 9px; }
+      .windows-contexts { padding: 10px; display: grid; gap: 8px; border: 1px solid #d5dcd7; border-radius: 6px; background: #fbfcfa; }.context-row { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 8px; align-items: center; }.context-name { color: #7a837d; font-size: 11px; text-align: center; }.context-name.proposed { color: #406852; font-weight: 600; }.taskbar { height: 42px; padding: 0 12px; display: flex; align-items: center; gap: 10px; color: #f2f4f3; background: #27302e; border-radius: 4px; }.taskbar-spacer { flex: 1; }.clock { display: flex; flex-direction: column; align-items: flex-end; font-size: 9px; line-height: 13px; }.clock strong { font-weight: 400; }
+      .windows-icon { display: grid; place-items: center; overflow: hidden; flex: 0 0 auto; }.windows-icon img { width: 100%; height: 100%; object-fit: contain; }.windows-icon.optimized img { transform: scale(1.13); }.desktop-icon { width: 32px; height: 32px; }.tray-size { width: 20px; height: 20px; }
+      .windows-sizes { grid-column: 1 / -1; padding: 8px 10px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; border: 1px solid #d5dcd7; border-radius: 6px; background: #fbfcfa; }.windows-size { display: flex; flex-direction: column; align-items: center; gap: 5px; }.windows-stage { width: 52px; height: 54px; display: grid; place-items: center; border-radius: 5px; background: #e8ece9; }.windows-size strong { color: #707a73; font-size: 10px; }.windows-size small { color: #98a09b; font-size: 9px; }
+      .pipeline { max-width: 1180px; min-height: 48px; margin: 0 auto; padding: 0 14px; display: flex; align-items: center; gap: 10px; overflow-x: auto; border: 1px solid #d4dcd6; border-radius: 6px; color: #707a73; background: #eef2ef; font-size: 11px; white-space: nowrap; }.pipeline strong { color: #354039; font-size: 12px; }.pipeline-source { color: #38634d; font-weight: 600; }
+      @media (max-width: 920px) { .page { padding: 22px 18px 30px; }.comparison-grid { grid-template-columns: 1fr 1fr; }.details, .stroke-comparison { grid-column: 1 / -1; }.chrome-layout, .web-layout, .windows-layout { grid-template-columns: 1fr; } }
+      @media (max-width: 620px) { .page { padding: 18px 12px 24px; }.page-header { align-items: flex-start; flex-direction: column; gap: 12px; }.status { display: none; }h1 { font-size: 21px; line-height: 30px; }.band-heading { grid-template-columns: 32px minmax(0, 1fr); align-items: start; }.appearance-switch, .badge { grid-column: 2; justify-self: start; margin-top: 4px; }.comparison-grid { grid-template-columns: 1fr; }.details { grid-column: auto; align-items: flex-start; flex-wrap: wrap; gap: 12px; }.detail-spec { min-width: 0; margin-left: 0; }.stroke-comparison { grid-column: auto; }.stroke-heading { align-items: flex-start; flex-direction: column; gap: 2px; }.stroke-options { grid-template-columns: 1fr; }.chrome-layout, .web-layout, .windows-layout { grid-template-columns: minmax(0, 1fr); }.chrome-sizes { grid-template-columns: 1fr 1fr; }.optical-note { grid-column: 1 / -1; }.windows-sizes { padding-inline: 8px; } }
+    </style>
   </head>
   <body>
-    <div id="app"></div>
-    <script type="module" src="/src/icon-platform-prototype.ts"></script>
+    <svg width="0" height="0" aria-hidden="true" style="position:absolute">
+      <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+      <symbol id="icon-connection" viewBox="0 0 24 24"><path d="M5 8a10 10 0 0 1 14 0M8 11a6 6 0 0 1 8 0m-5 4a1.5 1.5 0 1 1 2 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" /></symbol>
+      <symbol id="icon-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 21h8m-4-4v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+      <symbol id="icon-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7-.7-2h-3l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7-2 .7v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
+    </svg>
+
+    <main class="page">
+      <header class="page-header">
+        <div><p class="kicker">外观 / 平台图标</p><h1>小尺寸图标适配</h1><p class="summary">按各平台的真实显示尺寸检查清晰度与视觉占比。</p></div>
+        <div class="status"><svg class="check"><use href="#icon-check" /></svg>Chrome 比例已确认</div>
+      </header>
+
+      <section class="band" aria-labelledby="mac-title">
+        <div class="band-heading">
+          <span class="platform-mark apple-mark" aria-hidden="true">⌘</span>
+          <div><h2 id="mac-title">macOS 菜单栏</h2><p>改为单色轮廓 Template 图标，系统自动适配浅色和深色菜单栏。</p></div>
+          <div class="appearance-switch" aria-label="菜单栏外观预览"><button class="active" type="button" data-appearance="light">浅色</button><button type="button" data-appearance="dark">深色</button></div>
+        </div>
+        <div class="comparison-grid">
+          <article class="comparison"><div class="comparison-label"><span>原版</span><small>彩色图标</small></div><div class="menubar appearance-target"><span class="menu-copy">VRC</span><span class="menu-spacer"></span><svg class="connection-icon"><use href="#icon-connection" /></svg><img class="tray-icon" src="./public/prototype-icons/tray-current.png" alt="原版 VRC 菜单栏图标"/><span class="menu-clock">09:41</span></div></article>
+          <article class="comparison selected"><div class="comparison-label"><span>当前</span><small>单色轮廓 · 1.00px</small></div><div class="menubar appearance-target"><span class="menu-copy">VRC</span><span class="menu-spacer"></span><svg class="connection-icon"><use href="#icon-connection" /></svg><img class="template-icon" src="./public/prototype-icons/tray-template@2x.png" alt="当前 VRC 单色菜单栏图标"/><span class="menu-clock">09:41</span></div></article>
+          <article class="comparison"><div class="comparison-label"><span>备选</span><small>实心底板 · VRC 镂空</small></div><div class="menubar reference"><span class="menu-copy">VRC</span><span class="menu-spacer"></span><svg class="connection-icon"><use href="#icon-connection" /></svg><svg class="knockout-icon" viewBox="0 0 18 18" aria-label="实心底板并镂空 VRC 字母的菜单栏图标"><defs><mask id="knockout-small"><rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="#fff"/><g fill="none" stroke="#000" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M2.7 6.1 4.25 10.8 5.8 6.1"/><path d="M6.65 10.8V6.1h1.5a1.45 1.38 0 0 1 0 2.75h-1.5m1.5-.3 1.8 2.25"/><path d="M14.72 6.62a2.45 2.45 0 1 0 0 3.66"/></g><rect x="10.35" y="12.5" width="3.55" height=".8" rx=".4" fill="#000"/></mask></defs><rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="currentColor" mask="url(#knockout-small)"/></svg><span class="menu-clock">09:41</span></div></article>
+
+          <aside class="details" aria-label="macOS 图标放大细节">
+            <div class="detail-option"><img class="template-icon enlarged" src="./public/prototype-icons/tray-template@2x.png" alt=""/><span><strong>单色轮廓</strong><small>当前接入版本 · 1.00px</small></span></div>
+            <div class="detail-option"><span class="knockout-stage"><svg class="knockout-icon enlarged" viewBox="0 0 18 18"><defs><mask id="knockout-large"><rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="#fff"/><g fill="none" stroke="#000" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M2.7 6.1 4.25 10.8 5.8 6.1"/><path d="M6.65 10.8V6.1h1.5a1.45 1.38 0 0 1 0 2.75h-1.5m1.5-.3 1.8 2.25"/><path d="M14.72 6.62a2.45 2.45 0 1 0 0 3.66"/></g><rect x="10.35" y="12.5" width="3.55" height=".8" rx=".4" fill="#000"/></mask></defs><rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="currentColor" mask="url(#knockout-large)"/></svg></span><span><strong>白底镂空</strong><small>候选版本</small></span></div>
+            <div class="detail-spec"><strong>18 × 18 pt</strong><span>最终导出 18px / 36px Template PNG</span></div>
+          </aside>
+
+          <aside class="stroke-comparison" aria-label="VRC 字母笔画粗度对比"><div class="stroke-heading"><strong>VRC 字母笔画粗度</strong><span>左侧为菜单栏实际 18px，右侧为放大细节</span></div><div class="stroke-options" id="stroke-options"></div></aside>
+        </div>
+      </section>
+
+      <section class="band" aria-labelledby="chrome-title">
+        <div class="band-heading"><span class="platform-mark chrome-mark" aria-hidden="true"></span><div><h2 id="chrome-title">Chrome 插件工具栏</h2><p>保持已确认的 VRC 图形比例，16px 负责标准屏，32px 负责高分屏清晰度。</p></div><span class="badge"><svg class="check"><use href="#icon-check"/></svg>比例确认</span></div>
+        <div class="chrome-layout"><div class="browser-window"><div class="browser-tabbar"><span class="browser-dot red"></span><span class="browser-dot yellow"></span><span class="browser-dot green"></span><div class="browser-tab"><span class="mini-site-icon"></span>Virtual Resource Console</div><div class="browser-actions"><span>▦</span><button type="button" title="Virtual Resource Console"><img src="./public/prototype-icons/chrome-32.png" alt="VRC Chrome 插件图标"/></button><span>•••</span></div></div><div class="browser-address"><span>←</span><div class="address-field">127.0.0.1:5173</div></div><div class="browser-body"><strong>工具栏实际显示约 16px</strong><span>Retina 屏会读取 32px 资源再缩放显示，因此边缘更清楚。</span></div></div><div class="chrome-sizes"><div class="size-sample"><div class="sample-stage"><img class="icon-16" src="./public/prototype-icons/chrome-16.png" alt="16px VRC 图标"/></div><strong>16px</strong><span>标准屏</span></div><div class="size-sample selected"><div class="sample-stage"><img class="icon-32" src="./public/prototype-icons/chrome-32.png" alt="32px VRC 图标"/></div><strong>32px</strong><span>高分屏 · 当前正好</span></div><div class="optical-note"><span class="measure-line"></span>不继续放大图形，避免圆角和文字在 16px 下挤成一团。</div></div></div>
+      </section>
+
+      <section class="band" aria-labelledby="web-title">
+        <div class="band-heading"><span class="platform-mark"><svg class="connection-icon"><use href="#icon-monitor"/></svg></span><div><h2 id="web-title">Web 正式界面</h2><p>保留彩色 SVG，统一提高共享 Logo 的视觉占比，侧栏、空状态和加载态同时生效。</p></div><span class="badge"><svg class="check"><use href="#icon-check"/></svg>已同步</span></div>
+        <div class="web-layout"><div class="web-sidebar"><div class="web-brand"><img src="./public/favicon.svg" alt="VRC"/><span><strong>资源控制台</strong><small>3 个连接</small></span></div><svg class="settings-icon"><use href="#icon-settings"/></svg></div><div class="web-sizes"><div class="web-size"><img class="logo-22" src="./public/favicon.svg" alt=""/><strong>22px</strong><small>紧凑加载</small></div><div class="web-size"><img class="logo-38" src="./public/favicon.svg" alt=""/><strong>38px</strong><small>空状态</small></div><div class="web-size selected"><img class="logo-54" src="./public/favicon.svg" alt=""/><strong>54px</strong><small>侧栏品牌</small></div></div></div>
+      </section>
+
+      <section class="band" aria-labelledby="windows-title">
+        <div class="band-heading"><span class="platform-mark windows-mark"><i></i><i></i><i></i><i></i></span><div><h2 id="windows-title">Windows 桌面与托盘</h2><p>保留现有彩色图标，按桌面和托盘的不同尺寸提高主体视觉占比。</p></div><span class="badge keep">彩色保留</span></div>
+        <div class="windows-layout"><div class="desktop-compare"><div class="desktop-title"><strong>桌面快捷方式</strong><span>32px 图标槽</span></div><div class="shortcuts"><div class="shortcut"><span class="windows-icon desktop-icon"><img src="./public/prototype-icons/windows.png" alt="当前 Windows VRC 桌面图标"/></span><span>VRC</span><small>原版</small></div><div class="shortcut proposed"><span class="windows-icon desktop-icon optimized"><img src="./public/prototype-icons/windows.png" alt="优化视觉占比后的 Windows VRC 桌面图标"/></span><span>VRC</span><small>当前</small></div></div></div><div class="windows-contexts"><div class="context-row"><span class="context-name">原版</span><div class="taskbar"><span class="taskbar-spacer"></span><span>⌃</span><span class="windows-icon tray-size"><img src="./public/prototype-icons/windows.png" alt="原版托盘图标"/></span><span>⌁</span><span>◖</span><div class="clock"><strong>9:41</strong><span>2026/7/29</span></div></div></div><div class="context-row"><span class="context-name proposed">当前</span><div class="taskbar"><span class="taskbar-spacer"></span><span>⌃</span><span class="windows-icon tray-size optimized"><img src="./public/prototype-icons/windows.png" alt="当前托盘图标"/></span><span>⌁</span><span>◖</span><div class="clock"><strong>9:41</strong><span>2026/7/29</span></div></div></div></div><div class="windows-sizes" id="windows-sizes"></div></div>
+      </section>
+
+      <footer class="pipeline"><strong>资源策略</strong><span class="pipeline-source">SVG 母版</span><span>→</span><span>Web 彩色 SVG</span><span>·</span><span>macOS Template PNG</span><span>·</span><span>Chrome PNG 16/32/48/128</span><span>·</span><span>Windows 多分辨率 ICO</span></footer>
+    </main>
+
+    <script>
+      const glyphPaths = '<path d="M2.7 6.1 4.25 10.8 5.8 6.1"/><path d="M6.65 10.8V6.1h1.5a1.45 1.38 0 0 1 0 2.75h-1.5m1.5-.3 1.8 2.25"/><path d="M14.72 6.62a2.45 2.45 0 1 0 0 3.66"/>';
+      const weightIcon = (weight, className = 'weight-icon') => `<svg class="${className}" viewBox="0 0 18 18" aria-hidden="true"><rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="none" stroke="currentColor" stroke-width=".8"/><g fill="none" stroke="currentColor" stroke-width="${weight}" stroke-linecap="round" stroke-linejoin="round">${glyphPaths}</g><rect x="10.35" y="12.5" width="3.55" height=".8" rx=".4" fill="currentColor"/></svg>`;
+      const weights = [{ value: 1, label: '当前 · 已实装' }, { value: 1.1, label: '对比' }, { value: 1.15, label: '对比' }];
+      document.querySelector('#stroke-options').innerHTML = weights.map(({ value, label }) => `<div class="stroke-option"><div class="stroke-copy"><strong>${value.toFixed(2)}px</strong><span>${label}</span></div><div class="stroke-pair"><span class="real-size appearance-target">${weightIcon(value)}</span>${weightIcon(value, 'weight-icon enlarged')}</div></div>`).join('');
+      document.querySelector('#windows-sizes').innerHTML = [16, 20, 24, 32, 48].map(size => `<div class="windows-size"><span class="windows-stage"><span class="windows-icon optimized" style="width:${size}px;height:${size}px"><img src="./public/prototype-icons/windows.png" alt=""/></span></span><strong>${size}px</strong><small>${size < 32 ? '托盘' : '桌面'}</small></div>`).join('');
+      document.querySelectorAll('[data-appearance]').forEach(button => button.addEventListener('click', () => {
+        const dark = button.dataset.appearance === 'dark';
+        document.querySelectorAll('[data-appearance]').forEach(item => item.classList.toggle('active', item === button));
+        document.querySelectorAll('.appearance-target').forEach(item => item.classList.toggle('dark', dark));
+      }));
+    </script>
   </body>
 </html>

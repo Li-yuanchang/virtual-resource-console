@@ -1,17 +1,179 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="graphite-sage">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>VRC 外观设置原型</title>
-    <!-- 原型演示用字体：正式版随应用打包为本地 woff2，不依赖外网 -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@latest/index.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@latest/500.css" />
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-screen-webfont@latest/style.css" />
+    <link rel="icon" href="./public/favicon.svg" />
+    <link rel="stylesheet" href="./src/styles.css" />
+    <link rel="stylesheet" href="./public/prototype-base.css" />
+    <link rel="stylesheet" href="./public/theme-prototype.css" />
   </head>
   <body>
-    <div id="app"></div>
-    <script type="module" src="/src/theme-prototype.ts"></script>
+    <main class="app-shell theme-prototype" id="themePrototype">
+      <aside class="sidebar prototype-sidebar">
+        <div class="sidebar-head">
+          <div class="brand-lockup">
+            <span class="brand-mark sidebar-logo" aria-hidden="true">
+              <svg viewBox="0 0 32 32"><rect x="1.5" y="1.5" width="29" height="29" rx="7"/><path d="M7 10.5 10.2 21h2.1l3.1-10.5M17 21V10.5h4.2c2.6 0 4.1 1.3 4.1 3.4s-1.5 3.4-4.1 3.4H17m4.3 0 4 3.7M19.7 24.5h5.6"/></svg>
+            </span>
+            <div class="brand-copy"><h1>资源控制台</h1><p>3 个连接</p></div>
+          </div>
+          <button class="icon-button settings-entry-button active" type="button" title="设置" aria-label="设置">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
+          </button>
+        </div>
+        <section class="sidebar-section">
+          <label class="prototype-search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+            <input type="search" placeholder="输入名称、平台或地址" aria-label="搜索连接" />
+          </label>
+        </section>
+        <div class="connection-groups">
+          <section class="connection-group overview-group">
+            <button class="overview-entry" type="button"><span class="overview-entry-icon">↗</span><span class="overview-entry-main"><strong>资源总览</strong><small>查看全部物理机</small></span></button>
+          </section>
+          <section class="connection-group">
+            <div class="group-title"><span>生产环境</span></div>
+            <button class="connection-item" type="button"><span class="status-dot online"></span><span class="connection-main"><strong>xenserver-1</strong><small>10.10.1.21</small></span><span class="connection-port">22</span></button>
+            <button class="connection-item" type="button"><span class="status-dot online"></span><span class="connection-main"><strong>xenserver-2</strong><small>10.10.1.22</small></span><span class="connection-port">22</span></button>
+          </section>
+          <section class="connection-group">
+            <div class="group-title"><span>测试环境</span></div>
+            <button class="connection-item" type="button"><span class="status-dot"></span><span class="connection-main"><strong>vmware-lab</strong><small>10.10.2.11</small></span><span class="connection-port">443</span></button>
+          </section>
+        </div>
+        <button class="activity-toggle" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4zM8 8h8M8 12h8M8 16h5"/></svg><span>操作记录</span><strong>6</strong></button>
+      </aside>
+
+      <section class="workspace is-settings-mode">
+        <section class="panel settings-workspace-panel">
+          <header class="settings-workspace-head">
+            <div><h3>设置</h3><span>管理外观、连接、创建模板和运行日志。</span></div>
+            <button type="button" class="settings-close-button"><span aria-hidden="true">←</span><span>返回资源总览</span></button>
+          </header>
+          <div class="settings-workspace-layout">
+            <nav class="settings-workspace-nav" aria-label="设置分组">
+              <button type="button" class="active"><span aria-hidden="true">◐</span><span>外观</span></button>
+              <button type="button"><span aria-hidden="true">⌁</span><span>连接</span></button>
+              <button type="button"><span aria-hidden="true">＋</span><span>创建模板</span></button>
+              <button type="button"><span aria-hidden="true">▤</span><span>日志</span></button>
+            </nav>
+
+            <section class="settings-workspace-content theme-canvas" id="themeCanvas">
+              <section class="settings-card theme-card">
+                <div class="settings-card-head"><div><strong>框架主题</strong><span>选择基础主题后，全局颜色、状态和预览会同步更新。</span></div></div>
+                <div class="theme-studio">
+                  <div class="theme-selection">
+                    <div class="theme-summary">
+                      <div><span class="eyebrow">当前方案</span><strong id="themeName">石墨青</strong><small id="themeDescription">低饱和灰绿，适合长时间查看资源和状态。</small></div>
+                      <div class="theme-summary-swatches" id="summarySwatches" aria-hidden="true"></div>
+                      <div class="theme-summary-meta"><span><strong id="toneSummary">浅色</strong><small>明暗模式</small></span><span><strong id="backgroundSummary">当前默认</strong><small>工作区背景</small></span><span><strong id="accentSummary">#426b57</strong><small>强调色</small></span></div>
+                    </div>
+                    <div class="theme-card-grid" id="themeCards" aria-label="框架主题"></div>
+                  </div>
+                  <aside class="live-preview" aria-label="主题实时预览">
+                    <div class="preview-window">
+                      <div class="preview-topbar"><span></span><span></span><span></span><strong>资源总览</strong></div>
+                      <div class="preview-toolbar"><div><strong>虚拟机列表</strong><small>主题变量实时预览</small></div><button type="button">创建</button></div>
+                      <div class="preview-table">
+                        <div class="preview-row header"><span>名称</span><span>IP</span><span>CPU</span><span>状态</span></div>
+                        <div class="preview-row"><span><strong>xenserver-2</strong><small>18.6 GiB</small></span><span>192.0.2.26</span><span>24%</span><span class="status good">运行中</span></div>
+                        <div class="preview-row"><span><strong>pve-lab-01</strong><small>9.4 GiB</small></span><span>192.0.2.68</span><span>12%</span><span class="status warn">维护</span></div>
+                        <div class="preview-row"><span><strong>vmware-prod</strong><small>-</small></span><span>10.10.1.21</span><span>-</span><span class="status danger">离线</span></div>
+                      </div>
+                    </div>
+                  </aside>
+                </div>
+              </section>
+
+              <section class="settings-card custom-card">
+                <div class="settings-card-head custom-head"><div><strong>自定义主题</strong><span>在基础主题上覆盖明暗模式和语义色。</span></div><div class="head-actions"><button class="prototype-button" type="button" id="importButton">载入</button><button class="prototype-button" type="button" id="exportButton">导出</button><button class="prototype-button" type="button" id="resetButton">重置</button></div></div>
+                <div class="setting-group">
+                  <div class="setting-row"><div><strong>界面明暗</strong><span>浅色、深色或跟随系统。</span></div><div class="prototype-segmented" data-control="tone"><button type="button" data-value="system">跟随系统</button><button class="active" type="button" data-value="light">浅色</button><button type="button" data-value="dark">深色</button></div></div>
+                  <div class="setting-row"><div><strong>强调色</strong><span>按钮、选中态、链接和图表主色。</span></div><div class="color-row" id="accentPresets"></div></div>
+                  <div class="setting-row"><div><strong>状态色</strong><span>成功、警告、危险保持独立语义。</span></div><div class="semantic-colors"><label>成功<input type="color" id="successColor" value="#477a45" /></label><label>警告<input type="color" id="warningColor" value="#b77935" /></label><label>危险<input type="color" id="dangerColor" value="#a5483d" /></label></div></div>
+                </div>
+              </section>
+
+              <section class="settings-card background-card">
+                <div class="settings-card-head"><div><strong>背景与壁纸</strong><span>背景位于工作区底层，卡片保持稳定可读性。</span></div></div>
+                <div class="background-preview" id="backgroundPreview" aria-hidden="true"><div><i></i><i class="short"></i></div><span>背景透过卡片显现</span></div>
+                <div class="setting-row"><div><strong>背景类型</strong><span>默认跟随主题画布。</span></div><div class="prototype-segmented" data-control="background"><button class="active" type="button" data-value="default">默认</button><button type="button" data-value="color">渐变</button><button type="button" data-value="image">图片</button></div></div>
+                <div class="background-panel" data-background-panel="color" hidden>
+                  <div class="gradient-presets" id="gradientPresets"></div>
+                  <label class="range-row"><span>渐变角度</span><input type="range" id="gradientAngle" min="0" max="360" step="5" value="135" /><output id="gradientAngleOutput">135°</output></label>
+                </div>
+                <div class="background-panel" data-background-panel="image" hidden>
+                  <div class="wallpaper-grid" id="wallpaperGrid"></div>
+                  <button class="dropzone" type="button" id="wallpaperUpload"><strong>点击选择本地壁纸</strong><span>JPG / PNG / WebP，原型内即时预览</span></button>
+                </div>
+              </section>
+
+              <section class="settings-card reading-card">
+                <div class="settings-card-head"><div><strong>文字与阅读</strong><span>统一界面文字层级，并保持资源列表的稳定布局。</span></div></div>
+                <div class="reading-grid">
+                  <div>
+                    <div class="setting-row"><div><strong>界面字体</strong><span>系统字体不增加安装包体积。</span></div><select id="uiFont" aria-label="界面字体"><option value="system">跟随系统</option><option value="inter">Inter</option><option value="noto">思源黑体</option><option value="wenkai">霞鹜文楷</option><option value="compact">紧凑字体</option></select></div>
+                    <div class="setting-row"><div><strong>自定义字体</strong><span>填写本机已安装字体名，留空使用上方选项。</span></div><input class="text-input" id="customFont" type="text" placeholder="例如 MiSans" /></div>
+                    <div class="setting-row"><div><strong>文字大小</strong><span>正文随设置变化，控件尺寸保持规范。</span></div><div class="prototype-segmented" data-control="fontSize"><button type="button" data-value="11">11</button><button class="active" type="button" data-value="12">12</button><button type="button" data-value="13">13</button></div></div>
+                    <div class="setting-row"><div><strong>减少动效</strong><span>降低页面切换和光标动画。</span></div><label class="switch"><input id="reduceMotion" type="checkbox"/><span></span></label></div>
+                  </div>
+                  <div class="reading-sample"><span>资源列表预览</span><strong>pve-production-01</strong><small>CPU 24% · 内存 18.6 / 32 GiB · 运行中</small></div>
+                </div>
+              </section>
+
+              <section class="settings-card console-card">
+                <div class="settings-card-head console-head"><div><strong>控制台外观</strong><span>目标策略决定 noVNC 或 xterm；这里仅切换两类外观预览。</span></div><div class="prototype-segmented" data-control="consoleMode"><button class="active" type="button" data-value="graphical">桌面 / noVNC</button><button type="button" data-value="cli">CLI / xterm</button></div></div>
+                <div class="console-layout">
+                  <div class="console-controls">
+                    <div class="control-group" data-cli-controls hidden>
+                      <div class="setting-row"><div><strong>终端字体</strong><span id="consoleFontSource">跟随系统 · 0 KB</span></div><select id="consoleFont"><option value="system">系统等宽</option><option value="jetbrains">JetBrains Mono</option><option value="cascadia">Cascadia Mono</option><option value="menlo">Menlo</option></select></div>
+                      <div class="setting-row"><div><strong>字号</strong><span>11–18px</span></div><label class="stepper"><button type="button" data-step="font" data-delta="-1">−</button><output id="consoleFontSize">13</output><button type="button" data-step="font" data-delta="1">＋</button></label></div>
+                      <div class="setting-row"><div><strong>行高</strong><span>紧凑到宽松</span></div><label class="stepper"><button type="button" data-step="line" data-delta="-0.05">−</button><output id="consoleLineHeight">1.20</output><button type="button" data-step="line" data-delta="0.05">＋</button></label></div>
+                      <div class="palette-grid" id="paletteGrid"></div>
+                      <div class="setting-row"><div><strong>光标样式</strong><span>按终端使用习惯选择。</span></div><div class="prototype-segmented" data-control="cursor"><button class="active" type="button" data-value="block">块</button><button type="button" data-value="bar">竖线</button><button type="button" data-value="underline">下划线</button></div></div>
+                      <div class="setting-row"><div><strong>光标闪烁</strong><span>失去焦点后停止。</span></div><label class="switch"><input id="cursorBlink" type="checkbox" checked/><span></span></label></div>
+                    </div>
+                    <div class="control-group">
+                      <div class="setting-row"><div><strong>安全水印</strong><span>显示用户、目标地址和时间。</span></div><label class="switch"><input id="watermarkEnabled" type="checkbox" checked/><span></span></label></div>
+                      <div class="setting-row"><div><strong>水印密度</strong><span>控制预览中的重复数量。</span></div><select id="watermarkDensity"><option value="sparse">稀疏</option><option value="standard" selected>标准</option><option value="dense">密集</option></select></div>
+                      <label class="range-row"><span>水印透明度</span><input type="range" id="watermarkOpacity" min="6" max="24" value="12"/><output id="watermarkOpacityOutput">12%</output></label>
+                    </div>
+                  </div>
+                  <div class="console-preview" id="consolePreview">
+                    <div class="graphical-preview" data-console-panel="graphical">
+                      <div class="console-toolbar"><div><i></i><strong>xenserver-2</strong></div><small>noVNC · 已连接</small></div>
+                      <div class="graphical-screen"><strong>CentOS Stream 9</strong><span>vrc-node login: <i></i></span></div>
+                      <div class="watermark-layer" aria-hidden="true"></div>
+                      <div class="console-status"><span>远端原始画面</span><span>1280 × 720</span></div>
+                    </div>
+                    <div class="terminal-preview" data-console-panel="cli" hidden tabindex="0">
+                      <div class="console-toolbar"><div><i></i><strong>xenserver-2</strong></div><small>xterm · 已连接</small></div>
+                      <div class="terminal-screen"><p><span class="muted">Last login: Tue Jul 29 08:42:16 2026</span></p><p><span class="accent">[root@vrc-node ~]#</span> systemctl status sshd</p><p><span class="success">● sshd.service</span> - OpenSSH server daemon</p><p>   Active: <span class="success">active (running)</span></p><p><span class="accent">[root@vrc-node ~]#</span> <i class="terminal-cursor"></i></p></div>
+                      <div class="watermark-layer" aria-hidden="true"></div>
+                      <div class="console-status"><span>交互式终端</span><span>120 × 34</span></div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section class="preference-grid" aria-label="交互偏好">
+                <article><div><strong>操作提示</strong><span>图标按钮显示 tooltip</span></div><label class="switch"><input type="checkbox" checked/><span></span></label></article>
+                <article><div><strong>资源列表</strong><span>长名称单行省略</span></div><label class="switch"><input type="checkbox" checked/><span></span></label></article>
+                <article><div><strong>控制台缩放</strong><span>拖拽中节流刷新</span></div><label class="switch"><input type="checkbox" checked/><span></span></label></article>
+              </section>
+            </section>
+          </div>
+        </section>
+      </section>
+
+      <input class="hidden-input" id="wallpaperInput" type="file" accept="image/png,image/jpeg,image/webp" />
+      <input class="hidden-input" id="themeImportInput" type="file" accept="application/json,.json" />
+      <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    </main>
+    <script src="./public/prototype-base.js"></script>
+    <script src="./public/theme-prototype.js"></script>
   </body>
 </html>

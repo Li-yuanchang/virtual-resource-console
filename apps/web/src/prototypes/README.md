@@ -1,8 +1,10 @@
-# Prototype-only components
+# Static prototype rules
 
-This directory contains isolated UI experiments. These components are not production application routes and must not be imported by `src/main.ts`, `src/App.vue`, or production components.
+UI prototypes are standalone `apps/web/*-prototype.html` files. They are not production routes and must not be imported by `src/main.ts`, `src/App.vue`, or production components.
 
-- Open prototypes only through their dedicated `*-prototype.html` entry files during local development.
-- Treat colors, dimensions, data, and interaction patterns here as disposable experiments, not production tokens or contracts.
-- Move an accepted design into production components explicitly; do not make the production application depend on a prototype component.
-- Verify a production build does not emit any `*-prototype.html` files or prototype component chunks.
+- All prototypes must use plain HTML, CSS, and native JavaScript. Vue components, `*-prototype.ts` mounting entries, Vue Router routes, and Element Plus runtime entries are prohibited for prototypes.
+- Reuse `src/styles.css` for VRC design tokens and `public/prototype-base.css` for shared prototype controls.
+- Use paths relative to each HTML file so prototypes work both through Vite and when opened directly with `file://`.
+- Keep page-specific layout and interaction styles inside the prototype HTML unless they are genuinely shared by multiple prototypes.
+- Treat prototype data and behavior as isolated experiments, not production contracts. Move accepted designs into production components explicitly.
+- Verify images, fonts, responsive layout, native interactions, and console output in both HTTP and direct-file modes before considering a prototype complete.
