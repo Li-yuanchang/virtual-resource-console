@@ -216,7 +216,7 @@ const uiPreferencesSchema = z.object({
   showIconTooltips: z.boolean().optional(),
   truncateLongNames: z.boolean().optional(),
   throttleConsoleResize: z.boolean().optional(),
-  uiFontPreset: z.enum(["system", "humanist", "compact"]).optional(),
+  uiFontPreset: z.enum(["system", "inter", "humanist", "lxgw-wenkai", "compact"]).optional(),
   uiFontSize: z.coerce.number().int().min(11).max(13).optional(),
   reduceMotion: z.boolean().optional(),
   consoleTheme: z.enum(["vrc", "tokyo-night", "catppuccin", "dracula", "nord", "rose-pine", "solarized", "light"]).optional(),
@@ -1388,7 +1388,7 @@ async function cleanupExpiredGeneratedIsoResidues(): Promise<void> {
 server.post("/api/connections", async (request, reply) => {
   if (!persistentConnectionStoreEnabled) {
     return reply.status(403).send({
-      message: "共享 Web 模式禁止在 2.26 服务器保存连接账号。请保存到当前浏览器本地，或使用桌面客户端保存到本机。",
+      message: "共享 Web 模式禁止在服务器保存连接账号。请保存到当前浏览器本地，或使用桌面客户端保存到本机。",
     });
   }
   const parsed = saveConnectionSchema.safeParse(request.body);
@@ -1411,7 +1411,7 @@ server.post("/api/connections", async (request, reply) => {
 server.post("/api/ephemeral-connections", async (request, reply) => {
   if (!persistentConnectionStoreEnabled) {
     return reply.status(403).send({
-      message: "共享 Web 模式禁止在 2.26 服务器暂存连接账号。",
+      message: "共享 Web 模式禁止在服务器暂存连接账号。",
     });
   }
   const parsed = ephemeralConnectionSchema.safeParse(request.body);

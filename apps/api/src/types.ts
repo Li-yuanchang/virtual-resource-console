@@ -299,6 +299,7 @@ export interface VmActionResult {
   action: VmPowerAction;
   accepted: boolean;
   message: string;
+  command?: string;
 }
 
 export interface VmRenameResult {

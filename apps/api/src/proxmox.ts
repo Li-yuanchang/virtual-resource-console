@@ -400,15 +400,19 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     }
     const client = await ProxmoxClient.login(input);
     const status = await client.get<ProxmoxVmStatus>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/current`);
+    const vmPath = `/api2/json/nodes/${node}/qemu/${id}`;
+    let command = "";
     if (action === "start") {
       if (status.status === "running") throw new Error("虚拟机已在运行。");
       const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`);
       await client.waitForTask(node, upid);
+      command = `POST ${vmPath}/status/start`;
     } else if (action === "shutdown") {
       if (status.status !== "running") throw new Error("虚拟机未运行，无需关机。");
       try {
         const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/shutdown`);
         await client.waitForTask(node, upid, options?.shutdownTimeoutMs);
+        command = `POST ${vmPath}/status/shutdown`;
       } catch (error) {
         if (options?.forceOnShutdownFailure === false) throw error;
         const upid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/stop`);
@@ -417,6 +421,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
           vmId,
           action,
           accepted: true,
+          command: `POST ${vmPath}/status/stop`,
           message: `关机完成：${vmId}`,
         };
       }
@@ -426,15 +431,18 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
       await client.waitForTask(node, stopUpid);
       const startUpid = await client.post<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/status/start`);
       await client.waitForTask(node, startUpid);
+      command = `POST ${vmPath}/status/stop\nPOST ${vmPath}/status/start`;
     } else {
       if (status.status === "running") throw new Error("虚拟机正在运行，请先关机后再删除。");
       const upid = await client.delete<string>(`/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}`);
       await client.waitForTask(node, upid);
+      command = `DELETE ${vmPath}`;
     }
     return {
       vmId,
       action,
       accepted: true,
+      command,
       message: `${proxmoxActionLabel(action)}完成：${vmId}`,
     };
   }

@@ -11,7 +11,7 @@ const uiBackgroundImageFile = getVrcDataFile("appearance-background");
 export type UiThemePreference = "graphite-sage" | "basalt-copper" | "mist-teal" | "prism-frost" | "aurora-mint" | "neon-carbon";
 export type UiTonePreference = "system" | "light" | "dark";
 export type UiBackgroundPreference = "default" | "solid" | "image";
-export type UiFontPreference = "system" | "humanist" | "compact";
+export type UiFontPreference = "system" | "inter" | "humanist" | "lxgw-wenkai" | "compact";
 export type ConsoleThemePreference = "vrc" | "tokyo-night" | "catppuccin" | "dracula" | "nord" | "rose-pine" | "solarized" | "light";
 export type ConsoleFontPreference = "system-mono" | "jetbrains" | "cascadia" | "menlo";
 
@@ -312,7 +312,9 @@ function normalizeConsoleFontPreset(value: unknown): ConsoleFontPreference {
 }
 
 function normalizeUiFontPreset(value: unknown): UiFontPreference {
-  return value === "humanist" || value === "compact" || value === "system" ? value : defaultUiPreferences.uiFontPreset;
+  return value === "inter" || value === "humanist" || value === "lxgw-wenkai" || value === "compact" || value === "system"
+    ? value
+    : defaultUiPreferences.uiFontPreset;
 }
 
 function normalizeHexColor(value: unknown, fallback: string): string {

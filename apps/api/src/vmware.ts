@@ -358,9 +358,11 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
       const vm = (await this.listVms(input, { page: 1, pageSize: 500 })).items.find((item) => item.providerId === vmId || item.id === vmId);
       if (!vm) throw new Error(`未找到 VMware 虚拟机：${vmId}`);
       const vmMoid = typeof vm.metadata?.managedObjectId === "string" ? vm.metadata.managedObjectId : vm.providerId;
+      let command = "";
       if (action === "start") {
         if (vm.powerState === "running") throw new Error("虚拟机已在运行。");
         await session.powerOnVm(vmMoid);
+        command = `SOAP PowerOnVM_Task vm=${vmMoid}`;
       } else if (action === "shutdown") {
         if (vm.powerState !== "running") throw new Error("虚拟机未运行，无需关机。");
         const forceOnFailure = options?.forceOnShutdownFailure ?? true;
@@ -369,34 +371,41 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
             throw new Error("VMware Tools unavailable before guest shutdown");
           }
           await session.shutdownGuest(vmMoid);
+          command = `SOAP ShutdownGuest vm=${vmMoid}`;
           const gracefullyPoweredOff = await session.waitForVmPowerState(vmMoid, "halted", options?.shutdownTimeoutMs ?? 18_000);
           if (!gracefullyPoweredOff) {
             if (!forceOnFailure) throw new Error("VMware 客户机关机超时，当前策略不允许强制关机。");
             await session.powerOffVm(vmMoid);
+            command = `SOAP ShutdownGuest vm=${vmMoid}\nSOAP PowerOffVM_Task vm=${vmMoid}`;
           }
         } catch (error) {
           if (!isVmwareGuestShutdownUnavailable(error)) throw error;
           if (!forceOnFailure) throw new Error("VMware Tools 不可用，当前策略不允许强制关机。");
           await session.powerOffVm(vmMoid);
+          command = `SOAP PowerOffVM_Task vm=${vmMoid}`;
         }
         return {
           vmId,
           action,
           accepted: true,
+          command,
           message: `${vmwareActionLabel(action)}完成：${vm.name}`,
         };
       } else if (action === "forceReboot") {
         if (vm.powerState !== "running") throw new Error("虚拟机未运行，不能强制重启。");
         await session.powerOffVm(vmMoid);
         await session.powerOnVm(vmMoid);
+        command = `SOAP PowerOffVM_Task vm=${vmMoid}\nSOAP PowerOnVM_Task vm=${vmMoid}`;
       } else {
         if (vm.powerState === "running") throw new Error("虚拟机正在运行，请先关机后再删除。");
         await session.destroyVm(vmMoid);
+        command = `SOAP Destroy_Task vm=${vmMoid}`;
       }
       return {
         vmId,
         action,
         accepted: true,
+        command,
         message: `${vmwareActionLabel(action)}完成：${vm.name}`,
       };
     } finally {

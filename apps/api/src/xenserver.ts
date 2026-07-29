@@ -1667,6 +1667,7 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
       vmId,
       action,
       accepted: true,
+      command: xenVmActionCommand(vmId, action, forced === "true"),
       message:
         action === "shutdown" && forced === "true"
           ? `关机完成：${name}`
@@ -1934,6 +1935,23 @@ function xenActionLabel(action: VmPowerAction) {
   if (action === "shutdown") return "关机";
   if (action === "forceReboot") return "强制重启";
   return "删除";
+}
+
+function xenVmActionCommand(vmId: string, action: VmPowerAction, forced: boolean) {
+  if (action === "start") {
+    return forced
+      ? `xe vm-start uuid=${vmId}\nxe vm-start uuid=${vmId} force=true`
+      : `xe vm-start uuid=${vmId}`;
+  }
+  if (action === "shutdown") {
+    return forced
+      ? `xe vm-shutdown uuid=${vmId}\nxe vm-shutdown uuid=${vmId} force=true`
+      : `xe vm-shutdown uuid=${vmId}`;
+  }
+  if (action === "forceReboot") {
+    return `xe vm-shutdown uuid=${vmId} force=true\nxe vm-start uuid=${vmId}`;
+  }
+  return `xe vm-uninstall uuid=${vmId} force=true`;
 }
 
 function xenTemplateNameForProvision(request: VmProvisionRequest) {
