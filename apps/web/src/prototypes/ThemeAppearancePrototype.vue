@@ -3,14 +3,13 @@ import {
   ArrowLeft,
   Brush,
   Connection,
-  Picture,
   Plus,
   Search,
   Setting,
   Tickets,
 } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import VrcLogoMark from "../components/VrcLogoMark.vue";
 
 type ThemeName =
@@ -33,8 +32,9 @@ type ThemeName =
   | "sci-fi-orbit"
   | "cyber-terminal";
 type ToneMode = "system" | "light" | "dark";
-type BackgroundMode = "default" | "solid" | "image";
-type UiFontFamily = "system" | "humanist" | "compact";
+type BackgroundMode = "default" | "color" | "image";
+type WallpaperTarget = "light" | "dark";
+type UiFontFamily = "system" | "inter" | "noto-sans-sc" | "lxgw-wenkai" | "compact";
 type ConsoleFontFamily = "system-mono" | "jetbrains" | "cascadia" | "menlo";
 type ConsoleMode = "graphical" | "cli";
 type ConsolePalette = "vrc" | "tokyo-night" | "catppuccin" | "dracula" | "nord" | "rose-pine" | "solarized" | "light";
@@ -82,6 +82,28 @@ interface ConsolePaletteOption {
   accent: string;
   success: string;
   colors: string[];
+}
+
+interface GradientPreset {
+  value: string;
+  name: string;
+  angle: number;
+  stops: string[];
+}
+
+interface BuiltinWallpaper {
+  value: string;
+  name: string;
+  src: string;
+  mood: "light" | "dark";
+}
+
+interface UiFontOption {
+  value: UiFontFamily;
+  name: string;
+  family: string;
+  badge: "内置" | "本机";
+  note: string;
 }
 
 const themeOptions: ThemeOption[] = [
@@ -461,6 +483,38 @@ const consolePaletteOptions: ConsolePaletteOption[] = [
     colors: ["#f6f7f5", "#b7c9be", "#658e78", "#29302c"],
   },
 ];
+
+const uiFontOptions: UiFontOption[] = [
+  { value: "system", name: "跟随系统", family: "-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif", badge: "本机", note: "随操作系统，macOS 为苹方，Windows 为雅黑" },
+  { value: "inter", name: "Inter", family: "\"Inter\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif", badge: "内置", note: "现代屏显无衬线，数字与英文锐利，中文回退黑体" },
+  { value: "noto-sans-sc", name: "思源黑体", family: "\"Noto Sans SC\", \"Source Han Sans SC\", \"PingFang SC\", sans-serif", badge: "内置", note: "Adobe 与 Google 联合发布，字形中性，字重齐全" },
+  { value: "lxgw-wenkai", name: "霞鹜文楷", family: "\"LXGW WenKai Screen\", \"LXGW WenKai\", \"Kaiti SC\", serif", badge: "内置", note: "开源楷体，阅读温润，适合长时间盯屏" },
+  { value: "compact", name: "紧凑字体", family: "\"DIN Next\", \"Roboto Condensed\", \"PingFang SC\", sans-serif", badge: "本机", note: "窄体字形，单行容纳更多字符" },
+];
+
+const gradientPresetsLight: GradientPreset[] = [
+  { value: "glacier-mist", name: "冰川薄雾", angle: 135, stops: ["#edf5fb", "#edf7f3", "#f3eef8"] },
+  { value: "rose-dawn", name: "玫瑰晨曦", angle: 130, stops: ["#fbf0f2", "#f3f0fb", "#eef6f3"] },
+  { value: "mint-spring", name: "薄荷清泉", angle: 140, stops: ["#e9f8f1", "#eaf4fb", "#f4f0e9"] },
+];
+
+const gradientPresetsDark: GradientPreset[] = [
+  { value: "neon-abyss", name: "霓虹深渊", angle: 135, stops: ["#10141c", "#12202b", "#1a1530"] },
+  { value: "deep-sea", name: "深海潜流", angle: 160, stops: ["#0f1c28", "#102a33", "#14253c"] },
+  { value: "ember-night", name: "余烬夜色", angle: 150, stops: ["#211a18", "#2b211d", "#1c2230"] },
+];
+
+const builtinWallpapers: BuiltinWallpaper[] = [
+  { value: "mint-breeze", name: "薄荷清风", src: "/prototype-wallpapers/mint-breeze.svg", mood: "light" },
+  { value: "frost-spectrum", name: "冰川光谱", src: "/prototype-wallpapers/frost-spectrum.svg", mood: "light" },
+  { value: "copper-dusk", name: "玄武暮色", src: "/prototype-wallpapers/copper-dusk.svg", mood: "light" },
+  { value: "aurora-rose", name: "极光玫瑰", src: "/prototype-wallpapers/aurora-rose.svg", mood: "light" },
+  { value: "graphite-mist", name: "石墨青岚", src: "/prototype-wallpapers/graphite-mist.svg", mood: "light" },
+  { value: "sunrise-amber", name: "晨曦琥珀", src: "/prototype-wallpapers/sunrise-amber.svg", mood: "light" },
+  { value: "deep-ocean", name: "深海潜流", src: "/prototype-wallpapers/deep-ocean.svg", mood: "dark" },
+  { value: "neon-night", name: "霓虹夜幕", src: "/prototype-wallpapers/neon-night.svg", mood: "dark" },
+];
+
 const currentTheme = ref<ThemeName>("graphite-sage");
 const toneMode = ref<ToneMode>("light");
 const systemDark = ref(false);
@@ -469,13 +523,9 @@ const successColor = ref(themeOptions[0].success);
 const warningColor = ref(themeOptions[0].warning);
 const dangerColor = ref(themeOptions[0].danger);
 const backgroundMode = ref<BackgroundMode>("default");
-const backgroundColor = ref("#edf1ee");
-const defaultBackgroundImage = "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=1600&q=82";
+const defaultBackgroundImage = "/prototype-wallpapers/mint-breeze.svg";
 const backgroundImage = ref(defaultBackgroundImage);
-const backgroundImageName = ref("内置示例");
-const backgroundOpacity = ref(18);
-const backgroundBlur = ref(0);
-const overlayOpacity = ref(8);
+const backgroundImageName = ref("薄荷清风（内置）");
 const showIconTooltips = ref(true);
 const truncateLongNames = ref(true);
 const throttleConsoleResize = ref(true);
@@ -496,16 +546,35 @@ const watermarkOpacity = ref(12);
 const watermarkText = ref("lyc · 192.168.2.26 · 2026-07-22 01:18");
 const imageFileInput = ref<HTMLInputElement>();
 const jsonFileInput = ref<HTMLInputElement>();
+const gradientPreset = ref("glacier-mist");
+const gradientAngle = ref(135);
+const gradientStops = ref<string[]>(["#edf5fb", "#edf7f3", "#f3eef8"]);
+const dualWallpaper = ref(false);
+const wallpaperTarget = ref<WallpaperTarget>("light");
+const darkBackgroundImage = ref("");
+const darkBackgroundImageName = ref("");
+const favoriteWallpapers = ref<string[]>([]);
+const rotationEnabled = ref(false);
+const rotationInterval = ref(15);
+const extractedColors = ref<string[]>([]);
+const imageMeta = ref<{ name: string; width: number; height: number; sizeText: string; compressedText: string } | null>(null);
+const customFontFamily = ref("");
 let darkModeQuery: MediaQueryList | undefined;
 let backgroundObjectUrl: string | undefined;
+let rotationTimer: number | undefined;
 
 const resolvedDark = computed(() => toneMode.value === "dark" || (toneMode.value === "system" && systemDark.value));
 const selectedTheme = computed(() => themeOptions.find((theme) => theme.value === currentTheme.value) ?? themeOptions[0]);
-const backgroundPreviewStyle = computed(() => ({ backgroundImage: `url(${JSON.stringify(backgroundImage.value)})` }));
+// 只推荐 3 款主题（浅/渐变/深各一），更多风格靠下方自定义自由搭配
+const recommendedThemes = computed(() => themeOptions.filter((theme) => ["graphite-sage", "prism-frost", "neon-carbon"].includes(theme.value)));
+const activeBackgroundImage = computed(() =>
+  resolvedDark.value && dualWallpaper.value && darkBackgroundImage.value ? darkBackgroundImage.value : backgroundImage.value,
+);
 const uiFontStack = computed(() => {
-  if (uiFontFamily.value === "humanist") return '"Source Han Sans SC", "Microsoft YaHei UI", sans-serif';
-  if (uiFontFamily.value === "compact") return '"DIN Next", "Roboto Condensed", "PingFang SC", sans-serif';
-  return '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif';
+  const custom = customFontFamily.value.trim();
+  const fallback = uiFontOptions[0].family;
+  if (custom) return `${custom}, ${fallback}`;
+  return uiFontOptions.find((option) => option.value === uiFontFamily.value)?.family ?? fallback;
 });
 const consoleFontStack = computed(() => {
   if (consoleFontFamily.value === "jetbrains") return '"JetBrains Mono", "SFMono-Regular", Consolas, monospace';
@@ -536,10 +605,26 @@ const currentThemeToneText = computed(() => {
   if (toneMode.value === "system") return systemDark.value ? "跟随系统 · 深色" : "跟随系统 · 浅色";
   return toneMode.value === "dark" ? "深色" : "浅色";
 });
+const recommendedGradients = computed(() => (resolvedDark.value ? gradientPresetsDark : gradientPresetsLight));
+const allGradientPresets = [...gradientPresetsLight, ...gradientPresetsDark];
+const activeGradientCss = computed(() =>
+  gradientStops.value.length === 1 ? gradientStops.value[0] : `linear-gradient(${gradientAngle.value}deg, ${gradientStops.value.join(", ")})`,
+);
+const currentGradientName = computed(() => allGradientPresets.find((item) => item.value === gradientPreset.value)?.name ?? "自定义");
+const hasCustomBackground = computed(() => backgroundMode.value !== "default");
 const currentBackgroundText = computed(() => {
-  if (backgroundMode.value === "solid") return "纯色背景";
-  if (backgroundMode.value === "image") return `图片背景 · ${backgroundOpacity.value}%`;
+  if (backgroundMode.value === "color") {
+    return gradientStops.value.length === 1 ? `纯色 ${gradientStops.value[0]}` : `渐变 · ${currentGradientName.value}`;
+  }
+  if (backgroundMode.value === "image") return dualWallpaper.value ? "图片 · 明暗双壁纸" : "图片背景";
   return selectedTheme.value.tone;
+});
+const bgPreviewStyle = computed(() => {
+  if (backgroundMode.value === "color") return { background: activeGradientCss.value };
+  if (backgroundMode.value === "image") {
+    return { backgroundImage: `url(${JSON.stringify(activeBackgroundImage.value)})`, backgroundSize: "cover", backgroundPosition: "center" };
+  }
+  return { background: resolvedDark.value ? selectedTheme.value.darkCanvas : selectedTheme.value.canvas };
 });
 const themePreviewRows = computed(() => [
   { name: "xenserver-2", ip: "192.168.2.26", status: "运行中", tone: "good", cpu: "24%", memory: "18.6 GiB" },
@@ -567,12 +652,9 @@ const prototypeStyle = computed<Record<string, string>>(() => {
     "--vrc-success": successColor.value,
     "--vrc-warning": warningColor.value,
     "--vrc-danger": dangerColor.value,
-    "--prototype-background-color": backgroundMode.value === "solid" ? backgroundColor.value : "transparent",
-    "--prototype-theme-background": backgroundMode.value === "default" ? (resolvedDark.value ? theme.darkCanvas : theme.canvas) : "none",
-    "--prototype-background-image": backgroundMode.value === "image" ? `url(${JSON.stringify(backgroundImage.value)})` : "none",
-    "--prototype-background-opacity": String(backgroundOpacity.value / 100),
-    "--prototype-background-blur": `${backgroundBlur.value}px`,
-    "--prototype-overlay-opacity": String(overlayOpacity.value / 100),
+    "--prototype-theme-background":
+      backgroundMode.value === "color" ? activeGradientCss.value : backgroundMode.value === "default" ? (resolvedDark.value ? theme.darkCanvas : theme.canvas) : "none",
+    "--prototype-background-image": backgroundMode.value === "image" && activeBackgroundImage.value ? `url(${JSON.stringify(activeBackgroundImage.value)})` : "none",
     "--prototype-ui-font": uiFontStack.value,
     "--prototype-ui-size": `${uiFontSize.value}px`,
   };
@@ -611,12 +693,20 @@ function resetPrototype() {
   releaseBackgroundObjectUrl();
   toneMode.value = "light";
   backgroundMode.value = "default";
-  backgroundColor.value = "#edf1ee";
   backgroundImage.value = defaultBackgroundImage;
-  backgroundImageName.value = "内置示例";
-  backgroundOpacity.value = 18;
-  backgroundBlur.value = 0;
-  overlayOpacity.value = 8;
+  backgroundImageName.value = "薄荷清风（内置）";
+  gradientPreset.value = "glacier-mist";
+  gradientAngle.value = 135;
+  gradientStops.value = ["#edf5fb", "#edf7f3", "#f3eef8"];
+  dualWallpaper.value = false;
+  wallpaperTarget.value = "light";
+  darkBackgroundImage.value = "";
+  darkBackgroundImageName.value = "";
+  favoriteWallpapers.value = [];
+  rotationEnabled.value = false;
+  extractedColors.value = [];
+  imageMeta.value = null;
+  customFontFamily.value = "";
   showIconTooltips.value = true;
   truncateLongNames.value = true;
   throttleConsoleResize.value = true;
@@ -644,26 +734,189 @@ function selectImageFile() {
 function loadBackgroundImage(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
-  if (!file) return;
+  input.value = "";
+  if (file) loadWallpaperFile(file);
+}
 
-  const objectUrl = URL.createObjectURL(file);
+function handleWallpaperDrop(event: DragEvent) {
+  const file = event.dataTransfer?.files?.[0];
+  if (file) loadWallpaperFile(file);
+}
+
+function loadWallpaperFile(file: File) {
+  if (!file.type.startsWith("image/")) {
+    ElMessage.error("请选择图片文件");
+    return;
+  }
+  if (file.size > 16 * 1024 * 1024) {
+    ElMessage.error("图片不能超过 16MB");
+    return;
+  }
+  const reader = new FileReader();
+  reader.addEventListener("load", () => {
+    const image = new Image();
+    image.addEventListener("load", () => {
+      // 原型演示正式版要做的压缩：最长边 2560 + WebP 0.85，16MB 原图通常压到 1-2MB
+      const maxEdge = 2560;
+      const scale = Math.min(1, maxEdge / Math.max(image.naturalWidth, image.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(image.naturalWidth * scale);
+      canvas.height = Math.round(image.naturalHeight * scale);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const compressed = canvas.toDataURL("image/webp", 0.85);
+      applyWallpaperSource(compressed, file.name);
+      imageMeta.value = {
+        name: file.name,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        sizeText: formatSize(file.size),
+        compressedText: formatSize(Math.round(compressed.length * 0.75)),
+      };
+      ElMessage.success("壁纸已压缩并应用");
+    });
+    image.addEventListener("error", () => ElMessage.error("图片无法读取，请使用 JPG、PNG 或 WebP 文件"));
+    image.src = String(reader.result);
+  });
+  reader.readAsDataURL(file);
+}
+
+function formatSize(bytes: number) {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function applyWallpaperSource(src: string, name: string) {
+  if (dualWallpaper.value && wallpaperTarget.value === "dark") {
+    darkBackgroundImage.value = src;
+    darkBackgroundImageName.value = name;
+  } else {
+    backgroundImage.value = src;
+    backgroundImageName.value = name;
+  }
+  backgroundMode.value = "image";
+  extractColorsFromImage(src);
+}
+
+function applyBuiltinWallpaper(wp: BuiltinWallpaper) {
+  imageMeta.value = null;
+  applyWallpaperSource(wp.src, wp.name);
+}
+
+function toggleFavorite(value: string) {
+  const index = favoriteWallpapers.value.indexOf(value);
+  if (index >= 0) favoriteWallpapers.value.splice(index, 1);
+  else favoriteWallpapers.value.push(value);
+}
+
+function extractColorsFromImage(src: string) {
   const image = new Image();
+  image.crossOrigin = "anonymous";
   image.addEventListener("load", () => {
-    releaseBackgroundObjectUrl();
-    backgroundObjectUrl = objectUrl;
-    backgroundImage.value = objectUrl;
-    backgroundImageName.value = file.name;
-    backgroundMode.value = "image";
-    backgroundOpacity.value = Math.max(backgroundOpacity.value, 32);
-    ElMessage.success("背景图片已载入");
+    try {
+      const size = 72;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = Math.max(1, Math.round((size * image.naturalHeight) / Math.max(1, image.naturalWidth)));
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return;
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const buckets = new Map<string, number>();
+      for (let i = 0; i + 2 < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        if (max - min < 28 || max > 244 || max < 36) continue;
+        const key = [r, g, b].map((v) => Math.round(v / 24) * 24).join(",");
+        buckets.set(key, (buckets.get(key) ?? 0) + 1);
+      }
+      extractedColors.value = [...buckets.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([key]) => `#${key.split(",").map((v) => Math.min(255, Number(v)).toString(16).padStart(2, "0")).join("")}`);
+    } catch {
+      extractedColors.value = [];
+    }
   });
   image.addEventListener("error", () => {
-    URL.revokeObjectURL(objectUrl);
-    ElMessage.error("图片无法读取，请使用 JPG、PNG 或 WebP 文件");
+    extractedColors.value = [];
   });
-  image.src = objectUrl;
-  input.value = "";
+  image.src = src;
 }
+
+function applyExtractedColor(color: string) {
+  accentColor.value = color;
+  ElMessage.success(`强调色已取色 ${color}`);
+}
+
+function applyGradientPreset(value: string) {
+  const preset = allGradientPresets.find((item) => item.value === value);
+  if (!preset) return;
+  gradientPreset.value = value;
+  gradientAngle.value = preset.angle;
+  gradientStops.value = [...preset.stops];
+  backgroundMode.value = "color";
+}
+
+function updateGradientStop(index: number, color: string | null) {
+  if (!color) return;
+  gradientStops.value.splice(index, 1, color);
+  gradientPreset.value = "custom";
+}
+
+function addGradientStop() {
+  if (gradientStops.value.length >= 4) return;
+  gradientStops.value.push("#a8cbe8");
+  gradientPreset.value = "custom";
+}
+
+function removeGradientStop() {
+  if (gradientStops.value.length <= 1) return;
+  gradientStops.value.pop();
+  gradientPreset.value = "custom";
+}
+
+function useThemeGradient() {
+  const source = resolvedDark.value ? selectedTheme.value.darkCanvas : selectedTheme.value.canvas;
+  const stops = source.match(/#[0-9a-fA-F]{3,8}/g);
+  const angle = source.match(/(\d+(?:\.\d+)?)deg/);
+  if (!stops || stops.length < 2) {
+    ElMessage.warning("当前主题画布没有可取色的渐变");
+    return;
+  }
+  gradientStops.value = stops.slice(0, 4);
+  if (angle) gradientAngle.value = Number(angle[1]);
+  gradientPreset.value = "custom";
+  backgroundMode.value = "color";
+  ElMessage.success("已从当前主题画布取色");
+}
+
+function stopRotation() {
+  if (rotationTimer !== undefined) {
+    window.clearInterval(rotationTimer);
+    rotationTimer = undefined;
+  }
+}
+
+watch([rotationEnabled, rotationInterval, favoriteWallpapers], () => {
+  stopRotation();
+  if (!rotationEnabled.value || favoriteWallpapers.value.length < 2) return;
+  rotationTimer = window.setInterval(() => {
+    const list = favoriteWallpapers.value;
+    const currentIndex = list.findIndex((value) => builtinWallpapers.find((item) => item.value === value)?.src === backgroundImage.value);
+    const next = list[(currentIndex + 1) % list.length];
+    const wp = builtinWallpapers.find((item) => item.value === next);
+    if (!wp) return;
+    // 轮换只切浅色槽位，避免打断深色槽位配置
+    backgroundImage.value = wp.src;
+    backgroundImageName.value = wp.name;
+    backgroundMode.value = "image";
+  }, rotationInterval.value * 1000);
+});
 
 function releaseBackgroundObjectUrl() {
   if (!backgroundObjectUrl) return;
@@ -684,15 +937,14 @@ function exportTheme() {
     },
     background: {
       mode: backgroundMode.value,
-      color: backgroundColor.value,
       image: backgroundImage.value.startsWith("data:") ? "" : backgroundImage.value,
-      opacity: backgroundOpacity.value,
-      blur: backgroundBlur.value,
-      overlay: overlayOpacity.value,
+      gradient: { angle: gradientAngle.value, stops: [...gradientStops.value] },
+      dualWallpaper: dualWallpaper.value,
     },
     typography: {
       family: uiFontFamily.value,
       size: uiFontSize.value,
+      customFontFamily: customFontFamily.value || null,
       reduceMotion: reduceMotion.value,
     },
     console: {
@@ -737,13 +989,15 @@ function importTheme(event: Event) {
       if (config.colors?.success) successColor.value = config.colors.success;
       if (config.colors?.warning) warningColor.value = config.colors.warning;
       if (config.colors?.danger) dangerColor.value = config.colors.danger;
-      if (["default", "solid", "image"].includes(config.background?.mode)) backgroundMode.value = config.background.mode;
-      if (config.background?.color) backgroundColor.value = config.background.color;
+      if (["default", "color", "image"].includes(config.background?.mode)) backgroundMode.value = config.background.mode;
       if (config.background?.image) backgroundImage.value = config.background.image;
-      if (Number.isFinite(config.background?.opacity)) backgroundOpacity.value = config.background.opacity;
-      if (Number.isFinite(config.background?.blur)) backgroundBlur.value = config.background.blur;
-      if (Number.isFinite(config.background?.overlay)) overlayOpacity.value = config.background.overlay;
-      if (["system", "humanist", "compact"].includes(config.typography?.family)) uiFontFamily.value = config.typography.family;
+      if (Array.isArray(config.background?.gradient?.stops) && config.background.gradient.stops.length >= 1) {
+        gradientStops.value = config.background.gradient.stops.map(String).slice(0, 4);
+        if (Number.isFinite(config.background.gradient.angle)) gradientAngle.value = Number(config.background.gradient.angle);
+      }
+      if (typeof config.background?.dualWallpaper === "boolean") dualWallpaper.value = config.background.dualWallpaper;
+      if (["system", "inter", "noto-sans-sc", "lxgw-wenkai", "compact"].includes(config.typography?.family)) uiFontFamily.value = config.typography.family;
+      if (typeof config.typography?.customFontFamily === "string") customFontFamily.value = config.typography.customFontFamily;
       if ([11, 12, 13].includes(config.typography?.size)) uiFontSize.value = config.typography.size;
       if (typeof config.typography?.reduceMotion === "boolean") reduceMotion.value = config.typography.reduceMotion;
       if (["graphical", "cli"].includes(config.console?.mode)) consoleMode.value = config.console.mode;
@@ -779,6 +1033,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   darkModeQuery?.removeEventListener("change", updateSystemMode);
   releaseBackgroundObjectUrl();
+  stopRotation();
 });
 </script>
 
@@ -865,12 +1120,12 @@ onBeforeUnmount(() => {
             <button type="button"><el-icon><Tickets /></el-icon><span>日志</span></button>
           </aside>
 
-          <section class="settings-workspace-content prototype-theme-canvas">
+          <section class="settings-workspace-content prototype-theme-canvas" :class="{ 'has-custom-bg': hasCustomBackground }">
             <section class="settings-card prototype-theme-card">
               <div class="settings-card-head">
                 <div>
                   <strong>框架主题</strong>
-                  <span>选择后全局应用，背景、surface、表格、弹窗、loading、toast 和图表都跟随主题。</span>
+                  <span>精选 3 款推荐主题，全局应用；更多风格用下方自定义主题和背景自由搭配。</span>
                 </div>
               </div>
               <div class="prototype-theme-studio">
@@ -892,7 +1147,7 @@ onBeforeUnmount(() => {
                   </div>
                   <div class="settings-theme-card-grid">
                     <button
-                      v-for="theme in themeOptions"
+                      v-for="theme in recommendedThemes"
                       :key="theme.value"
                       type="button"
                       class="settings-theme-card"
@@ -991,41 +1246,159 @@ onBeforeUnmount(() => {
                   </div>
                 </section>
 
-                <section class="prototype-setting-group prototype-background-group">
-                  <div class="prototype-group-title">
-                    <strong>工作区背景</strong>
-                    <span>背景只作用于内容画布，不覆盖侧栏和组件 surface。</span>
+              </div>
+            </section>
+
+            <section class="settings-card prototype-wallpaper-card">
+              <div class="settings-card-head">
+                <div>
+                  <strong>背景与壁纸</strong>
+                  <span>背景铺在卡片下层、透过卡片显现；选图即用，无需调参。</span>
+                </div>
+              </div>
+              <div class="prototype-wallpaper-body">
+                <div class="prototype-bg-preview" :style="bgPreviewStyle" aria-hidden="true">
+                  <div class="prototype-bg-preview-cards">
+                    <i></i><i class="short"></i>
                   </div>
+                  <span class="prototype-bg-preview-tip">背景透过卡片显现 —— 这就是它的作用范围</span>
+                </div>
+                <div class="prototype-setting-row">
+                  <div><strong>背景类型</strong><span>默认跟随主题画布。</span></div>
+                  <el-segmented
+                    v-model="backgroundMode"
+                    :options="[{ label: '默认', value: 'default' }, { label: '颜色', value: 'color' }, { label: '图片', value: 'image' }]"
+                    size="small"
+                  />
+                </div>
+
+                <template v-if="backgroundMode === 'color'">
                   <div class="prototype-setting-row">
-                    <div><strong>背景类型</strong><span>默认、纯色或本地图片。</span></div>
-                    <el-segmented
-                      v-model="backgroundMode"
-                      :options="[{ label: '默认', value: 'default' }, { label: '纯色', value: 'solid' }, { label: '图片', value: 'image' }]"
-                      size="small"
-                    />
-                  </div>
-                  <div v-if="backgroundMode === 'solid'" class="prototype-setting-row">
-                    <div><strong>背景颜色</strong><span>{{ backgroundColor }}</span></div>
-                    <el-color-picker v-model="backgroundColor" size="small" />
-                  </div>
-                  <div v-if="backgroundMode === 'image'" class="prototype-setting-row">
-                    <div><strong>背景图片</strong><span>支持 JPG、PNG 和 WebP。</span></div>
-                    <div class="prototype-image-control">
-                      <span class="prototype-image-preview" :style="backgroundPreviewStyle" aria-hidden="true"></span>
-                      <span class="prototype-image-name" :title="backgroundImageName">{{ backgroundImageName }}</span>
-                      <el-button size="small" :icon="Picture" @click="selectImageFile">选择图片</el-button>
+                    <div><strong>推荐</strong><span>{{ resolvedDark ? "深色系" : "浅色系" }} 3 款，跟随明暗模式切换。</span></div>
+                    <div class="prototype-gradient-recs">
+                      <button
+                        v-for="preset in recommendedGradients"
+                        :key="preset.value"
+                        type="button"
+                        class="prototype-gradient-rec"
+                        :class="{ active: gradientPreset === preset.value }"
+                        @click="applyGradientPreset(preset.value)"
+                      >
+                        <i :style="{ background: `linear-gradient(${preset.angle}deg, ${preset.stops.join(', ')})` }" aria-hidden="true"></i>
+                        <span>{{ preset.name }}</span>
+                      </button>
                     </div>
                   </div>
-                  <div v-if="backgroundMode === 'image'" class="prototype-slider-row">
-                    <span>透明度</span><el-slider v-model="backgroundOpacity" :min="5" :max="60" :show-tooltip="false" /><strong>{{ backgroundOpacity }}%</strong>
+                  <div class="prototype-gradient-builder">
+                    <div class="prototype-gradient-stops">
+                      <span class="prototype-control-meta">颜色</span>
+                      <el-color-picker
+                        v-for="(stop, index) in gradientStops"
+                        :key="index"
+                        :model-value="stop"
+                        size="small"
+                        @change="updateGradientStop(index, $event)"
+                      />
+                      <el-button size="small" :disabled="gradientStops.length >= 4" @click="addGradientStop">＋</el-button>
+                      <el-button size="small" :disabled="gradientStops.length <= 1" @click="removeGradientStop">－</el-button>
+                      <el-button size="small" type="primary" plain @click="useThemeGradient">从主题取色</el-button>
+                    </div>
+                    <div v-if="gradientStops.length >= 2" class="prototype-gradient-angle">
+                      <span class="prototype-control-meta">角度</span>
+                      <el-slider v-model="gradientAngle" :min="0" :max="360" :step="5" :show-tooltip="false" @change="gradientPreset = 'custom'" />
+                      <span class="prototype-control-meta">{{ gradientAngle }}°</span>
+                    </div>
                   </div>
-                  <div v-if="backgroundMode === 'image'" class="prototype-slider-row">
-                    <span>模糊</span><el-slider v-model="backgroundBlur" :min="0" :max="16" :show-tooltip="false" /><strong>{{ backgroundBlur }}px</strong>
+                </template>
+
+                <template v-if="backgroundMode === 'image'">
+                  <div class="prototype-gallery-head">
+                    <strong>内置图库</strong>
+                    <span>点击应用 · ☆ 收藏加入轮换</span>
                   </div>
-                  <div v-if="backgroundMode !== 'default'" class="prototype-slider-row">
-                    <span>遮罩</span><el-slider v-model="overlayOpacity" :min="0" :max="35" :show-tooltip="false" /><strong>{{ overlayOpacity }}%</strong>
+                  <div class="prototype-wallpaper-grid">
+                    <div
+                      v-for="wp in builtinWallpapers"
+                      :key="wp.value"
+                      class="prototype-wallpaper-item"
+                      :class="{ active: backgroundImage === wp.src || darkBackgroundImage === wp.src }"
+                      @click="applyBuiltinWallpaper(wp)"
+                    >
+                      <div class="prototype-wallpaper-thumb" :style="{ backgroundImage: `url(${wp.src})` }">
+                        <button
+                          type="button"
+                          class="prototype-wallpaper-star"
+                          :class="{ on: favoriteWallpapers.includes(wp.value) }"
+                          :aria-label="`收藏 ${wp.name}`"
+                          @click.stop="toggleFavorite(wp.value)"
+                        >{{ favoriteWallpapers.includes(wp.value) ? "★" : "☆" }}</button>
+                        <span v-if="wp.mood === 'dark'" class="prototype-wallpaper-mood">深色</span>
+                      </div>
+                      <span class="prototype-wallpaper-name">{{ wp.name }}</span>
+                    </div>
                   </div>
-                </section>
+
+                  <div class="prototype-upload-row">
+                    <div class="prototype-dropzone" @dragover.prevent @drop.prevent="handleWallpaperDrop" @click="selectImageFile">
+                      <span class="prototype-dropzone-title">点击或拖拽上传</span>
+                      <span class="prototype-dropzone-meta">自动压缩 WebP ≤2560 · JPG/PNG/WebP ≤16MB</span>
+                    </div>
+                    <div v-if="imageMeta" class="prototype-image-meta">
+                      {{ imageMeta.name }} · {{ imageMeta.width }}×{{ imageMeta.height }} · 原始 {{ imageMeta.sizeText }} → 压缩后约 {{ imageMeta.compressedText }}
+                    </div>
+                  </div>
+
+                  <div v-if="extractedColors.length" class="prototype-extract-row">
+                    <strong>壁纸取色</strong>
+                    <div class="prototype-extract-colors">
+                      <button
+                        v-for="color in extractedColors"
+                        :key="color"
+                        type="button"
+                        class="prototype-extract-chip"
+                        :style="{ background: color }"
+                        :title="`设为强调色 ${color}`"
+                        @click="applyExtractedColor(color)"
+                      ></button>
+                      <span class="prototype-control-meta">点击色块设为强调色</span>
+                    </div>
+                  </div>
+
+                  <div class="prototype-bg-toggles">
+                    <span class="prototype-bg-toggle">
+                      <span class="prototype-bg-toggle-label">明暗双壁纸</span>
+                      <el-switch v-model="dualWallpaper" size="small" aria-label="明暗双壁纸" />
+                    </span>
+                    <span class="prototype-bg-toggle">
+                      <span class="prototype-bg-toggle-label">轮换</span>
+                      <el-switch v-model="rotationEnabled" size="small" :disabled="favoriteWallpapers.length < 2" aria-label="壁纸轮换" />
+                      <el-select v-model="rotationInterval" size="small" class="prototype-rotation-interval" :disabled="!rotationEnabled">
+                        <el-option :value="15" label="15 秒（演示）" />
+                        <el-option :value="60" label="1 分钟" />
+                        <el-option :value="300" label="5 分钟" />
+                        <el-option :value="1800" label="30 分钟" />
+                      </el-select>
+                      <span class="prototype-control-meta">已收藏 {{ favoriteWallpapers.length }} 张</span>
+                    </span>
+                  </div>
+                  <div v-if="dualWallpaper" class="prototype-dual-row">
+                    <div class="prototype-dual-slot" :class="{ armed: wallpaperTarget === 'light' }" @click="wallpaperTarget = 'light'">
+                      <div class="prototype-dual-thumb" :style="{ backgroundImage: backgroundImage ? `url(${JSON.stringify(backgroundImage)})` : 'none' }"></div>
+                      <div class="prototype-dual-meta">
+                        <strong>浅色壁纸</strong>
+                        <span>{{ backgroundImageName || "未设置" }}</span>
+                      </div>
+                    </div>
+                    <div class="prototype-dual-slot" :class="{ armed: wallpaperTarget === 'dark' }" @click="wallpaperTarget = 'dark'">
+                      <div class="prototype-dual-thumb dark" :style="{ backgroundImage: darkBackgroundImage ? `url(${JSON.stringify(darkBackgroundImage)})` : 'none' }"></div>
+                      <div class="prototype-dual-meta">
+                        <strong>深色壁纸</strong>
+                        <span>{{ darkBackgroundImageName || "未设置 · 跟随浅色" }}</span>
+                      </div>
+                    </div>
+                    <span class="prototype-dual-tip">点选槽位后，再从图库或上传应用</span>
+                  </div>
+                </template>
               </div>
             </section>
 
@@ -1039,12 +1412,19 @@ onBeforeUnmount(() => {
               <div class="prototype-reading-grid">
                 <div class="prototype-reading-controls">
                   <div class="prototype-setting-row">
-                    <div><strong>界面字体</strong><span>使用本机已安装字体，缺失时自动回退系统字体。</span></div>
-                    <el-select v-model="uiFontFamily" class="prototype-control-medium" aria-label="界面字体">
-                      <el-option label="跟随系统" value="system" />
-                      <el-option label="思源黑体" value="humanist" />
-                      <el-option label="紧凑字体" value="compact" />
+                    <div><strong>界面字体</strong><span>「内置」随应用打包、跨设备效果一致；「本机」依赖系统安装。</span></div>
+                    <el-select v-model="uiFontFamily" class="prototype-control-medium" size="small" aria-label="界面字体">
+                      <el-option v-for="option in uiFontOptions" :key="option.value" :label="option.name" :value="option.value">
+                        <span class="prototype-font-option">
+                          <span class="prototype-font-option-name" :style="{ fontFamily: option.family }">{{ option.name }}</span>
+                          <span class="prototype-font-option-tag" :class="{ bundled: option.badge === '内置' }">{{ option.badge }}</span>
+                        </span>
+                      </el-option>
                     </el-select>
+                  </div>
+                  <div class="prototype-setting-row">
+                    <div><strong>自定义字体</strong><span>填入本机已安装的字体名（高级），留空则使用上方选择。</span></div>
+                    <el-input v-model="customFontFamily" class="prototype-control-medium" size="small" placeholder="例如 MiSans、HarmonyOS Sans SC" clearable />
                   </div>
                   <div class="prototype-setting-row">
                     <div><strong>文字大小</strong><span>只调整界面正文，表格与按钮尺寸保持规范。</span></div>
@@ -1257,8 +1637,7 @@ onBeforeUnmount(() => {
   background: var(--vrc-surface);
 }
 
-.prototype-theme-canvas::before,
-.prototype-theme-canvas::after {
+.prototype-theme-canvas::before {
   position: absolute;
   z-index: 0;
   inset: 0;
@@ -1268,17 +1647,24 @@ onBeforeUnmount(() => {
 }
 
 .prototype-theme-canvas::before {
-  inset: calc(var(--prototype-background-blur, 0px) * -1);
+  inset: 0;
   background-image: var(--prototype-background-image, none);
   background-position: center;
   background-size: cover;
-  filter: blur(var(--prototype-background-blur, 0px));
-  opacity: var(--prototype-background-opacity, 0);
+  opacity: 0.42;
 }
 
-.prototype-theme-canvas::after {
-  background: var(--vrc-surface);
-  opacity: var(--prototype-overlay-opacity, 0);
+.prototype-theme-canvas.has-custom-bg :deep(.settings-card),
+.prototype-theme-canvas.has-custom-bg :deep(.settings-tile),
+.prototype-theme-canvas.has-custom-bg :deep(.settings-theme-card),
+.prototype-theme-canvas.has-custom-bg .prototype-preview-window,
+.prototype-theme-canvas.has-custom-bg .prototype-theme-summary {
+  background: color-mix(in srgb, var(--vrc-surface) 84%, transparent);
+  backdrop-filter: blur(18px) saturate(1.25);
+}
+
+.prototype-theme-canvas.has-custom-bg :deep(.settings-theme-card.active) {
+  background: color-mix(in srgb, var(--vrc-accent-soft) 88%, transparent);
 }
 
 .prototype-theme-canvas > * {
@@ -1387,7 +1773,7 @@ onBeforeUnmount(() => {
 }
 
 .prototype-theme-canvas :deep(.settings-theme-card-grid) {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -1588,7 +1974,7 @@ onBeforeUnmount(() => {
 
 .prototype-custom-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
 }
 
@@ -1618,8 +2004,6 @@ onBeforeUnmount(() => {
 
 .prototype-group-title span,
 .prototype-setting-row > div > span,
-.prototype-slider-row > span,
-.prototype-slider-row > strong,
 .prototype-semantic-colors label > span {
   color: var(--vrc-text-muted);
   font-size: 11px;
@@ -1678,43 +2062,6 @@ onBeforeUnmount(() => {
 
 .prototype-semantic-colors label {
   gap: 5px;
-}
-
-.prototype-image-control {
-  display: grid;
-  grid-template-columns: 42px minmax(0, 112px) auto;
-  align-items: center;
-  gap: 7px;
-}
-
-.prototype-image-preview {
-  width: 42px;
-  height: 28px;
-  background-color: var(--vrc-surface-muted);
-  background-position: center;
-  background-size: cover;
-  border: 1px solid var(--vrc-border);
-  border-radius: 5px;
-}
-
-.prototype-image-name {
-  overflow: hidden;
-  color: var(--vrc-text-muted);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.prototype-slider-row {
-  display: grid;
-  grid-template-columns: 44px minmax(80px, 1fr) 36px;
-  align-items: center;
-  gap: 8px;
-  min-height: 34px;
-}
-
-.prototype-slider-row > strong {
-  text-align: right;
 }
 
 .prototype-hidden-input {
@@ -2136,7 +2483,7 @@ onBeforeUnmount(() => {
 
 @media (max-width: 1380px) {
   .prototype-theme-canvas :deep(.settings-theme-card-grid) {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .prototype-custom-grid {
@@ -2204,6 +2551,419 @@ onBeforeUnmount(() => {
 
   .prototype-control-medium,
   .prototype-size-segmented {
+    width: 100%;
+  }
+}
+
+/* 背景与壁纸 */
+.prototype-wallpaper-body {
+  display: grid;
+  gap: 4px;
+}
+
+.prototype-bg-preview {
+  position: relative;
+  height: 72px;
+  margin-bottom: 8px;
+  overflow: hidden;
+  border: 1px solid var(--vrc-border);
+  border-radius: 10px;
+  background-color: var(--vrc-surface-muted);
+}
+
+.prototype-bg-preview-cards {
+  position: absolute;
+  inset: 10px 12px auto;
+  display: grid;
+  gap: 6px;
+}
+
+.prototype-bg-preview-cards i {
+  display: block;
+  width: 62%;
+  height: 22px;
+  border: 1px solid var(--vrc-border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--vrc-surface) 84%, transparent);
+  backdrop-filter: blur(6px);
+}
+
+.prototype-bg-preview-cards i.short {
+  width: 44%;
+}
+
+.prototype-bg-preview-tip {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--vrc-surface) 80%, transparent);
+  color: var(--vrc-text-muted);
+  font-size: 10px;
+}
+
+.prototype-gallery-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 2px 8px;
+}
+
+.prototype-gallery-head strong {
+  font-size: 12px;
+  color: var(--vrc-text);
+}
+
+.prototype-gallery-head span {
+  font-size: 11px;
+  color: var(--vrc-text-muted);
+}
+
+.prototype-wallpaper-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.prototype-wallpaper-item {
+  display: grid;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.prototype-wallpaper-thumb {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  border: 1px solid var(--vrc-border);
+  border-radius: 8px;
+  background-position: center;
+  background-size: cover;
+  transition: box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+.prototype-wallpaper-item:hover .prototype-wallpaper-thumb {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(29, 36, 48, 0.14);
+}
+
+.prototype-wallpaper-item.active .prototype-wallpaper-thumb {
+  border-color: transparent;
+  box-shadow: 0 0 0 2px var(--vrc-accent);
+}
+
+.prototype-wallpaper-name {
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.prototype-wallpaper-item.active .prototype-wallpaper-name {
+  color: var(--vrc-text);
+  font-weight: 600;
+}
+
+.prototype-wallpaper-star {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(20, 24, 32, 0.45);
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.prototype-wallpaper-item:hover .prototype-wallpaper-star,
+.prototype-wallpaper-star.on {
+  opacity: 1;
+}
+
+.prototype-wallpaper-star.on {
+  background: rgba(20, 24, 32, 0.6);
+  color: #ffd666;
+}
+
+.prototype-wallpaper-mood {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(20, 24, 32, 0.55);
+  color: #fff;
+  font-size: 10px;
+}
+
+.prototype-upload-row {
+  display: grid;
+  gap: 6px;
+  padding-top: 10px;
+}
+
+.prototype-dropzone {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px dashed var(--vrc-border-strong);
+  border-radius: 10px;
+  background: var(--vrc-surface-muted);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.prototype-dropzone:hover {
+  border-color: var(--vrc-accent);
+}
+
+.prototype-dropzone-title {
+  color: var(--vrc-text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.prototype-dropzone-meta,
+.prototype-image-meta {
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+}
+
+.prototype-extract-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 8px;
+}
+
+.prototype-extract-row > strong {
+  font-size: 12px;
+  color: var(--vrc-text);
+}
+
+.prototype-extract-colors {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prototype-extract-chip {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--vrc-border-strong);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+.prototype-extract-chip:hover {
+  transform: scale(1.14);
+}
+
+.prototype-control-meta {
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.prototype-dual-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 2px 2px;
+}
+
+.prototype-dual-slot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--vrc-border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.prototype-dual-slot.armed {
+  border-color: var(--vrc-accent);
+  box-shadow: 0 0 0 1px var(--vrc-accent);
+}
+
+.prototype-dual-thumb {
+  width: 64px;
+  height: 40px;
+  flex: 0 0 64px;
+  border: 1px solid var(--vrc-border);
+  border-radius: 6px;
+  background-color: var(--vrc-surface-muted);
+  background-position: center;
+  background-size: cover;
+}
+
+.prototype-dual-thumb.dark {
+  background-color: #171a21;
+}
+
+.prototype-dual-meta {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.prototype-dual-meta strong {
+  font-size: 12px;
+  color: var(--vrc-text);
+}
+
+.prototype-dual-meta span {
+  overflow: hidden;
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prototype-dual-tip {
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+}
+
+.prototype-bg-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 28px;
+  padding-top: 10px;
+}
+
+.prototype-bg-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prototype-bg-toggle-label {
+  color: var(--vrc-text);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.prototype-rotation-interval {
+  width: 118px;
+}
+
+/* 渐变 */
+.prototype-gradient-recs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prototype-gradient-rec {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 4px;
+  border: 1px solid var(--vrc-border);
+  border-radius: 7px;
+  background: var(--vrc-surface-muted);
+  color: var(--vrc-text);
+  cursor: pointer;
+  font-size: 11px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.prototype-gradient-rec:hover {
+  border-color: var(--vrc-border-strong);
+}
+
+.prototype-gradient-rec.active {
+  border-color: var(--vrc-accent);
+  box-shadow: 0 0 0 1px var(--vrc-accent);
+}
+
+.prototype-gradient-rec i {
+  width: 26px;
+  height: 16px;
+  border: 1px solid var(--vrc-border);
+  border-radius: 5px;
+}
+
+.prototype-gradient-builder {
+  display: grid;
+  gap: 10px;
+  padding: 4px 0 6px;
+}
+
+.prototype-gradient-angle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 320px;
+}
+
+.prototype-gradient-angle :deep(.el-slider) {
+  flex: 1;
+}
+
+.prototype-gradient-stops {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prototype-gradient-stops :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+
+/* 字体 */
+.prototype-font-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  width: 100%;
+}
+
+.prototype-font-option-name {
+  font-size: 13px;
+}
+
+.prototype-font-option-tag {
+  font-size: 10px;
+  color: var(--vrc-text-subtle);
+}
+
+.prototype-font-option-tag.bundled {
+  color: var(--vrc-accent);
+}
+
+@media (max-width: 1380px) {
+  .prototype-wallpaper-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .prototype-dual-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 860px) {
+  .prototype-wallpaper-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .prototype-gradient-angle {
     width: 100%;
   }
 }

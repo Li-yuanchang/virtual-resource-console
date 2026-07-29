@@ -450,7 +450,7 @@ function errorMessage(error: unknown, fallback: string) {
               <label class="schedule-field"><span>冲突处理</span><el-select v-model="conflictPolicy"><el-option label="阻止创建并提示冲突" value="block" /><el-option label="跳过冲突 VM，其余继续" value="skip" /><el-option label="以当前计划覆盖旧计划" value="replace" /></el-select></label>
               <label v-if="scheduleAction === 'shutdown'" class="schedule-field"><span>关机超时（分钟）</span><span class="schedule-timeout-control"><el-input-number v-model="shutdownTimeout" :min="2" :max="60" controls-position="right" /></span></label>
               <label v-if="scheduleAction === 'shutdown'" class="schedule-field"><span>失败处理</span><el-select v-model="shutdownFallback"><el-option label="超时后强制关机" value="force" /><el-option label="仅记录失败" value="fail" /></el-select></label>
-              <div class="schedule-field schedule-skip-setting"><span>状态一致时跳过</span><div class="schedule-skip-control"><small>不重复发送相同指令</small><el-switch v-model="skipMatchingState" /></div></div>
+              <div class="schedule-field schedule-skip-setting"><span>状态一致时跳过</span><div class="schedule-skip-control"><small>不重复发送相同指令</small><el-switch v-model="skipMatchingState" aria-label="状态一致时跳过" /></div></div>
             </div>
           </section>
 
@@ -491,7 +491,7 @@ function errorMessage(error: unknown, fallback: string) {
             <el-table-column label="周期" min-width="126"><template #default="{ row }">{{ taskCycleLabel(row) }}</template></el-table-column>
             <el-table-column label="目标" width="62" align="center"><template #default="{ row }">{{ row.targets.length }} 台</template></el-table-column>
             <el-table-column label="下一次执行" width="112"><template #default="{ row }">{{ row.enabled ? formatDateTime(row.nextRunAt, row.timezone) : '已停用' }}</template></el-table-column>
-            <el-table-column label="启用" width="62" align="center"><template #default="{ row }"><el-switch v-model="row.enabled" size="small" @change="toggleTask(row, $event)" /></template></el-table-column>
+            <el-table-column label="启用" width="62" align="center"><template #default="{ row }"><el-switch v-model="row.enabled" size="small" :aria-label="`${row.name}任务启用开关`" @change="toggleTask(row, $event)" /></template></el-table-column>
             <el-table-column label="操作" width="82" align="center" fixed="right"><template #default="{ row }"><div class="schedule-row-actions"><button type="button" title="编辑任务" aria-label="编辑任务" @click="editTask(row)"><el-icon><EditPen /></el-icon></button><button type="button" class="danger" title="删除任务" aria-label="删除任务" @click="removeTask(row)"><el-icon><Delete /></el-icon></button></div></template></el-table-column>
           </el-table>
         </section>
@@ -533,11 +533,7 @@ function errorMessage(error: unknown, fallback: string) {
 .schedule-field :deep(.el-input__wrapper:hover), .schedule-field :deep(.el-select__wrapper:hover), .schedule-field :deep(.el-input-number .el-input__wrapper:hover) { border-color: var(--vrc-border); box-shadow: none; }
 .schedule-field :deep(.el-input__wrapper.is-focus), .schedule-field :deep(.el-select__wrapper.is-focused) { border-color: var(--vrc-border-strong); box-shadow: none; }
 .schedule-field :deep(.el-input__inner), .schedule-field :deep(.el-select__selected-item), .schedule-field :deep(.el-select__placeholder) { height: calc(var(--vrc-control-height) - 2px); color: var(--vrc-text); font-size: var(--vrc-font-size-body); font-weight: var(--vrc-font-weight-regular); line-height: calc(var(--vrc-control-height) - 2px); }
-.schedule-action-segmented, .schedule-cycle-segmented { --el-segmented-item-selected-color: var(--vrc-text); --el-segmented-item-selected-bg-color: var(--vrc-surface); box-sizing: border-box; width: 100%; height: 28px; min-height: 28px; padding: 2px; color: var(--vrc-text-muted); background: var(--vrc-surface-muted); border: 1px solid transparent; border-radius: 7px; box-shadow: none; }
-.schedule-action-segmented :deep(.el-segmented__group), .schedule-cycle-segmented :deep(.el-segmented__group) { align-items: center; height: 22px; min-height: 22px; }
-.schedule-action-segmented :deep(.el-segmented__item), .schedule-cycle-segmented :deep(.el-segmented__item) { height: 22px; min-height: 22px; padding: 0 8px; color: var(--vrc-text-muted); border-radius: 5px; font-size: 12px; font-weight: 400; line-height: 22px; }
-.schedule-action-segmented :deep(.el-segmented__item.is-selected), .schedule-cycle-segmented :deep(.el-segmented__item.is-selected) { color: var(--vrc-text); }
-.schedule-action-segmented :deep(.el-segmented__item-selected), .schedule-cycle-segmented :deep(.el-segmented__item-selected) { box-shadow: 0 1px 2px color-mix(in srgb, var(--vrc-text) 8%, transparent); }
+.schedule-action-segmented, .schedule-cycle-segmented { width: 100%; }
 .schedule-week-field { grid-column: 1 / -1; }
 .schedule-weekdays { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; min-height: 28px; padding: 0 2px; }
 .schedule-weekdays :deep(.el-checkbox) { height: 28px; margin-right: 0; color: var(--vrc-text); font-size: 12px; }
@@ -549,9 +545,6 @@ function errorMessage(error: unknown, fallback: string) {
 .schedule-timeout-control :deep(.el-input-number__decrease:hover), .schedule-timeout-control :deep(.el-input-number__increase:hover) { color: var(--vrc-accent); background: var(--vrc-surface); border-color: var(--vrc-border); }
 .schedule-skip-control { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 28px; min-width: 0; padding: 0 2px; }
 .schedule-skip-control small { min-width: 0; overflow: hidden; color: var(--vrc-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.schedule-skip-control :deep(.el-switch) { flex: 0 0 34px; width: 34px; height: 20px; }
-.schedule-skip-control :deep(.el-switch__core) { width: 34px; min-width: 34px; height: 20px; }
-.schedule-skip-control :deep(.el-switch__action) { width: 16px; height: 16px; }
 .schedule-target-heading { align-items: center; }
 .schedule-target-heading strong { display: inline-flex; align-items: center; gap: 5px; line-height: 16px; }
 .schedule-target-heading strong em { color: var(--vrc-text-muted); font-size: 11px; font-style: normal; font-weight: 400; font-variant-numeric: tabular-nums; line-height: 16px; white-space: nowrap; }
@@ -568,9 +561,7 @@ function errorMessage(error: unknown, fallback: string) {
 .schedule-target-filters :deep(.el-select__selected-item), .schedule-target-filters :deep(.el-select__placeholder) { display: flex; align-items: center; }
 .schedule-target-filters :deep(.el-input__inner::placeholder) { color: var(--vrc-text-subtle); font-size: var(--vrc-font-size-label); font-weight: var(--vrc-font-weight-regular); line-height: calc(var(--vrc-control-height) - 2px); }
 .schedule-target-filters :deep(.el-select__placeholder.is-transparent) { color: var(--vrc-text-subtle); font-size: var(--vrc-font-size-label); font-weight: var(--vrc-font-weight-regular); }
-.schedule-target-power-filter { --el-segmented-item-selected-color: var(--vrc-text); --el-segmented-item-selected-bg-color: var(--vrc-surface); box-sizing: border-box; width: 100%; height: 28px; min-height: 28px; padding: 2px; color: var(--vrc-text-muted); background: var(--vrc-surface-muted); border: 1px solid transparent; border-radius: 7px; }
-.schedule-target-power-filter :deep(.el-segmented__group), .schedule-target-power-filter :deep(.el-segmented__item) { height: 22px; min-height: 22px; }
-.schedule-target-power-filter :deep(.el-segmented__item) { padding: 0 7px; border-radius: 5px; font-size: 12px; font-weight: 400; line-height: 22px; }
+.schedule-target-power-filter { width: 100%; }
 .schedule-target-batch-actions { display: flex; flex: 0 0 auto; gap: 6px; margin-left: auto; white-space: nowrap; }
 .schedule-target-batch-actions .toolbar-tooltip-target { display: inline-flex; }
 .schedule-target-icon-action { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; color: var(--vrc-text-muted); background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 6px; cursor: pointer; }

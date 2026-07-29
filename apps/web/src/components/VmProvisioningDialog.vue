@@ -1711,9 +1711,11 @@ type ProvisioningSourceType = "iso" | "template";
                 placeholder="选择已保存 IP 池"
                 clearable
                 :disabled="provisioningFormLocked"
-                popper-class="vrc-provision-select-dropdown"
+                popper-class="vrc-provision-select-dropdown vrc-provision-ip-pool-dropdown"
                 fit-input-width
                 placement="bottom-start"
+                :offset="0"
+                :show-arrow="false"
                 :fallback-placements="['bottom-start', 'top-start']"
                 @change="applyProvisioningPool"
               >

@@ -130,6 +130,7 @@ const CONSOLE_TITLEBAR_HEIGHT = 44;
 const CONSOLE_WAKE_REFRESH_DELAY_MS = 260;
 const CONSOLE_RETRY_DELAY_MS = 2500;
 const CONSOLE_CONNECT_ATTEMPT_TIMEOUT_MS = 20_000;
+const TERMINAL_CONNECT_TIMEOUT_MS = 20_000;
 const CONSOLE_FRAME_REVEAL_RETRY_LIMIT = 80;
 const CONSOLE_FRAME_REVEAL_RETRY_DELAY_MS = 180;
 const CONSOLE_FRAME_RECONNECT_TIMEOUT_MS = 8000;
@@ -204,6 +205,7 @@ const consoleAspectRatioCache = new Map<string, number>();
 let rfb: RFB | null = null;
 let terminalSocket: WebSocket | null = null;
 let terminalAbortController: AbortController | null = null;
+let terminalConnectTimer: number | null = null;
 let terminalConnectSeq = 0;
 let terminalTargetKey = "";
 const terminalCredentialCache = new Map<string, TerminalSessionCredentials>();
@@ -1021,6 +1023,21 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
   let established = false;
   const manualLogin = Boolean(credentials);
   terminalSocket = socket;
+  clearTerminalConnectTimer();
+  terminalConnectTimer = window.setTimeout(() => {
+    if (terminalSocket !== socket || connectSeq !== terminalConnectSeq || established) return;
+    terminalSocket = null;
+    socket.close(1000, "terminal connect timeout");
+    connected.value = false;
+    const message = "SSH 连接超时，请检查堡垒机或目标机网络后重试。";
+    if (manualLogin) {
+      showTerminalLoginPrompt(message);
+      return;
+    }
+    terminalStatus.value = "error";
+    terminalErrorMessage.value = message;
+    statusText.value = "CLI 连接超时";
+  }, TERMINAL_CONNECT_TIMEOUT_MS);
   socket.addEventListener("open", () => {
     if (terminalSocket !== socket || connectSeq !== terminalConnectSeq) return;
     terminalStatus.value = "connecting";
@@ -1032,6 +1049,7 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
     if (!message) return;
     if (message.type === "connected") {
       established = true;
+      clearTerminalConnectTimer();
       if (credentials && terminalTargetKey) terminalCredentialCache.set(terminalTargetKey, credentials);
       terminalLoginPrompt.reset();
       terminalStatus.value = "connected";
@@ -1045,6 +1063,7 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
       return;
     }
     if (message.type === "error") {
+      clearTerminalConnectTimer();
       if (manualLogin && !established) {
         if (isTerminalAuthenticationFailure(message.message)) terminalCredentialCache.delete(terminalTargetKey);
         returnToTerminalLogin(socket, message.message || "Login incorrect");
@@ -1061,6 +1080,7 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
   });
   socket.addEventListener("close", (event) => {
     if (terminalSocket !== socket || connectSeq !== terminalConnectSeq) return;
+    clearTerminalConnectTimer();
     terminalSocket = null;
     connected.value = false;
     if (!established && (manualLogin || event.code === 4403)) {
@@ -1076,7 +1096,11 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
   });
   socket.addEventListener("error", () => {
     if (terminalSocket !== socket || connectSeq !== terminalConnectSeq) return;
-    if (manualLogin && !established) return;
+    clearTerminalConnectTimer();
+    if (manualLogin && !established) {
+      returnToTerminalLogin(socket, "SSH WebSocket 连接失败，请检查堡垒机或目标机网络后重试。");
+      return;
+    }
     terminalStatus.value = "error";
     terminalErrorMessage.value = "Linux CLI WebSocket 连接失败。";
     statusText.value = "CLI 连接失败";
@@ -1085,6 +1109,7 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
 
 function disconnectTerminal(options: { keepStatus?: boolean; keepLoginPrompt?: boolean } = {}) {
   terminalConnectSeq += 1;
+  clearTerminalConnectTimer();
   terminalAbortController?.abort();
   terminalAbortController = null;
   if (terminalSocket) {
@@ -1103,6 +1128,12 @@ function disconnectTerminal(options: { keepStatus?: boolean; keepLoginPrompt?: b
     terminalStatus.value = "idle";
     terminalErrorMessage.value = "";
   }
+}
+
+function clearTerminalConnectTimer() {
+  if (terminalConnectTimer == null) return;
+  window.clearTimeout(terminalConnectTimer);
+  terminalConnectTimer = null;
 }
 
 function handleConsoleClosed() {
@@ -1152,7 +1183,7 @@ function showTerminalLoginPrompt(message = "") {
   terminalStatus.value = "authenticating";
   terminalErrorMessage.value = "";
   statusText.value = "等待登录";
-  const prompt = terminalLoginPrompt.start(message);
+  const prompt = `${message ? `${message}\r\n` : "SSH authentication required\r\n"}${terminalLoginPrompt.start()}`;
   // TerminalConsole 是异步组件，登录失败返回时可能尚未完成挂载；保留初始提示，
   // 让组件挂载时通过 initialData 重放，避免用户看到只有光标的黑屏。
   terminalLoginDisplay.value = prompt;

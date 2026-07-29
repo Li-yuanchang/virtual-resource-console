@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+<defs>
+    <radialGradient id="b0" gradientUnits="userSpaceOnUse" cx="300" cy="220" r="640">
+      <stop offset="0%" stop-color="#46b592" stop-opacity="0.8"/>
+      <stop offset="58%" stop-color="#46b592" stop-opacity="0.36"/>
+      <stop offset="100%" stop-color="#46b592" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="b1" gradientUnits="userSpaceOnUse" cx="1300" cy="260" r="560">
+      <stop offset="0%" stop-color="#8fd0e8" stop-opacity="0.65"/>
+      <stop offset="58%" stop-color="#8fd0e8" stop-opacity="0.29"/>
+      <stop offset="100%" stop-color="#8fd0e8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="b2" gradientUnits="userSpaceOnUse" cx="820" cy="860" r="720">
+      <stop offset="0%" stop-color="#5ec49a" stop-opacity="0.7"/>
+      <stop offset="58%" stop-color="#5ec49a" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#5ec49a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="b3" gradientUnits="userSpaceOnUse" cx="1500" cy="880" r="430">
+      <stop offset="0%" stop-color="#2e8f74" stop-opacity="0.5"/>
+      <stop offset="58%" stop-color="#2e8f74" stop-opacity="0.23"/>
+      <stop offset="100%" stop-color="#2e8f74" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="b4" gradientUnits="userSpaceOnUse" cx="200" cy="900" r="420">
+      <stop offset="0%" stop-color="#f2e3c9" stop-opacity="0.45"/>
+      <stop offset="58%" stop-color="#f2e3c9" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#f2e3c9" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vig" gradientUnits="userSpaceOnUse" cx="800" cy="500" r="992">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="72%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.14"/>
+    </radialGradient>
+</defs>
+<rect width="1600" height="1000" fill="#cfe9dd"/>
+  <ellipse cx="300" cy="220" rx="640" ry="480" fill="url(#b0)"/>
+  <ellipse cx="1300" cy="260" rx="560" ry="430" fill="url(#b1)"/>
+  <ellipse cx="820" cy="860" rx="720" ry="430" fill="url(#b2)"/>
+  <ellipse cx="1500" cy="880" rx="430" ry="350" fill="url(#b3)"/>
+  <ellipse cx="200" cy="900" rx="420" ry="330" fill="url(#b4)"/>
+<rect width="1600" height="1000" fill="url(#vig)"/>
+</svg>

@@ -42,17 +42,19 @@ const shadowId = computed(() => `${logoId}-shadow`);
         <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#173128" flood-opacity=".22" />
       </filter>
     </defs>
-    <rect
-      x="17"
-      y="17"
-      width="94"
-      height="94"
-      rx="20"
-      :fill="`url(#${gradientId})`"
-      :filter="shadow ? `url(#${shadowId})` : undefined"
-    />
-    <rect v-if="grid" x="17" y="17" width="94" height="94" rx="20" :fill="`url(#${gridId})`" />
-    <text class="vrc-logo-mark__text" x="64" y="60" text-anchor="middle" dominant-baseline="middle">VRC</text>
-    <rect class="vrc-logo-mark__cursor" x="70" y="78" width="19" height="4" rx="2" />
+    <g transform="translate(64 64) scale(1.064) translate(-64 -64)">
+      <rect
+        x="17"
+        y="17"
+        width="94"
+        height="94"
+        rx="20"
+        :fill="`url(#${gradientId})`"
+        :filter="shadow ? `url(#${shadowId})` : undefined"
+      />
+      <rect v-if="grid" x="17" y="17" width="94" height="94" rx="20" :fill="`url(#${gridId})`" />
+      <text class="vrc-logo-mark__text" x="64" y="60" text-anchor="middle" dominant-baseline="middle">VRC</text>
+      <rect class="vrc-logo-mark__cursor" x="70" y="78" width="19" height="4" rx="2" />
+    </g>
   </svg>
 </template>

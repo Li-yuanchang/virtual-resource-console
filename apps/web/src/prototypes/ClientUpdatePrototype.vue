@@ -27,7 +27,7 @@ const variants = [
 const targets: Target[] = [
   { key: "mac", name: "macOS 客户端", version: "0.1.38", current: "0.1.37", mode: "下载后重启", description: "适用于 Apple 芯片和 Intel Mac" },
   { key: "windows", name: "Windows 客户端", version: "0.1.38", current: "0.1.37", mode: "下载后重启", description: "适用于 Windows 桌面客户端" },
-  { key: "web", name: "2.26 Web 服务", version: "0.1.38", current: "0.1.37", mode: "更新后刷新", description: "更新完成后刷新浏览器即可生效" },
+  { key: "web", name: "Web 服务", version: "0.1.38", current: "0.1.37", mode: "更新后刷新", description: "更新完成后刷新浏览器即可生效" },
   { key: "chrome", name: "Chrome 插件", version: "0.1.8", current: "0.1.7", mode: "浏览器管理", description: "由 Chrome 自动完成安装和启用" },
 ];
 
@@ -181,7 +181,7 @@ onBeforeUnmount(() => timers.forEach((timer) => window.clearInterval(timer)));
           </article>
           <article class="process-row">
             <span class="platform-icon web"><PlatformIcon platform="web" /></span>
-            <div class="process-main"><div><strong>2.26 Web 服务</strong><span class="is-applying">正在应用更新</span></div><div class="indeterminate-progress"><i></i></div><small>正在切换资源，请保持页面打开</small></div>
+            <div class="process-main"><div><strong>Web 服务</strong><span class="is-applying">正在应用更新</span></div><div class="indeterminate-progress"><i></i></div><small>正在切换资源，请保持页面打开</small></div>
             <button class="text-button" type="button" disabled>更新中</button>
           </article>
           <article class="process-row">
