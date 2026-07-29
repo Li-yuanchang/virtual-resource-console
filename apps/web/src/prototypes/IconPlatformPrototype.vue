@@ -59,7 +59,7 @@ const macAppearance = ref<"light" | "dark">("light");
 
         <article class="comparison proposed-comparison">
           <div class="comparison-label">
-            <span>建议</span>
+            <span>A</span>
             <small>单色轮廓 · 视觉占比约 16/18</small>
           </div>
           <div class="mac-menubar" :class="macAppearance">
@@ -71,11 +71,52 @@ const macAppearance = ref<"light" | "dark">("light");
           </div>
         </article>
 
+        <article class="comparison knockout-comparison">
+          <div class="comparison-label">
+            <span>B</span>
+            <small>实心底板 · VRC 镂空</small>
+          </div>
+          <div class="mac-menubar reference-tone">
+            <span class="menu-copy">VRC</span>
+            <div class="menu-spacer"></div>
+            <Connection class="icon-15" aria-hidden="true" />
+            <svg class="mac-knockout-icon" viewBox="0 0 18 18" role="img" aria-label="白色底板并镂空 VRC 字母的菜单栏图标">
+              <defs>
+                <mask id="vrc-knockout-small" maskUnits="userSpaceOnUse">
+                  <rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="#fff" />
+                  <text x="9" y="9" fill="#000" font-family="Arial Narrow, Arial, sans-serif" font-size="5.8" font-weight="800" text-anchor="middle" dominant-baseline="middle">VRC</text>
+                  <rect x="10.35" y="12.5" width="3.55" height="0.8" rx="0.4" fill="#000" />
+                </mask>
+              </defs>
+              <rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="currentColor" mask="url(#vrc-knockout-small)" />
+            </svg>
+            <span class="menu-clock">09:41</span>
+          </div>
+        </article>
+
         <aside class="detail-inspector mac-detail" aria-label="macOS 图标放大细节">
-          <img class="mac-template-icon enlarged" :src="macTemplateIcon" alt="" />
-          <div>
+          <div class="detail-option">
+            <img class="mac-template-icon enlarged" :src="macTemplateIcon" alt="" />
+            <span><strong>A · 细轮廓</strong><small>当前接入版本</small></span>
+          </div>
+          <div class="detail-option knockout-detail-option">
+            <span class="knockout-detail-stage">
+              <svg class="mac-knockout-icon enlarged" viewBox="0 0 18 18" aria-hidden="true">
+                <defs>
+                  <mask id="vrc-knockout-large" maskUnits="userSpaceOnUse">
+                    <rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="#fff" />
+                    <text x="9" y="9" fill="#000" font-family="Arial Narrow, Arial, sans-serif" font-size="5.8" font-weight="800" text-anchor="middle" dominant-baseline="middle">VRC</text>
+                    <rect x="10.35" y="12.5" width="3.55" height="0.8" rx="0.4" fill="#000" />
+                  </mask>
+                </defs>
+                <rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="currentColor" mask="url(#vrc-knockout-large)" />
+              </svg>
+            </span>
+            <span><strong>B · 白底镂空</strong><small>候选版本</small></span>
+          </div>
+          <div class="detail-spec">
             <strong>18 × 18 pt</strong>
-            <span>导出 18px / 36px Template PNG</span>
+            <span>最终导出 18px / 36px Template PNG</span>
           </div>
         </aside>
       </div>
@@ -262,7 +303,7 @@ h1 { margin: 0; font-size: 24px; line-height: 34px; font-weight: 600; letter-spa
 .appearance-switch button { min-width: 48px; height: 26px; padding: 0 10px; border: 0; border-radius: 3px; color: #707a73; background: transparent; font-size: 12px; cursor: pointer; }
 .appearance-switch button.active { color: #2f3b34; background: #fff; box-shadow: 0 1px 2px rgb(31 44 35 / 12%); }
 
-.comparison-grid { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(260px, 1fr) 230px; gap: 14px; align-items: stretch; }
+.comparison-grid { display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 14px; align-items: stretch; }
 .comparison { min-width: 0; border: 1px solid #d5dcd7; border-radius: 6px; overflow: hidden; background: #fbfcfa; }
 .proposed-comparison { border-color: #aebfb3; }
 .comparison-label { height: 38px; padding: 0 12px; display: flex; align-items: center; gap: 8px; }
@@ -276,12 +317,15 @@ h1 { margin: 0; font-size: 24px; line-height: 34px; font-weight: 600; letter-spa
 .mac-current-icon { width: 18px; height: 18px; object-fit: contain; }
 .mac-template-icon { width: 18px; height: 18px; display: block; object-fit: contain; }
 .mac-menubar.dark .mac-template-icon { filter: invert(1); }
-.detail-inspector { min-height: 74px; padding: 12px 14px; display: flex; align-items: center; gap: 14px; border: 1px dashed #bdc7c0; border-radius: 6px; background: #eef2ef; }
+.mac-knockout-icon { width: 18px; height: 18px; display: block; color: currentColor; }
+.mac-menubar.reference-tone { color: #fff; background: #777ac8; border-top-color: #696cb6; }
+.detail-inspector { min-height: 74px; padding: 12px 14px; display: flex; align-items: center; gap: 24px; border: 1px dashed #bdc7c0; border-radius: 6px; background: #eef2ef; }
+.mac-detail { grid-column: 1 / -1; }
 .mac-template-icon.enlarged { width: 48px; height: 48px; flex: 0 0 auto; }
-.detail-inspector div { min-width: 0; }
-.detail-inspector strong, .detail-inspector span { display: block; }
-.detail-inspector strong { margin-bottom: 4px; font-size: 13px; line-height: 18px; }
-.detail-inspector span { color: #768079; font-size: 11px; line-height: 17px; }
+.detail-option { min-width: 168px; display: flex; align-items: center; gap: 10px; }.detail-option > span:last-child { display: grid; gap: 2px; }
+.detail-option strong, .detail-spec strong { color: #303a34; font-size: 12px; line-height: 18px; }.detail-option small, .detail-spec span { color: #768079; font-size: 10px; line-height: 15px; }
+.knockout-detail-stage { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 5px; color: #fff; background: #777ac8; }
+.mac-knockout-icon.enlarged { width: 48px; height: 48px; }.detail-spec { margin-left: auto; min-width: 190px; display: grid; gap: 2px; }
 
 .confirmed-badge, .keep-badge { display: inline-flex; align-items: center; gap: 5px; min-height: 25px; padding: 0 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; }
 .confirmed-badge { color: #3f6a52; background: #e7f0e9; }
@@ -363,7 +407,8 @@ h1 { margin: 0; font-size: 24px; line-height: 34px; font-weight: 600; letter-spa
   .platform-heading { grid-template-columns: 32px minmax(0, 1fr); align-items: start; }
   .appearance-switch, .confirmed-badge, .keep-badge { grid-column: 2; justify-self: start; margin-top: 4px; }
   .comparison-grid { grid-template-columns: 1fr; }
-  .detail-inspector { grid-column: auto; }
+  .detail-inspector { grid-column: auto; align-items: flex-start; flex-wrap: wrap; gap: 12px; }
+  .detail-spec { min-width: 0; margin-left: 0; }
   .chrome-preview-layout, .web-preview-layout, .windows-preview-layout { grid-template-columns: minmax(0, 1fr); }
   .browser-tab { width: 44%; }
   .chrome-size-family { grid-template-columns: 1fr 1fr; }

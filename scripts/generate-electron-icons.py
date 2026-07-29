@@ -24,6 +24,20 @@ def font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+def macos_template_font(size: int) -> ImageFont.FreeTypeFont:
+    candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Narrow Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
 def rounded_rect_mask(size: int, radius: int) -> Image.Image:
     mask = Image.new("L", (size, size), 0)
     draw = ImageDraw.Draw(mask)
@@ -144,7 +158,7 @@ def draw_macos_template_icon(size: int) -> Image.Image:
     )
 
     label = "VRC"
-    label_font = font(max(1, round(5.4 * unit)))
+    label_font = macos_template_font(max(1, round(5.8 * unit)))
     bbox = draw.textbbox((0, 0), label, font=label_font)
     text_x = canvas / 2 - (bbox[0] + bbox[2]) / 2
     text_y = 9 * unit - (bbox[1] + bbox[3]) / 2
@@ -167,7 +181,7 @@ def optically_scale_icon(source: Image.Image, factor: float) -> Image.Image:
 def save_macos_template_svg() -> None:
     svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" role="img" aria-label="VRC">
   <rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="none" stroke="#000" stroke-width="0.8"/>
-  <text x="9" y="9" fill="#000" font-family="Arial Narrow, Arial, sans-serif" font-size="5.4" font-weight="700" text-anchor="middle" dominant-baseline="middle">VRC</text>
+  <text x="9" y="9" fill="#000" font-family="Arial Narrow, Arial, sans-serif" font-size="5.8" font-weight="800" text-anchor="middle" dominant-baseline="middle">VRC</text>
   <rect x="10.35" y="12.5" width="3.55" height="0.8" rx="0.4" fill="#000"/>
 </svg>
 """
