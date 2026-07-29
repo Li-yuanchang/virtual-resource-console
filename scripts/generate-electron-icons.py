@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 ROOT = Path(__file__).resolve().parents[1]
 ASSET_DIR = ROOT / "apps" / "electron" / "assets"
 ICONSET_DIR = ASSET_DIR / "app-icon.iconset"
+WINDOWS_ICON_SCALE = 1.13
 
 
 def font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
@@ -126,6 +127,53 @@ def draw_tray_icon(size: int) -> Image.Image:
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
+def draw_macos_template_icon(size: int) -> Image.Image:
+    """Render the macOS menu bar mark as a single-color VRC template image."""
+    supersample = 8
+    canvas = size * supersample
+    unit = canvas / 18
+    image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    outer = tuple(round(value * unit) for value in (1.4, 1.4, 16.6, 16.6))
+    draw.rounded_rectangle(
+        outer,
+        radius=round(2.9 * unit),
+        outline=(0, 0, 0, 255),
+        width=max(1, round(0.8 * unit)),
+    )
+
+    label = "VRC"
+    label_font = font(max(1, round(5.4 * unit)))
+    bbox = draw.textbbox((0, 0), label, font=label_font)
+    text_x = canvas / 2 - (bbox[0] + bbox[2]) / 2
+    text_y = 9 * unit - (bbox[1] + bbox[3]) / 2
+    draw.text((text_x, text_y), label, font=label_font, fill=(0, 0, 0, 255))
+
+    cursor = tuple(round(value * unit) for value in (10.35, 12.5, 13.9, 13.3))
+    draw.rounded_rectangle(cursor, radius=max(1, round(0.4 * unit)), fill=(0, 0, 0, 255))
+    return image.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def optically_scale_icon(source: Image.Image, factor: float) -> Image.Image:
+    """Increase the visible body while preserving the platform icon canvas size."""
+    width, height = source.size
+    scaled = source.resize((round(width * factor), round(height * factor)), Image.Resampling.LANCZOS)
+    left = (scaled.width - width) // 2
+    top = (scaled.height - height) // 2
+    return scaled.crop((left, top, left + width, top + height))
+
+
+def save_macos_template_svg() -> None:
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" role="img" aria-label="VRC">
+  <rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="none" stroke="#000" stroke-width="0.8"/>
+  <text x="9" y="9" fill="#000" font-family="Arial Narrow, Arial, sans-serif" font-size="5.4" font-weight="700" text-anchor="middle" dominant-baseline="middle">VRC</text>
+  <rect x="10.35" y="12.5" width="3.55" height="0.8" rx="0.4" fill="#000"/>
+</svg>
+"""
+    (ASSET_DIR / "tray-template.svg").write_text(svg, encoding="ascii")
+
+
 def save_iconset() -> None:
     ICONSET_DIR.mkdir(parents=True, exist_ok=True)
     specs = [
@@ -144,7 +192,8 @@ def save_iconset() -> None:
     for filename, size in specs:
         source.resize((size, size), Image.Resampling.LANCZOS).save(ICONSET_DIR / filename)
     source.save(ASSET_DIR / "app-icon-1024.png")
-    source.save(
+    windows_source = optically_scale_icon(source, WINDOWS_ICON_SCALE)
+    windows_source.save(
         ASSET_DIR / "app-icon.ico",
         sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
     )
@@ -154,6 +203,9 @@ def save_iconset() -> None:
 def save_tray() -> None:
     draw_tray_icon(18).save(ASSET_DIR / "tray.png")
     draw_tray_icon(36).save(ASSET_DIR / "tray@2x.png")
+    save_macos_template_svg()
+    draw_macos_template_icon(18).save(ASSET_DIR / "tray-template.png")
+    draw_macos_template_icon(36).save(ASSET_DIR / "tray-template@2x.png")
 
 
 def main() -> None:

@@ -470,11 +470,11 @@ function configureDesktopUpdater() {
       checkedAt: new Date().toISOString(),
     });
   });
-  autoUpdater.on("update-not-available", () => {
+  autoUpdater.on("update-not-available", (info) => {
     updateDesktopUpdateState({
       stage: "up-to-date",
       availableVersion: desktopUpdateState.currentVersion,
-      releaseNotes: readBundledReleaseNotes(),
+      releaseNotes: normalizeReleaseNotes(info?.releaseNotes) || readBundledReleaseNotes(),
       message: "当前已是最新版本",
       progress: 0,
       checkedAt: new Date().toISOString(),
@@ -812,10 +812,15 @@ function resolveTrayIcon() {
   const iconCandidates =
     process.platform === "win32"
       ? ["app-icon.ico", "tray.png"]
-      : ["tray.png", "app-icon.icns"];
+      : process.platform === "darwin"
+        ? ["tray-template.png", "tray.png", "app-icon.icns"]
+        : ["tray.png", "app-icon.icns"];
   for (const filename of iconCandidates) {
     const icon = nativeImage.createFromPath(resolveAssetPath(filename));
     if (!icon.isEmpty()) {
+      if (process.platform === "darwin" && filename === "tray-template.png") {
+        icon.setTemplateImage(true);
+      }
       return process.platform === "win32" ? icon.resize({ width: 16, height: 16 }) : icon;
     }
   }

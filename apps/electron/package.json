@@ -1,6 +1,6 @@
 {
   "name": "@vrc/electron",
-  "version": "0.1.51",
+  "version": "0.1.56",
   "private": true,
   "description": "Desktop shell for Virtual Resource Console.",
   "main": "main.cjs",
@@ -9,9 +9,9 @@
     "prepack": "node ../../scripts/prepare-electron-update-config.mjs && node ../../scripts/prepare-electron-runtime.mjs && node ../../scripts/prepare-electron-api-runtime.mjs",
     "pack": "electron-builder --dir",
     "predist:mac": "node ../../scripts/prepare-electron-update-config.mjs && node ../../scripts/prepare-electron-runtime.mjs darwin-arm64 && node ../../scripts/prepare-electron-api-runtime.mjs",
-    "dist:mac": "electron-builder --mac",
+    "dist:mac": "electron-builder --mac --publish never",
     "predist:win": "node ../../scripts/clean-electron-windows-output.mjs && node ../../scripts/prepare-electron-update-config.mjs && node ../../scripts/prepare-electron-runtime.mjs win-x64 && node ../../scripts/prepare-electron-api-runtime.mjs",
-    "dist:win": "electron-builder --win --x64"
+    "dist:win": "electron-builder --win --x64 --publish never"
   },
   "devDependencies": {
     "electron": "38.2.2",
@@ -21,7 +21,7 @@
     "appId": "com.virtualresource.console",
     "electronVersion": "38.2.2",
     "productName": "VRC",
-    "afterPack": "../../scripts/ensure-macos-app-signature.cjs",
+    "afterPack": "./ensure-macos-app-signature.cjs",
     "directories": {
       "output": "dist"
     },
