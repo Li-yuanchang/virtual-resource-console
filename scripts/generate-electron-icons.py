@@ -158,6 +158,49 @@ def draw_macos_template_icon(size: int) -> Image.Image:
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
+def save_macos_status_svg() -> None:
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" role="img" aria-label="VRC">
+  <rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="#fff"/>
+  <g fill="none" stroke="#777ac8" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2.7 6.1 4.25 10.8 5.8 6.1"/>
+    <path d="M6.65 10.8V6.1h1.5a1.45 1.38 0 0 1 0 2.75h-1.5m1.5-.3 1.8 2.25"/>
+    <path d="M14.72 6.62a2.45 2.45 0 1 0 0 3.66"/>
+  </g>
+  <rect x="10.35" y="12.5" width="3.55" height=".8" rx=".4" fill="#777ac8"/>
+</svg>
+"""
+    (ASSET_DIR / "tray-status.svg").write_text(svg, encoding="ascii")
+
+
+def draw_macos_status_icon(size: int) -> Image.Image:
+    """Rasterize the macOS status icon from the same geometry as tray-status.svg."""
+    supersample = 8
+    canvas = size * supersample
+    unit = canvas / 18
+    image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    purple = (119, 122, 200, 255)
+    white = (255, 255, 255, 255)
+    outer = tuple(round(value * unit) for value in (1.4, 1.4, 16.6, 16.6))
+    draw.rounded_rectangle(outer, radius=round(2.9 * unit), fill=white)
+
+    glyph_width = max(1, round(1.25 * unit))
+    glyph = lambda points: [(round(x * unit), round(y * unit)) for x, y in points]
+    draw.line(glyph([(2.7, 6.1), (4.25, 10.8), (5.8, 6.1)]), fill=purple, width=glyph_width, joint="curve")
+    draw.line(glyph([(6.65, 10.8), (6.65, 6.1), (8.15, 6.1)]), fill=purple, width=glyph_width)
+    draw.arc(tuple(round(value * unit) for value in (6.45, 6.1, 9.85, 8.85)), 270, 90, fill=purple, width=glyph_width)
+    draw.line(glyph([(8.15, 8.55), (9.95, 10.8)]), fill=purple, width=glyph_width)
+    draw.arc(tuple(round(value * unit) for value in (10.35, 6.0, 15.25, 10.9)), 45, 315, fill=purple, width=glyph_width)
+
+    cursor = tuple(round(value * unit) for value in (10.35, 12.5, 13.9, 13.3))
+    draw.rounded_rectangle(cursor, radius=max(1, round(0.4 * unit)), fill=purple)
+    icon = image.resize((size, size), Image.Resampling.LANCZOS)
+    alpha = icon.getchannel("A").point(lambda value: 0 if value < 96 else value)
+    icon.putalpha(alpha)
+    return icon
+
+
 def optically_scale_icon(source: Image.Image, factor: float) -> Image.Image:
     """Increase the visible body while preserving the platform icon canvas size."""
     width, height = source.size
@@ -211,6 +254,9 @@ def save_tray() -> None:
     draw_tray_icon(18).save(ASSET_DIR / "tray.png")
     draw_tray_icon(36).save(ASSET_DIR / "tray@2x.png")
     save_macos_template_svg()
+    save_macos_status_svg()
+    draw_macos_status_icon(18).save(ASSET_DIR / "tray-status.png")
+    draw_macos_status_icon(36).save(ASSET_DIR / "tray-status@2x.png")
     draw_macos_template_icon(18).save(ASSET_DIR / "tray-template.png")
     draw_macos_template_icon(36).save(ASSET_DIR / "tray-template@2x.png")
 

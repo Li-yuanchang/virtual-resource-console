@@ -128,6 +128,7 @@ async function createWindow() {
     if (isQuitting) return;
     event.preventDefault();
     mainWindow.hide();
+    hideDockIconForMac();
   });
 
   startupStartedAt = Date.now();
@@ -220,6 +221,7 @@ async function showMainWindow() {
   }
   const targetWindow = await ensureMainWindow();
   if (!targetWindow || targetWindow.isDestroyed()) return;
+  await showDockIconForMac();
   if (targetWindow.isMinimized()) targetWindow.restore();
   targetWindow.setSkipTaskbar(false);
   if (!targetWindow.isVisible()) targetWindow.show();
@@ -233,6 +235,16 @@ async function showMainWindow() {
       if (!targetWindow.isDestroyed()) targetWindow.setAlwaysOnTop(false);
     }, 250);
   }
+}
+
+function hideDockIconForMac() {
+  if (process.platform !== "darwin" || !app.dock || typeof app.dock.hide !== "function") return;
+  app.dock.hide();
+}
+
+async function showDockIconForMac() {
+  if (process.platform !== "darwin" || !app.dock || typeof app.dock.show !== "function") return;
+  await app.dock.show();
 }
 
 app.on("before-quit", () => {
@@ -767,22 +779,21 @@ function createTray() {
   const trayIcon = resolveTrayIcon();
   tray = new Tray(trayIcon);
   tray.setToolTip("Virtual Resource Console");
-  tray.on("click", () => {
-    void showMainWindow();
-  });
-  tray.on("double-click", () => {
-    void showMainWindow();
-  });
+  if (process.platform === "win32") {
+    tray.on("click", () => {
+      void showMainWindow();
+    });
+  }
   tray.setContextMenu(
     Menu.buildFromTemplate([
       {
-        label: "打开资源控制台",
+        label: "显示主界面",
         click: () => {
           void showMainWindow();
         },
       },
       {
-        label: "打开本机服务",
+        label: "打开 Web 界面",
         click: () => {
           if (apiBaseUrl) {
             shell.openExternal(apiBaseUrl);
@@ -790,7 +801,7 @@ function createTray() {
         },
       },
       {
-        label: "打开日志目录",
+        label: "查看日志文件",
         click: () => {
           fs.mkdirSync(getLogDir(), { recursive: true });
           shell.openPath(getLogDir());
@@ -813,7 +824,7 @@ function resolveTrayIcon() {
     process.platform === "win32"
       ? ["app-icon.ico", "tray.png"]
       : process.platform === "darwin"
-        ? ["tray-template.png", "tray.png", "app-icon.icns"]
+        ? ["tray-status.png", "tray-template.png", "tray.png", "app-icon.icns"]
         : ["tray.png", "app-icon.icns"];
   for (const filename of iconCandidates) {
     const icon = nativeImage.createFromPath(resolveAssetPath(filename));
