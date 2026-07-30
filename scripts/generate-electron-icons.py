@@ -24,20 +24,6 @@ def font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def macos_template_font(size: int) -> ImageFont.FreeTypeFont:
-    candidates = [
-        "/System/Library/Fonts/Supplemental/Arial Narrow Bold.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-        "/System/Library/Fonts/SFNS.ttf",
-    ]
-    for candidate in candidates:
-        try:
-            return ImageFont.truetype(candidate, size=size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
 def rounded_rect_mask(size: int, radius: int) -> Image.Image:
     mask = Image.new("L", (size, size), 0)
     draw = ImageDraw.Draw(mask)
@@ -157,12 +143,15 @@ def draw_macos_template_icon(size: int) -> Image.Image:
         width=max(1, round(0.8 * unit)),
     )
 
-    label = "VRC"
-    label_font = macos_template_font(max(1, round(5.8 * unit)))
-    bbox = draw.textbbox((0, 0), label, font=label_font)
-    text_x = canvas / 2 - (bbox[0] + bbox[2]) / 2
-    text_y = 9 * unit - (bbox[1] + bbox[3]) / 2
-    draw.text((text_x, text_y), label, font=label_font, fill=(0, 0, 0, 255))
+    glyph_width = max(1, round(1.0 * unit))
+    glyph_color = (0, 0, 0, 255)
+    glyph = lambda points: [(round(x * unit), round(y * unit)) for x, y in points]
+
+    draw.line(glyph([(2.7, 6.1), (4.25, 10.8), (5.8, 6.1)]), fill=glyph_color, width=glyph_width, joint="curve")
+    draw.line(glyph([(6.65, 10.8), (6.65, 6.1), (8.15, 6.1)]), fill=glyph_color, width=glyph_width)
+    draw.arc(tuple(round(value * unit) for value in (6.45, 6.1, 9.85, 8.85)), 270, 90, fill=glyph_color, width=glyph_width)
+    draw.line(glyph([(8.15, 8.55), (9.95, 10.8)]), fill=glyph_color, width=glyph_width)
+    draw.arc(tuple(round(value * unit) for value in (10.35, 6.0, 15.25, 10.9)), 45, 315, fill=glyph_color, width=glyph_width)
 
     cursor = tuple(round(value * unit) for value in (10.35, 12.5, 13.9, 13.3))
     draw.rounded_rectangle(cursor, radius=max(1, round(0.4 * unit)), fill=(0, 0, 0, 255))
@@ -181,7 +170,11 @@ def optically_scale_icon(source: Image.Image, factor: float) -> Image.Image:
 def save_macos_template_svg() -> None:
     svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" role="img" aria-label="VRC">
   <rect x="1.4" y="1.4" width="15.2" height="15.2" rx="2.9" fill="none" stroke="#000" stroke-width="0.8"/>
-  <text x="9" y="9" fill="#000" font-family="Arial Narrow, Arial, sans-serif" font-size="5.8" font-weight="800" text-anchor="middle" dominant-baseline="middle">VRC</text>
+  <g fill="none" stroke="#000" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2.7 6.1 4.25 10.8 5.8 6.1"/>
+    <path d="M6.65 10.8V6.1h1.5a1.45 1.38 0 0 1 0 2.75h-1.5m1.5-.3 1.8 2.25"/>
+    <path d="M14.72 6.62a2.45 2.45 0 1 0 0 3.66"/>
+  </g>
   <rect x="10.35" y="12.5" width="3.55" height="0.8" rx="0.4" fill="#000"/>
 </svg>
 """
