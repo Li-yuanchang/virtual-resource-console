@@ -304,6 +304,7 @@ body {
 
 .app-shell :where(
   .connection-groups,
+  .connection-list-scroll,
   .activity-list,
   .workspace,
   .quick-provision,
@@ -329,6 +330,7 @@ body {
 
 .app-shell :where(
   .connection-groups,
+  .connection-list-scroll,
   .activity-list,
   .workspace,
   .quick-provision,
@@ -353,6 +355,7 @@ body {
 
 .app-shell :where(
   .connection-groups,
+  .connection-list-scroll,
   .activity-list,
   .workspace,
   .quick-provision,
@@ -378,6 +381,7 @@ body {
 
 .app-shell :where(
   .connection-groups,
+  .connection-list-scroll,
   .activity-list,
   .workspace,
   .quick-provision,
@@ -402,6 +406,7 @@ body {
 
 .app-shell :where(
   .connection-groups,
+  .connection-list-scroll,
   .activity-list,
   .workspace,
   .quick-provision,
@@ -429,6 +434,7 @@ body {
 
 .app-shell :where(
   .connection-groups,
+  .connection-list-scroll,
   .activity-list,
   .workspace,
   .quick-provision,
@@ -451,6 +457,7 @@ body {
 
 .app-shell :where(
   .connection-groups,
+  .connection-list-scroll,
   .activity-list,
   .workspace,
   .quick-provision.is-single-draft,
@@ -720,14 +727,28 @@ textarea,
 }
 
 .connection-groups {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 150px;
+  overflow: hidden;
+  padding: 8px 0 0;
+}
+
+.connection-list-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
-  padding: 8px 0;
+  padding: 0 0 8px;
 }
 
 .connection-group {
   padding: 0 14px 8px;
+}
+
+.overview-group {
+  flex: 0 0 auto;
+  padding-bottom: 6px;
 }
 
 .overview-entry {
@@ -13714,11 +13735,22 @@ button:focus-visible,
 
   .connection-groups {
     display: flex;
+    flex-direction: row;
     flex: 0 0 auto;
     gap: 6px;
     max-height: none;
     min-height: 0;
     padding: 5px 10px 7px;
+    overflow: hidden;
+  }
+
+  .connection-list-scroll {
+    display: flex;
+    flex: 1 1 auto;
+    gap: 6px;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
     overflow-x: auto;
     overflow-y: hidden;
     overscroll-behavior-inline: contain;

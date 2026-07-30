@@ -6365,31 +6365,33 @@ function normalizePort(value: unknown, providerType: ProviderType) {
             </span>
           </button>
         </section>
-        <section v-for="[groupName, groupItems] in groupedStoredConnections" :key="groupName" class="connection-group">
-          <div class="group-title">
-            <span>{{ groupName }}</span>
+        <div class="connection-list-scroll">
+          <section v-for="[groupName, groupItems] in groupedStoredConnections" :key="groupName" class="connection-group">
+            <div class="group-title">
+              <span>{{ groupName }}</span>
+            </div>
+            <button
+              v-for="item in groupItems"
+              :key="item.id"
+              class="connection-item"
+              :class="{ active: workspaceMode === 'connection' && selectedConnectionId === item.id }"
+              @click="selectConnectionAndLoad(item.id)"
+            >
+              <span class="status-dot" :class="{ online: workspaceMode === 'connection' && selectedConnectionId === item.id && !!inventory }"></span>
+              <span class="connection-main">
+                <strong>{{ item.name }}</strong>
+                <small>{{ item.host }}</small>
+              </span>
+              <span class="connection-port">{{ item.port }}</span>
+            </button>
+          </section>
+          <div v-if="storedConnections.length && connectionSearch.trim() && !filteredStoredConnections.length" class="sidebar-search-empty" role="status">
+            未找到匹配连接
           </div>
-          <button
-            v-for="item in groupItems"
-            :key="item.id"
-            class="connection-item"
-            :class="{ active: workspaceMode === 'connection' && selectedConnectionId === item.id }"
-            @click="selectConnectionAndLoad(item.id)"
-          >
-            <span class="status-dot" :class="{ online: workspaceMode === 'connection' && selectedConnectionId === item.id && !!inventory }"></span>
-            <span class="connection-main">
-              <strong>{{ item.name }}</strong>
-              <small>{{ item.host }}</small>
-            </span>
-            <span class="connection-port">{{ item.port }}</span>
-          </button>
-        </section>
-        <div v-if="storedConnections.length && connectionSearch.trim() && !filteredStoredConnections.length" class="sidebar-search-empty" role="status">
-          未找到匹配连接
-        </div>
-        <div v-if="!storedConnections.length" class="sidebar-empty vrc-muted-block">
-          <strong>还没有连接</strong>
-          <span>在右侧填写账号后保存，之后可直接加载资源清单。</span>
+          <div v-if="!storedConnections.length" class="sidebar-empty vrc-muted-block">
+            <strong>还没有连接</strong>
+            <span>在右侧填写账号后保存，之后可直接加载资源清单。</span>
+          </div>
         </div>
       </div>
 
