@@ -220,7 +220,7 @@
 
   function renderWatermark() {
     const counts = { sparse: 3, standard: 6, dense: 10 };
-    const text = "lyc · 192.0.2.26 · 2026-07-29 09:18";
+    const text = "lyc · 192.168.2.26 · 2026-07-29 09:18";
     $$(".watermark-layer").forEach((layer) => {
       layer.hidden = !state.watermark;
       layer.style.opacity = String(state.watermarkOpacity / 100);
