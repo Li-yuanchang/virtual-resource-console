@@ -373,6 +373,57 @@ export interface VmResizeResult {
   message: string;
 }
 
+/**
+ * GRUB 启动项读取结果中识别的 GRUB 版本。
+ */
+export type GuestGrubKind = "grub1" | "grub2" | "unknown";
+
+/**
+ * 虚拟机操作系统内可用于设置"下一次启动启动项"的工具。
+ */
+export type GuestBootEntryTool = "grub2-reboot" | "grub-reboot" | "none" | "unknown";
+
+/**
+ * 虚拟机操作系统 GRUB 菜单中的单个启动项（通常对应一个内核）。
+ */
+export interface GuestBootEntry {
+  /** GRUB 菜单中的 0 基序号 */
+  index: number;
+  /** 菜单标题；GRUB2 子菜单项为 "子菜单>条目" 完整路径 */
+  title: string;
+  /** 是否为当前默认启动项 */
+  isDefault: boolean;
+}
+
+/**
+ * 虚拟机操作系统 GRUB 启动项读取结果。
+ */
+export interface GuestBootEntryList {
+  grubKind: GuestGrubKind;
+  /** 检测到的 GRUB 配置文件路径，如 /boot/grub2/grub.cfg */
+  config: string;
+  /** 可用的"下一次启动"设置工具 */
+  oneTimeTool: GuestBootEntryTool;
+  /** 当前默认启动项序号；无法确定时为 null */
+  defaultIndex: number | null;
+  /** grubenv 中 saved_entry / next_entry 的回读值（GRUB2 且工具可用时） */
+  savedEntry?: string;
+  /** 供前端展示的说明文案；无异常时为空字符串 */
+  message?: string;
+  entries: GuestBootEntry[];
+}
+
+/**
+ * 用户为"关机 / 重启"选择的下一次启动项。
+ */
+export interface GuestBootEntrySelection {
+  /** GRUB 菜单中的 0 基序号 */
+  index: number;
+  /** 菜单标题；GRUB2 子菜单项为 "子菜单>条目" 完整路径 */
+  title: string;
+  grubKind: GuestGrubKind;
+}
+
 export interface VmActionOptions {
   shutdownTimeoutMs?: number;
   forceOnShutdownFailure?: boolean;
@@ -736,4 +787,59 @@ export interface XenOverview {
   storage: StorageRepository[];
   networks: NetworkInterface[];
   vms: VmSummary[];
+}
+
+export type HostDiagnosticStatus = "ok" | "warn" | "error" | "unknown";
+
+export type HostDiagnosticCategory = "system" | "storage" | "service" | "network";
+
+export type HostDiagnosticScope = "host" | "vm-link";
+
+export interface HostDiagnosticCheck {
+  key: string;
+  label: string;
+  category: HostDiagnosticCategory;
+  scope: HostDiagnosticScope;
+  status: HostDiagnosticStatus;
+  summary: string;
+  evidence?: string[];
+  detail?: string;
+}
+
+export interface HostDiagnosticRepairAction {
+  key: string;
+  label: string;
+  description: string;
+  recommended?: boolean;
+  scopeNote: string;
+  commands: string[];
+  verificationCommands: string[];
+}
+
+export interface HostDiagnosticsResult {
+  collectedAt: string;
+  providerType: ProviderType;
+  supported: boolean;
+  message?: string;
+  hostId?: string;
+  hostName: string;
+  hostAddress: string;
+  vmId?: string;
+  vmName?: string;
+  vmIp?: string;
+  conclusion: {
+    summary: string;
+    faultPoint?: string;
+    impact?: string;
+    riskLevel: "none" | "low" | "medium" | "high";
+  };
+  checks: HostDiagnosticCheck[];
+  repairActions: HostDiagnosticRepairAction[];
+}
+
+export interface HostDiagnosticsRequest {
+  hostId?: string;
+  vmId?: string;
+  vmName?: string;
+  vmIp?: string;
 }

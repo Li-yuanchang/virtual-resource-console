@@ -28,6 +28,8 @@ interface PendingTerminalSession {
   credentials: VmSystemCredentials;
   guestIp: string;
   expiresAt: number;
+  /** 本次会话是否携带前端显式输入的凭据；false 表示正在使用本机密码库中的凭据。 */
+  explicitCredentials: boolean;
 }
 
 interface TerminalQuery {
@@ -79,7 +81,13 @@ export async function registerTerminalRoutes(server: FastifyInstance, dependenci
       const sessionId = randomUUID();
       const expiresAt = Date.now() + TERMINAL_SESSION_TTL_MS;
       const { credentials: _credentials, ...sessionRequest } = body;
-      terminalSessions.set(sessionId, { request: sessionRequest, credentials, guestIp: resolved.guestIp, expiresAt });
+      terminalSessions.set(sessionId, {
+        request: sessionRequest,
+        credentials,
+        guestIp: resolved.guestIp,
+        expiresAt,
+        explicitCredentials: Boolean(body.credentials),
+      });
       cleanupSessions();
       const response: TerminalSessionResponse = {
         sessionId,
@@ -165,7 +173,12 @@ export async function registerTerminalRoutes(server: FastifyInstance, dependenci
         },
         "terminal ssh session failed",
       );
-      closeWithError(socket, isAuthenticationFailure(diagnostic) ? "Login incorrect" : "SSH 连接失败，请检查虚拟机网络。", isAuthenticationFailure(diagnostic) ? 4403 : 1011);
+      const authenticationFailed = isAuthenticationFailure(diagnostic);
+      if (authenticationFailed && !pending.explicitCredentials) {
+        // 自动套用的密码库凭据已失效，删除后下次会重新弹出登录输入，避免一直失败。
+        vmSystemCredentialStore.delete(pending.request.connectionId, pending.request.vmId);
+      }
+      closeWithError(socket, authenticationFailed ? "Login incorrect" : "SSH 连接失败，请检查虚拟机网络。", authenticationFailed ? 4403 : 1011);
       closeAll();
     });
 

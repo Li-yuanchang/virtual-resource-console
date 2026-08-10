@@ -33,6 +33,11 @@ import type {
   VmResizeResult,
   VmSearchIndexItem,
   VmSnapshot,
+  HostDiagnosticCheck,
+  HostDiagnosticRepairAction,
+  HostDiagnosticsRequest,
+  HostDiagnosticsResult,
+  HostDiagnosticStatus,
   XenConnectionInput,
   XenOverview,
 } from "./types.js";
@@ -119,6 +124,99 @@ for sr in $(xe sr-list --minimal 2>/dev/null | tr ',' ' '); do
   shared="$(xe sr-param-get uuid="$sr" param-name=shared 2>/dev/null | clean_one_line)"
   printf 'SR\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$(bytes_to_gib "$physical")" "$(bytes_to_gib "$used")" "$(bytes_to_gib "$virtual")" "$shared"
 done
+`;
+
+const HOST_DIAGNOSTICS_SCRIPT = String.raw`
+clean_one_line() {
+  tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+num_or_zero() {
+  if [ -z "$1" ] || [ "$1" = "<not in database>" ]; then
+    printf "0"
+  else
+    printf "%s" "$1"
+  fi
+}
+
+# 本脚本只读：只查询、统计、探测连通性，不执行任何会改变宿主机 / VM 状态的命令。
+VRC_HOST_ID="$VRC_HOST_ID"
+VRC_VM_ID="$VRC_VM_ID"
+VRC_VM_IP="$VRC_VM_IP"
+
+# 确定目标物理机：优先使用请求传入的 host uuid，未传时取第一台作为兜底。
+host_uuid="$VRC_HOST_ID"
+if [ -z "$host_uuid" ]; then
+  host_uuid="$(xe host-list --minimal 2>/dev/null | tr ',' ' ' | awk '{print $1}')"
+fi
+
+host_name="$(xe host-param-get uuid="$host_uuid" param-name=name-label 2>/dev/null | clean_one_line)"
+host_address="$(xe host-param-get uuid="$host_uuid" param-name=address 2>/dev/null | clean_one_line)"
+host_version="$(xe host-param-get uuid="$host_uuid" param-name=software-version 2>/dev/null | clean_one_line)"
+product_version="$(printf "%s" "$host_version" | sed -n 's/.*product_version_text: \([^;]*\).*/\1/p')"
+printf 'META\t%s\t%s\t%s\t%s\n' "$host_uuid" "$host_name" "$host_address" "$product_version"
+
+# 根分区占用：df -P 输出固定列，第二行为目标分区。
+LC_ALL=C df -P / 2>/dev/null | awk 'NR==2 { printf "ROOT\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5, $6 }'
+
+# 删除但仍被进程占用的文件：lsof +L1 只读列出 link count < 1 的文件，统计数量与总大小。
+lsof_output="$(LC_ALL=C lsof +L1 2>/dev/null || true)"
+if [ -n "$lsof_output" ]; then
+  printf '%s\n' "$lsof_output" | awk 'NR>1 && $7 > 0 {
+    n++; sum += $7;
+    if (n <= 3) printf "DELETED_FILE\t%s\t%s\t%s\n", $2, $7, $NF
+  } END { printf "DELETED_SUMMARY\t%d\t%d\n", n + 0, sum + 0 }'
+else
+  printf 'DELETED_SUMMARY\t0\t0\n'
+fi
+
+# OVS 服务：pgrep 只读统计 ovsdb-server / ovs-vswitchd 进程，service status 尽力兼容老版本 XenServer。
+ovsdb_count="$(pgrep -f 'ovsdb-server' 2>/dev/null | wc -l | awk '{print $1}')"
+ovsd_count="$(pgrep -f 'ovs-vswitchd' 2>/dev/null | wc -l | awk '{print $1}')"
+ovs_service="$(service openvswitch status 2>/dev/null | clean_one_line)"
+printf 'OVS\t%s\t%s\t%s\n' "$(num_or_zero "$ovsdb_count")" "$(num_or_zero "$ovsd_count")" "$ovs_service"
+
+# 网桥清单：ovs-vsctl 只读列出网桥及其端口 / 接口数量。
+for br in $(ovs-vsctl list-br 2>/dev/null || true); do
+  ports="$(ovs-vsctl list-ports "$br" 2>/dev/null | sed '/^$/d' | wc -l | awk '{print $1}')"
+  ifaces="$(ovs-vsctl list-ifaces "$br" 2>/dev/null | sed '/^$/d' | wc -l | awk '{print $1}')"
+  printf 'BRIDGE\t%s\t%s\t%s\n' "$br" "$(num_or_zero "$ports")" "$(num_or_zero "$ifaces")"
+done
+
+# 存储仓库状态：只读读取每个 SR 的 state 字段。
+for sr in $(xe sr-list --minimal 2>/dev/null | tr ',' ' '); do
+  sr_name="$(xe sr-param-get uuid="$sr" param-name=name-label 2>/dev/null | clean_one_line)"
+  sr_type="$(xe sr-param-get uuid="$sr" param-name=type 2>/dev/null | clean_one_line)"
+  sr_state="$(xe sr-param-get uuid="$sr" param-name=state 2>/dev/null | clean_one_line)"
+  printf 'SR_DIAG\t%s\t%s\t%s\t%s\n' "$sr" "$sr_name" "$sr_type" "$sr_state"
+done
+
+# VM 链路检查（仅当请求携带 VM 线索时）：VIF 设备、挂载网桥关系。
+if [ -n "$VRC_VM_ID" ]; then
+  for vif in $(xe vif-list vm-uuid="$VRC_VM_ID" --minimal 2>/dev/null | tr ',' ' '); do
+    device="$(xe vif-param-get uuid="$vif" param-name=device 2>/dev/null | clean_one_line)"
+    mac="$(xe vif-param-get uuid="$vif" param-name=MAC 2>/dev/null | clean_one_line)"
+    network="$(xe vif-param-get uuid="$vif" param-name=network-name-label 2>/dev/null | clean_one_line)"
+    attached="$(xe vif-param-get uuid="$vif" param-name=currently-attached 2>/dev/null | clean_one_line)"
+    bridge=""
+    if [ -n "$device" ]; then
+      bridge="$(ovs-vsctl iface-to-br "vif$device.0" 2>/dev/null | clean_one_line)"
+      if [ -z "$bridge" ]; then
+        bridge="$(ip -o link show "vif$device.0" 2>/dev/null | sed -n 's/.*master \([^ ]*\).*/\1/p' | clean_one_line)"
+      fi
+    fi
+    printf 'VIF\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vif" "$device" "$mac" "$network" "$attached" "$bridge"
+  done
+fi
+
+# VM 连通性：ping 属于只读网络探测，丢包率仅作为证据。
+if [ -n "$VRC_VM_IP" ]; then
+  ping_result="$(LC_ALL=C ping -c 3 -W 2 "$VRC_VM_IP" 2>&1 || true)"
+  ping_loss="$(printf '%s\n' "$ping_result" | sed -n 's/.* \([0-9][0-9]*\)% packet loss.*/\1/p' | tail -n 1)"
+  ping_tx="$(printf '%s\n' "$ping_result" | sed -n 's/^\([0-9][0-9]*\) packets transmitted.*/\1/p' | tail -n 1)"
+  ping_rx="$(printf '%s\n' "$ping_result" | sed -n 's/^[0-9][0-9]* packets transmitted, \([0-9][0-9]*\) received.*/\1/p' | tail -n 1)"
+  ping_rtt="$(printf '%s\n' "$ping_result" | grep -o 'rtt min/avg/max/mdev = [^ ]*' | head -n 1)"
+  printf 'PING\t%s\t%s\t%s\t%s\t%s\n' "$VRC_VM_IP" "$(num_or_zero "$ping_tx")" "$(num_or_zero "$ping_rx")" "$(num_or_zero "$ping_loss")" "$ping_rtt"
+fi
 `;
 
 const VM_SUMMARY_SCRIPT = String.raw`
@@ -587,6 +685,22 @@ for vbd in $(xe vbd-list vm-uuid="$VRC_VM_UUID" type=Disk --minimal 2>/dev/null 
     sr_name="$(xe sr-param-get uuid="$sr_uuid" param-name=name-label 2>/dev/null | clean_one_line)"
   fi
   printf 'DISK\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vdi" "$VRC_VM_UUID" "$device" "$label" "$(num_or_zero "$size")" "$sr_uuid" "$sr_name" "$online_resize_supported"
+done
+`;
+
+const VM_SNAPSHOTS_SCRIPT = String.raw`
+clean_one_line() {
+  tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+if [ -z "$VRC_VM_UUID" ]; then
+  exit 0
+fi
+# 只读查询：xe snapshot-list 列出该 VM 的快照（快照在 XenServer 中也是 VM 记录）
+for snap in $(xe snapshot-list vm-uuid="$VRC_VM_UUID" --minimal 2>/dev/null | tr ',' ' '); do
+  [ -z "$snap" ] && continue
+  name="$(xe vm-param-get uuid="$snap" param-name=name-label 2>/dev/null | clean_one_line)"
+  created="$(xe vm-param-get uuid="$snap" param-name=snapshot-time 2>/dev/null | clean_one_line)"
+  printf 'SNAP\t%s\t%s\t%s\t%s\n' "$snap" "$VRC_VM_UUID" "$name" "$created"
 done
 `;
 
@@ -1645,8 +1759,13 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     );
   }
 
-  async listVmSnapshots(_input: XenConnectionInput, _vmId: string): Promise<VmSnapshot[]> {
-    return [];
+  async listVmSnapshots(input: XenConnectionInput, vmId: string): Promise<VmSnapshot[]> {
+    const output = await runRemoteScript(input, VM_SNAPSHOTS_SCRIPT, {
+      env: {
+        VRC_VM_UUID: sanitizeUuid(vmId),
+      },
+    });
+    return parseVmSnapshots(output, vmId);
   }
 
   async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction, options?: VmActionOptions): Promise<VmActionResult> {
@@ -1896,6 +2015,35 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
     };
   }
 
+  /**
+   * 宿主机只读诊断：以物理机为主语采集健康证据，VM 仅作为可选线索补充链路检查。
+   * 脚本只执行查询 / 统计 / ping 探测，返回的修复动作均为建议命令，绝不在此执行。
+   */
+  async runHostDiagnostics(input: XenConnectionInput, request: HostDiagnosticsRequest): Promise<HostDiagnosticsResult> {
+    const output = await runRemoteScript(input, HOST_DIAGNOSTICS_SCRIPT, {
+      env: {
+        VRC_HOST_ID: sanitizeUuid(request.hostId),
+        VRC_VM_ID: sanitizeUuid(request.vmId),
+        VRC_VM_IP: sanitizePlainText(request.vmIp),
+      },
+    });
+    const parsed = parseHostDiagnostics(output, request);
+    return {
+      collectedAt: new Date().toISOString(),
+      providerType: this.type,
+      supported: true,
+      hostId: parsed.hostId || request.hostId,
+      hostName: parsed.hostName || input.host,
+      hostAddress: parsed.hostAddress || input.host,
+      vmId: request.vmId,
+      vmName: request.vmName,
+      vmIp: request.vmIp,
+      conclusion: parsed.conclusion,
+      checks: parsed.checks,
+      repairActions: parsed.repairActions,
+    };
+  }
+
   async collectMetrics(input: XenConnectionInput, query: MetricQuery): Promise<MetricSample[]> {
     if (query.targetType !== "vm") {
       return [];
@@ -2128,6 +2276,453 @@ function parseHostInventory(output: string, connectionId: string): HostInventory
   return { hosts, storage, networks };
 }
 
+interface ParsedHostDiagnostics {
+  hostId: string;
+  hostName: string;
+  hostAddress: string;
+  platformVersion: string;
+  root: { fs: string; totalKb: number; usedKb: number; availableKb: number; capacityPercent: number; mount: string } | null;
+  deletedCount: number;
+  deletedBytes: number;
+  deletedFiles: Array<{ pid: string; size: number; name: string }>;
+  ovs: { ovsdbCount: number; ovsdCount: number; serviceStatus: string };
+  bridges: Array<{ name: string; ports: number; ifaces: number }>;
+  storageRepositories: Array<{ uuid: string; name: string; type: string; state: string }>;
+  vifs: Array<{ uuid: string; device: string; mac: string; network: string; attached: boolean; bridge: string }>;
+  ping: { tx: number; rx: number; lossPercent: number; rtt: string } | null;
+}
+
+interface HostDiagnosticsParsedReport {
+  hostId: string;
+  hostName: string;
+  hostAddress: string;
+  platformVersion: string;
+  conclusion: HostDiagnosticsResult["conclusion"];
+  checks: HostDiagnosticCheck[];
+  repairActions: HostDiagnosticRepairAction[];
+}
+
+/**
+ * 解析宿主机只读诊断脚本输出（TAB 分隔），并根据证据生成检查项、修复建议与结论。
+ * 修复建议只作为命令文本返回，调用方不得在本方法内执行任何变更操作。
+ */
+export function parseHostDiagnostics(output: string, request: HostDiagnosticsRequest): HostDiagnosticsParsedReport {
+  const data = parseDiagnosticsData(output);
+  const checks: HostDiagnosticCheck[] = [];
+  const failingChecks: Array<{ key: string; label: string }> = [];
+
+  if (data.root) {
+    const percent = data.root.capacityPercent;
+    const status: HostDiagnosticStatus = percent >= 95 ? "error" : percent >= 85 ? "warn" : "ok";
+    checks.push({
+      key: "root-partition",
+      label: "根分区空间",
+      category: "system",
+      scope: "host",
+      status,
+      summary: status === "ok" ? `根分区使用 ${percent}%` : `根分区使用 ${percent}%，建议尽快清理`,
+      evidence: [`分区 ${data.root.mount}（${data.root.fs}）`, `总容量 ${formatKib(data.root.totalKb)} · 可用 ${formatKib(data.root.availableKb)}`],
+      detail: status === "ok" ? undefined : "根分区过高会影响 XenServer 数据库、日志与系统盘写入，需优先处理。",
+    });
+    if (status !== "ok") failingChecks.push({ key: "root-partition", label: "根分区空间" });
+  } else {
+    checks.push({
+      key: "root-partition",
+      label: "根分区空间",
+      category: "system",
+      scope: "host",
+      status: "unknown",
+      summary: "未读取到根分区信息",
+      evidence: ["df -P / 未返回分区行"],
+    });
+  }
+
+  if (data.deletedCount > 0) {
+    checks.push({
+      key: "deleted-open-files",
+      label: "删除占用文件",
+      category: "storage",
+      scope: "host",
+      status: "warn",
+      summary: `${data.deletedCount} 个已删除但仍被占用的文件，合计 ${formatBytes(data.deletedBytes)}`,
+      evidence: data.deletedFiles.map((file) => `pid ${file.pid} · ${formatBytes(file.size)} · ${file.name}`),
+      detail: "已删除文件仍被进程占用时，磁盘空间不会真正释放；需确认占用进程后重启或清理。",
+    });
+    failingChecks.push({ key: "deleted-open-files", label: "删除占用文件" });
+  } else {
+    checks.push({
+      key: "deleted-open-files",
+      label: "删除占用文件",
+      category: "storage",
+      scope: "host",
+      status: "ok",
+      summary: "未发现删除后仍被占用的文件",
+      evidence: ["lsof +L1 未发现 link count < 1 的文件（或 lsof 未安装）"],
+    });
+  }
+
+  const ovsRunning = data.ovs.ovsdbCount > 0 && data.ovs.ovsdCount > 0;
+  let ovsStatus: HostDiagnosticStatus = ovsRunning ? "ok" : "error";
+  if (!ovsRunning && data.ovs.ovsdbCount === 0 && data.ovs.ovsdCount === 0 && !data.ovs.serviceStatus) {
+    ovsStatus = "unknown";
+  }
+  checks.push({
+    key: "ovs-service",
+    label: "OVS 服务",
+    category: "service",
+    scope: "host",
+    status: ovsStatus,
+    summary:
+      ovsRunning ? "ovsdb-server / ovs-vswitchd 运行中" :
+      ovsStatus === "unknown" ? "未读取到 OVS 服务状态" :
+      "OVS 进程缺失，网络后端可能不可用",
+    evidence: [
+      `ovsdb-server 进程 ${data.ovs.ovsdbCount} 个`,
+      `ovs-vswitchd 进程 ${data.ovs.ovsdCount} 个`,
+      ...(data.ovs.serviceStatus ? [`service openvswitch：${data.ovs.serviceStatus}`] : []),
+    ],
+  });
+  if (ovsStatus !== "ok") failingChecks.push({ key: "ovs-service", label: "OVS 服务" });
+
+  if (data.bridges.length > 0) {
+    checks.push({
+      key: "bridges",
+      label: "OVS 网桥",
+      category: "network",
+      scope: "host",
+      status: "ok",
+      summary: `发现 ${data.bridges.length} 个网桥`,
+      evidence: data.bridges.map((bridge) => `${bridge.name} · ${bridge.ports} 端口 / ${bridge.ifaces} 接口`),
+    });
+  } else if (data.ovs.ovsdCount > 0) {
+    checks.push({
+      key: "bridges",
+      label: "OVS 网桥",
+      category: "network",
+      scope: "host",
+      status: "warn",
+      summary: "未发现 OVS 网桥",
+      evidence: ["ovs-vsctl list-br 为空"],
+    });
+    failingChecks.push({ key: "bridges", label: "OVS 网桥" });
+  } else {
+    checks.push({
+      key: "bridges",
+      label: "OVS 网桥",
+      category: "network",
+      scope: "host",
+      status: "unknown",
+      summary: "未读取到网桥信息",
+      evidence: ["ovs-vsctl 不可用或未输出"],
+    });
+  }
+
+  if (data.storageRepositories.length > 0) {
+    const abnormal = data.storageRepositories.filter((sr) => sr.state && sr.state !== "ok");
+    const unknown = data.storageRepositories.filter((sr) => !sr.state);
+    const status: HostDiagnosticStatus = abnormal.length > 0 ? "warn" : unknown.length > 0 ? "unknown" : "ok";
+    checks.push({
+      key: "storage-repositories",
+      label: "存储仓库",
+      category: "storage",
+      scope: "host",
+      status,
+      summary:
+        abnormal.length > 0 ? `${abnormal.length} 个存储仓库状态异常` :
+        unknown.length > 0 ? `${unknown.length} 个存储仓库状态未读取到` :
+        `${data.storageRepositories.length} 个存储仓库状态正常`,
+      evidence: data.storageRepositories.map((sr) => `${sr.name}（${sr.type || "未知类型"}）· ${sr.state || "未知"}`),
+    });
+    if (abnormal.length > 0) failingChecks.push({ key: "storage-repositories", label: "存储仓库" });
+  } else {
+    checks.push({
+      key: "storage-repositories",
+      label: "存储仓库",
+      category: "storage",
+      scope: "host",
+      status: "unknown",
+      summary: "未读取到存储仓库信息",
+      evidence: ["xe sr-list 未返回"],
+    });
+  }
+
+  if (data.vifs.length > 0) {
+    const unattached = data.vifs.filter((vif) => !vif.attached);
+    const noBridge = data.vifs.filter((vif) => vif.attached && !vif.bridge);
+    const status: HostDiagnosticStatus = noBridge.length > 0 ? "error" : unattached.length > 0 ? "warn" : "ok";
+    checks.push({
+      key: "vif-bridge",
+      label: "VIF 挂桥",
+      category: "network",
+      scope: "vm-link",
+      status,
+      summary:
+        status === "ok" ? `${data.vifs.length} 个 VIF 已挂接到网桥` :
+        status === "error" ? `${noBridge.length} 个 VIF 未挂接到网桥` :
+        `${unattached.length} 个 VIF 未连接`,
+      evidence: data.vifs.map((vif) => `vif${vif.device || "?"}.0（${vif.network || "无网络"}）· 已连接=${vif.attached ? "是" : "否"} · 网桥=${vif.bridge || "无"}`),
+      detail: status === "ok" ? undefined : "VIF 未挂桥时该 VM 网卡与宿主机网桥断开，需在宿主机侧确认后端。",
+    });
+    if (status !== "ok") failingChecks.push({ key: "vif-bridge", label: "VIF 挂桥" });
+  } else if (request.vmId) {
+    checks.push({
+      key: "vif-bridge",
+      label: "VIF 挂桥",
+      category: "network",
+      scope: "vm-link",
+      status: "unknown",
+      summary: "未读取到该 VM 的 VIF",
+      evidence: ["xe vif-list 未返回该 VM 的虚拟网卡"],
+    });
+  }
+
+  if (data.ping) {
+    const loss = data.ping.lossPercent;
+    const status: HostDiagnosticStatus = loss >= 100 ? "error" : loss > 0 ? "warn" : "ok";
+    checks.push({
+      key: "vm-ping",
+      label: "连通性验证",
+      category: "network",
+      scope: "vm-link",
+      status,
+      summary: status === "ok" ? "VM 连通性正常" : `ping 丢包 ${loss}%`,
+      evidence: [`发送 ${data.ping.tx} · 接收 ${data.ping.rx} · 丢包 ${loss}%`, ...(data.ping.rtt ? [data.ping.rtt] : [])],
+    });
+    if (status !== "ok") failingChecks.push({ key: "vm-ping", label: "连通性验证" });
+  } else if (request.vmIp) {
+    checks.push({
+      key: "vm-ping",
+      label: "连通性验证",
+      category: "network",
+      scope: "vm-link",
+      status: "unknown",
+      summary: "未执行连通性探测",
+      evidence: ["未携带 VM IP，跳过 ping 探测"],
+    });
+  }
+
+  const errorChecks = checks.filter((check) => check.status === "error");
+  const warnChecks = checks.filter((check) => check.status === "warn");
+  const unknownOnly = checks.length > 0 && checks.every((check) => check.status === "unknown");
+  const riskLevel: HostDiagnosticsResult["conclusion"]["riskLevel"] = errorChecks.length > 0 ? "high" : warnChecks.length > 0 ? "medium" : unknownOnly ? "none" : "low";
+  const faultPoint = errorChecks[0]?.label ?? warnChecks[0]?.label;
+  const conclusion: HostDiagnosticsResult["conclusion"] = {
+    summary:
+      riskLevel === "high" ? "宿主机存在异常项，建议优先处理以下故障点" :
+      riskLevel === "medium" ? "宿主机存在需要关注的项目" :
+      riskLevel === "low" ? "宿主机各项检查正常" :
+      "未能采集到足够的宿主机诊断数据",
+    ...(faultPoint ? { faultPoint } : {}),
+    ...(faultPoint ? { impact: `${faultPoint} 异常可能影响宿主机或该 VM 的网络 / 存储可用性` } : {}),
+    riskLevel,
+  };
+
+  return {
+    hostId: data.hostId,
+    hostName: data.hostName,
+    hostAddress: data.hostAddress,
+    platformVersion: data.platformVersion,
+    conclusion,
+    checks,
+    repairActions: buildDiagnosticRepairActions(failingChecks, data.vifs, data.bridges),
+  };
+}
+
+function parseDiagnosticsData(output: string): ParsedHostDiagnostics {
+  const data: ParsedHostDiagnostics = {
+    hostId: "",
+    hostName: "",
+    hostAddress: "",
+    platformVersion: "",
+    root: null,
+    deletedCount: 0,
+    deletedBytes: 0,
+    deletedFiles: [],
+    ovs: { ovsdbCount: 0, ovsdCount: 0, serviceStatus: "" },
+    bridges: [],
+    storageRepositories: [],
+    vifs: [],
+    ping: null,
+  };
+
+  for (const line of output.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const cols = line.split("\t");
+    const tag = cols[0];
+    if (tag === "META") {
+      data.hostId = cols[1] ?? "";
+      data.hostName = cols[2] ?? "";
+      data.hostAddress = cols[3] ?? "";
+      data.platformVersion = cols[4] ?? "";
+    } else if (tag === "ROOT") {
+      data.root = {
+        fs: cols[1] ?? "",
+        totalKb: parseNumber(cols[2]),
+        usedKb: parseNumber(cols[3]),
+        availableKb: parseNumber(cols[4]),
+        capacityPercent: parseNumber((cols[5] ?? "").replace("%", "")),
+        mount: cols[6] ?? "",
+      };
+    } else if (tag === "DELETED_SUMMARY") {
+      data.deletedCount = parseNumber(cols[1]);
+      data.deletedBytes = parseNumber(cols[2]);
+    } else if (tag === "DELETED_FILE") {
+      data.deletedFiles.push({ pid: cols[1] ?? "", size: parseNumber(cols[2]), name: cols[3] ?? "" });
+    } else if (tag === "OVS") {
+      data.ovs = { ovsdbCount: parseNumber(cols[1]), ovsdCount: parseNumber(cols[2]), serviceStatus: cols[3] ?? "" };
+    } else if (tag === "BRIDGE") {
+      data.bridges.push({ name: cols[1] ?? "", ports: parseNumber(cols[2]), ifaces: parseNumber(cols[3]) });
+    } else if (tag === "SR_DIAG") {
+      data.storageRepositories.push({ uuid: cols[1] ?? "", name: cols[2] ?? "", type: cols[3] ?? "", state: cols[4] ?? "" });
+    } else if (tag === "VIF") {
+      data.vifs.push({
+        uuid: cols[1] ?? "",
+        device: cols[2] ?? "",
+        mac: cols[3] ?? "",
+        network: cols[4] ?? "",
+        attached: parseBool(cols[5]),
+        bridge: cols[6] ?? "",
+      });
+    } else if (tag === "PING") {
+      data.ping = {
+        tx: parseNumber(cols[2]),
+        rx: parseNumber(cols[3]),
+        lossPercent: parseNumber(cols[4]),
+        rtt: cols[5] ?? "",
+      };
+    }
+  }
+  return data;
+}
+
+const HOST_DIAGNOSTIC_REPAIR_ACTIONS: Record<string, Omit<HostDiagnosticRepairAction, "key">> = {
+  "root-partition": {
+    label: "清理根分区空间",
+    description: "根分区使用率过高会影响 XenServer 数据库、日志与系统盘写入。先定位大文件与已删除占用文件，再决定清理对象。",
+    recommended: true,
+    scopeNote: "仅输出建议命令，需在宿主机以 root 权限二次确认后手动执行；删除文件前必须核实用途。",
+    commands: [
+      "df -h /",
+      "du -h --max-depth=1 / 2>/dev/null | sort -h | tail -20",
+      "lsof +L1 | sort -k7 -nr | head -20",
+      "rm -f <确认可删除的大文件路径>",
+    ],
+    verificationCommands: ["df -h /"],
+  },
+  "deleted-open-files": {
+    label: "释放已删除但仍被占用的文件",
+    description: "文件已被删除但进程仍持有句柄，磁盘空间不会释放。确认占用进程后重启该进程，或删除残留句柄路径。",
+    recommended: true,
+    scopeNote: "kill 进程会影响对应服务，需先确认进程用途并获得确认后再执行。",
+    commands: [
+      "lsof +L1 | sort -k7 -nr | head -20",
+      "kill -HUP <占用进程 PID>",
+      "rm -f <已删除文件路径>",
+    ],
+    verificationCommands: ["lsof +L1 | wc -l", "df -h /"],
+  },
+  "ovs-service": {
+    label: "检查并恢复 OVS 服务",
+    description: "ovsdb-server / ovs-vswitchd 进程缺失时，宿主机虚拟网络后端不可用，VIF 无法挂桥。",
+    recommended: true,
+    scopeNote: "重启 openvswitch 会短暂中断该宿主机上的虚拟网络，需在低峰期二次确认后执行。",
+    commands: [
+      "service openvswitch status",
+      "service openvswitch restart",
+      "ovs-vsctl show",
+    ],
+    verificationCommands: ["pgrep -f ovsdb-server", "pgrep -f ovs-vswitchd", "ovs-vsctl show"],
+  },
+  "bridges": {
+    label: "核对 OVS 网桥与端口",
+    description: "未发现 OVS 网桥时，VM 虚拟网卡缺少后端承载。核对网桥是否创建、端口是否挂载。",
+    recommended: true,
+    scopeNote: "创建网桥属于网络变更，需确认网桥名称与网络规划后再执行。",
+    commands: [
+      "ovs-vsctl show",
+      "ovs-vsctl list-br",
+      "ovs-vsctl list-ports xenbr0",
+      "ip link show",
+    ],
+    verificationCommands: ["ovs-vsctl list-br", "ovs-vsctl show"],
+  },
+  "vif-bridge": {
+    label: "重新挂接 VIF 到网桥",
+    description: "目标 VM 的虚拟网卡未挂接到宿主机网桥，导致 VM 网络中断。重新挂接该 VIF 后端。",
+    recommended: true,
+    scopeNote: "add-port 会改变该 VM 虚拟网卡后端，执行前需确认网桥名称；只影响当前 VM 链路。",
+    commands: [
+      "ovs-vsctl add-port <网桥名> <VIF 设备名>",
+      "ovs-vsctl show",
+    ],
+    verificationCommands: ["ovs-vsctl iface-to-br <VIF 设备名>", "ping -c 3 <VM IP>"],
+  },
+  "vm-ping": {
+    label: "验证 VM 网络连通",
+    description: "VM 存在丢包或不可达。结合 VIF 挂桥与宿主机网络逐层定位。",
+    scopeNote: "仅提供只读排查命令，不改变任何状态。",
+    commands: [
+      "ping -c 5 <VM IP>",
+      "ovs-vsctl show",
+      "xe vif-list vm-uuid=<VM UUID>",
+    ],
+    verificationCommands: ["ping -c 3 <VM IP>"],
+  },
+  "storage-repositories": {
+    label: "检查存储仓库状态",
+    description: "存在状态异常的存储仓库，可能影响 VM 磁盘读写与快照。查看详情并确认存储端状态。",
+    scopeNote: "sr-scan 为只读扫描，但如需重启存储端服务需二次确认。",
+    commands: [
+      "xe sr-list",
+      "xe sr-param-list uuid=<SR UUID>",
+      "xe sr-scan uuid=<SR UUID>",
+    ],
+    verificationCommands: ["xe sr-list"],
+  },
+};
+
+function buildDiagnosticRepairActions(
+  failingChecks: Array<{ key: string; label: string }>,
+  vifs: ParsedHostDiagnostics["vifs"],
+  bridges: ParsedHostDiagnostics["bridges"],
+): HostDiagnosticRepairAction[] {
+  const actions: HostDiagnosticRepairAction[] = [];
+  for (const check of failingChecks) {
+    const template = HOST_DIAGNOSTIC_REPAIR_ACTIONS[check.key];
+    if (!template) continue;
+    const action: HostDiagnosticRepairAction = { ...template, key: `repair-${check.key}` };
+    // VIF 挂桥建议必须指向真实设备：取第一个"已连接但未挂桥"的 VIF 作为目标，
+    // 网桥名优先取诊断到的第一个网桥，避免给出原型里的假设备名误导用户。
+    if (check.key === "vif-bridge") {
+      const targetVif = vifs.find((vif) => vif.attached && !vif.bridge) ?? vifs[0];
+      const device = targetVif?.device ? `vif${targetVif.device}.0` : "<VIF 设备名>";
+      const bridgeName = bridges[0]?.name || "xenbr0";
+      action.commands = [
+        `ovs-vsctl add-port ${bridgeName} ${device}`,
+        "ovs-vsctl show",
+      ];
+      action.verificationCommands = [
+        `ovs-vsctl iface-to-br ${device}`,
+        "ping -c 3 <VM IP>",
+      ];
+    }
+    actions.push(action);
+  }
+  return actions;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** index;
+  return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
+function formatKib(kib: number): string {
+  return formatBytes(kib * 1024);
+}
+
 function parseVmList(output: string, connectionId: string): VmNode[] {
   const policy = getRuntimePolicy();
   return output
@@ -2239,6 +2834,32 @@ function parseVmDisks(output: string): VmDisk[] {
     })
     .filter((disk) => disk.id)
     .sort((left, right) => left.device.localeCompare(right.device, "zh-CN", { numeric: true, sensitivity: "base" }));
+}
+
+/**
+ * 解析 XenServer 快照脚本输出（SNAP\t uuid \t vmUuid \t name \t createdAt）。
+ * 只读数据转换，不涉及任何平台变更。
+ *
+ * @param output 脚本标准输出，按行以 SNAP 前缀标记快照记录。
+ * @param vmId 调用方传入的 VM 标识，快照记录缺省时兜底使用。
+ * @return 快照列表，按平台返回顺序保持；无快照时为空数组。
+ */
+export function parseVmSnapshots(output: string, vmId: string): VmSnapshot[] {
+  return output
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("SNAP\t"))
+    .map((line) => {
+      const cols = line.split("\t");
+      const createdAt = cols[4];
+      return {
+        id: cols[1] ?? "",
+        vmId: cols[2] || vmId,
+        providerId: cols[1] ?? "",
+        name: cols[3] && cols[3] !== "<not in database>" ? cols[3] : cols[1] || "快照",
+        ...(createdAt && createdAt !== "<not in database>" ? { createdAt } : {}),
+      };
+    })
+    .filter((snapshot) => snapshot.id);
 }
 
 function parseVirtualDisks(output: string): VirtualDisk[] {

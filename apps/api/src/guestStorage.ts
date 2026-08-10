@@ -680,6 +680,22 @@ function resolveNewGuestDisk(before: GuestStorageInventory, after: GuestStorageI
   return candidates.length === 1 ? candidates[0] : undefined;
 }
 
+
+/**
+ * 在虚拟机操作系统内执行一条 Shell 命令，返回标准输出。
+ *
+ * 优先使用平台 guest agent（已配置 executeGuestCommand 时），失败或不可用时回退到 SSH；
+ * 仅当调用方显式提供系统凭据时才允许 SSH 回退，避免默认凭据意外落到 SSH 通道。
+ *
+ * @param access 访客访问上下文，包含 VM IP、平台连接与系统凭据
+ * @param command 要在虚拟机内执行的 Shell 命令
+ * @param timeoutMs 命令超时毫秒数，默认 45 秒
+ * @returns 命令标准输出内容；命令退出码非 0 或超时时抛出错误
+ */
+export function runGuestShellCommand(access: GuestStorageAccess, command: string, timeoutMs = guestCommandTimeoutMs): Promise<string> {
+  return runGuestCommand(access, command, timeoutMs);
+}
+
 function runGuestCommand(access: GuestStorageAccess, command: string, timeoutMs: number): Promise<string> {
   if (access.executeCommand) {
     return access.executeCommand(command, timeoutMs).catch((error) => {

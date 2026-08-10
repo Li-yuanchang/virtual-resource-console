@@ -22,6 +22,8 @@ import type {
   VmResizeExecutionRequest,
   VmResizeResult,
   VmSnapshot,
+  HostDiagnosticsRequest,
+  HostDiagnosticsResult,
   XenConnectionInput,
   ProvisionTaskStepKey,
   ProvisionTaskStepStatus,
@@ -63,6 +65,12 @@ export interface VirtualizationProvider<C> {
   renameVm?(connection: C, vmId: string, currentName: string, newName: string): Promise<VmRenameResult>;
   resizeVm?(connection: C, vmId: string, request: VmResizeExecutionRequest): Promise<VmResizeResult>;
   createVms?(connection: C, request: VmProvisionRequest, reporter?: ProvisionProgressReporter): Promise<VmProvisionResult>;
+  /**
+   * 宿主机只读诊断：以宿主机为主语，可选携带 VM 线索补充链路检查。
+   * 实现方必须保证只读，不执行任何会改变宿主机/VM 状态的操作。
+   * 未实现该能力的 Provider 应返回 supported=false 的结果。
+   */
+  runHostDiagnostics?(connection: C, request: HostDiagnosticsRequest): Promise<HostDiagnosticsResult>;
   collectMetrics(connection: C, query: MetricQuery): Promise<MetricSample[]>;
 }
 

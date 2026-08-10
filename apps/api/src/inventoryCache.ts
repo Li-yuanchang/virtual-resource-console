@@ -5,6 +5,7 @@ import type {
   ProviderType,
   StorageRepository,
   VmDisk,
+  VmSnapshot,
   VmInventorySummary,
   VmNode,
   VmSearchIndexItem,
@@ -48,6 +49,7 @@ const HOST_TTL_MS = 60_000;
 const VM_SUMMARY_TTL_MS = 30_000;
 const VM_LIST_TTL_MS = 45_000;
 const VM_DISK_TTL_MS = 30_000;
+const VM_SNAPSHOT_TTL_MS = 60_000;
 const VM_SEARCH_INDEX_TTL_MS = 60_000;
 
 export class InventoryCache {
@@ -55,6 +57,7 @@ export class InventoryCache {
   private readonly vmSummaries = new Map<string, InventoryCacheEntry<VmInventorySummary>>();
   private readonly vmLists = new Map<string, InventoryCacheEntry<PagedResult<VmNode>>>();
   private readonly vmDisks = new Map<string, InventoryCacheEntry<VmDisk[]>>();
+  private readonly vmSnapshots = new Map<string, InventoryCacheEntry<VmSnapshot[]>>();
   private readonly vmSearchIndexes = new Map<string, InventoryCacheEntry<VmSearchIndexItem[]>>();
 
   getHosts(scope: InventoryCacheScope, loader: () => Promise<HostInventorySnapshot>, forceRefresh = false) {
@@ -91,6 +94,10 @@ export class InventoryCache {
     return this.getOrRefresh(this.vmDisks, buildInventoryCacheKey("vm-disks", scope), scope, VM_DISK_TTL_MS, loader, forceRefresh);
   }
 
+  getVmSnapshots(scope: InventoryCacheScope, loader: () => Promise<VmSnapshot[]>, forceRefresh = false) {
+    return this.getOrRefresh(this.vmSnapshots, buildInventoryCacheKey("vm-snapshots", scope), scope, VM_SNAPSHOT_TTL_MS, loader, forceRefresh);
+  }
+
   getVmSearchIndex(scope: InventoryCacheScope, loader: () => Promise<VmSearchIndexItem[]>, forceRefresh = false) {
     return this.getOrRefresh(
       this.vmSearchIndexes,
@@ -123,6 +130,7 @@ export class InventoryCache {
     invalidateMatching(this.vmSummaries, scope);
     invalidateMatching(this.vmLists, scope);
     invalidateMatching(this.vmDisks, scope);
+    invalidateMatching(this.vmSnapshots, scope);
     invalidateMatching(this.vmSearchIndexes, scope);
   }
 

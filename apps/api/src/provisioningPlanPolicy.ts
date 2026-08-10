@@ -1,5 +1,6 @@
 import { getProvisioningConfig } from "./provisioningStore.js";
 import { providerLabel } from "./providerCatalog.js";
+import { matchesIsoNamePattern } from "./isoTemplateMatch.js";
 import type { IsoImage, ProviderType, StorageRepository, VmProvisionRequest } from "./types.js";
 
 export interface ProvisioningPlanValidationInput {
@@ -133,8 +134,9 @@ function validateCommonPlan(providerType: ProviderType, request: VmProvisionRequ
       const requestProfile = request.installProfile === "desktop" ? "desktop" : "server";
       if (template.installProfile !== requestProfile) errors.push(`系统环境与安装类型不匹配：${template.name}`);
       if (template.sourceType === "iso" && template.isoNamePattern) {
-        const isoIdentity = `${request.isoName || ""} ${request.isoId || ""}`.toLowerCase();
-        if (!isoIdentity.includes(template.isoNamePattern.toLowerCase())) errors.push(`系统环境与镜像不匹配：${template.name} 需要 ${template.isoNamePattern}`);
+        if (!matchesIsoNamePattern({ name: request.isoName, id: request.isoId }, template.isoNamePattern)) {
+          errors.push(`系统环境与镜像不匹配：${template.name} 需要 ${template.isoNamePattern}`);
+        }
       }
     }
   }

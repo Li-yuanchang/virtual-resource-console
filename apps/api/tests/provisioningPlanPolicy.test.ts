@@ -42,3 +42,31 @@ test("manual ISO fallback is allowed only where the provider has a registered st
   assert.match(validateProvisionPlan("proxmox", pveRequest, {}).join("；"), /尚未配置所选 ISO/);
   assert.equal(validateProvisionPlan("xenserver", xenRequest, {}).length, 0);
 });
+
+test("accepts XenServer host DVD CentOS volume label for the maintained CentOS 7 template", () => {
+  const xenRequest: VmProvisionRequest = {
+    ...request("xenserver"),
+    sourceType: "iso",
+    environmentTemplateId: "xenserver-centos7-standard",
+    installStrategy: "kickstart",
+    installProfile: "server",
+    isoId: "3ed87d7a-3f2a-47d9-bc71-3e19c3f1d08b",
+    isoName: "CentOS 7 x86_64",
+  };
+
+  assert.equal(validateProvisionPlan("xenserver", xenRequest, {}).length, 0);
+});
+
+test("keeps blocking clearly unrelated ISO names for the maintained CentOS 7 template", () => {
+  const xenRequest: VmProvisionRequest = {
+    ...request("xenserver"),
+    sourceType: "iso",
+    environmentTemplateId: "xenserver-centos7-standard",
+    installStrategy: "kickstart",
+    installProfile: "server",
+    isoId: "ubuntu",
+    isoName: "ubuntu-24.04.1-desktop-amd64.iso",
+  };
+
+  assert.match(validateProvisionPlan("xenserver", xenRequest, {}).join("；"), /系统环境与镜像不匹配/);
+});

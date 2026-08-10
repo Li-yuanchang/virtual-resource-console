@@ -1,4 +1,5 @@
 import type { EnvironmentProvisioningTemplate, IsoImage, IsoInstallProfileHint, ProviderType } from "./types.js";
+import { matchesIsoNamePattern } from "./isoTemplateMatch.js";
 
 const desktopMediaPattern = /(?:^|[-_.\s])(desktop|workstation|graphical|livegui)(?:[-_.\s]|$)/i;
 const serverMediaPattern = /(?:^|[-_.\s])(server|minimal|netinst|core)(?:[-_.\s]|$)/i;
@@ -35,7 +36,7 @@ export function resolveIsoInstallProfileHint(
   const identity = `${image.name} ${image.id}`.toLowerCase();
   const templateProfiles = new Set(
     templates
-      .filter((template) => (!template.providerType || template.providerType === providerType) && templateMatchesIso(template, identity))
+      .filter((template) => (!template.providerType || template.providerType === providerType) && templateMatchesIso(template, image))
       .map((template) => template.installProfile),
   );
   const windowsMedia = /windows|winserver/i.test(identity);
@@ -61,6 +62,6 @@ export function resolveIsoInstallProfileHint(
   return { available: ["server"], recommended: "server", source: "default" };
 }
 
-function templateMatchesIso(template: EnvironmentProvisioningTemplate, isoIdentity: string): boolean {
-  return template.sourceType === "iso" && !!template.isoNamePattern && isoIdentity.includes(template.isoNamePattern.toLowerCase());
+function templateMatchesIso(template: EnvironmentProvisioningTemplate, image: IsoImage): boolean {
+  return template.sourceType === "iso" && matchesIsoNamePattern(image, template.isoNamePattern);
 }

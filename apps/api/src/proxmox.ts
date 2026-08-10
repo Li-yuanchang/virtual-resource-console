@@ -3,6 +3,13 @@ import { assessVmReclaim } from "./analysis/reclaimStateMachine.js";
 import { getGeneratedIso, markGeneratedIsoStatus, markGeneratedIsoUploaded, registerGeneratedIso } from "./generatedIsoStore.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
 import {
+  buildDiagnosticRepairActions,
+  concludeHostDiagnostics,
+  formatBytes,
+  percentOf,
+  statusForPercent,
+} from "./hostDiagnostics.js";
+import {
   buildProxmoxInstallerArgs,
   cleanupProxmoxKickstartArtifacts,
   prepareProxmoxArmKickstartArtifacts,
@@ -12,6 +19,10 @@ import { inferIpv4FromName, isManagedIpv4 } from "./runtimePolicy.js";
 import { normalizeStorageCapacity } from "./storageCapacity.js";
 import { describeStorageRepository } from "./storageRepositoryProfile.js";
 import type {
+  HostDiagnosticCheck,
+  HostDiagnosticsRequest,
+  HostDiagnosticsResult,
+  HostDiagnosticStatus,
   HostNode,
   IsoImage,
   MetricQuery,
@@ -63,7 +74,21 @@ interface ProxmoxNode {
 interface ProxmoxNodeStatus {
   pveversion?: string;
   uptime?: number;
+  cpu?: number;
+  loadavg?: string;
+  kversion?: string;
   memory?: {
+    total?: number;
+    used?: number;
+    free?: number;
+  };
+  rootfs?: {
+    total?: number;
+    used?: number;
+    free?: number;
+    avail?: number;
+  };
+  swap?: {
     total?: number;
     used?: number;
     free?: number;
@@ -73,6 +98,24 @@ interface ProxmoxNodeStatus {
     sockets?: number;
     model?: string;
   };
+}
+
+interface ProxmoxDisk {
+  devpath?: string;
+  disk?: string;
+  type?: string;
+  size?: number;
+  used?: number;
+  health?: string;
+  model?: string;
+  serial?: string;
+  wearout?: number;
+}
+
+interface ProxmoxService {
+  name?: string;
+  state?: string;
+  desc?: string;
 }
 
 interface ProxmoxStorage {
@@ -120,6 +163,16 @@ interface ProxmoxVmStatus {
   diskwrite?: number;
   netin?: number;
   netout?: number;
+}
+
+/** Proxmox VE 虚拟机快照列表项（GET /nodes/{node}/qemu/{vmid}/snapshot）。 */
+interface ProxmoxSnapshotEntry {
+  name: string;
+  description?: string;
+  snaptime?: number;
+  vmstate?: number;
+  parent?: string;
+  type?: string;
 }
 
 interface ProxmoxGuestAgentFsInfo {
@@ -389,8 +442,16 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     );
   }
 
-  async listVmSnapshots(_input: XenConnectionInput, _vmId: string): Promise<VmSnapshot[]> {
-    return [];
+  async listVmSnapshots(input: XenConnectionInput, vmId: string): Promise<VmSnapshot[]> {
+    const [node, id] = parseVmProviderId(vmId);
+    if (!node || !id) {
+      throw new Error(`Proxmox VE VM ID 不完整：${vmId}`);
+    }
+    const client = await ProxmoxClient.login(input);
+    const entries = await client.get<ProxmoxSnapshotEntry[]>(
+      `/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(id)}/snapshot`,
+    );
+    return parseVmSnapshots(entries, vmId);
   }
 
   async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction, options?: VmActionOptions): Promise<VmActionResult> {
@@ -779,6 +840,317 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
       networks: Array.from(inventory.networksByNode.entries()).flatMap(([node, networks]) => toNetworkInterfaces(node, networks)),
     };
   }
+
+  /**
+   * 宿主机只读诊断（Proxmox VE）：通过 PVE API 采集节点状态、磁盘健康、服务状态与网桥信息，
+   * 可选携带 VM 线索（proxmox:<node>:<vmid> 或 <node>:<vmid>）补充网卡挂桥检查。
+   * 全部使用只读 GET 接口，不执行任何变更操作。
+   *
+   * @param input PVE API 连接参数。
+   * @param request 诊断请求；hostId 为节点名，vmId 为 `proxmox:<node>:<vmid>` 或 `<node>:<vmid>` 格式。
+   * @return 结构化诊断报告；supported 恒为 true。
+   */
+  async runHostDiagnostics(input: XenConnectionInput, request: HostDiagnosticsRequest): Promise<HostDiagnosticsResult> {
+    const client = await ProxmoxClient.login(input);
+    const data = await collectProxmoxDiagnostics(client, input, request);
+    return buildProxmoxHostDiagnostics(input, request, data);
+  }
+}
+
+interface ProxmoxDiagnosticsData {
+  status: ProxmoxNodeStatus;
+  disks: ProxmoxDisk[];
+  services: ProxmoxService[];
+  networks: ProxmoxNetworkInterface[];
+  vmConfig?: ProxmoxVmConfig;
+  vm?: ProxmoxVm;
+}
+
+/**
+ * 采集 PVE 节点只读诊断证据。所有接口均为只读 GET，单个接口失败时降级为空数据，
+ * 由 buildProxmoxHostDiagnostics 按证据完整性给出 unknown 检查项。
+ *
+ * @param client 已登录的 PVE API 客户端。
+ * @param request 诊断请求；hostId / vmId 用于定位节点与 VM。
+ * @return 采集到的节点状态、磁盘、服务、网络与可选 VM 配置。
+ */
+async function collectProxmoxDiagnostics(client: ProxmoxClient, input: XenConnectionInput, request: HostDiagnosticsRequest): Promise<ProxmoxDiagnosticsData> {
+  const [node, vmId] = parseVmProviderId(request.hostId || request.vmId || "");
+  const nodeName = node || input.host;
+  const [status, disks, services, networks] = await Promise.all([
+    client.get<ProxmoxNodeStatus>(`/nodes/${encodeURIComponent(nodeName)}/status`).catch(() => ({})),
+    client.get<ProxmoxDisk[]>(`/nodes/${encodeURIComponent(nodeName)}/disks/list`).catch(() => []),
+    client.get<ProxmoxService[]>(`/nodes/${encodeURIComponent(nodeName)}/services`).catch(() => []),
+    client.get<ProxmoxNetworkInterface[]>(`/nodes/${encodeURIComponent(nodeName)}/network`).catch(() => []),
+  ]);
+  let vmConfig: ProxmoxVmConfig | undefined;
+  let vm: ProxmoxVm | undefined;
+  if (vmId) {
+    const vms = await client.get<ProxmoxVm[]>(`/nodes/${encodeURIComponent(nodeName)}/qemu`).catch(() => []);
+    vm = vms.find((item) => String(item.vmid) === vmId);
+    vmConfig = await client.get<ProxmoxVmConfig>(`/nodes/${encodeURIComponent(nodeName)}/qemu/${encodeURIComponent(vmId)}/config`).catch(() => ({}));
+  }
+  return { status, disks, services, networks, vmConfig, vm };
+}
+
+const PROXMOX_CRITICAL_SERVICES = ["pve-cluster", "pvedaemon", "pveproxy", "pvestatd", "qemu-server", "pve-container", "corosync"];
+
+const PROXMOX_DIAGNOSTIC_REPAIR_SUGGESTIONS: Record<
+  string,
+  { label: string; description: string; scopeNote: string; commands: string[]; verificationCommands: string[] }
+> = {
+  "node-load": {
+    label: "排查 CPU / 内存高负载",
+    description: "定位占用 CPU / 内存的 VM 与容器，必要时在低峰期调整配额或迁移。",
+    scopeNote: "以下命令仅用于排查与确认，调整资源需管理员在 PVE 界面或 API 上另行执行。",
+    commands: ["pct list", "qm list", "top -bn1 | head -25", "free -h"],
+    verificationCommands: ["uptime", "cat /proc/loadavg"],
+  },
+  "rootfs-usage": {
+    label: "清理根分区空间",
+    description: "根分区使用率偏高时清理包缓存、日志与不再使用的模板。",
+    scopeNote: "清理操作会影响节点磁盘内容，执行前需确认目标文件可删除。",
+    commands: ["apt-get autoremove --purge", "pveam update", "du -xhd1 / | sort -h | tail -20", "journalctl --vacuum-time=7d"],
+    verificationCommands: ["df -h /"],
+  },
+  "storage-health": {
+    label: "检查磁盘健康与存储状态",
+    description: "对健康异常的磁盘执行 SMART 自检，并确认存储卷挂载状态。",
+    scopeNote: "smartctl 为只读自检，可安全执行；更换磁盘属于硬件变更操作。",
+    commands: ["pvesm status", "smartctl -H /dev/<disk>", "dmesg | tail -50"],
+    verificationCommands: ["pvesm status"],
+  },
+  "pve-services": {
+    label: "恢复 PVE 核心服务",
+    description: "PVE 核心服务未运行时先查看状态与日志，确认后按需重启。",
+    scopeNote: "重启服务会影响对应服务可用性，需在维护窗口执行。",
+    commands: ["systemctl status pveproxy", "journalctl -u pveproxy -n 50", "systemctl restart pveproxy"],
+    verificationCommands: ["systemctl is-active pveproxy pvedaemon pvestatd"],
+  },
+  "network-bridges": {
+    label: "检查 Linux Bridge 网络",
+    description: "确认 vmbr 网桥与物理网卡绑定、接口地址是否正确。",
+    scopeNote: "修改 /etc/network/interfaces 会触发网络重载，需谨慎执行。",
+    commands: ["ip -br link show", "bridge link show", "cat /etc/network/interfaces"],
+    verificationCommands: ["ip -br addr show"],
+  },
+  "vm-link": {
+    label: "核对 VM 网卡挂桥",
+    description: "确认 VM 网卡桥接参数与宿主机网桥一致，必要时重新挂接。",
+    scopeNote: "修改 VM 网卡配置需要 VM 停机或在维护窗口执行。",
+    commands: ["qm config <vmid>", "ip -br addr show", "bridge link show"],
+    verificationCommands: ["qm config <vmid>"],
+  },
+};
+
+function readProxmoxVmNet(config: ProxmoxVmConfig | undefined): { netKey: string; value: string; bridge: string } | null {
+  if (!config) return null;
+  const entry = Object.entries(config).find(([key]) => /^net\d+$/.test(key));
+  if (!entry) return null;
+  const value = String(entry[1] ?? "");
+  const bridge = /(?:^|,)bridge=([^,\s]+)/.exec(value)?.[1] ?? "";
+  return { netKey: entry[0], value, bridge };
+}
+
+/**
+ * 由 PVE 只读证据生成诊断报告。纯函数，便于单元测试；不发起任何请求、不执行任何变更。
+ *
+ * @param input PVE 连接参数（host 用于回退展示地址）。
+ * @param request 诊断请求。
+ * @param data collectProxmoxDiagnostics 采集到的只读证据。
+ * @return 结构化诊断报告。
+ */
+export function buildProxmoxHostDiagnostics(
+  input: XenConnectionInput,
+  request: HostDiagnosticsRequest,
+  data: ProxmoxDiagnosticsData,
+): HostDiagnosticsResult {
+  const checks: HostDiagnosticCheck[] = [];
+  const findings: Array<{ key: string; label: string }> = [];
+  const [node, vmId] = parseVmProviderId(request.hostId || request.vmId || "");
+  const nodeName = node || input.host;
+
+  // 1. 节点负载：CPU / 内存 / Swap
+  const cpuPercent = data.status.cpu != null ? Math.min(Math.max(Number(data.status.cpu) * 100, 0), 100) : null;
+  const memoryPercent = percentOf(data.status.memory?.used, data.status.memory?.total);
+  const swapPercent = percentOf(data.status.swap?.used, data.status.swap?.total);
+  const loadStatuses = [statusForPercent(cpuPercent), statusForPercent(memoryPercent), statusForPercent(swapPercent)];
+  const loadStatus: HostDiagnosticStatus = loadStatuses.includes("error") ? "error" : loadStatuses.includes("warn") ? "warn" : loadStatuses.includes("unknown") ? "unknown" : "ok";
+  const formatPercentText = (value: number | null) => (value == null ? "未知" : `${Math.round(value)}%`);
+  checks.push({
+    key: "node-load",
+    label: "节点负载",
+    category: "system",
+    scope: "host",
+    status: loadStatus,
+    summary:
+      loadStatus === "ok" ? "CPU / 内存 / Swap 负载正常" :
+      loadStatus === "unknown" ? "未读取到节点负载数据" :
+      "CPU / 内存 / Swap 存在高负载项",
+    evidence: [
+      `CPU ${formatPercentText(cpuPercent)} · 内存 ${formatPercentText(memoryPercent)} · Swap ${formatPercentText(swapPercent)}`,
+      `负载 ${data.status.loadavg || "未知"} · 运行 ${formatUptime(data.status.uptime) || "未知"}`,
+      `内核 ${data.status.kversion || "未知"} · ${data.status.pveversion || "未知"}`,
+    ],
+  });
+  if (loadStatus !== "ok" && loadStatus !== "unknown") findings.push({ key: "node-load", label: "节点负载" });
+
+  // 2. 根分区使用率
+  const rootfsPercent = percentOf(data.status.rootfs?.used, data.status.rootfs?.total);
+  const rootfsStatus = statusForPercent(rootfsPercent);
+  checks.push({
+    key: "rootfs-usage",
+    label: "根分区空间",
+    category: "storage",
+    scope: "host",
+    status: rootfsStatus,
+    summary:
+      rootfsStatus === "ok" ? `根分区使用 ${Math.round(rootfsPercent ?? 0)}%` :
+      rootfsStatus === "unknown" ? "未读取到根分区信息" :
+      `根分区使用 ${Math.round(rootfsPercent ?? 0)}%，建议尽快清理`,
+    evidence: [
+      data.status.rootfs ? `总容量 ${formatBytes(data.status.rootfs.total ?? 0)} · 已用 ${formatBytes(data.status.rootfs.used ?? 0)} · 可用 ${formatBytes(data.status.rootfs.avail ?? data.status.rootfs.free ?? 0)}` : "未返回 rootfs 数据",
+    ],
+    detail: rootfsStatus === "ok" ? undefined : "根分区过高会影响 PVE 系统盘、日志与模板缓存写入，需优先处理。",
+  });
+  if (rootfsStatus !== "ok" && rootfsStatus !== "unknown") findings.push({ key: "rootfs-usage", label: "根分区空间" });
+
+  // 3. 磁盘健康
+  const failedDisks = data.disks.filter((disk) => /failed|fault/i.test(disk.health ?? ""));
+  const unusualDisks = data.disks.filter((disk) => {
+    const health = (disk.health ?? "").toLowerCase();
+    return health && !["passed", "ok", "good", "failed", "fault"].includes(health);
+  });
+  const diskStatus: HostDiagnosticStatus =
+    data.disks.length === 0 ? "unknown" :
+    failedDisks.length > 0 ? "error" :
+    unusualDisks.length > 0 ? "warn" : "ok";
+  checks.push({
+    key: "storage-health",
+    label: "磁盘健康",
+    category: "storage",
+    scope: "host",
+    status: diskStatus,
+    summary:
+      diskStatus === "ok" ? `${data.disks.length} 块磁盘健康正常` :
+      diskStatus === "error" ? `${failedDisks.length} 块磁盘健康异常` :
+      diskStatus === "warn" ? `${unusualDisks.length} 块磁盘状态待确认` :
+      "未读取到磁盘健康数据",
+    evidence:
+      data.disks.length === 0
+        ? ["/nodes/<node>/disks/list 未返回磁盘数据"]
+        : data.disks.map((disk) => `${disk.devpath || disk.disk || "未知设备"} · ${disk.model || "未知型号"} · ${formatBytes(disk.size ?? 0)} · ${disk.health || "未报告"}`),
+    detail: diskStatus === "ok" ? undefined : "磁盘健康异常可能由 SMART 告警或控制器故障引起，建议在宿主机侧执行 SMART 自检并确认备份。",
+  });
+  if (diskStatus === "error" || diskStatus === "warn") findings.push({ key: "storage-health", label: "磁盘健康" });
+
+  // 4. PVE 核心服务
+  const serviceByName = new Map(data.services.map((item) => [item.name ?? "", item.state ?? ""]));
+  const presentCritical = PROXMOX_CRITICAL_SERVICES.filter((name) => serviceByName.has(name));
+  const stoppedCritical = presentCritical.filter((name) => serviceByName.get(name) !== "running");
+  const missingCritical = PROXMOX_CRITICAL_SERVICES.filter((name) => !serviceByName.has(name) && name !== "corosync");
+  const serviceStatus: HostDiagnosticStatus =
+    data.services.length === 0 ? "unknown" :
+    stoppedCritical.length > 0 ? "error" :
+    missingCritical.length > 0 ? "warn" : "ok";
+  checks.push({
+    key: "pve-services",
+    label: "PVE 核心服务",
+    category: "service",
+    scope: "host",
+    status: serviceStatus,
+    summary:
+      serviceStatus === "ok" ? "PVE 核心服务运行正常" :
+      serviceStatus === "error" ? `${stoppedCritical.length} 个核心服务未运行` :
+      serviceStatus === "warn" ? `${missingCritical.length} 个核心服务未返回状态` :
+      "未读取到服务状态",
+    evidence:
+      data.services.length === 0
+        ? ["/nodes/<node>/services 未返回服务数据"]
+        : data.services
+            .filter((item) => PROXMOX_CRITICAL_SERVICES.includes(item.name ?? ""))
+            .map((item) => `${item.name} · ${item.state ?? "未知"}`),
+    detail: serviceStatus === "ok" ? undefined : "pveproxy / pvedaemon / pvestatd 等核心服务未运行会影响 PVE 界面与 API 可用性。",
+  });
+  if (serviceStatus === "error" || serviceStatus === "warn") findings.push({ key: "pve-services", label: "PVE 核心服务" });
+
+  // 5. 网络网桥
+  const bridges = data.networks.filter((item) => item.type === "bridge" && item.iface);
+  const activeBridges = bridges.filter((item) => item.active === 1 || item.active == null);
+  const bridgeStatus: HostDiagnosticStatus =
+    bridges.length === 0 ? "unknown" :
+    activeBridges.length > 0 ? "ok" : "warn";
+  checks.push({
+    key: "network-bridges",
+    label: "网络网桥",
+    category: "network",
+    scope: "host",
+    status: bridgeStatus,
+    summary:
+      bridgeStatus === "ok" ? `${bridges.length} 个网桥 · 启用 ${activeBridges.length}` :
+      bridgeStatus === "warn" ? "网桥存在但均未启用" :
+      "未读取到网桥信息",
+    evidence:
+      bridges.length === 0
+        ? ["/nodes/<node>/network 未返回 bridge 接口"]
+        : bridges.map((item) => `${item.iface} · ${item.address || item.cidr || "无地址"} · ${item.active === 1 ? "启用" : "未启用"}`),
+  });
+  if (bridgeStatus === "warn") findings.push({ key: "network-bridges", label: "网络网桥" });
+
+  // 6. VM 网卡挂桥（仅携带 VM 线索时）
+  if (vmId) {
+    const net = readProxmoxVmNet(data.vmConfig);
+    const vmRunning = data.vm?.status === "running";
+    let vmLinkStatus: HostDiagnosticStatus = "unknown";
+    if (!data.vm) {
+      vmLinkStatus = "unknown";
+    } else if (!vmRunning) {
+      vmLinkStatus = "warn";
+    } else if (!net) {
+      vmLinkStatus = "unknown";
+    } else if (!net.bridge) {
+      vmLinkStatus = "unknown";
+    } else if (!bridges.some((item) => item.iface === net.bridge)) {
+      vmLinkStatus = "error";
+    } else {
+      vmLinkStatus = "ok";
+    }
+    checks.push({
+      key: "vm-link",
+      label: "VM 网卡挂桥",
+      category: "network",
+      scope: "vm-link",
+      status: vmLinkStatus,
+      summary:
+        vmLinkStatus === "ok" ? `${net?.netKey ?? "net0"} 已挂接到 ${net?.bridge ?? "未知网桥"}` :
+        vmLinkStatus === "error" ? `网卡桥接 ${net?.bridge ?? "未知"} 在宿主机上不存在` :
+        vmLinkStatus === "warn" ? "VM 未运行，无法验证网卡挂桥" :
+        "未读取到该 VM 网卡配置",
+      evidence: [
+        `VM 状态：${data.vm?.status ?? "未知"}`,
+        ...(net ? [`${net.netKey} 配置：${net.value}`] : ["VM 配置中未找到 net 网卡"]),
+        `宿主机网桥：${bridges.map((item) => item.iface).join("、") || "无"}`,
+      ],
+      detail: vmLinkStatus === "ok" ? undefined : "VM 网卡桥接与宿主机网桥不一致时该 VM 会失去网络，需在宿主机侧核对网络配置。",
+    });
+    if (vmLinkStatus === "error" || vmLinkStatus === "warn") findings.push({ key: "vm-link", label: "VM 网卡挂桥" });
+  }
+
+  const conclusion = concludeHostDiagnostics(checks);
+  return {
+    collectedAt: new Date().toISOString(),
+    providerType: "proxmox",
+    supported: true,
+    hostId: request.hostId,
+    hostName: nodeName,
+    hostAddress: input.host,
+    vmId: request.vmId,
+    vmName: request.vmName,
+    vmIp: request.vmIp,
+    conclusion,
+    checks,
+    repairActions: buildDiagnosticRepairActions(findings, PROXMOX_DIAGNOSTIC_REPAIR_SUGGESTIONS),
+  };
 }
 
 /** Builds the PVE form body for the array-typed QEMU Guest Agent command parameter. */
@@ -1287,6 +1659,30 @@ function nextProxmoxScsiDevice(config: ProxmoxVmConfig): string {
 function assertResizeIncrease(label: string, target: number | undefined, current: number): void {
   if (target == null) return;
   if (!Number.isFinite(target) || target <= current) throw new Error(`${label}扩容目标必须大于当前值。`);
+}
+
+/**
+ * 转换 Proxmox 快照列表：排除代表"当前状态"的 current 占位项，其余按创建时间升序返回。
+ * 只读数据转换，不涉及任何平台变更。
+ *
+ * @param entries GET /snapshot 返回的快照数组。
+ * @param vmId 调用方传入的 VM 标识（node:vmid），作为快照归属 VM 的展示口径。
+ * @return 快照列表；无快照时为空数组。
+ */
+export function parseVmSnapshots(entries: ProxmoxSnapshotEntry[], vmId: string): VmSnapshot[] {
+  return entries
+    .filter((entry) => entry && typeof entry.name === "string" && entry.name && entry.name !== "current")
+    .map((entry) => {
+      const createdAt = typeof entry.snaptime === "number" && entry.snaptime > 0 ? new Date(entry.snaptime * 1000).toISOString() : undefined;
+      return {
+        id: entry.name,
+        vmId,
+        providerId: entry.name,
+        name: entry.description?.trim() || entry.name,
+        ...(createdAt ? { createdAt } : {}),
+      };
+    })
+    .sort((left, right) => (left.createdAt ?? "").localeCompare(right.createdAt ?? ""));
 }
 
 function parseVmProviderId(value: string): [string, string] {

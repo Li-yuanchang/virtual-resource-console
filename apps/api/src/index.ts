@@ -66,6 +66,7 @@ import type { VirtualizationProvider } from "./providers/provider.js";
 import { ProxmoxProvider } from "./proxmox.js";
 import { registerRequestCrypto } from "./requestCrypto.js";
 import { getRuntimePolicy } from "./runtimePolicy.js";
+import { auditStore, redactAuditRequest, type AuditRecordInput } from "./auditStore.js";
 import { summarizeResourceCapacity } from "./storageCapacity.js";
 import {
   deleteUiBackgroundImage,
@@ -99,6 +100,9 @@ import { VmRenameConflictError, VmRenameValidationError } from "./vmRename.js";
 import { VmwareProvider } from "./vmware.js";
 import { VmScheduleRunner } from "./vmScheduleRunner.js";
 import { executeVmResize, inspectVmResizeStorage, VmResizeValidationError } from "./vmResizeService.js";
+import { isGuestAuthenticationError } from "./guestStorage.js";
+import { listGuestBootEntries, resolveGuestBootAccess, setGuestBootEntry } from "./vmBootEntry.js";
+import { vmSystemCredentialStore } from "./vmSystemCredentialStore.js";
 import {
   createVmSchedule,
   deleteVmSchedule,
@@ -119,7 +123,7 @@ writeApiStartupLog("api module loaded", {
 
 const server = Fastify({
   logger: {
-    redact: ["req.body.password", "req.body.rootPassword", "req.body.systemCredentials.password", "req.body.guestStorage.password", "req.body.planItems[*].rootPassword", "req.body.leases[*].rootPassword", "password", "rootPassword"],
+    redact: ["req.body.password", "req.body.rootPassword", "req.body.systemCredentials.password", "req.body.guestStorage.password", "req.body.systemCredentials", "req.body.planItems[*].rootPassword", "req.body.leases[*].rootPassword", "password", "rootPassword"],
   },
 });
 
@@ -264,6 +268,12 @@ const saveConnectionSchema = z.object({
   password: z.string().min(1),
 });
 
+const auditQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(1000).optional(),
+  status: z.enum(["all", "info", "pending", "success", "warning", "error"]).optional().default("all"),
+  keyword: z.string().trim().max(200).optional(),
+});
+
 const deleteConnectionSchema = z.object({
   id: z.string().min(1),
 });
@@ -286,6 +296,13 @@ const hostsSchema = connectionSchema.extend({
   forceRefresh: z.boolean().optional(),
 });
 
+const hostDiagnosticsSchema = connectionSchema.extend({
+  hostId: z.string().optional(),
+  vmId: z.string().optional(),
+  vmName: z.string().optional(),
+  vmIp: z.string().optional(),
+});
+
 const vmsSchema = connectionSchema.extend({
   poolId: z.string().optional(),
   hostId: z.string().optional(),
@@ -297,6 +314,14 @@ const vmsSchema = connectionSchema.extend({
 
 const vmDisksSchema = connectionSchema.extend({
   vmId: z.string().min(1),
+});
+
+const vmSnapshotsSchema = connectionSchema.extend({
+  vmId: z.string().min(1),
+});
+
+const hostVmSnapshotsSchema = connectionSchema.extend({
+  hostId: z.string().min(1),
 });
 
 const vmSystemJumpCredentialsSchema = z.object({
@@ -318,11 +343,32 @@ const vmGuestStorageSchema = connectionSchema.extend({
   rememberSystemCredentials: z.boolean().optional().default(false),
 });
 
+const vmBootEntrySelectionSchema = z.object({
+  index: z.number().int().min(0),
+  title: z.string().min(1).max(300),
+  grubKind: z.enum(["grub1", "grub2"]),
+});
+
+const vmBootEntriesSchema = connectionSchema.extend({
+  vmId: z.string().min(1),
+  systemCredentials: vmSystemCredentialsSchema.optional(),
+  rememberSystemCredentials: z.boolean().optional().default(false),
+});
+
+const vmSystemCredentialSaveSchema = z.object({
+  connectionId: z.string().min(1),
+  vmId: z.string().min(1),
+  systemCredentials: vmSystemCredentialsSchema,
+});
+
 const vmActionSchema = connectionSchema.extend({
   vmId: z.string().min(1),
   hostId: z.string().optional(),
   action: z.enum(["start", "shutdown", "forceReboot", "delete"]),
   confirmToken: z.literal("CONFIRMED"),
+  bootEntry: vmBootEntrySelectionSchema.optional(),
+  systemCredentials: vmSystemCredentialsSchema.optional(),
+  rememberSystemCredentials: z.boolean().optional().default(false),
 });
 
 const vmRenameSchema = connectionSchema.extend({
@@ -600,6 +646,24 @@ interface ProvisionPreflightCheck {
   details?: Record<string, unknown>;
 }
 
+server.get("/api/audit", async (request) => {
+  const parsed = auditQuerySchema.safeParse(request.query);
+  if (!parsed.success) {
+    return {
+      records: [],
+      total: auditStore.count(),
+    };
+  }
+  return {
+    records: auditStore.list({
+      limit: parsed.data.limit,
+      status: parsed.data.status,
+      keyword: parsed.data.keyword,
+    }),
+    total: auditStore.count(),
+  };
+});
+
 server.get("/api/health", async () => ({
   ok: true,
   service: "virtual-resource-console-api",
@@ -651,6 +715,12 @@ server.patch("/api/preferences", async (request, reply) => {
       issues: parsed.error.issues,
     });
   }
+  recordAudit({
+    title: "更新应用偏好",
+    action: "preferences.update",
+    request: auditRequestSummary(parsed.data),
+    status: "success",
+  });
   return {
     preferences: persistentConnectionStoreEnabled
       ? saveAppPreferences(parsed.data)
@@ -666,6 +736,12 @@ server.patch("/api/preferences/ui", async (request, reply) => {
       issues: parsed.error.issues,
     });
   }
+  recordAudit({
+    title: "更新界面偏好",
+    action: "preferences.ui.update",
+    request: auditRequestSummary(parsed.data),
+    status: "success",
+  });
   return {
     preferences: saveUiPreferences(parsed.data),
   };
@@ -688,6 +764,15 @@ server.post("/api/preferences/ui/background-image", async (request, reply) => {
   const content = await file.toBuffer();
   saveUiBackgroundImage(content);
   const updatedAt = new Date().toISOString();
+  recordAudit({
+    title: "上传工作区背景图",
+    action: "preferences.ui.background-image.upload",
+    request: auditRequestSummary({
+      filename: path.basename(file.filename).slice(0, 240),
+      mime: file.mimetype,
+    }),
+    status: "success",
+  });
   return {
     preferences: saveUiPreferences({
       backgroundMode: "image",
@@ -701,6 +786,11 @@ server.post("/api/preferences/ui/background-image", async (request, reply) => {
 
 server.delete("/api/preferences/ui/background-image", async () => {
   deleteUiBackgroundImage();
+  recordAudit({
+    title: "移除工作区背景图",
+    action: "preferences.ui.background-image.delete",
+    status: "success",
+  });
   return {
     preferences: saveUiPreferences({
       backgroundMode: "default",
@@ -728,6 +818,12 @@ server.patch("/api/preferences/connection", async (request, reply) => {
       preferences: publicConnectionPreferences(),
     };
   }
+  recordAudit({
+    title: "更新连接偏好",
+    action: "preferences.connection.update",
+    request: auditRequestSummary(parsed.data),
+    status: "success",
+  });
   return {
     preferences: saveConnectionPreferences(parsed.data),
   };
@@ -762,10 +858,23 @@ server.patch("/api/ip-pools/policy", async (request, reply) => {
     });
   }
   try {
+    recordAudit({
+      title: "更新 IP 池策略",
+      action: "ip-pools.policy.update",
+      request: auditRequestSummary(parsed.data),
+      status: "success",
+    });
     return {
       policy: saveIpPoolPolicy(parsed.data),
     };
   } catch (error) {
+    recordAudit({
+      title: "更新 IP 池策略失败",
+      action: "ip-pools.policy.update",
+      request: auditRequestSummary(parsed.data),
+      detail: error instanceof Error ? error.message : "IP 池配置格式不正确",
+      status: "error",
+    });
     return reply.status(400).send({
       message: error instanceof Error ? error.message : "IP 池配置格式不正确",
     });
@@ -780,6 +889,12 @@ server.post("/api/provisioning/config", async (request, reply) => {
       issues: parsed.error.issues,
     });
   }
+  recordAudit({
+    title: "保存创建预设",
+    action: "provisioning.config.save",
+    request: auditRequestSummary(parsed.data),
+    status: "success",
+  });
   return {
     config: saveProvisioningConfig(parsed.data),
   };
@@ -797,6 +912,14 @@ server.post("/api/provisioning/ip-leases", async (request, reply) => {
       issues: parsed.error.issues,
     });
   }
+  recordAudit({
+    title: "预留 IP 地址",
+    action: "ip-leases.reserve",
+    request: auditRequestSummary(
+      parsed.data.leases.map((lease) => ({ ip: lease.ip, vmName: lease.vmName })),
+    ),
+    status: "success",
+  });
   return {
     leases: reserveIpLeases(parsed.data.leases),
   };
@@ -810,6 +933,15 @@ server.post("/api/provisioning/ip-leases/release", async (request, reply) => {
       issues: parsed.success ? undefined : parsed.error.issues,
     });
   }
+  recordAudit({
+    title: "释放 IP 地址",
+    action: "ip-leases.release",
+    request: auditRequestSummary({
+      ips: parsed.data.ips,
+      vmNames: parsed.data.vmNames,
+    }),
+    status: "success",
+  });
   return {
     leases: releaseIpLeases(parsed.data),
   };
@@ -946,6 +1078,13 @@ server.post("/api/maintenance/generated-isos/cleanup", async (request, reply) =>
     includeUnexpiredFailed: parsed.data.includeUnexpiredFailed,
     resolveConnection: resolveGeneratedIsoCleanupConnection,
   });
+  recordAudit({
+    title: "清理安装临时介质",
+    action: "maintenance.generated-iso-cleanup",
+    request: auditRequestSummary({ includeUnexpiredFailed: parsed.data.includeUnexpiredFailed }),
+    detail: `清理 ${report.summary.cleaned} 条，保留 ${report.summary.retained} 条，失败 ${report.summary.failed} 条`,
+    status: report.summary.failed > 0 ? "warning" : "success",
+  });
   return {
     operatedAt: new Date().toISOString(),
     report,
@@ -1077,6 +1216,19 @@ server.post("/api/provisioning/vms", async (request, reply) => {
         provisionExecutionStore.delete(task.id);
       });
     }, 0);
+    recordAudit({
+      title: `创建虚拟机 ${parsed.data.planItems.length} 台`,
+      action: "provisioning.vms.create",
+      providerType: resolved.providerType,
+      connectionId: resolved.connectionId,
+      connectionName: auditConnectionName(resolved.connectionId),
+      target: parsed.data.hostId,
+      request: auditRequestSummary(
+        parsed.data.planItems.map((item) => ({ name: item.name, ip: item.ip, cpu: item.cpu, memoryGiB: item.memoryGiB })),
+      ),
+      detail: `${providerLabel(resolved.providerType)} 创建任务已提交：${task.id}`,
+      status: "success",
+    });
     return reply.status(202).send({
       operatedAt: new Date().toISOString(),
       result: {
@@ -1090,6 +1242,17 @@ server.post("/api/provisioning/vms", async (request, reply) => {
     });
   } catch (error) {
     request.log.error({ error }, "failed to accept virtual machine provisioning task");
+    recordAudit({
+      title: "创建虚拟机失败",
+      action: "provisioning.vms.create",
+      providerType: parsed.data.providerType,
+      connectionId: parsed.data.connectionId,
+      request: auditRequestSummary(
+        parsed.data.planItems.map((item) => ({ name: item.name, ip: item.ip, cpu: item.cpu, memoryGiB: item.memoryGiB })),
+      ),
+      detail: toClientErrorMessage(error, "创建虚拟机失败"),
+      status: "error",
+    });
     return reply.status(502).send({
       message: toClientErrorMessage(error, "提交创建任务失败"),
     });
@@ -1405,6 +1568,22 @@ server.post("/api/connections", async (request, reply) => {
   };
   const saved = saveStoredConnection(data);
   invalidateVmScheduleTargetCache();
+  const isConnectionUpdate = !!parsed.data.id;
+  recordAudit({
+    title: isConnectionUpdate ? "更新已保存连接" : "保存连接",
+    action: isConnectionUpdate ? "connection.update" : "connection.save",
+    providerType: saved.providerType,
+    connectionId: saved.id,
+    connectionName: saved.name,
+    request: auditRequestSummary({
+      name: saved.name,
+      providerType: saved.providerType,
+      host: saved.host,
+      port: saved.port,
+      username: saved.username,
+    }),
+    status: "success",
+  });
   return { connection: saved };
 });
 
@@ -1426,6 +1605,22 @@ server.post("/api/ephemeral-connections", async (request, reply) => {
     ...parsed.data,
     port: normalizeProviderPort(parsed.data.providerType, parsed.data.port),
   });
+  recordAudit({
+    title: "创建临时连接",
+    action: "connection.create-ephemeral",
+    providerType: connection.providerType,
+    connectionId: connection.id,
+    connectionName: connection.name,
+    request: auditRequestSummary({
+      name: connection.name,
+      providerType: connection.providerType,
+      host: connection.host,
+      port: connection.port,
+      username: connection.username,
+      ttlMinutes: parsed.data.ttlMinutes,
+    }),
+    status: "success",
+  });
   return { connection };
 });
 
@@ -1440,9 +1635,18 @@ server.delete("/api/connections/:id", async (request, reply) => {
   if (!persistentConnectionStoreEnabled) {
     return { deleted: false };
   }
+  const deletedName = auditConnectionName(parsed.data.id);
   const deletedEphemeral = deleteEphemeralConnection(parsed.data.id);
   const deletedStored = deletedEphemeral ? false : deleteStoredConnection(parsed.data.id);
   if (deletedStored) invalidateVmScheduleTargetCache();
+  recordAudit({
+    title: deletedEphemeral ? "删除临时连接" : "删除已保存连接",
+    action: deletedEphemeral ? "connection.delete-ephemeral" : "connection.delete",
+    connectionId: parsed.data.id,
+    connectionName: deletedName,
+    status: deletedEphemeral || deletedStored ? "success" : "warning",
+    detail: deletedEphemeral || deletedStored ? undefined : "未找到对应连接，未执行删除",
+  });
   return { deleted: deletedEphemeral || deletedStored };
 });
 
@@ -1457,8 +1661,17 @@ server.delete("/api/ephemeral-connections/:id", async (request, reply) => {
   if (!persistentConnectionStoreEnabled) {
     return { deleted: false };
   }
+  const ephemeralDeleted = deleteEphemeralConnection(parsed.data.id);
+  recordAudit({
+    title: "删除临时连接",
+    action: "connection.delete-ephemeral",
+    connectionId: parsed.data.id,
+    connectionName: auditConnectionName(parsed.data.id),
+    status: ephemeralDeleted ? "success" : "warning",
+    detail: ephemeralDeleted ? undefined : "未找到对应临时连接，未执行删除",
+  });
   return {
-    deleted: deleteEphemeralConnection(parsed.data.id),
+    deleted: ephemeralDeleted,
   };
 });
 
@@ -1476,9 +1689,38 @@ server.post("/api/connections/test", async (request, reply) => {
     const provider = providers.get(resolved.providerType);
     const result = await provider.testConnection(resolved.connection);
     if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    recordAudit({
+      title: "连接测试成功",
+      action: "connection.test",
+      providerType: resolved.providerType,
+      connectionId: resolved.connectionId,
+      connectionName: auditConnectionName(resolved.connectionId),
+      request: auditRequestSummary({
+        providerType: parsed.data.providerType,
+        host: parsed.data.host,
+        port: parsed.data.port,
+        username: parsed.data.username,
+      }),
+      detail: result.hostName || result.message,
+      status: "success",
+    });
     return result;
   } catch (error) {
     request.log.error({ error }, "failed to test virtualization connection");
+    recordAudit({
+      title: "连接测试失败",
+      action: "connection.test",
+      providerType: parsed.data.providerType,
+      connectionId: parsed.data.connectionId,
+      request: auditRequestSummary({
+        providerType: parsed.data.providerType,
+        host: parsed.data.host,
+        port: parsed.data.port,
+        username: parsed.data.username,
+      }),
+      detail: toClientErrorMessage(error, "连接虚拟化平台失败"),
+      status: "error",
+    });
     return reply.status(502).send({
       message: toClientErrorMessage(error, "连接虚拟化平台失败"),
     });
@@ -1539,6 +1781,54 @@ server.post("/api/inventory/hosts", async (request, reply) => {
     request.log.error({ error }, "failed to list virtualization hosts");
     return reply.status(502).send({
       message: toClientErrorMessage(error, "读取物理机清单失败"),
+    });
+  }
+});
+
+server.post("/api/hosts/diagnostics", async (request, reply) => {
+  // 虚拟机诊断功能仍在开发中，暂未开放：接口与前端入口一并屏蔽，避免误用不完整的诊断结果。
+  const HOST_DIAGNOSTICS_ENABLED = false;
+  if (!HOST_DIAGNOSTICS_ENABLED) {
+    return reply.status(501).send({ message: "虚拟机诊断功能暂未开放，开发完善后再恢复" });
+  }
+  const parsed = hostDiagnosticsSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "请填写平台连接参数",
+      issues: parsed.error.issues,
+    });
+  }
+
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    const provider = providers.get(resolved.providerType);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    if (!provider.runHostDiagnostics) {
+      return {
+        collectedAt: new Date().toISOString(),
+        providerType: resolved.providerType,
+        supported: false,
+        hostName: resolved.connection.host,
+        hostAddress: resolved.connection.host,
+        conclusion: {
+          summary: "当前平台 Provider 尚未实现宿主机诊断能力。",
+          riskLevel: "none",
+        },
+        checks: [],
+        repairActions: [],
+        message: "当前平台 Provider 尚未实现宿主机诊断能力。",
+      };
+    }
+    return await provider.runHostDiagnostics(resolved.connection, {
+      hostId: parsed.data.hostId,
+      vmId: parsed.data.vmId,
+      vmName: parsed.data.vmName,
+      vmIp: parsed.data.vmIp,
+    });
+  } catch (error) {
+    request.log.error({ error }, "failed to run host diagnostics");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "宿主机诊断失败"),
     });
   }
 });
@@ -1705,6 +1995,87 @@ server.post("/api/inventory/vm-disks", async (request, reply) => {
   }
 });
 
+server.post("/api/inventory/vm-snapshots", async (request, reply) => {
+  const parsed = vmSnapshotsSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "请填写平台连接参数和 VM",
+      issues: parsed.error.issues,
+    });
+  }
+
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    const provider = providers.get(resolved.providerType);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const snapshots = await inventoryCache.getVmSnapshots(
+      buildInventoryCacheScope(resolved, { vmId: parsed.data.vmId }),
+      () => provider.listVmSnapshots(resolved.connection, parsed.data.vmId),
+    );
+    return {
+      collectedAt: snapshots.updatedAt,
+      snapshots: snapshots.value,
+    };
+  } catch (error) {
+    request.log.error({ error }, "failed to list vm snapshots");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "读取虚拟机快照失败"),
+    });
+  }
+});
+
+server.post("/api/hosts/vm-snapshots", async (request, reply) => {
+  const parsed = hostVmSnapshotsSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "请填写平台连接参数和物理机",
+      issues: parsed.error.issues,
+    });
+  }
+
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    const provider = providers.get(resolved.providerType);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    // 按物理机维度聚合快照：先取该宿主机下的全部 VM，再逐个并发读取快照；
+    // 单个 VM 读取失败只影响该 VM，不拖垮整台物理机的快照总览。
+    const vmsResult = await loadVmsCached(resolved, {
+      hostId: parsed.data.hostId,
+      page: 1,
+      pageSize: 500,
+    });
+    const items = await mapWithConcurrency(vmsResult.value.items, 8, async (vm) => {
+      try {
+        const snapshots = await inventoryCache.getVmSnapshots(
+          buildInventoryCacheScope(resolved, { vmId: vm.providerId }),
+          () => provider.listVmSnapshots(resolved.connection, vm.providerId),
+        );
+        return {
+          vm: { providerId: vm.providerId, name: vm.name, powerState: vm.powerState },
+          snapshots: snapshots.value,
+        };
+      } catch (error) {
+        request.log.warn({ error, vmId: vm.providerId, vmName: vm.name }, "failed to list snapshots for vm");
+        return {
+          vm: { providerId: vm.providerId, name: vm.name, powerState: vm.powerState },
+          snapshots: [],
+          error: toClientErrorMessage(error, "读取该虚拟机快照失败"),
+        };
+      }
+    });
+    return {
+      collectedAt: new Date().toISOString(),
+      hostId: parsed.data.hostId,
+      items,
+    };
+  } catch (error) {
+    request.log.error({ error }, "failed to list host vm snapshots");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "读取物理机快照失败"),
+    });
+  }
+});
+
 server.post("/api/inventory/vm-guest-storage", async (request, reply) => {
   const parsed = vmGuestStorageSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -1835,6 +2206,73 @@ server.post("/api/inventory/iso-images", async (request, reply) => {
   }
 });
 
+server.post("/api/vms/boot-entries", async (request, reply) => {
+  const parsed = vmBootEntriesSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "请填写平台连接参数和虚拟机；使用临时系统凭据时登录名和密码必须同时提供。",
+      issues: parsed.error.issues,
+    });
+  }
+
+  try {
+    const resolved = resolveConnectionRequest(parsed.data);
+    const provider = providers.get(resolved.providerType);
+    if (resolved.connectionId) markResolvedConnectionUsed(resolved.connectionId);
+    const cacheScope = buildInventoryCacheScope(resolved, { vmId: parsed.data.vmId });
+    const access = await resolveGuestBootAccess({
+      provider,
+      connection: resolved.connection,
+      vmId: parsed.data.vmId,
+      connectionId: resolved.connectionId,
+      vmHint: inventoryCache.findVm(cacheScope, parsed.data.vmId),
+      systemCredentials: parsed.data.systemCredentials,
+    });
+    const bootEntries = await listGuestBootEntries(access);
+    if (parsed.data.systemCredentials && parsed.data.rememberSystemCredentials && resolved.connectionId) {
+      vmSystemCredentialStore.save(resolved.connectionId, parsed.data.vmId, parsed.data.systemCredentials);
+    }
+    return {
+      collectedAt: new Date().toISOString(),
+      ...bootEntries,
+    };
+  } catch (error) {
+    if (isGuestAuthenticationError(error)) {
+      if (!parsed.data.systemCredentials && parsed.data.connectionId) {
+        vmSystemCredentialStore.delete(parsed.data.connectionId, parsed.data.vmId);
+      }
+      return reply.status(401).send({
+        message: "默认凭据无法登录虚拟机操作系统，请提供系统账号和密码；仅能通过 JumpServer 访问时请同时填写跳板连接。",
+        code: "SYSTEM_AUTHENTICATION_REQUIRED",
+      });
+    }
+    request.log.error({ error }, "failed to list vm boot entries");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "读取虚拟机启动项失败"),
+    });
+  }
+});
+
+server.post("/api/vms/system-credentials", async (request, reply) => {
+  const parsed = vmSystemCredentialSaveSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "保存本机系统凭据参数不完整，请刷新后重试。",
+      issues: parsed.error.issues,
+    });
+  }
+  try {
+    // 只把凭据写进用户本机加密密码库（AES-256-GCM），不回传、不落服务端日志。
+    vmSystemCredentialStore.save(parsed.data.connectionId, parsed.data.vmId, parsed.data.systemCredentials);
+    return { saved: true };
+  } catch (error) {
+    request.log.error({ error }, "failed to save vm system credentials");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "保存本机系统凭据失败"),
+    });
+  }
+});
+
 server.post("/api/vms/action", async (request, reply) => {
   const parsed = vmActionSchema.safeParse(request.body);
   if (!parsed.success) {
@@ -1866,7 +2304,26 @@ server.post("/api/vms/action", async (request, reply) => {
         vmIpsForLeaseRelease = [];
       }
     }
+    let bootEntryReadback = "";
+    if ((parsed.data.action === "shutdown" || parsed.data.action === "forceReboot") && parsed.data.bootEntry) {
+      const cacheScope = buildInventoryCacheScope(resolved, { vmId: parsed.data.vmId });
+      const access = await resolveGuestBootAccess({
+        provider,
+        connection: resolved.connection,
+        vmId: parsed.data.vmId,
+        connectionId: resolved.connectionId,
+        vmHint: inventoryCache.findVm(cacheScope, parsed.data.vmId),
+        systemCredentials: parsed.data.systemCredentials,
+      });
+      bootEntryReadback = await setGuestBootEntry(access, parsed.data.bootEntry);
+      if (parsed.data.systemCredentials && parsed.data.rememberSystemCredentials && resolved.connectionId) {
+        vmSystemCredentialStore.save(resolved.connectionId, parsed.data.vmId, parsed.data.systemCredentials);
+      }
+    }
     const result = await provider.performVmAction(resolved.connection, parsed.data.vmId, parsed.data.action);
+    if (bootEntryReadback && parsed.data.bootEntry) {
+      result.message = `${result.message}；已设置下次启动内核：${parsed.data.bootEntry.title}`;
+    }
     const operatedAt = new Date().toISOString();
     const powerStateScope = buildVmPowerStateScope(resolved);
     if (parsed.data.action === "shutdown") recordVmShutdown(powerStateScope, parsed.data.vmId, operatedAt);
@@ -1914,6 +2371,17 @@ server.post("/api/vms/action", async (request, reply) => {
             vmNames: vmNameForLeaseRelease ? [vmNameForLeaseRelease] : [],
           })
         : [];
+    recordAudit({
+      title: `VM ${vmActionLabel(parsed.data.action)}`,
+      action: `vm.action.${parsed.data.action}`,
+      providerType: resolved.providerType,
+      connectionId: resolved.connectionId,
+      connectionName: auditConnectionName(resolved.connectionId),
+      target: parsed.data.vmId,
+      command: result.command,
+      detail: result.message,
+      status: "success",
+    });
     return {
       operatedAt,
       result,
@@ -1921,7 +2389,25 @@ server.post("/api/vms/action", async (request, reply) => {
       stoppedProvisionTaskIds,
     };
   } catch (error) {
+    if (isGuestAuthenticationError(error)) {
+      if (!parsed.data.systemCredentials && parsed.data.connectionId) {
+        vmSystemCredentialStore.delete(parsed.data.connectionId, parsed.data.vmId);
+      }
+      return reply.status(401).send({
+        message: "默认凭据无法登录虚拟机操作系统，请提供系统账号和密码后再设置启动项。",
+        code: "SYSTEM_AUTHENTICATION_REQUIRED",
+      });
+    }
     request.log.error({ error }, "failed to perform vm action");
+    recordAudit({
+      title: `VM ${vmActionLabel(parsed.data.action)}失败`,
+      action: `vm.action.${parsed.data.action}`,
+      providerType: parsed.data.providerType,
+      connectionId: parsed.data.connectionId,
+      target: parsed.data.vmId,
+      detail: toClientErrorMessage(error, `VM ${vmActionLabel(parsed.data.action)}失败`),
+      status: "error",
+    });
     return reply.status(502).send({
       message: toClientErrorMessage(error, `VM ${vmActionLabel(parsed.data.action)}失败`),
     });
@@ -1972,6 +2458,20 @@ server.post("/api/vms/rename", async (request, reply) => {
         refreshVmSearchIndex: true,
       });
     }
+    recordAudit({
+      title: "虚拟机改名",
+      action: "vm.rename",
+      providerType: resolved.providerType,
+      connectionId: resolved.connectionId,
+      connectionName: auditConnectionName(resolved.connectionId),
+      target: parsed.data.vmId,
+      request: auditRequestSummary({
+        currentName: parsed.data.currentName,
+        newName: parsed.data.newName,
+      }),
+      detail: `${parsed.data.currentName} → ${result.newName}`,
+      status: "success",
+    });
     return {
       operatedAt: new Date().toISOString(),
       result,
@@ -1979,6 +2479,19 @@ server.post("/api/vms/rename", async (request, reply) => {
   } catch (error) {
     request.log.error({ error }, "failed to rename vm");
     const statusCode = error instanceof VmRenameValidationError ? 400 : error instanceof VmRenameConflictError ? 409 : 502;
+    recordAudit({
+      title: "虚拟机改名失败",
+      action: "vm.rename",
+      providerType: parsed.data.providerType,
+      connectionId: parsed.data.connectionId,
+      target: parsed.data.vmId,
+      request: auditRequestSummary({
+        currentName: parsed.data.currentName,
+        newName: parsed.data.newName,
+      }),
+      detail: toClientErrorMessage(error, "虚拟机改名失败"),
+      status: "error",
+    });
     return reply.status(statusCode).send({
       message: toClientErrorMessage(error, "虚拟机改名失败"),
     });
@@ -2045,6 +2558,23 @@ server.post("/api/vms/resize", async (request, reply) => {
         changedVmIds: [parsed.data.vmId],
       });
     }
+    recordAudit({
+      title: "虚拟机扩容",
+      action: "vm.resize",
+      providerType: resolved.providerType,
+      connectionId: resolved.connectionId,
+      connectionName: auditConnectionName(resolved.connectionId),
+      target: parsed.data.vmId,
+      request: auditRequestSummary({
+        cpuCount: parsed.data.cpuCount,
+        memoryBytes: parsed.data.memoryBytes,
+        disk: parsed.data.disk,
+        allowShutdown: parsed.data.allowShutdown,
+        restartAfterResize: parsed.data.restartAfterResize,
+      }),
+      detail: `${result.previousCpuCount}→${result.cpuCount} vCPU / ${result.previousMemoryBytes}→${result.memoryBytes} B`,
+      status: "success",
+    });
     return {
       operatedAt: new Date().toISOString(),
       result,
@@ -2052,6 +2582,20 @@ server.post("/api/vms/resize", async (request, reply) => {
   } catch (error) {
     request.log.error({ error }, "failed to resize vm");
     const statusCode = error instanceof VmResizeValidationError ? 409 : 502;
+    recordAudit({
+      title: "虚拟机扩容失败",
+      action: "vm.resize",
+      providerType: parsed.data.providerType,
+      connectionId: parsed.data.connectionId,
+      target: parsed.data.vmId,
+      request: auditRequestSummary({
+        cpuCount: parsed.data.cpuCount,
+        memoryBytes: parsed.data.memoryBytes,
+        disk: parsed.data.disk,
+      }),
+      detail: toClientErrorMessage(error, "虚拟机扩容失败"),
+      status: "error",
+    });
     return reply.status(statusCode).send({
       message: toClientErrorMessage(error, "虚拟机扩容失败"),
     });
@@ -2089,6 +2633,17 @@ server.post("/api/vm-schedules", async (request, reply) => {
     const { confirmToken: _confirmToken, ...rawInput } = parsed.data;
     const input = validateVmScheduleConnections(rawInput);
     const task = createVmSchedule(input);
+    recordAudit({
+      title: "创建定时任务",
+      action: "vm-schedule.create",
+      target: task.name,
+      request: auditRequestSummary({
+        action: task.action,
+        cycle: task.cycle,
+        targets: task.targets.map((item) => item.name),
+      }),
+      status: "success",
+    });
     return reply.status(201).send({ task, runner: vmScheduleRunner.status() });
   } catch (error) {
     if (error instanceof VmScheduleConflictError) {
@@ -2116,6 +2671,12 @@ server.put("/api/vm-schedules/:id", async (request, reply) => {
     const input = validateVmScheduleConnections(rawInput);
     const task = updateVmSchedule(params.data.id, input);
     if (!task) return reply.status(404).send({ message: "未找到定时任务。" });
+    recordAudit({
+      title: "更新定时任务",
+      action: "vm-schedule.update",
+      target: task.name,
+      status: "success",
+    });
     return { task, runner: vmScheduleRunner.status() };
   } catch (error) {
     if (error instanceof VmScheduleConflictError) {
@@ -2138,6 +2699,13 @@ server.patch("/api/vm-schedules/:id/enabled", async (request, reply) => {
   try {
     const task = setVmScheduleEnabled(params.data.id, parsed.data.enabled);
     if (!task) return reply.status(404).send({ message: "未找到定时任务。" });
+    recordAudit({
+      title: parsed.data.enabled ? "启用定时任务" : "停用定时任务",
+      action: "vm-schedule.set-enabled",
+      target: task.name,
+      detail: parsed.data.enabled ? "已启用" : "已停用",
+      status: "success",
+    });
     return { task, runner: vmScheduleRunner.status() };
   } catch (error) {
     return reply.status(400).send({ message: toClientErrorMessage(error, "更新任务状态失败") });
@@ -2151,6 +2719,12 @@ server.delete("/api/vm-schedules/:id", async (request, reply) => {
   const params = vmScheduleIdSchema.safeParse(request.params);
   if (!params.success) return reply.status(400).send({ message: "任务 ID 无效。" });
   if (!deleteVmSchedule(params.data.id)) return reply.status(404).send({ message: "未找到定时任务。" });
+  recordAudit({
+    title: "删除定时任务",
+    action: "vm-schedule.delete",
+    target: params.data.id,
+    status: "success",
+  });
   return { deleted: true, id: params.data.id };
 });
 
@@ -3408,6 +3982,34 @@ function buildIsoEmptyState(providerType: ProviderType, images: IsoImage[] = [])
     message: descriptor.capabilities.isoLibrary.emptyMessage,
     actionHint: descriptor.capabilities.isoLibrary.actionHint,
   };
+}
+
+function recordAudit(input: AuditRecordInput): void {
+  try {
+    auditStore.record(input);
+  } catch (error) {
+    server.log.warn({ error }, "failed to persist audit record");
+  }
+}
+
+function auditConnectionName(connectionId?: string): string | undefined {
+  if (!connectionId) return undefined;
+  try {
+    const stored = listStoredConnections().find((item) => item.id === connectionId);
+    if (stored) return stored.name;
+    const ephemeral = listEphemeralConnections().find((item) => item.id === connectionId);
+    return ephemeral?.name;
+  } catch {
+    return undefined;
+  }
+}
+
+function auditRequestSummary(payload: unknown): string | undefined {
+  try {
+    return JSON.stringify(redactAuditRequest(payload));
+  } catch {
+    return undefined;
+  }
 }
 
 function toClientErrorMessage(error: unknown, fallback: string): string {

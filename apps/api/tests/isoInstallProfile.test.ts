@@ -73,3 +73,27 @@ test("defaults omitted Windows install profiles to Desktop while Linux stays CLI
   assert.equal(defaultInstallProfileForIdentity("Windows Server 2012 R2"), "desktop");
   assert.equal(defaultInstallProfileForIdentity("CentOS-7-x86_64-DVD.iso"), "server");
 });
+
+test("maps XenServer host DVD CentOS label to the maintained CentOS 7 template profile", () => {
+  const templates: EnvironmentProvisioningTemplate[] = [
+    {
+      id: "xenserver-centos7-standard",
+      name: "XenServer CentOS 7 标准环境",
+      providerType: "xenserver",
+      sourceType: "iso",
+      isoNamePattern: "CentOS-7-x86_64-DVD-1511.iso",
+      specId: "linux",
+      ipPoolId: "",
+      vmNamePrefix: "centos7",
+      autoStart: true,
+      installStrategy: "kickstart",
+      installProfile: "server",
+    },
+  ];
+
+  assert.deepEqual(resolveIsoInstallProfileHint("xenserver", image("CentOS 7 x86_64"), templates), {
+    available: ["server"],
+    recommended: "server",
+    source: "template",
+  });
+});

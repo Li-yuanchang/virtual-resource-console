@@ -5,10 +5,15 @@ import { assessVmReclaim } from "./analysis/reclaimStateMachine.js";
 import { getGeneratedIso, markGeneratedIsoStatus, markGeneratedIsoUploaded, registerGeneratedIso } from "./generatedIsoStore.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
 import { inferIpv4FromName, isManagedIpv4 } from "./runtimePolicy.js";
+import { buildDiagnosticRepairActions, concludeHostDiagnostics, formatBytes, percentOf, statusForPercent } from "./hostDiagnostics.js";
 import { normalizeStorageCapacity } from "./storageCapacity.js";
 import { describeStorageRepository } from "./storageRepositoryProfile.js";
 import { ensureVmwareCentosBootFiles, generateVmwareCentosKickstartIso, removeLocalVmwareKickstartIso } from "./vmwareUnattendedIso.js";
 import type {
+  HostDiagnosticCheck,
+  HostDiagnosticStatus,
+  HostDiagnosticsRequest,
+  HostDiagnosticsResult,
   HostNode,
   IsoImage,
   MetricQuery,
@@ -348,8 +353,17 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
     }
   }
 
-  async listVmSnapshots(_input: XenConnectionInput, _vmId: string): Promise<VmSnapshot[]> {
-    return [];
+  async listVmSnapshots(input: XenConnectionInput, vmId: string): Promise<VmSnapshot[]> {
+    const session = await VmwareSoapSession.login(input);
+    try {
+      const vmObjects = await session.retrieveContainerProperties("VirtualMachine", ["name", "snapshot.rootSnapshotList"]);
+      const target = normalizeVmwareTargetId(vmId);
+      const match = vmObjects.find((item) => vmwareProviderId(item) === target || item.ref.value === target);
+      if (!match) throw new Error(`未找到 VMware 虚拟机：${vmId}`);
+      return collectVmSnapshots(match.props.get("snapshot.rootSnapshotList"), vmId, vmwareProviderId(match));
+    } finally {
+      await session.logout();
+    }
   }
 
   async performVmAction(input: XenConnectionInput, vmId: string, action: VmPowerAction, options?: VmActionOptions): Promise<VmActionResult> {
@@ -729,6 +743,401 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
       await session.logout();
     }
   }
+
+  /**
+   * 宿主机只读诊断（VMware vSphere）：通过 SOAP 只读属性采集宿主机负载、数据存储、
+   * ESXi 服务、硬件传感器与 VMkernel 网络，可选携带 VM 线索补充链路检查。
+   * 全部使用 RetrievePropertiesEx 只读查询，不执行任何变更操作。
+   *
+   * @param input vSphere 连接参数。
+   * @param request 诊断请求；hostId 为 HostSystem 的 ManagedObjectReference（如 host-12），
+   *                vmId 为 VM 的 config.uuid / instanceUuid / ManagedObjectReference。
+   * @return 结构化诊断报告；supported 恒为 true。
+   */
+  async runHostDiagnostics(input: XenConnectionInput, request: HostDiagnosticsRequest): Promise<HostDiagnosticsResult> {
+    const session = await VmwareSoapSession.login(input);
+    try {
+      const data = await session.retrieveHostDiagnostics(request.hostId, request.vmId);
+      return buildVmwareHostDiagnostics(input, request, data);
+    } finally {
+      await session.logout();
+    }
+  }
+}
+
+interface VmwareDiagnosticsData {
+  host?: {
+    name: string;
+    connectionState: string;
+    productFullName?: string;
+    cpuModel?: string;
+    cpuUsageMhz?: number;
+    cpuMhz?: number;
+    numCpuCores?: number;
+    memoryTotalBytes?: number;
+    memoryUsageMb?: number;
+    pnics: Array<{ device: string; linked: boolean }>;
+    vmknicIps: string[];
+  };
+  datastores: Array<{
+    name: string;
+    capacityBytes?: number;
+    freeSpaceBytes?: number;
+    accessible: boolean;
+    type?: string;
+  }>;
+  services: VmwareServiceData[];
+  sensors: VmwareNumericSensorData[];
+  storageStatus: VmwareStorageElementData[];
+  vm?: VmwareVmLinkData;
+}
+
+interface VmwareServiceData {
+  key: string;
+  label: string;
+  running: boolean;
+  policy: string;
+}
+
+interface VmwareNumericSensorData {
+  name: string;
+  health: string;
+  sensorType?: string;
+  currentReading?: string;
+  baseUnits?: string;
+}
+
+interface VmwareStorageElementData {
+  name: string;
+  health: string;
+}
+
+interface VmwareVmLinkData {
+  name: string;
+  powerState: string;
+  toolsStatus: string;
+  guestIp?: string;
+  guestNics: Array<{ deviceName: string; network: string; connected: boolean; ipAddresses: string[] }>;
+}
+
+const VMWARE_CRITICAL_SERVICES = ["hostd", "vpxa", "ntpd", "slpd"];
+
+const VMWARE_DIAGNOSTIC_REPAIR_SUGGESTIONS: Record<
+  string,
+  { label: string; description: string; scopeNote: string; commands: string[]; verificationCommands: string[] }
+> = {
+  "node-load": {
+    label: "排查 CPU / 内存高负载",
+    description: "定位占用 CPU / 内存的 VM，必要时在低峰期调整资源配额或迁移。",
+    scopeNote: "以下命令仅用于排查与确认，调整资源需管理员在 vSphere 客户端或 API 上另行执行。",
+    commands: ["esxtop -b -n 1", "esxcli system process list", "esxcli vm process list"],
+    verificationCommands: ["esxtop -b -n 1 -d 5"],
+  },
+  "datastore-usage": {
+    label: "清理数据存储空间",
+    description: "对使用率偏高的数据存储清理快照、日志与不再使用的模板。",
+    scopeNote: "清理操作会影响数据存储内容，执行前需确认目标文件可删除。",
+    commands: ["esxcli storage filesystem list", "du -sh /vmfs/volumes/*", "vim-cmd vmsvc/snapshot.removeall <vmid>"],
+    verificationCommands: ["df -h /vmfs/volumes/<datastore>"],
+  },
+  "storage-health": {
+    label: "检查存储健康与设备状态",
+    description: "对健康异常的存储设备执行状态核对与日志排查。",
+    scopeNote: "esxcli 查询为只读操作，可安全执行；更换磁盘属于硬件变更操作。",
+    commands: ["esxcli storage core device list", "esxcli storage health list"],
+    verificationCommands: ["esxcli storage health list"],
+  },
+  "esx-services": {
+    label: "恢复 ESXi 核心服务",
+    description: "核心服务未运行时先查看状态与日志，确认后按需重启。",
+    scopeNote: "重启服务会影响对应服务可用性，需在维护窗口执行。",
+    commands: ["/etc/init.d/hostd status", "/etc/init.d/vpxa status", "/etc/init.d/ntpd status"],
+    verificationCommands: ["/etc/init.d/hostd status"],
+  },
+  "sensor-health": {
+    label: "核对硬件传感器告警",
+    description: "查看温度 / 风扇 / 电压 / 电源等传感器详情，确认是否需要硬件维护。",
+    scopeNote: "esxcli 查询为只读操作，可安全执行；更换硬件属于变更操作。",
+    commands: ["esxcli hardware sensor list", "esxcli hardware status get"],
+    verificationCommands: ["esxcli hardware sensor list"],
+  },
+  "network-vmk": {
+    label: "检查 VMkernel 网络",
+    description: "核对物理网卡链路与 VMkernel 地址配置。",
+    scopeNote: "修改 vSphere 网络配置会影响管理网络与 VM 网络，需谨慎执行。",
+    commands: ["esxcli network nic list", "esxcli network ip interface list", "esxcli network ip route ipv4 list"],
+    verificationCommands: ["esxcli network ip interface list"],
+  },
+  "vm-link": {
+    label: "核对 VM 网络连通",
+    description: "确认 VM 网卡连接状态、Tools 与 IP 获取情况，必要时重新挂接网络。",
+    scopeNote: "修改 VM 网络适配器需要 VM 停机或在维护窗口执行。",
+    commands: ["vim-cmd vmsvc/get.summary <vmid>", "esxcli network vm list"],
+    verificationCommands: ["esxcli network vm list"],
+  },
+};
+
+/**
+ * 由 VMware 只读证据生成诊断报告。纯函数，便于单元测试；不发起任何请求、不执行任何变更。
+ *
+ * @param input vSphere 连接参数（host 用于回退展示地址）。
+ * @param request 诊断请求。
+ * @param data retrieveHostDiagnostics 采集到的只读证据。
+ * @return 结构化诊断报告。
+ */
+export function buildVmwareHostDiagnostics(
+  input: XenConnectionInput,
+  request: HostDiagnosticsRequest,
+  data: VmwareDiagnosticsData,
+): HostDiagnosticsResult {
+  const checks: HostDiagnosticCheck[] = [];
+  const findings: Array<{ key: string; label: string }> = [];
+  const hostName = data.host?.name || input.host;
+  const hostAddress = input.host;
+  const formatPercentText = (value: number | null) => (value == null ? "未知" : `${Math.round(value)}%`);
+
+  // 1. 宿主机负载：CPU / 内存 / 连接状态
+  const connectionState = data.host?.connectionState ?? "";
+  const connectionStatus: HostDiagnosticStatus =
+    connectionState === "connected" ? "ok" :
+    connectionState === "maintenance" ? "warn" :
+    connectionState === "disconnected" || connectionState === "notResponding" ? "error" :
+    "unknown";
+  const cpuPercent =
+    data.host?.cpuUsageMhz != null && data.host.cpuMhz && data.host.numCpuCores
+      ? percentOf(data.host.cpuUsageMhz, data.host.cpuMhz * data.host.numCpuCores)
+      : null;
+  const memoryPercent = percentOf(
+    data.host?.memoryUsageMb != null ? data.host.memoryUsageMb * 1024 * 1024 : undefined,
+    data.host?.memoryTotalBytes,
+  );
+  const loadStatuses = [connectionStatus, statusForPercent(cpuPercent), statusForPercent(memoryPercent)];
+  const loadStatus: HostDiagnosticStatus = loadStatuses.includes("error") ? "error" : loadStatuses.includes("warn") ? "warn" : loadStatuses.includes("unknown") ? "unknown" : "ok";
+  checks.push({
+    key: "node-load",
+    label: "宿主机负载",
+    category: "system",
+    scope: "host",
+    status: loadStatus,
+    summary:
+      loadStatus === "ok" ? "CPU / 内存 / 连接状态正常" :
+      loadStatus === "unknown" ? "未读取到宿主机负载数据" :
+      connectionStatus === "error" ? "宿主机连接状态异常" :
+      connectionStatus === "warn" ? "宿主机处于维护模式" :
+      "CPU / 内存存在高负载项",
+    evidence: [
+      `CPU ${formatPercentText(cpuPercent)} · 内存 ${formatPercentText(memoryPercent)}`,
+      `连接状态：${connectionState || "未知"}`,
+      ...(data.host?.cpuModel ? [`CPU 型号：${data.host.cpuModel}`] : []),
+      ...(data.host?.productFullName ? [`系统：${data.host.productFullName}`] : []),
+    ],
+    detail: loadStatus === "ok" ? undefined : "宿主机 CPU / 内存长期高负载或连接异常会直接影响 VM 性能与可用性。",
+  });
+  if (loadStatus === "error" || loadStatus === "warn") findings.push({ key: "node-load", label: "宿主机负载" });
+
+  // 2. 数据存储空间：容量使用率与可访问性
+  const datastoreUsage = data.datastores.map((ds) => ({
+    ds,
+    percent: percentOf(
+      ds.capacityBytes != null && ds.freeSpaceBytes != null ? ds.capacityBytes - ds.freeSpaceBytes : undefined,
+      ds.capacityBytes,
+    ),
+  }));
+  const inaccessibleCount = data.datastores.filter((ds) => !ds.accessible).length;
+  const maxUsage = datastoreUsage.reduce((max, item) => Math.max(max, item.percent ?? 0), 0);
+  const hasUsage = datastoreUsage.some((item) => item.percent != null);
+  let datastoreStatus: HostDiagnosticStatus = "unknown";
+  if (data.datastores.length === 0) datastoreStatus = "unknown";
+  else if (inaccessibleCount > 0) datastoreStatus = "error";
+  else if (!hasUsage) datastoreStatus = "unknown";
+  else if (maxUsage >= 95) datastoreStatus = "error";
+  else if (maxUsage >= 85) datastoreStatus = "warn";
+  else datastoreStatus = "ok";
+  checks.push({
+    key: "datastore-usage",
+    label: "数据存储空间",
+    category: "storage",
+    scope: "host",
+    status: datastoreStatus,
+    summary:
+      datastoreStatus === "ok" ? `${data.datastores.length} 个数据存储使用正常` :
+      datastoreStatus === "error" && inaccessibleCount > 0 ? `${inaccessibleCount} 个数据存储不可访问` :
+      datastoreStatus === "error" ? "存在使用率超过 95% 的数据存储" :
+      datastoreStatus === "warn" ? "存在使用率超过 85% 的数据存储" :
+      "未读取到数据存储信息",
+    evidence:
+      data.datastores.length === 0
+        ? ["未读取到 Datastore 数据"]
+        : datastoreUsage.map(({ ds, percent }) => `${ds.name || "未知存储"} · ${ds.type || "未知类型"} · ${percent == null ? "使用率未知" : `${Math.round(percent)}%`} · 可用 ${formatBytes(ds.freeSpaceBytes ?? 0)} · ${ds.accessible ? "可访问" : "不可访问"}`),
+    detail: datastoreStatus === "ok" ? undefined : "数据存储使用率过高或不可访问会影响 VM 磁盘读写与迁移，需优先处理。",
+  });
+  if (datastoreStatus === "error" || datastoreStatus === "warn") findings.push({ key: "datastore-usage", label: "数据存储空间" });
+
+  // 3. 存储健康：硬件存储设备告警状态
+  const redStorage = data.storageStatus.filter((item) => item.health === "red");
+  const yellowStorage = data.storageStatus.filter((item) => item.health === "yellow" || item.health === "gray");
+  let storageHealthStatus: HostDiagnosticStatus = "unknown";
+  if (data.storageStatus.length === 0) storageHealthStatus = "unknown";
+  else if (redStorage.length > 0) storageHealthStatus = "error";
+  else if (yellowStorage.length > 0) storageHealthStatus = "warn";
+  else storageHealthStatus = "ok";
+  checks.push({
+    key: "storage-health",
+    label: "存储健康",
+    category: "storage",
+    scope: "host",
+    status: storageHealthStatus,
+    summary:
+      storageHealthStatus === "ok" ? "存储硬件健康正常" :
+      storageHealthStatus === "error" ? `${redStorage.length} 个存储设备健康异常` :
+      storageHealthStatus === "warn" ? `${yellowStorage.length} 个存储设备状态待确认` :
+      "未读取到存储健康数据",
+    evidence:
+      data.storageStatus.length === 0
+        ? ["runtime.healthSystemRuntime.hardwareStatusInfo 未返回存储健康数据"]
+        : data.storageStatus.map((item) => `${item.name || "未知设备"} · ${item.health || "未知"}`),
+    detail: storageHealthStatus === "ok" ? undefined : "存储健康异常（如磁盘 / 控制器告警）会影响数据可用性，建议在 vSphere 客户端或 esxcli 侧核对。",
+  });
+  if (storageHealthStatus === "error" || storageHealthStatus === "warn") findings.push({ key: "storage-health", label: "存储健康" });
+
+  // 4. ESXi 核心服务
+  const serviceByName = new Map(data.services.map((item) => [item.key, item]));
+  const presentCritical = VMWARE_CRITICAL_SERVICES.filter((key) => serviceByName.has(key));
+  const stoppedCritical = presentCritical.filter((key) => !serviceByName.get(key)?.running);
+  let serviceStatus: HostDiagnosticStatus = "unknown";
+  if (data.services.length === 0) serviceStatus = "unknown";
+  else if (stoppedCritical.length > 0) serviceStatus = "error";
+  else serviceStatus = "ok";
+  checks.push({
+    key: "esx-services",
+    label: "ESXi 核心服务",
+    category: "service",
+    scope: "host",
+    status: serviceStatus,
+    summary:
+      serviceStatus === "ok" ? "ESXi 核心服务运行正常" :
+      serviceStatus === "error" ? `${stoppedCritical.length} 个核心服务未运行` :
+      "未读取到 ESXi 服务状态",
+    evidence:
+      data.services.length === 0
+        ? ["configManager.serviceSystem.serviceInfo 未返回服务数据"]
+        : [
+            ...presentCritical.map((key) => {
+              const service = serviceByName.get(key);
+              return `${service?.label || key} · ${service?.running ? "运行中" : "未运行"}`;
+            }),
+            `服务总数：${data.services.length}`,
+          ],
+    detail: serviceStatus === "ok" ? undefined : "hostd / vpxa / ntpd 等核心服务未运行会影响 ESXi 管理面与时间同步。",
+  });
+  if (serviceStatus === "error") findings.push({ key: "esx-services", label: "ESXi 核心服务" });
+
+  // 5. 硬件传感器：温度 / 风扇 / 电压 / 电源等
+  const redSensors = data.sensors.filter((item) => item.health === "red");
+  const yellowSensors = data.sensors.filter((item) => item.health === "yellow" || item.health === "gray");
+  let sensorStatus: HostDiagnosticStatus = "unknown";
+  if (data.sensors.length === 0) sensorStatus = "unknown";
+  else if (redSensors.length > 0) sensorStatus = "error";
+  else if (yellowSensors.length > 0) sensorStatus = "warn";
+  else sensorStatus = "ok";
+  checks.push({
+    key: "sensor-health",
+    label: "硬件传感器",
+    category: "system",
+    scope: "host",
+    status: sensorStatus,
+    summary:
+      sensorStatus === "ok" ? `${data.sensors.length} 项硬件传感器正常` :
+      sensorStatus === "error" ? `${redSensors.length} 项硬件传感器告警` :
+      sensorStatus === "warn" ? `${yellowSensors.length} 项硬件传感器状态待确认` :
+      "未读取到硬件传感器数据",
+    evidence:
+      data.sensors.length === 0
+        ? ["runtime.healthSystemRuntime.systemHealthInfo 未返回传感器数据"]
+        : [
+            `传感器总数：${data.sensors.length}`,
+            ...data.sensors
+              .filter((item) => item.health && item.health !== "green")
+              .slice(0, 20)
+              .map((item) => `${item.name || "未知传感器"} · ${item.health || "未知"}`),
+          ],
+    detail: sensorStatus === "ok" ? undefined : "硬件传感器（温度 / 风扇 / 电压 / 电源等）告警可能预示硬件故障，建议在 vSphere 客户端查看告警详情。",
+  });
+  if (sensorStatus === "error" || sensorStatus === "warn") findings.push({ key: "sensor-health", label: "硬件传感器" });
+
+  // 6. VMkernel 网络：物理网卡链路与 vmk 地址
+  const pnics = data.host?.pnics ?? [];
+  const vmknicIps = data.host?.vmknicIps ?? [];
+  let networkStatus: HostDiagnosticStatus = "unknown";
+  if (pnics.length === 0 && vmknicIps.length === 0) networkStatus = "unknown";
+  else if (pnics.length > 0 && !pnics.some((item) => item.linked)) networkStatus = "error";
+  else if (vmknicIps.length === 0) networkStatus = "warn";
+  else networkStatus = "ok";
+  checks.push({
+    key: "network-vmk",
+    label: "VMkernel 网络",
+    category: "network",
+    scope: "host",
+    status: networkStatus,
+    summary:
+      networkStatus === "ok" ? `${pnics.length} 个物理网卡 · ${vmknicIps.length} 个 VMkernel 地址` :
+      networkStatus === "error" ? "物理网卡均未连接链路" :
+      networkStatus === "warn" ? "未读取到 VMkernel 地址" :
+      "未读取到网络信息",
+    evidence: [
+      ...(pnics.length === 0 ? ["未返回物理网卡（pnic）数据"] : pnics.map((item) => `${item.device || "未知网卡"} · ${item.linked ? "链路已连接" : "链路断开"}`)),
+      ...(vmknicIps.length === 0 ? ["未返回 VMkernel 地址"] : [`VMkernel 地址：${vmknicIps.join("、")}`]),
+    ],
+    detail: networkStatus === "ok" ? undefined : "物理网卡链路断开或 VMkernel 地址缺失会导致宿主机管理网络与 VM 网络不可用。",
+  });
+  if (networkStatus === "error" || networkStatus === "warn") findings.push({ key: "network-vmk", label: "VMkernel 网络" });
+
+  // 7. VM 网络链路（仅携带 VM 线索时）
+  if (data.vm) {
+    const connectedNicsWithIp = data.vm.guestNics.filter((nic) => nic.connected && nic.ipAddresses.length > 0).length;
+    const toolsReady = data.vm.toolsStatus === "toolsOk";
+    let vmLinkStatus: HostDiagnosticStatus = "unknown";
+    if (data.vm.powerState !== "poweredOn") vmLinkStatus = "warn";
+    else if (!toolsReady) vmLinkStatus = "warn";
+    else if (connectedNicsWithIp === 0) vmLinkStatus = "warn";
+    else vmLinkStatus = "ok";
+    checks.push({
+      key: "vm-link",
+      label: "VM 网络连通",
+      category: "network",
+      scope: "vm-link",
+      status: vmLinkStatus,
+      summary:
+        vmLinkStatus === "ok" ? `${connectedNicsWithIp} 个网卡已连接且获取到 IP` :
+        vmLinkStatus === "warn" && data.vm.powerState !== "poweredOn" ? "VM 未运行，无法验证网络" :
+        vmLinkStatus === "warn" ? "VM 网卡未全部连接或未获取到 IP" :
+        "未读取到该 VM 网络信息",
+      evidence: [
+        `VM 状态：${data.vm.powerState || "未知"}`,
+        `Tools 状态：${data.vm.toolsStatus || "未知"}`,
+        ...(data.vm.guestIp ? [`Guest IP：${data.vm.guestIp}`] : []),
+        `网卡：${data.vm.guestNics.map((nic) => `${nic.deviceName || "未知网卡"} · ${nic.connected ? "已连接" : "未连接"} · ${nic.ipAddresses.join("/") || "无 IP"}`).join("；") || "未返回网卡"}`,
+      ],
+      detail: vmLinkStatus === "ok" ? undefined : "VM 网卡未连接或未获取 IP 时该 VM 会失去网络，需在 vSphere 客户端核对网络适配器与 Tools 状态。",
+    });
+    if (vmLinkStatus === "warn") findings.push({ key: "vm-link", label: "VM 网络连通" });
+  }
+
+  const conclusion = concludeHostDiagnostics(checks);
+  return {
+    collectedAt: new Date().toISOString(),
+    providerType: "vmware",
+    supported: true,
+    hostId: request.hostId,
+    hostName,
+    hostAddress,
+    vmId: request.vmId,
+    vmName: request.vmName,
+    vmIp: request.vmIp,
+    conclusion,
+    checks,
+    repairActions: buildDiagnosticRepairActions(findings, VMWARE_DIAGNOSTIC_REPAIR_SUGGESTIONS),
+  };
 }
 
 export async function cleanupRegisteredVmwareGeneratedIso(input: XenConnectionInput, registryId: string): Promise<void> {
@@ -812,6 +1221,137 @@ export class VmwareSoapSession {
       token = textOf(response?.returnval?.token);
     }
     return objects;
+  }
+
+
+  /**
+   * 只读采集宿主机诊断证据（VMware vSphere）：返回结构化数据，供 buildVmwareHostDiagnostics 生成报告。
+   * 仅使用 RetrievePropertiesEx 只读查询，不调用任何会改变状态的接口。
+   *
+   * @param hostId HostSystem 的 ManagedObjectReference（如 host-12）；为空时取清单中第一个宿主机。
+   * @param vmId 可选的 VM 标识（config.uuid / instanceUuid / ManagedObjectReference），用于补充链路检查。
+   * @return 结构化诊断证据；宿主机不存在时 host 为 undefined。
+   */
+  async retrieveHostDiagnostics(hostId?: string, vmId?: string): Promise<VmwareDiagnosticsData> {
+    const hostObjects = await this.retrieveContainerProperties("HostSystem", [
+      "name",
+      "config.product.fullName",
+      "summary.hardware.cpuModel",
+      "summary.hardware.cpuMhz",
+      "summary.hardware.numCpuCores",
+      "summary.hardware.memorySize",
+      "summary.quickStats.overallCpuUsage",
+      "summary.quickStats.overallMemoryUsage",
+      "summary.managementServerIp",
+      "runtime.connectionState",
+      "config.network.vnic",
+      "config.network.pnic",
+      "config.virtualNicManagerInfo.netConfig",
+      "configManager.serviceSystem",
+      "runtime.healthSystemRuntime",
+    ]);
+    const host = hostObjects.find((item) => item.ref.value === hostId) ?? hostObjects[0];
+    const datastoreObjects = await this.retrieveContainerProperties("Datastore", [
+      "name",
+      "summary.capacity",
+      "summary.freeSpace",
+      "summary.accessible",
+      "summary.type",
+    ]);
+    const [services, healthData, vm] = await Promise.all([
+      host ? this.retrieveServiceData(host.props.get("configManager.serviceSystem")) : [],
+      host ? this.retrieveHealthData(host.props.get("runtime.healthSystemRuntime")) : { sensors: [], storageStatus: [] },
+      vmId ? this.retrieveVmLinkData(vmId) : undefined,
+    ]);
+    return {
+      host: host
+        ? {
+            name: textOf(host.props.get("name")),
+            connectionState: textOf(host.props.get("runtime.connectionState")),
+            productFullName: textOf(host.props.get("config.product.fullName")),
+            cpuModel: textOf(host.props.get("summary.hardware.cpuModel")),
+            cpuUsageMhz: numberOf(host.props.get("summary.quickStats.overallCpuUsage")) || undefined,
+            cpuMhz: numberOf(host.props.get("summary.hardware.cpuMhz")) || undefined,
+            numCpuCores: numberOf(host.props.get("summary.hardware.numCpuCores")) || undefined,
+            memoryTotalBytes: numberOf(host.props.get("summary.hardware.memorySize")) || undefined,
+            memoryUsageMb: numberOf(host.props.get("summary.quickStats.overallMemoryUsage")) || undefined,
+            pnics: toArray(host.props.get("config.network.pnic")).map((pnic) => ({
+              device: textOf(pnic?.device),
+              linked: Boolean(pnic?.linkSpeed),
+            })),
+            vmknicIps: collectVmkernelIps(host.props.get("config.network.vnic"), host.props.get("config.virtualNicManagerInfo.netConfig")),
+          }
+        : undefined,
+      datastores: datastoreObjects.map((item) => ({
+        name: textOf(item.props.get("name")),
+        capacityBytes: numberOf(item.props.get("summary.capacity")) || undefined,
+        freeSpaceBytes: numberOf(item.props.get("summary.freeSpace")) || undefined,
+        accessible: textOf(item.props.get("summary.accessible")) !== "false",
+        type: textOf(item.props.get("summary.type")),
+      })),
+      services,
+      sensors: healthData.sensors,
+      storageStatus: healthData.storageStatus,
+      vm,
+    };
+  }
+
+  private async retrieveServiceData(serviceSystemValue: XmlValue): Promise<VmwareServiceData[]> {
+    const ref = readOptionalManagedRefAs(serviceSystemValue, "HostServiceSystem");
+    if (!ref) return [];
+    const [serviceObject] = await this.retrieveObjectProperties(ref, ["serviceInfo.services"]).catch(() => []);
+    return toArray(serviceObject?.props.get("serviceInfo.services")).map((service) => ({
+      key: textOf(service?.key),
+      label: textOf(service?.label),
+      running: textOf(service?.running) === "true",
+      policy: textOf(service?.policy),
+    }));
+  }
+
+  private async retrieveHealthData(healthSystemValue: XmlValue): Promise<{ sensors: VmwareNumericSensorData[]; storageStatus: VmwareStorageElementData[] }> {
+    const ref = readOptionalManagedRefAs(healthSystemValue, "HealthSystemRuntime");
+    if (!ref) return { sensors: [], storageStatus: [] };
+    const [healthObject] = await this.retrieveObjectProperties(ref, ["systemHealthInfo.numericSensor", "hardwareStatusInfo"]).catch(() => []);
+    const sensors = toArray(healthObject?.props.get("systemHealthInfo.numericSensor")).map((sensor) => ({
+      name: textOf(sensor?.name),
+      health: textOf(sensor?.healthState?.key) || textOf(sensor?.healthState),
+      sensorType: textOf(sensor?.sensorType),
+      currentReading: textOf(sensor?.currentReading),
+      baseUnits: textOf(sensor?.baseUnits),
+    }));
+    const hardwareStatus = healthObject?.props.get("hardwareStatusInfo");
+    const storageStatus = toArray(hardwareStatus?.storageStatusInfo).map((item) => ({
+      name: textOf(item?.name),
+      health: textOf(item?.healthState?.key) || textOf(item?.healthState),
+    }));
+    return { sensors, storageStatus };
+  }
+
+  private async retrieveVmLinkData(vmId: string): Promise<VmwareVmLinkData | undefined> {
+    const vmObjects = await this.retrieveContainerProperties("VirtualMachine", [
+      "name",
+      "config.uuid",
+      "config.instanceUuid",
+      "runtime.powerState",
+      "guest.toolsStatus",
+      "guest.net",
+      "guest.ipAddress",
+    ]);
+    const target = normalizeVmwareTargetId(vmId);
+    const vm = vmObjects.find((item) => vmwareProviderId(item) === target || item.ref.value === vmId);
+    if (!vm) return undefined;
+    return {
+      name: textOf(vm.props.get("name")),
+      powerState: textOf(vm.props.get("runtime.powerState")),
+      toolsStatus: textOf(vm.props.get("guest.toolsStatus")),
+      guestIp: textOf(vm.props.get("guest.ipAddress")),
+      guestNics: toArray(vm.props.get("guest.net")).map((nic) => ({
+        deviceName: textOf(nic?.deviceName),
+        network: textOf(nic?.network),
+        connected: textOf(nic?.connected) === "true",
+        ipAddresses: toArray(nic?.ipAddress).map((ip) => textOf(ip)).filter(Boolean),
+      })),
+    };
   }
 
   async getPerformanceCounters(): Promise<XmlValue> {
@@ -1994,6 +2534,44 @@ export function collectVirtualDisks(value: XmlValue, vmId: string): VmwareDiskIn
   };
   visit(value);
   return disks;
+}
+
+/**
+ * 递归收集 VMware VirtualMachineSnapshotTree 中的全部快照（含子快照），只读解析清单数据。
+ *
+ * @param value RetrieveProperties 返回的 snapshot.rootSnapshotList 原始 XML 值。
+ * @param vmId 调用方传入的 VM 标识，作为快照归属 VM 的展示口径。
+ * @param providerId 快照所属 VM 的 providerId（config.uuid / instanceUuid / ManagedObjectReference）。
+ * @return 快照列表，按树深度优先顺序返回；无快照时为空数组。
+ */
+export function collectVmSnapshots(value: XmlValue, vmId: string, providerId: string): VmSnapshot[] {
+  const snapshots: VmSnapshot[] = [];
+  const visit = (node: XmlValue) => {
+    if (node == null) return;
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+      return;
+    }
+    if (typeof node !== "object") return;
+    const snapshotRef = readOptionalManagedRef(node.snapshot);
+    if (snapshotRef) {
+      const createTime = textOf(node.createTime);
+      snapshots.push({
+        id: snapshotRef.value,
+        vmId,
+        providerId: snapshotRef.value,
+        name: textOf(node.name) || snapshotRef.value,
+        ...(createTime ? { createdAt: createTime } : {}),
+      });
+      visit(node.childSnapshotList);
+      return;
+    }
+    for (const child of Object.values(node)) {
+      visit(child);
+    }
+  };
+  visit(value);
+  return snapshots;
 }
 
 export function vmwareEditDiskSpec(disk: VmwareDiskInfo, targetSizeBytes: number): string {
