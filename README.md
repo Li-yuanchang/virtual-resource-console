@@ -25,7 +25,7 @@
 ### 3. 虚拟机管理
 
 - 展示 VM 电源状态、CPU、内存、磁盘、IP、Guest OS、Tools 状态
-- 支持 VM 详情、磁盘列表和指标快照查询；平台快照接口已预留，当前暂未返回快照数据
+- 支持 VM 详情、磁盘列表、虚拟机快照和指标快照查询（XenServer / VMware / Proxmox 三平台只读快照清单）
 - 支持 VNC / Web Console 接入 XenServer、VMware、Proxmox 控制台
 - 支持受控执行开机、关机、删除、改名和扩容等操作，后端要求确认令牌
 - 支持 Linux CLI 终端；终端使用短时一次性 SSH PTY 会话，不把系统密码放入 WebSocket URL
@@ -90,9 +90,9 @@ Chrome Extension
 
 | Provider | 资源盘点 | 控制台 | 创建 VM | 改名 | 扩容 | 快照查询 |
 |----------|----------|--------|---------|------|------|----------|
-| XenServer | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 暂未返回数据 |
-| VMware | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 暂未返回数据 |
-| Proxmox VE | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 暂未返回数据 |
+| XenServer | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 |
+| VMware | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 |
+| Proxmox VE | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 | 已接入 |
 | KVM/libvirt | 未接入 | 未接入 | 未接入 | 未接入 | 未接入 | 未接入 |
 
 表中的“已接入”表示 Provider 和统一 API 已提供该能力入口，具体平台版本、权限和安装介质仍需按目标环境进行验收。
@@ -454,7 +454,7 @@ XenServer 创建 VM 时生成的 `vrc-*.iso` 是临时启动介质，不会进�
 - 开机、关机、删除、创建 VM、挂载 ISO、修改 CPU / 内存 / 磁盘等操作必须经过界面确认和后端参数校验
 - 连接密码在后端日志中做脱敏处理
 - 保存到本机的数据中的 Guest 系统凭据和平台连接密码使用本机密钥加密；密码、私钥和长期 token 不放入 URL、localStorage 或任务响应
-- 当前活动记录仅在会话内保存，持久化审计尚未接入
+- 操作记录持久化到本机审计文件（`~/.virtual-resource-console/audit-log.json`），只保存脱敏摘要，重启后仍可查询
 - README 和仓库源码不包含任何真实服务器账号、密码或连接清单
 
 ### 共享 Web 模式
@@ -479,8 +479,10 @@ VRC_SHARED_WEB_MODE=true HOST=0.0.0.0 PORT=3987 npm run start:server
 | 连接测试 | `POST /api/connections/test` |
 | 资源清单 | `POST /api/inventory/pools`, `POST /api/inventory/hosts`, `POST /api/inventory/vms`, `POST /api/inventory/vm-summary`, `POST /api/inventory/vm-search-index` |
 | 存储与 ISO | `POST /api/inventory/virtual-disks`, `POST /api/inventory/vm-disks`, `POST /api/inventory/vm-guest-storage`, `POST /api/inventory/iso-images` |
+| 虚拟机快照 | `POST /api/inventory/vm-snapshots`（XenServer / VMware / Proxmox 只读快照清单） |
 | 资源增量事件 | `GET /api/inventory/events`（SSE） |
-| VM 操作 | `POST /api/vms/action`, `POST /api/vms/rename`, `POST /api/vms/resize` |
+| VM 操作 | `POST /api/vms/action`, `POST /api/vms/rename`, `POST /api/vms/resize`, `POST /api/vms/boot-entries` |
+| 本机系统凭据 | `POST /api/vms/system-credentials`（写入用户本机加密密码库，供控制台 / 扩容 / 重启选内核复用） |
 | VM 定时任务 | `GET /api/vm-schedules`, `POST /api/vm-schedules`, `PUT /api/vm-schedules/:id`, `PATCH /api/vm-schedules/:id/enabled`, `DELETE /api/vm-schedules/:id` |
 | 指标快照 | `POST /api/metrics/snapshot` |
 | 创建 VM | `POST /api/provisioning/preflight`, `POST /api/provisioning/vms` |
@@ -490,6 +492,7 @@ VRC_SHARED_WEB_MODE=true HOST=0.0.0.0 PORT=3987 npm run start:server
 | 控制台上传 | `POST /api/console/upload`, `GET /api/console/upload/:uploadId/events` |
 | Linux CLI | `POST /api/terminal/session` 后通过 `/api/terminal?sessionId=...` 建立 WebSocket |
 | 介质维护 | `GET /api/maintenance/generated-isos`, `POST /api/maintenance/generated-isos/cleanup` |
+| 操作审计 | `GET /api/audit?limit=&status=&keyword=`（本机持久化操作记录，敏感字段已脱敏） |
 
 ---
 
@@ -498,7 +501,7 @@ VRC_SHARED_WEB_MODE=true HOST=0.0.0.0 PORT=3987 npm run start:server
 - 新增平台时优先实现 `apps/api/src/providers/provider.ts` 中定义的 Provider 能力
 - UI 不直接处理平台私有字段，平台差异应在 Provider 或前端 domain 策略内收敛
 - 资源盘点接口应避免首屏一次性读取所有 VM、磁盘、快照和指标
-- 变更类能力需要保留确认、失败提示和操作上下文；持久化审计单独建设
+- 变更类能力需要保留确认、失败提示和操作上下文；操作记录统一走 `recordAudit` 写入持久化审计
 - 前端样式遵循已有 Element Plus 与项目主题变量，不新增一次性颜色体系
 
 ## 文档索引
