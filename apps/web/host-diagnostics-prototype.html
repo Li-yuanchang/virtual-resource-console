@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="graphite-sage">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="./public/favicon.svg">
+    <link rel="stylesheet" href="./src/styles.css">
+    <link rel="stylesheet" href="./public/prototype-base.css">
+    <link rel="stylesheet" href="./public/prototype-pages.css">
+    <title>VRC 物理机诊断原型</title>
+  </head>
+  <body class="static-prototype" data-prototype="host-diagnostics">
+    <main class="diagnostics-prototype-static">
+      <section class="diagnostics-host-page-static" aria-hidden="true">
+        <header class="prototype-header-static">
+          <div><span>宿主机详情</span><h1>xenserver-5</h1></div>
+          <div class="dialog-footer-actions">
+            <button class="button-static" type="button">刷新</button>
+            <button class="button-static primary" type="button">问题诊断</button>
+          </div>
+        </header>
+
+        <section class="diagnostics-host-overview-static">
+          <div><span>管理地址</span><strong>192.168.2.11</strong></div>
+          <div><span>平台版本</span><strong>XenServer 6.5</strong></div>
+          <div><span>根分区</span><strong>72%</strong></div>
+          <div><span>网络状态</span><strong class="state-warn-static">1 个异常</strong></div>
+        </section>
+
+        <section class="diagnostics-host-table-static">
+          <div class="toolbar-row">
+            <div class="panel-title"><h2>虚拟机列表</h2><span>从异常 VM 行进入宿主机诊断</span></div>
+          </div>
+          <table class="data-table diagnostics-table-static">
+            <thead>
+              <tr><th>名称</th><th>IP</th><th>状态</th><th>宿主机</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>2.31-test</td><td>192.168.2.31</td><td class="state-ok-static">运行中</td><td>xenserver-5</td><td>控制台</td></tr>
+              <tr class="diagnostics-linked-row-static"><td>2.91</td><td>192.168.2.91</td><td class="state-warn-static">网络不通</td><td>xenserver-5</td><td>问题诊断</td></tr>
+              <tr><td>2.127-app</td><td>192.168.2.127</td><td class="state-ok-static">运行中</td><td>xenserver-5</td><td>控制台</td></tr>
+            </tbody>
+          </table>
+        </section>
+      </section>
+
+      <div class="dialog-backdrop-static diagnostics-dialog-mask-static">
+        <section class="dialog-static diagnostics-dialog-static" role="dialog" aria-modal="true" aria-labelledby="diagnosticsDialogTitle">
+          <header class="dialog-header-static">
+            <div class="dialog-title-static">
+              <strong id="diagnosticsDialogTitle">物理机问题诊断</strong>
+              <span>从 VM 列表进入 · 2.91 网络不通 · xenserver-5</span>
+            </div>
+            <button class="dialog-close-static" type="button" title="关闭" aria-label="关闭">×</button>
+          </header>
+
+          <section class="diagnostics-dialog-context-static">
+            <dl>
+              <div><dt>宿主机</dt><dd>xenserver-5</dd></div>
+              <div><dt>管理地址</dt><dd>192.168.2.11</dd></div>
+              <div><dt>平台</dt><dd>XenServer 6.5</dd></div>
+              <div><dt>触发对象</dt><dd>2.91 · vif74.0</dd></div>
+            </dl>
+            <details class="diagnostics-context-detail-static">
+              <summary>检查范围：全部</summary>
+              <div class="diagnostics-scope-static">
+                <button class="active" type="button">全部</button>
+                <button type="button">网络链路</button>
+                <button type="button">存储日志</button>
+                <button type="button">服务状态</button>
+              </div>
+            </details>
+          </section>
+
+          <section class="dialog-body-static diagnostics-dialog-body-static">
+            <div class="diagnostics-report-state-static is-idle" id="diagnosticsReportState">
+              <div class="diagnostics-report-head-static">
+                <div class="diagnostics-report-title-static">
+                  <i class="status-dot-static"></i>
+                  <div>
+                    <strong id="diagnosticsReportLabel">正在生成诊断报告</strong>
+                    <span id="diagnosticsReportSubtitle">采集宿主机证据</span>
+                  </div>
+                </div>
+                <small id="diagnosticsReportPercent">0%</small>
+              </div>
+              <div class="diagnostics-report-stages-static" aria-label="报告生成步骤">
+                <span data-report-stage="collect">采集证据</span>
+                <span data-report-stage="analyze">关联检查</span>
+                <span data-report-stage="render">整理报告</span>
+              </div>
+              <div class="diagnostics-report-activity-static" aria-label="报告生成明细">
+                <div data-report-activity="collect">
+                  <span>1</span>
+                  <strong>采集宿主机证据</strong>
+                  <em>等待中</em>
+                </div>
+                <div data-report-activity="analyze">
+                  <span>2</span>
+                  <strong>关联 OVS 与 VIF 检查</strong>
+                  <em>等待中</em>
+                </div>
+                <div data-report-activity="render">
+                  <span>3</span>
+                  <strong>整理异常链路与建议</strong>
+                  <em>等待中</em>
+                </div>
+              </div>
+            </div>
+
+            <section class="diagnostics-main-static">
+              <div class="diagnostics-result-static diagnostics-card-static">
+                <div class="diagnostics-card-head-static">
+                  <span>当前结论</span>
+                  <strong>VIF 未挂接到 xenbr0</strong>
+                  <small>宿主机磁盘和 OVS 服务正常，问题定位在 2.91 的 vif74.0 链路。</small>
+                </div>
+                <dl class="diagnostics-result-meta-static">
+                  <div><dt>故障点</dt><dd>宿主机 OVS / VIF 后端</dd></div>
+                  <div><dt>影响对象</dt><dd>2.91 · vif74.0</dd></div>
+                  <div><dt>风险等级</dt><dd class="state-warn-static">中</dd></div>
+                </dl>
+                <div class="diagnostics-scope-summary-static">
+                  <div><span>诊断对象</span><strong>xenserver-5</strong><small>192.168.2.11 · XenServer 6.5</small></div>
+                  <div><span>VM 线索</span><strong>2.91 · 网络不通</strong><small>只追加该 VM 链路检查</small></div>
+                  <div><span>检查范围</span><strong>宿主机健康 + VM 链路</strong><small>不扫描全部虚拟机</small></div>
+                </div>
+              </div>
+
+              <div class="diagnostics-checks-static diagnostics-card-static">
+                <div class="diagnostics-card-head-static">
+                  <span>检查项</span>
+                  <strong>5 项检查 · 1 项异常</strong>
+                  <small>默认先查宿主机，VM 只作为线索补充。</small>
+                </div>
+                <div class="diagnostics-check-list-static">
+                  <div data-check-key="disk"><span>根分区空间</span><strong>72% · 1.1G 可用</strong><em class="state-ok-static">正常</em></div>
+                  <div data-check-key="delete"><span>删除占用文件</span><strong>无大文件占用</strong><em class="state-ok-static">正常</em></div>
+                  <div data-check-key="ovs"><span>OVS 服务</span><strong>ovsdb-server running</strong><em class="state-ok-static">正常</em></div>
+                  <div class="warning" data-check-key="vif"><span>VIF 挂桥</span><strong>vif74.0 未接入 xenbr0</strong><em class="state-warn-static">异常</em></div>
+                  <div data-check-key="ping"><span>连通性验证</span><strong>ping 0% 丢包</strong><em class="state-ok-static">恢复</em></div>
+                </div>
+                <details class="diagnostics-detail-static diagnostics-check-detail-static">
+                  <summary>查看检查证据</summary>
+                  <section class="diagnostics-detail-body-static">
+                    <div class="diagnostics-trace-static">
+                      <div data-trace-step="disk"><span>1</span><strong>宿主机基础状态</strong><code>df -h / = 72% · deleted fd 无大文件</code><em class="state-ok-static">正常</em></div>
+                      <div data-trace-step="ovs"><span>2</span><strong>虚拟交换服务</strong><code>ovsdb-server running · xenbr0 存在</code><em class="state-ok-static">正常</em></div>
+                      <div class="warning" data-trace-step="vif"><span>3</span><strong>VM 网卡后端</strong><code>vif74.0 bridge 为空，未接入 xenbr0</code><em class="state-warn-static">异常</em></div>
+                      <div data-trace-step="ping"><span>4</span><strong>修复后验证</strong><code>ping 192.168.2.91 0% 丢包</code><em class="state-ok-static">恢复</em></div>
+                    </div>
+                  </section>
+                </details>
+              </div>
+            </section>
+
+            <section class="diagnostics-panel-static diagnostics-repair-static diagnostics-card-static">
+              <div class="diagnostics-card-head-static">
+                <span>建议修复</span>
+                <strong>重新挂接 VIF 到 xenbr0</strong>
+                <small>默认选择影响范围最小的动作，执行前必须确认。</small>
+              </div>
+              <div class="diagnostics-repair-body-static">
+                <label class="diagnostics-repair-option-static active">
+                  <input type="radio" name="repair-action" checked>
+                  <span>
+                    <strong>重新挂接 VIF 到 xenbr0</strong>
+                    <small>只影响 2.91 的 vif74.0，执行后立即验证 ping 和 ARP。</small>
+                  </span>
+                  <em>推荐</em>
+                </label>
+                <details class="diagnostics-subdetail-static">
+                  <summary>备选动作与命令预览</summary>
+                  <div class="diagnostics-action-list-static">
+                    <label>
+                      <input type="radio" name="repair-action">
+                      <span><strong>重启 Open vSwitch 服务</strong><small>仅当挂桥失败或 OVS 状态异常时使用。</small></span>
+                      <em>影响宿主机网络</em>
+                    </label>
+                    <section>
+                      <div><span>命令预览</span><code>ovs-vsctl add-port xenbr0 vif74.0</code></div>
+                      <div><span>验证动作</span><code>ping -c 3 192.168.2.91</code></div>
+                    </section>
+                  </div>
+                </details>
+              </div>
+            </section>
+          </section>
+
+          <footer class="dialog-footer-static diagnostics-dialog-footer-static">
+            <span id="diagnosticsFooterState">诊断默认只读。涉及重启 OVS、kill 进程、挂桥、删除文件等动作时必须二次确认。</span>
+            <div class="dialog-footer-actions">
+              <button class="button-static" type="button">重新诊断</button>
+              <button class="button-static" type="button" data-diagnostics-report>生成诊断报告</button>
+              <button class="button-static primary" type="button" data-diagnostics-confirm>确认修复</button>
+            </div>
+          </footer>
+        </section>
+      </div>
+    </main>
+    <script src="./public/prototype-base.js"></script>
+    <script src="./public/prototype-pages.js"></script>
+  </body>
+</html>

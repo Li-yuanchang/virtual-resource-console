@@ -34,6 +34,7 @@ import type {
 } from "../types";
 import type { VmConsoleTarget } from "../domain/consoleStrategies";
 import { validateProvisioningIpPool } from "../domain/ipPoolValidation";
+import { matchesIsoNamePattern } from "../domain/isoTemplateMatch";
 import { getProviderBrand } from "../domain/providerBrand";
 import { groupIsoImagesBySource, isoSourceLabel, resolveProvisioningStrategy } from "../domain/provisioningStrategies";
 import { secureJsonRequest } from "../domain/secureRequest";
@@ -254,9 +255,7 @@ const templateIsoMismatchMessage = computed(() => {
   const template = selectedEnvironmentTemplate.value;
   const image = selectedIsoImage.value;
   if (provisioningForm.sourceType !== "iso" || !template?.isoNamePattern || !image) return "";
-  const expected = template.isoNamePattern.toLowerCase();
-  const actual = `${image.name} ${image.id}`.toLowerCase();
-  return actual.includes(expected) ? "" : `系统环境与镜像不匹配：${template.name} 需要 ${template.isoNamePattern}`;
+  return matchesIsoNamePattern(image, template.isoNamePattern) ? "" : `系统环境与镜像不匹配：${template.name} 需要 ${template.isoNamePattern}`;
 });
 const isoOptionGroups = computed(() => groupIsoImagesBySource(isoImages.value));
 const selectedToolsIsoImage = computed(() => toolsIsoImage.value);
@@ -849,7 +848,7 @@ function syncEnvironmentTemplateToIso() {
 
 function templateMatchesIso(template: EnvironmentProvisioningTemplate, image: IsoImage) {
   if (template.sourceType !== "iso" || !template.isoNamePattern) return false;
-  return `${image.name} ${image.id}`.toLowerCase().includes(template.isoNamePattern.toLowerCase());
+  return matchesIsoNamePattern(image, template.isoNamePattern);
 }
 
 function isSupportedWindowsIso(image: IsoImage | null | undefined): boolean {
@@ -1005,10 +1004,8 @@ function provisioningSourceLabel() {
 
 function resolveTemplateIsoId(template: EnvironmentProvisioningTemplate) {
   if (!template.isoNamePattern) return provisioningStrategy.value.defaultIsoId(isoImages.value);
-  const pattern = template.isoNamePattern.toLowerCase();
   return (
-    isoImages.value.find((image) => image.name.toLowerCase() === pattern)?.id ??
-    isoImages.value.find((image) => image.name.toLowerCase().includes(pattern))?.id ??
+    isoImages.value.find((image) => matchesIsoNamePattern(image, template.isoNamePattern))?.id ??
     provisioningStrategy.value.defaultIsoId(isoImages.value)
   );
 }

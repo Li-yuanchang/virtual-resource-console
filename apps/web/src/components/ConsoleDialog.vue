@@ -209,6 +209,9 @@ let terminalConnectTimer: number | null = null;
 let terminalConnectSeq = 0;
 let terminalTargetKey = "";
 const terminalCredentialCache = new Map<string, TerminalSessionCredentials>();
+// 本机密码库：记录本次会话内已保存过凭据的目标，避免连接成功后反复弹出“保存到本机”。
+const terminalCredentialSavedKeys = new Set<string>();
+const terminalSaveOffer = ref<TerminalSessionCredentials | null>(null);
 let screenResizeObserver: ResizeObserver | null = null;
 let consoleLoadingStartedAt = 0;
 let consoleWakeRefreshTimer: number | null = null;
@@ -1051,6 +1054,9 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
       established = true;
       clearTerminalConnectTimer();
       if (credentials && terminalTargetKey) terminalCredentialCache.set(terminalTargetKey, credentials);
+      if (credentials && terminalTargetKey && !terminalCredentialSavedKeys.has(terminalTargetKey)) {
+        terminalSaveOffer.value = credentials;
+      }
       terminalLoginPrompt.reset();
       terminalStatus.value = "connected";
       connected.value = true;
@@ -1083,6 +1089,7 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
     clearTerminalConnectTimer();
     terminalSocket = null;
     connected.value = false;
+    terminalSaveOffer.value = null;
     if (!established && (manualLogin || event.code === 4403)) {
       if (event.code === 4403 || isTerminalAuthenticationFailure(event.reason)) terminalCredentialCache.delete(terminalTargetKey);
       showTerminalLoginPrompt(event.reason || "Login incorrect");
@@ -1097,6 +1104,7 @@ function openTerminalSocket(session: PreparedTerminalSession, connectSeq: number
   socket.addEventListener("error", () => {
     if (terminalSocket !== socket || connectSeq !== terminalConnectSeq) return;
     clearTerminalConnectTimer();
+    terminalSaveOffer.value = null;
     if (manualLogin && !established) {
       returnToTerminalLogin(socket, "SSH WebSocket 连接失败，请检查堡垒机或目标机网络后重试。");
       return;
@@ -1119,6 +1127,7 @@ function disconnectTerminal(options: { keepStatus?: boolean; keepLoginPrompt?: b
   }
   terminalSession.value = null;
   terminalTargetKey = "";
+  terminalSaveOffer.value = null;
   connected.value = false;
   if (!options.keepLoginPrompt) {
     terminalLoginPrompt.reset();
@@ -1179,6 +1188,7 @@ function handleTerminalInput(event: TerminalInputEvent) {
 
 function showTerminalLoginPrompt(message = "") {
   terminalSession.value = null;
+  terminalSaveOffer.value = null;
   connected.value = false;
   terminalStatus.value = "authenticating";
   terminalErrorMessage.value = "";
@@ -1198,6 +1208,44 @@ function returnToTerminalLogin(socket: WebSocket, message: string) {
   if (terminalSocket === socket) terminalSocket = null;
   socket.close(1000, "retry login");
   showTerminalLoginPrompt(message);
+}
+
+/**
+ * 手动输入凭据并连接成功后，把登录信息写入用户本机加密密码库，
+ * 下次打开控制台或执行扩容时自动套用，无需再次输入。
+ */
+function saveTerminalCredentialsToVault() {
+  const offer = terminalSaveOffer.value;
+  const target = props.target;
+  if (!offer || !target?.connectionId || !target.vmId) {
+    showConsoleNotice("缺少连接信息，无法保存本机密码", 2400);
+    return;
+  }
+  void secureJsonRequest<{ saved: boolean }>(
+    "/api/vms/system-credentials",
+    {
+      connectionId: target.connectionId,
+      vmId: target.vmId,
+      systemCredentials: {
+        username: offer.username,
+        password: offer.password,
+      },
+    },
+    "POST",
+  )
+    .then(() => {
+      const targetKey = resolveTerminalTargetKey(target);
+      if (targetKey) terminalCredentialSavedKeys.add(targetKey);
+      terminalSaveOffer.value = null;
+      showConsoleNotice("已保存到本机密码库（加密）", 2600);
+    })
+    .catch((error) => {
+      showConsoleNotice(error instanceof Error ? `保存失败：${error.message}` : "保存失败，请重试", 3600);
+    });
+}
+
+function dismissTerminalSaveOffer() {
+  terminalSaveOffer.value = null;
 }
 
 function handleTerminalResize(event: TerminalResizeEvent) {
@@ -3149,6 +3197,11 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
             @paste.capture="handleClipboardCapturePaste"
           ></textarea>
           <div v-if="isCliConsole" class="console-cli-frame">
+            <div v-if="terminalSaveOffer" class="console-credential-save-offer" role="status">
+              <span>本次登录成功。是否将登录信息保存到本机密码库（加密）？下次打开控制台或扩容将自动套用。</span>
+              <button type="button" class="console-credential-save-confirm" @click.stop="saveTerminalCredentialsToVault">保存到本机</button>
+              <button type="button" class="console-credential-save-dismiss" @click.stop="dismissTerminalSaveOffer">不保存</button>
+            </div>
             <TerminalConsole
               ref="terminalConsoleRef"
               :session="terminalSession"

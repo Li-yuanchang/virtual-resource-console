@@ -348,6 +348,32 @@ export interface VmSystemCredentials {
   };
 }
 
+export type GuestGrubKind = "grub1" | "grub2" | "unknown";
+
+export type GuestBootEntryTool = "grub2-reboot" | "grub-reboot" | "none" | "unknown";
+
+export interface GuestBootEntry {
+  index: number;
+  title: string;
+  isDefault: boolean;
+}
+
+export interface GuestBootEntryList {
+  grubKind: GuestGrubKind;
+  config: string;
+  oneTimeTool: GuestBootEntryTool;
+  defaultIndex: number | null;
+  savedEntry?: string;
+  message?: string;
+  entries: GuestBootEntry[];
+}
+
+export interface GuestBootEntrySelection {
+  index: number;
+  title: string;
+  grubKind: GuestGrubKind;
+}
+
 export interface VmResizeRequest {
   cpuCount?: number;
   memoryBytes?: number;
@@ -491,6 +517,35 @@ export interface VmSearchIndexResponse {
 export interface VmDisksResponse {
   collectedAt: string;
   disks: VmDisk[];
+}
+
+export interface VmSnapshot {
+  id: string;
+  vmId: string;
+  providerId: string;
+  name: string;
+  createdAt?: string;
+}
+
+export interface VmSnapshotsResponse {
+  collectedAt: string;
+  snapshots: VmSnapshot[];
+}
+
+export interface HostVmSnapshotGroup {
+  vm: {
+    providerId: string;
+    name: string;
+    powerState: PowerState;
+  };
+  snapshots: VmSnapshot[];
+  error?: string;
+}
+
+export interface HostVmSnapshotsResponse {
+  collectedAt: string;
+  hostId: string;
+  items: HostVmSnapshotGroup[];
 }
 
 export interface GuestStorageResponse {
@@ -759,3 +814,60 @@ export interface ProvisionTask {
 export interface ProvisionTaskResponse {
   task: ProvisionTask;
 }
+
+export type HostDiagnosticStatus = "ok" | "warn" | "error" | "unknown";
+
+export type HostDiagnosticCategory = "system" | "storage" | "service" | "network";
+
+export type HostDiagnosticScope = "host" | "vm-link";
+
+export interface HostDiagnosticCheck {
+  key: string;
+  label: string;
+  category: HostDiagnosticCategory;
+  scope: HostDiagnosticScope;
+  status: HostDiagnosticStatus;
+  summary: string;
+  evidence?: string[];
+  detail?: string;
+}
+
+export interface HostDiagnosticRepairAction {
+  key: string;
+  label: string;
+  description: string;
+  recommended?: boolean;
+  scopeNote: string;
+  commands: string[];
+  verificationCommands: string[];
+}
+
+export interface HostDiagnosticsRequest {
+  hostId?: string;
+  vmId?: string;
+  vmName?: string;
+  vmIp?: string;
+}
+
+export interface HostDiagnosticsResult {
+  collectedAt: string;
+  providerType: ProviderType;
+  supported: boolean;
+  message?: string;
+  hostId?: string;
+  hostName: string;
+  hostAddress: string;
+  vmId?: string;
+  vmName?: string;
+  vmIp?: string;
+  conclusion: {
+    summary: string;
+    faultPoint?: string;
+    impact?: string;
+    riskLevel: "none" | "low" | "medium" | "high";
+  };
+  checks: HostDiagnosticCheck[];
+  repairActions: HostDiagnosticRepairAction[];
+}
+
+export type HostDiagnosticsResponse = HostDiagnosticsResult;

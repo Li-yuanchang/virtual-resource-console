@@ -2,7 +2,7 @@
 import VmResizeIconMark from "./VmResizeIconMark.vue";
 
 defineProps<{
-  name: "start" | "shutdown" | "forceReboot" | "resize" | "delete";
+  name: "start" | "shutdown" | "forceReboot" | "resize" | "diagnose" | "snapshot" | "delete";
 }>();
 </script>
 
@@ -22,6 +22,15 @@ defineProps<{
       <path d="M19.3 14.6A7.5 7.5 0 0 1 5.8 16.8" />
       <path d="M5.8 19.6v-3.2H9" />
       <path d="M10 8.7v6.6l5.2-3.3Z" />
+    </template>
+    <template v-else-if="name === 'diagnose'">
+      <path d="M5.4 12.1a6.6 6.6 0 1 0 13.2 0 6.6 6.6 0 0 0-13.2 0Z" />
+      <path d="M9.2 12.2h1.75l1.05-2.65 1.55 5.2 1.05-2.55h1.95" />
+      <path d="M16.7 16.8l2.2 2.2" />
+    </template>
+    <template v-else-if="name === 'snapshot'">
+      <path d="M5.2 8.4h2.15l1.3-2.05h6.7l1.3 2.05h2.15c.61 0 1.1.49 1.1 1.1v7.1c0 .61-.49 1.1-1.1 1.1H5.2a1.1 1.1 0 0 1-1.1-1.1V9.5c0-.61.49-1.1 1.1-1.1Z" />
+      <circle cx="12" cy="12.9" r="3.15" />
     </template>
     <template v-else>
       <path d="M5.9 7.4h12.2" />

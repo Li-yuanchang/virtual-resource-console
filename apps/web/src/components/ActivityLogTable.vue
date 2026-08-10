@@ -52,7 +52,7 @@ function activityStatusLabel(status: ActivityStatus) {
       <div class="settings-table-empty" role="status">当前暂无操作记录</div>
     </template>
     <el-table-column type="index" label="序号" width="62" align="center" />
-    <el-table-column label="时间" width="96" align="center">
+    <el-table-column label="时间" width="158" align="center">
       <template #default="{ row }"><time>{{ row.time }}</time></template>
     </el-table-column>
     <el-table-column label="事件" min-width="180" align="center" show-overflow-tooltip>

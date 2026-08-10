@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { matchesIsoNamePattern } from "../src/domain/isoTemplateMatch.js";
 import { groupIsoImagesBySource, resolveProvisioningStrategy } from "../src/domain/provisioningStrategies.js";
 import type { IsoImage } from "../src/types.js";
 
@@ -44,4 +45,9 @@ test("groups install media by stable source type", () => {
 test("keeps XenServer tools out of operating-system choices", () => {
   const installImages = resolveProvisioningStrategy("xenserver").installIsoImages(images);
   assert.deepEqual(installImages.map((image) => image.id), ["dvd", "shared"]);
+});
+
+test("matches XenServer host DVD CentOS label to the maintained CentOS 7 template", () => {
+  assert.equal(matchesIsoNamePattern(images[0], "CentOS-7-x86_64-DVD-1511.iso"), true);
+  assert.equal(matchesIsoNamePattern({ name: "ubuntu-24.04.1-desktop-amd64.iso" }, "CentOS-7-x86_64-DVD-1511.iso"), false);
 });

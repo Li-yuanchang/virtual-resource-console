@@ -39,6 +39,9 @@ type HostVmPanelVariant = "page" | "dialog";
 type VmSortOrder = "ascending" | "descending" | null;
 type VmSortKey = "name" | "powerState" | "guestOs" | "cpuCount" | "memoryBytes" | "diskVirtualBytes" | "ip" | "lastShutdownAt";
 
+// 虚拟机诊断功能暂未开放：先整体屏蔽前端入口，功能完善后再放开（改回 true 即恢复）。
+const HOST_DIAGNOSTICS_ENABLED = false;
+
 const powerFilterOptions: Array<{ label: string; value: VmPowerFilter }> = [
   { label: "全部", value: "all" },
   { label: "开机", value: "running" },
@@ -107,6 +110,7 @@ const emit = defineEmits<{
   "schedule-vms": [rows: VmNode[]];
   "rename-vm": [vm: VmNode];
   "resize-vm": [vm: VmNode];
+  "diagnose-vm": [vm: VmNode];
 }>();
 
 const searchModel = computed({
@@ -557,6 +561,10 @@ function emitResize(vm: VmNode) {
   emit("resize-vm", vm);
 }
 
+function emitDiagnose(vm: VmNode) {
+  emit("diagnose-vm", vm);
+}
+
 function emitVmAction(action: VmPowerAction, vm: VmNode) {
   if (!canRunVmAction(action, vm)) return;
   emit("vm-action", action, vm);
@@ -940,6 +948,9 @@ function openVmConsoleByRow(vm: VmNode) {
               </button>
               <button v-if="supportsVmResize" type="button" class="vm-action-link action-resize" :disabled="!canResizeVm(row)" :aria-label="resizeButtonTitle(row)" :title="resizeButtonTitle(row)" @click.stop="emitResize(row)">
                 <VrcVmActionIcon name="resize" />
+              </button>
+              <button v-if="HOST_DIAGNOSTICS_ENABLED" type="button" class="vm-action-link action-diagnose" aria-label="问题诊断" title="问题诊断" @click.stop="emitDiagnose(row)">
+                <VrcVmActionIcon name="diagnose" />
               </button>
               <button type="button" class="vm-action-link action-delete" :disabled="!canRunVmAction('delete', row)" :aria-label="actionButtonTitle('delete', row)" :title="actionButtonTitle('delete', row)" @click.stop="emitVmAction('delete', row)">
                 <VrcVmActionIcon name="delete" />

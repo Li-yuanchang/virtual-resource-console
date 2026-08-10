@@ -4,6 +4,7 @@ import { ArrowLeft, Brush, Check, Connection, Delete, Download, Loading, Picture
 import { ElMessage } from "element-plus";
 import ActivityLogTable from "./components/ActivityLogTable.vue";
 import ConsoleDialog from "./components/ConsoleDialog.vue";
+import HostDiagnosticsDialog from "./components/HostDiagnosticsDialog.vue";
 import HostVmPanel from "./components/HostVmPanel.vue";
 import UpdateCenterPanel from "./components/UpdateCenterPanel.vue";
 import VrcLogoMark from "./components/VrcLogoMark.vue";
@@ -11,19 +12,26 @@ import VrcToolbarIcon from "./components/VrcToolbarIcon.vue";
 import VmProvisioningDialog from "./components/VmProvisioningDialog.vue";
 import VmRenameDialog from "./components/VmRenameDialog.vue";
 import VmResizeDialog from "./components/VmResizeDialog.vue";
+import VmBootEntryDialog from "./components/VmBootEntryDialog.vue";
 import VmScheduleDialog from "./components/VmScheduleDialog.vue";
 import VrcVmActionIcon from "./components/VrcVmActionIcon.vue";
 import { resolveVmConsoleTarget, resolveVmGraphConsoleTarget, type VmConsoleTarget } from "./domain/consoleStrategies";
 import { confirmVrcAction } from "./domain/confirmAction";
 import { getProviderBrand } from "./domain/providerBrand";
 import { isoSourceLabel } from "./domain/provisioningStrategies";
-import { secureJsonRequest } from "./domain/secureRequest";
+import { SecureRequestError, secureJsonRequest } from "./domain/secureRequest";
 import { createVmListReconciler } from "./domain/vmListReconciliation";
 import { vmPowerActionRowPatch } from "./domain/vmPowerState";
 import type {
   HostsResponse,
+  GuestBootEntryList,
+  GuestBootEntrySelection,
   GuestStorageInventory,
   GuestStorageResponse,
+  HostNode,
+  HostDiagnosticRepairAction,
+  HostVmSnapshotGroup,
+  HostVmSnapshotsResponse,
   IpPoolPolicy,
   IpPoolPolicyResponse,
   RuntimeIpPoolPolicy,
@@ -225,6 +233,10 @@ interface ActivityEntry {
   request?: string;
   command?: string;
   status: "info" | "pending" | "success" | "warning" | "error";
+  action?: string;
+  providerType?: string;
+  connectionId?: string;
+  connectionName?: string;
 }
 
 interface ConsoleUploadResultEvent {
@@ -234,6 +246,21 @@ interface ConsoleUploadResultEvent {
   message: string;
   files: string[];
   remotePaths: string[];
+}
+
+interface PersistentAuditRecord {
+  id: string;
+  time: string;
+  title: string;
+  detail?: string;
+  target?: string;
+  request?: string;
+  command?: string;
+  status: ActivityEntry["status"];
+  action?: string;
+  providerType?: string;
+  connectionId?: string;
+  connectionName?: string;
 }
 
 type ActivityStatusFilter = "all" | ActivityEntry["status"];
@@ -706,6 +733,8 @@ const activityEntries = ref<ActivityEntry[]>([
     status: "info",
   },
 ]);
+const persistentAuditEntries = ref<ActivityEntry[]>([]);
+const persistentAuditLoading = ref(false);
 const selectedHostId = ref("");
 const connectionSettingsVisible = ref(false);
 const accountImportVisible = ref(false);
@@ -728,11 +757,30 @@ const vmRenameSaving = ref(false);
 const vmResizeVisible = ref(false);
 const vmResizeTarget = ref<VmNode | null>(null);
 const vmResizeDisks = ref<VmDisk[]>([]);
+const vmSnapshotVisible = ref(false);
+const vmSnapshotHost = ref<HostNodeItem | null>(null);
+const vmSnapshotProviderLabel = ref("");
+const vmSnapshotGroups = ref<HostVmSnapshotGroup[]>([]);
+const vmSnapshotLoading = ref(false);
 const vmResizeLoadingDisks = ref(false);
 const vmResizeGuestStorage = ref<GuestStorageInventory | null>(null);
 const vmResizeLoadingGuestStorage = ref(false);
 const vmResizeGuestStorageError = ref("");
 const vmResizeSaving = ref(false);
+const bootEntryVisible = ref(false);
+const bootEntryDialogVm = ref<VmNode | null>(null);
+const bootEntryDialogAction = ref<"shutdown" | "forceReboot">("forceReboot");
+const bootEntryList = ref<GuestBootEntryList | null>(null);
+const bootEntryLoading = ref(false);
+const bootEntryError = ref("");
+const bootEntryAuthRequired = ref(false);
+// 虚拟机诊断功能暂未开放：先整体屏蔽前端入口，功能完善后再放开（改回 true 即恢复）。
+const HOST_DIAGNOSTICS_ENABLED = false;
+const hostDiagnosticsVisible = ref(false);
+const hostDiagnosticsTarget = ref<VmNode | null>(null);
+const hostDiagnosticsHost = ref<HostNode | null>(null);
+const hostDiagnosticsProviderDescriptor = ref<ProviderDescriptor | undefined>(undefined);
+const hostDiagnosticsConnectionPayload = ref<Record<string, unknown> | null>(null);
 const consoleDialogVisible = ref(false);
 const consoleTarget = ref<VmConsoleTarget | null>(null);
 const consoleProvisionTaskId = ref("");
@@ -767,6 +815,7 @@ const selectedVmIds = ref<string[]>([]);
 const hostOverviewRows = ref<HostOverviewRow[]>([]);
 const loadingHostOverview = ref(false);
 const selectedHostOverviewKey = ref("");
+const overviewSelectedRows = ref<HostOverviewRow[]>([]);
 const workspaceMode = ref<WorkspaceMode>("empty");
 const settingsPanel = ref<SettingsPanel>("appearance");
 const appearanceConsolePreviewMode = ref<ConsolePreviewMode>("graphical");
@@ -967,7 +1016,7 @@ const settingsDescription = computed(() => {
   if (settingsPanel.value === "chromeExtension") return "管理 Chrome 插件的服务地址和本地密文连接，和 Web、macOS、Windows 客户端配置分开。";
   if (settingsPanel.value === "updates") return "按当前运行端检查版本并应用更新，macOS、Windows、Web 和 Chrome 插件分别使用对应的更新策略。";
   if (settingsPanel.value === "maintenance") return "查看无人值守安装生成的临时介质，只清理任务已结束且校验通过的记录。";
-  if (settingsPanel.value === "logs") return "查看当前会话操作记录，持久化审计后续单独接入。";
+  if (settingsPanel.value === "logs") return "查看持久化保存的本机操作记录，重启后仍然保留，敏感字段已脱敏。";
   return "主题、按钮密度、表格密度和控制台偏好统一归档，不混入 VM 工具栏。";
 });
 const settingsBackLabel = computed(() => (hostOverviewRows.value.length || loadingHostOverview.value ? "返回总览" : "关闭设置"));
@@ -1013,9 +1062,12 @@ const groupedStoredConnections = computed(() => {
   }
   return Array.from(groups.entries());
 });
+const auditDialogEntries = computed(() =>
+  persistentAuditEntries.value.length ? persistentAuditEntries.value : activityEntries.value,
+);
 const filteredActivityEntries = computed(() => {
   const keyword = activitySearch.value.trim().toLowerCase();
-  return activityEntries.value.filter((item) => {
+  return auditDialogEntries.value.filter((item) => {
     if (activityStatusFilter.value !== "all" && item.status !== activityStatusFilter.value) return false;
     if (!keyword) return true;
     return [item.time, item.title, item.target ?? "", item.detail ?? "", item.request ?? "", item.command ?? "", activityStatusLabel(item.status)]
@@ -1515,6 +1567,15 @@ watch(
 watch(settingsPanel, (panel) => {
   if (panel === "maintenance" && !maintenanceIsoReport.value && !maintenanceIsoLoading.value) {
     void loadMaintenanceGeneratedIsos({ silent: true });
+  }
+  if (panel === "logs" && !persistentAuditEntries.value.length && !persistentAuditLoading.value) {
+    void loadPersistentAudit();
+  }
+});
+
+watch(activityLogVisible, (visible) => {
+  if (visible && !persistentAuditEntries.value.length && !persistentAuditLoading.value) {
+    void loadPersistentAudit();
   }
 });
 
@@ -4700,6 +4761,88 @@ function openVmResize(vm: VmNode) {
   vmResizeVisible.value = true;
 }
 
+function openHostDiagnostics(vm: VmNode) {
+  const connectionPayload = buildConnectionPayload();
+  if (!connectionPayload) {
+    return;
+  }
+  hostDiagnosticsTarget.value = vm;
+  hostDiagnosticsHost.value = selectedHost.value;
+  hostDiagnosticsProviderDescriptor.value = selectedProviderDescriptor.value;
+  hostDiagnosticsConnectionPayload.value = connectionPayload;
+  hostDiagnosticsVisible.value = true;
+}
+
+function openHostOverviewDiagnosticsToolbar() {
+  const selected = overviewSelectedRows.value;
+  if (!selected.length) {
+    showToast("warning", "请先在列表勾选要诊断的物理机");
+    return;
+  }
+  if (selected.length > 1) {
+    showToast("warning", "一次只支持诊断一台物理机，请仅勾选一台");
+    return;
+  }
+  const target = selected[0];
+  if (!hasOverviewInventory(target)) {
+    showToast("warning", "该物理机尚未完成总览加载，请刷新后再诊断");
+    return;
+  }
+  openHostOverviewDiagnostics(target);
+}
+
+function overviewRowSelectable(row: HostOverviewRow) {
+  return hasOverviewInventory(row);
+}
+
+function handleOverviewSelectionChange(rows: HostOverviewRow[]) {
+  // 总览数据刷新时会重建行对象（map/spread），这里统一按 key 映射到最新行引用，
+  // 避免诊断时误用已失效的旧行对象。
+  const byKey = new Map(hostOverviewRows.value.map((row) => [row.key, row]));
+  overviewSelectedRows.value = rows.map((row) => byKey.get(row.key) ?? row);
+}
+
+function handleOverviewRowClick(row: HostOverviewRow, _column: unknown, event: MouseEvent) {
+  const target = event.target as HTMLElement | null;
+  if (target?.closest(".el-checkbox") || target?.closest("td.el-table-column--selection")) return;
+  void openHostOverview(row);
+}
+
+watch(hostOverviewRows, (rows) => {
+  // 数据刷新后，把勾选状态同步到最新行对象；行已不存在则自动丢弃勾选。
+  const byKey = new Map(rows.map((row) => [row.key, row]));
+  overviewSelectedRows.value = overviewSelectedRows.value
+    .map((row) => byKey.get(row.key))
+    .filter((row): row is HostOverviewRow => Boolean(row));
+});
+
+function openHostOverviewDiagnostics(row: HostOverviewRow) {
+  let connectionPayload: Record<string, unknown>;
+  try {
+    connectionPayload = buildConnectionPayloadFromSummary(row.connection);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "读取该连接的本地密码失败";
+    setErrorMessage(message);
+    showToast("error", message);
+    return;
+  }
+  hostDiagnosticsTarget.value = null;
+  hostDiagnosticsHost.value = row.host;
+  hostDiagnosticsProviderDescriptor.value = providerDescriptorFor(row.connection.providerType) ?? undefined;
+  hostDiagnosticsConnectionPayload.value = connectionPayload;
+  hostDiagnosticsVisible.value = true;
+}
+
+function handleHostDiagnosticsConfirm(payload: { host: HostNode; vm: VmNode | null; action: HostDiagnosticRepairAction }) {
+  const target = payload.vm ? `${payload.host.name} / ${payload.vm.name}` : payload.host.name;
+  showToast("warning", "修复动作已记录，请在宿主机上手动确认执行建议命令。");
+  pushActivity("诊断修复待确认", {
+    target,
+    detail: `建议动作：${payload.action.label}；命令需在宿主机二次确认后手动执行`,
+    status: "warning",
+  });
+}
+
 async function loadVmResizeDisks(vm: VmNode) {
   const connectionPayload = buildConnectionPayload();
   if (!connectionPayload) return;
@@ -4719,6 +4862,58 @@ async function loadVmResizeDisks(vm: VmNode) {
   } finally {
     vmResizeLoadingDisks.value = false;
   }
+}
+
+function openHostOverviewSnapshotsToolbar() {
+  const selected = overviewSelectedRows.value;
+  if (!selected.length) {
+    showToast("warning", "请先在列表勾选要查看快照的物理机");
+    return;
+  }
+  if (selected.length > 1) {
+    showToast("warning", "一次只支持查看一台物理机的快照，请仅勾选一台");
+    return;
+  }
+  const target = selected[0];
+  if (!hasOverviewInventory(target)) {
+    showToast("warning", "该物理机尚未完成总览加载，请刷新后再查看快照");
+    return;
+  }
+  void openHostOverviewSnapshots(target);
+}
+
+async function openHostOverviewSnapshots(row: HostOverviewRow) {
+  let connectionPayload: Record<string, unknown>;
+  try {
+    connectionPayload = buildConnectionPayloadFromSummary(row.connection);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "读取该连接的本地密码失败";
+    setErrorMessage(message);
+    showToast("error", message);
+    return;
+  }
+  vmSnapshotHost.value = row.host;
+  vmSnapshotProviderLabel.value = providerLabel(row.connection.providerType);
+  vmSnapshotGroups.value = [];
+  vmSnapshotVisible.value = true;
+  vmSnapshotLoading.value = true;
+  try {
+    const response = await postJson<HostVmSnapshotsResponse>("/api/hosts/vm-snapshots", {
+      ...connectionPayload,
+      hostId: row.host.providerId,
+    });
+    vmSnapshotGroups.value = response.items;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "读取物理机快照失败";
+    setErrorMessage(message);
+    showToast("error", message);
+  } finally {
+    vmSnapshotLoading.value = false;
+  }
+}
+
+function formatSnapshotTime(value?: string) {
+  return value ? formatMaintenanceIsoDate(value) : "-";
 }
 
 async function loadVmResizeGuestStorage(vm: VmNode, systemCredentials?: VmSystemCredentials, rememberSystemCredentials = false) {
@@ -4879,6 +5074,23 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
   const vmTarget = `${hostName} / ${vm.name}`;
   const vmActionDetail = `${providerLabel(connection.providerType)} · ${displayVmIp(vm)} · ${displayGuestOs(vm)}`;
 
+  // 关机 / 重启前先让用户选择下次启动内核；确认后走 handleBootEntryConfirm 二次确认并提交。
+  if (action === "shutdown" || action === "forceReboot") {
+    bootEntryDialogVm.value = vm;
+    bootEntryDialogAction.value = action;
+    bootEntryList.value = null;
+    bootEntryError.value = "";
+    bootEntryAuthRequired.value = false;
+    bootEntryVisible.value = true;
+    pushActivity(`请求${meta.label}`, {
+      target: vmTarget,
+      detail: "等待选择启动内核",
+      status: "pending",
+    });
+    void loadVmBootEntries(vm);
+    return;
+  }
+
   try {
     pushActivity(`请求${meta.label}`, {
       target: vmTarget,
@@ -4911,6 +5123,132 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
     return;
   }
 
+  await executeVmAction(action, vm);
+}
+
+async function handleBootEntryConfirm(
+  selection: GuestBootEntrySelection | null,
+  systemCredentials?: VmSystemCredentials,
+  rememberSystemCredentials = false,
+) {
+  const action = bootEntryDialogAction.value;
+  const vm = bootEntryDialogVm.value;
+  bootEntryVisible.value = false;
+  if (!action || !vm) return;
+  const payload = buildConnectionPayload();
+  if (!payload) return;
+  const meta = vmActionMeta(action);
+  const hostName = selectedHost.value?.name || connection.host;
+  const vmTarget = `${hostName} / ${vm.name}`;
+  const vmActionDetail = `${providerLabel(connection.providerType)} · ${displayVmIp(vm)} · ${displayGuestOs(vm)}`;
+  const bootEntryBody: Record<string, unknown> = {};
+  if (selection) {
+    bootEntryBody.bootEntry = selection;
+    if (systemCredentials) {
+      bootEntryBody.systemCredentials = systemCredentials;
+      bootEntryBody.rememberSystemCredentials = rememberSystemCredentials;
+    }
+  }
+
+  try {
+    pushActivity(`请求${meta.label}`, {
+      target: vmTarget,
+      detail: "等待二次确认",
+      status: "pending",
+    });
+    await confirmVrcAction({
+      heading: meta.confirmHeading,
+      tone: meta.confirmTone,
+      summary: `${hostName} / ${vm.name}`,
+      detail: [
+        vmActionDescription(action, connection.providerType),
+        selection ? `本次${meta.label}后进入所选内核：${selection.title}` : "本次不指定内核，按系统默认启动项启动",
+      ].join("\n"),
+      confirmButtonText: meta.confirmButtonText,
+      customClass: meta.customClass,
+    });
+  } catch (error) {
+    if (error !== "cancel" && error !== "close") {
+      setErrorMessage(error instanceof Error ? error.message : "操作确认失败");
+      pushActivity(`${meta.label}确认失败`, {
+        target: vmTarget,
+        detail: errorMessage.value,
+        status: "error",
+      });
+    } else {
+      pushActivity(`取消${meta.label}`, {
+        target: vmTarget,
+        detail: vmActionDetail,
+        status: "warning",
+      });
+    }
+    return;
+  }
+
+  await executeVmAction(action, vm, bootEntryBody);
+}
+
+async function loadVmBootEntries(vm: VmNode, systemCredentials?: VmSystemCredentials, rememberSystemCredentials = false) {
+  const connectionPayload = buildConnectionPayload();
+  if (!connectionPayload) return;
+  if (bootEntryDialogVm.value?.providerId !== vm.providerId) return;
+  bootEntryList.value = null;
+  bootEntryError.value = "";
+  bootEntryAuthRequired.value = false;
+  bootEntryLoading.value = true;
+  try {
+    const response = await postJson<GuestBootEntryList & { collectedAt: string }>("/api/vms/boot-entries", {
+      ...connectionPayload,
+      vmId: vm.providerId,
+      systemCredentials,
+      rememberSystemCredentials,
+    });
+    if (bootEntryDialogVm.value?.providerId === vm.providerId) {
+      bootEntryList.value = response;
+      bootEntryError.value = "";
+      bootEntryAuthRequired.value = false;
+    }
+  } catch (error) {
+    if (bootEntryDialogVm.value?.providerId === vm.providerId) {
+      if (error instanceof SecureRequestError && error.code === "SYSTEM_AUTHENTICATION_REQUIRED") {
+        bootEntryAuthRequired.value = true;
+        bootEntryError.value = "需要虚拟机系统账号";
+      } else {
+        bootEntryError.value = error instanceof Error ? error.message : "读取虚拟机启动项失败";
+      }
+    }
+  } finally {
+    if (bootEntryDialogVm.value?.providerId === vm.providerId) {
+      bootEntryLoading.value = false;
+    }
+  }
+}
+
+function handleBootEntryDialogClose(value: boolean) {
+  if (!value && bootEntryVisible.value) {
+    const action = bootEntryDialogAction.value;
+    const vm = bootEntryDialogVm.value;
+    if (action && vm) {
+      const meta = vmActionMeta(action);
+      const hostName = selectedHost.value?.name || connection.host;
+      pushActivity(`取消${meta.label}`, {
+        target: `${hostName} / ${vm.name}`,
+        detail: "未选择启动内核",
+        status: "warning",
+      });
+    }
+  }
+  bootEntryVisible.value = value;
+}
+
+async function executeVmAction(action: VmPowerAction, vm: VmNode, extraBody: Record<string, unknown> = {}) {
+  const payload = buildConnectionPayload();
+  if (!payload) return;
+  const meta = vmActionMeta(action);
+  const hostName = selectedHost.value?.name || connection.host;
+  const vmTarget = `${hostName} / ${vm.name}`;
+  const vmActionDetail = `${providerLabel(connection.providerType)} · ${displayVmIp(vm)} · ${displayGuestOs(vm)}`;
+
   clearMessages();
   const resourceBaseline = captureSelectedHostResourceFingerprint();
   setVmActionState(vm, {
@@ -4932,6 +5270,7 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
       hostId: selectedHost.value?.providerId,
       action,
       confirmToken: "CONFIRMED",
+      ...extraBody,
     });
     if (!response.result.accepted) {
       throw new Error(response.result.message || `VM ${meta.label}请求未被平台接受`);
@@ -5007,6 +5346,9 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
     skippedCount ? `跳过：${skippedCount} 台状态不满足条件` : "",
     vmActionDescription(action, connection.providerType),
     action === "start" ? "说明：批量开机不会自动打开多个控制台，可在完成后点击 VM 名称查看。" : "",
+    action === "forceReboot" || action === "shutdown"
+      ? "说明：批量操作不指定下次启动内核，按系统默认启动项启动；如需选择内核请单台操作。"
+      : "",
     batchVmNames,
     actionableRows.length > 8 ? `... 还有 ${actionableRows.length - 8} 台` : "",
   ].filter(Boolean);
@@ -6114,6 +6456,58 @@ function formatActivityTime() {
   return new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }
 
+function formatPersistentAuditTime(value: string) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+async function loadPersistentAudit() {
+  if (persistentAuditLoading.value) return;
+  persistentAuditLoading.value = true;
+  try {
+    const result = await postJson<{ records: PersistentAuditRecord[]; total: number }>("/api/audit", undefined, "GET");
+    persistentAuditEntries.value = (result.records ?? []).map((row) => ({
+      id: row.id,
+      time: formatPersistentAuditTime(row.time),
+      title: row.title,
+      status: row.status,
+      ...(row.detail ? { detail: row.detail } : {}),
+      ...(row.target ? { target: row.target } : {}),
+      ...(row.request ? { request: row.request } : {}),
+      ...(row.command ? { command: row.command } : {}),
+      ...(row.action ? { action: row.action } : {}),
+      ...(row.providerType ? { providerType: row.providerType } : {}),
+      ...(row.connectionId ? { connectionId: row.connectionId } : {}),
+      ...(row.connectionName ? { connectionName: row.connectionName } : {}),
+    }));
+  } catch {
+    persistentAuditEntries.value = [];
+  } finally {
+    persistentAuditLoading.value = false;
+  }
+}
+
+async function refreshPersistentAudit() {
+  persistentAuditEntries.value = [];
+  await loadPersistentAudit();
+}
+
+async function openPersistentAuditDialog() {
+  if (!persistentAuditEntries.value.length && !persistentAuditLoading.value) {
+    await loadPersistentAudit();
+  }
+  activityLogVisible.value = true;
+}
+
 function maintenanceIsoDecisionLabel(item: MaintenanceGeneratedIsoEntry) {
   if (item.decision === "eligible") return "可清理";
   if (item.decision === "retained") return "暂保留";
@@ -6506,6 +6900,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           @schedule-vms="openVmScheduleCreate"
           @rename-vm="openVmRename"
           @resize-vm="openVmResize"
+          @diagnose-vm="openHostDiagnostics"
         />
       </section>
 
@@ -6554,6 +6949,32 @@ function normalizePort(value: unknown, providerType: ProviderType) {
             />
           </div>
           <div class="overview-action-group" aria-label="总览列表动作">
+            <el-tooltip v-if="HOST_DIAGNOSTICS_ENABLED" content="问题诊断：勾选一台物理机后执行只读健康诊断" placement="top" :disabled="!uiPreferences.showIconTooltips">
+              <span class="toolbar-tooltip-target">
+                <button
+                  type="button"
+                  class="overview-toolbar-button"
+                  :disabled="!sortedHostOverviewRows.some(hasOverviewInventory)"
+                  aria-label="问题诊断"
+                  @click="openHostOverviewDiagnosticsToolbar"
+                >
+                  <VrcToolbarIcon name="diagnose" />
+                </button>
+              </span>
+            </el-tooltip>
+            <el-tooltip content="查看快照：勾选一台物理机后查看其下全部虚拟机的快照" placement="top" :disabled="!uiPreferences.showIconTooltips">
+              <span class="toolbar-tooltip-target">
+                <button
+                  type="button"
+                  class="overview-toolbar-button"
+                  :disabled="!sortedHostOverviewRows.some(hasOverviewInventory)"
+                  aria-label="查看快照"
+                  @click="openHostOverviewSnapshotsToolbar"
+                >
+                  <VrcToolbarIcon name="snapshot" />
+                </button>
+              </span>
+            </el-tooltip>
             <el-tooltip content="定时任务：跨物理机搜索并选择虚拟机" placement="top" :disabled="!uiPreferences.showIconTooltips">
               <span class="toolbar-tooltip-target">
                 <button
@@ -6605,7 +7026,8 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           :default-sort="{ prop: 'hostName', order: 'ascending' }"
           :row-class-name="overviewRowClassName"
           @sort-change="handleHostOverviewSort"
-          @row-click="openHostOverview"
+          @selection-change="handleOverviewSelectionChange"
+          @row-click="handleOverviewRowClick"
         >
           <template #empty>
             <div class="overview-empty-state">
@@ -6633,6 +7055,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </div>
             </div>
           </template>
+          <el-table-column type="selection" width="46" align="center" header-align="center" reserve-selection :selectable="overviewRowSelectable" />
           <el-table-column type="index" label="序号" width="58" align="center" header-align="center" />
           <el-table-column prop="hostName" label="物理机" min-width="160" align="left" sortable="custom" show-overflow-tooltip>
             <template #default="{ row }">
@@ -7718,11 +8141,20 @@ serverStore: disabled</pre>
               <div class="settings-card-head settings-section-head">
                 <div>
                   <strong>操作记录</strong>
-                  <span>当前会话内记录，完整审计后续需要后端持久化。</span>
+                  <span>持久化保存本机操作记录，重启后仍然保留，敏感字段已脱敏。</span>
                 </div>
-                <el-button @click="activityLogVisible = true">查看完整记录</el-button>
+                <div class="settings-log-actions">
+                  <el-button :loading="persistentAuditLoading" @click="refreshPersistentAudit">刷新</el-button>
+                  <el-button @click="openPersistentAuditDialog">查看完整记录</el-button>
+                </div>
               </div>
-              <ActivityLogTable class="settings-log-table" :entries="activityEntries.slice(0, 6)" @detail="openActivityDetail" />
+              <div v-if="persistentAuditLoading" class="settings-log-loading" role="status">正在加载操作记录…</div>
+              <ActivityLogTable
+                v-else
+                class="settings-log-table"
+                :entries="persistentAuditEntries.slice(0, 6)"
+                @detail="openActivityDetail"
+              />
             </section>
           </section>
         </div>
@@ -7775,6 +8207,7 @@ serverStore: disabled</pre>
           @schedule-vms="openVmScheduleCreate"
           @rename-vm="openVmRename"
           @resize-vm="openVmResize"
+          @diagnose-vm="openHostDiagnostics"
         />
       </el-dialog>
 
@@ -7807,6 +8240,59 @@ serverStore: disabled</pre>
         @submit="handleVmResize"
       />
 
+      <VmBootEntryDialog
+        :model-value="bootEntryVisible"
+        :vm="bootEntryDialogVm"
+        :action="bootEntryDialogAction"
+        :loading="bootEntryLoading"
+        :boot-entries="bootEntryList"
+        :error="bootEntryError"
+        :auth-required="bootEntryAuthRequired"
+        @update:model-value="handleBootEntryDialogClose"
+        @load-boot-entries="loadVmBootEntries"
+        @confirm="handleBootEntryConfirm"
+      />
+
+      <HostDiagnosticsDialog
+        v-model="hostDiagnosticsVisible"
+        :host="hostDiagnosticsHost"
+        :vm="hostDiagnosticsTarget"
+        :provider-descriptor="hostDiagnosticsProviderDescriptor"
+        :connection-payload="hostDiagnosticsConnectionPayload"
+        @confirm="handleHostDiagnosticsConfirm"
+      />
+
+      <el-dialog v-model="vmSnapshotVisible" title="物理机快照" width="820px" class="vm-snapshot-dialog" top="10vh" :close-on-click-modal="false">
+        <div v-if="vmSnapshotHost" class="vm-snapshot-target">
+          <strong class="vrc-copyable-text">{{ vmSnapshotHost.name }}</strong>
+          <small>{{ vmSnapshotProviderLabel }} · {{ vmSnapshotHost.providerId }}</small>
+        </div>
+        <div v-if="vmSnapshotLoading" class="vm-snapshot-loading" role="status">正在读取快照…</div>
+        <div v-else-if="vmSnapshotGroups.length === 0" class="vm-snapshot-empty" role="status">该物理机下暂无快照</div>
+        <div v-else class="vm-snapshot-groups">
+          <section v-for="group in vmSnapshotGroups" :key="group.vm.providerId" class="vm-snapshot-group">
+            <header class="vm-snapshot-group-head">
+              <span class="vm-snapshot-group-name vrc-copyable-text" :title="group.vm.name">{{ group.vm.name }}</span>
+              <code class="vm-snapshot-group-id vrc-copyable-text">{{ group.vm.providerId }}</code>
+            </header>
+            <div v-if="group.error" class="vm-snapshot-group-error" role="status">读取该虚拟机快照失败：{{ group.error }}</div>
+            <el-table v-else-if="group.snapshots.length" class="vm-snapshot-table" :data="group.snapshots" row-key="providerId">
+              <el-table-column type="index" label="序号" width="62" align="center" />
+              <el-table-column prop="name" label="快照名称" min-width="200" align="left" show-overflow-tooltip>
+                <template #default="{ row }"><span class="vrc-copyable-text">{{ row.name }}</span></template>
+              </el-table-column>
+              <el-table-column label="创建时间" width="176" align="center">
+                <template #default="{ row }"><time>{{ formatSnapshotTime(row.createdAt) }}</time></template>
+              </el-table-column>
+              <el-table-column prop="providerId" label="快照 ID" min-width="180" align="center" show-overflow-tooltip>
+                <template #default="{ row }"><code class="vrc-copyable-text">{{ row.providerId }}</code></template>
+              </el-table-column>
+            </el-table>
+            <div v-else class="vm-snapshot-group-empty" role="status">该虚拟机暂无快照</div>
+          </section>
+        </div>
+      </el-dialog>
+
       <ConsoleDialog
         v-model:visible="consoleDialogVisible"
         :target="consoleTarget"
@@ -7834,7 +8320,7 @@ serverStore: disabled</pre>
         <div class="activity-log-tools">
           <div class="activity-query-group">
             <el-input v-model="activitySearch" class="activity-search" :prefix-icon="Search" placeholder="搜索动作 / 对象 / 详情" clearable />
-            <span class="activity-log-count">{{ filteredActivityEntries.length }} / {{ activityEntries.length }}</span>
+            <span class="activity-log-count">{{ filteredActivityEntries.length }} / {{ auditDialogEntries.length }}</span>
           </div>
           <el-segmented
             v-model="activityStatusFilter"
@@ -7842,8 +8328,10 @@ serverStore: disabled</pre>
             :options="activityStatusSegmentOptions"
             aria-label="操作记录状态筛选"
           />
+          <el-button :loading="persistentAuditLoading" @click="refreshPersistentAudit">刷新</el-button>
         </div>
-        <ActivityLogTable class="activity-log-table" :entries="filteredActivityEntries" :max-height="460" @detail="openActivityDetail" />
+        <div v-if="persistentAuditLoading" class="activity-log-loading" role="status">正在加载操作记录…</div>
+        <ActivityLogTable v-else class="activity-log-table" :entries="filteredActivityEntries" :max-height="460" @detail="openActivityDetail" />
       </el-dialog>
 
       <el-dialog

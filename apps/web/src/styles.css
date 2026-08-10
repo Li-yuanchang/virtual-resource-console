@@ -1124,6 +1124,127 @@ textarea,
   width: 100% !important;
 }
 
+.activity-log-tools .el-button {
+  justify-self: start;
+}
+
+.settings-log-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.settings-log-loading {
+  margin: 14px 16px 16px;
+  color: var(--vrc-text-muted);
+  font-size: 12px;
+}
+
+.activity-log-loading {
+  padding: 24px 0;
+  color: var(--vrc-text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.vm-snapshot-target {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--vrc-surface);
+  border: 1px solid var(--vrc-border);
+  border-radius: 8px;
+}
+
+.vm-snapshot-target strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vrc-text);
+  font-size: 14px;
+  font-weight: var(--vrc-font-weight-regular);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vm-snapshot-target small {
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+}
+
+.vm-snapshot-loading {
+  padding: 40px 0;
+  color: var(--vrc-text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.vm-snapshot-table {
+  width: 100% !important;
+}
+
+.vm-snapshot-empty {
+  padding: 40px 0;
+  color: var(--vrc-text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.vm-snapshot-groups {
+  display: grid;
+  gap: 10px;
+  max-height: 54vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.vm-snapshot-group {
+  border: 1px solid var(--vrc-border);
+  border-radius: 8px;
+  background: var(--vrc-surface);
+}
+
+.vm-snapshot-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--vrc-border);
+}
+
+.vm-snapshot-group-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vrc-text);
+  font-size: 13px;
+  font-weight: var(--vrc-font-weight-medium, 500);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vm-snapshot-group-id {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vm-snapshot-group-error,
+.vm-snapshot-group-empty {
+  padding: 14px 12px;
+  color: var(--vrc-text-muted);
+  font-size: 12px;
+}
+
+.vm-snapshot-group-error {
+  color: var(--vrc-danger, #c45656);
+}
+
 .activity-record-detail-cell {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 26px;
@@ -3021,6 +3142,65 @@ textarea,
 
 .console-cli-frame .terminal-console {
   min-height: 100%;
+}
+
+.console-credential-save-offer {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--vrc-accent) 48%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--vrc-terminal-surface, #020402) 96%, var(--vrc-accent) 6%);
+  color: var(--vrc-terminal-text);
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.console-credential-save-offer > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.console-credential-save-offer button {
+  flex: none;
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background 0.15s ease, filter 0.15s ease, color 0.15s ease;
+}
+
+.console-credential-save-confirm {
+  color: #fff;
+  background: var(--vrc-accent, #426b57);
+}
+
+.console-credential-save-confirm:hover,
+.console-credential-save-confirm:focus-visible {
+  filter: brightness(1.1);
+  outline: 0;
+}
+
+.console-credential-save-dismiss {
+  color: var(--vrc-terminal-text-muted, #8d95a3);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--vrc-terminal-text) 24%, transparent) !important;
+}
+
+.console-credential-save-dismiss:hover,
+.console-credential-save-dismiss:focus-visible {
+  color: var(--vrc-terminal-text);
+  background: color-mix(in srgb, var(--vrc-terminal-text) 10%, transparent);
+  outline: 0;
 }
 
 .console-security-watermark {

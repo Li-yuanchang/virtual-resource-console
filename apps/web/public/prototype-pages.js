@@ -390,8 +390,184 @@
     updateFooter();
   }
 
+  function initDiagnostics() {
+    const dialog = $(".diagnostics-dialog-static");
+    if (!dialog) return;
+    const reportState = $("#diagnosticsReportState");
+    const reportLabel = $("#diagnosticsReportLabel");
+    const reportSubtitle = $("#diagnosticsReportSubtitle");
+    const reportPercent = $("#diagnosticsReportPercent");
+    const footerState = $("#diagnosticsFooterState");
+    const reportButton = $("[data-diagnostics-report]");
+    const confirmButton = $("[data-diagnostics-confirm]");
+    const checkCards = $$(".diagnostics-check-list-static > div");
+    const traceCards = $$(".diagnostics-trace-static > div");
+    const activityCards = $$(".diagnostics-report-activity-static > div");
+    const stageLabels = $$("[data-report-stage]");
+    const repairCard = $(".diagnostics-repair-static");
+    const checkDetail = $(".diagnostics-check-detail-static");
+    const timeline = [
+      { percent: 10, title: "正在生成诊断报告", subtitle: "采集宿主机证据", stage: "collect", active: 0, doneChecks: [], doneStages: [] },
+      { percent: 34, title: "正在生成诊断报告", subtitle: "关联 OVS 与 VIF 检查", stage: "analyze", active: 2, doneChecks: [0, 1], doneStages: ["collect"] },
+      { percent: 68, title: "正在生成诊断报告", subtitle: "整理异常链路与修复建议", stage: "render", active: 3, doneChecks: [0, 1, 2], doneStages: ["collect", "analyze"] },
+      { percent: 92, title: "正在生成诊断报告", subtitle: "输出报告摘要与证据链", stage: "render", active: 3, doneChecks: [0, 1, 2, 3], doneStages: ["collect", "analyze", "render"] },
+    ];
+    let reportTimers = [];
+    let reportResetTimer = null;
+    let reportRunning = false;
+    let reportFinishTimer = null;
+
+    [...stageLabels].forEach((label, index) => label.style.setProperty("--report-index", index));
+    [...activityCards].forEach((card, index) => card.style.setProperty("--report-index", index));
+    [...checkCards].forEach((card, index) => card.style.setProperty("--report-index", index));
+    [...traceCards].forEach((card, index) => card.style.setProperty("--report-index", index));
+
+    function clearReportTimers() {
+      reportTimers.forEach((timer) => window.clearTimeout(timer));
+      reportTimers = [];
+      window.clearTimeout(reportResetTimer);
+      reportResetTimer = null;
+      window.clearTimeout(reportFinishTimer);
+      reportFinishTimer = null;
+    }
+
+    function setStage(activeStage) {
+      const order = ["collect", "analyze", "render"];
+      stageLabels.forEach((label) => {
+        label.classList.toggle("is-active", label.dataset.reportStage === activeStage);
+        label.classList.toggle("is-done", order.indexOf(label.dataset.reportStage) < order.indexOf(activeStage));
+      });
+    }
+
+    function setRowState(activeIndex, doneIndexes) {
+      checkCards.forEach((card, index) => {
+        card.classList.toggle("is-active", index === activeIndex);
+        card.classList.toggle("is-done", doneIndexes.includes(index));
+        card.classList.toggle("is-pending", !doneIndexes.includes(index) && index !== activeIndex);
+      });
+      traceCards.forEach((card, index) => {
+        card.classList.toggle("is-active", index === activeIndex);
+        card.classList.toggle("is-done", doneIndexes.includes(index));
+      });
+    }
+
+    function setActivityState(activeStage, doneStages) {
+      activityCards.forEach((card) => {
+        const stage = card.dataset.reportActivity;
+        const label = $("em", card);
+        card.classList.toggle("is-active", stage === activeStage);
+        card.classList.toggle("is-done", doneStages.includes(stage));
+        card.classList.toggle("is-pending", !doneStages.includes(stage) && stage !== activeStage);
+        if (label) {
+          label.textContent = stage === activeStage ? "进行中" : doneStages.includes(stage) ? "已完成" : "等待中";
+        }
+      });
+    }
+
+    function setReportUi(percent, title, subtitle, stage, activeIndex, doneIndexes, doneStages) {
+      reportState.classList.remove("is-complete");
+      reportState.classList.remove("is-idle");
+      reportState.classList.add("is-live");
+      dialog.classList.add("is-reporting");
+      repairCard.classList.add("is-reporting");
+      reportLabel.textContent = title;
+      reportSubtitle.textContent = subtitle;
+      reportPercent.textContent = `${percent}%`;
+      footerState.textContent = `${subtitle} · ${percent}%`;
+      reportButton.textContent = percent >= 92 ? "报告收尾中…" : `生成中 ${percent}%`;
+      setStage(stage);
+      setRowState(activeIndex, doneIndexes);
+      setActivityState(stage, doneStages);
+    }
+
+    function resetReportUi() {
+      reportState.classList.remove("is-complete");
+      reportState.classList.remove("is-live");
+      reportState.classList.add("is-idle");
+      dialog.classList.remove("is-reporting");
+      repairCard.classList.remove("is-reporting");
+      reportButton.disabled = false;
+      confirmButton.disabled = false;
+      reportButton.textContent = "生成诊断报告";
+      footerState.textContent = "诊断默认只读。涉及重启 OVS、kill 进程、挂桥、删除文件等动作时必须二次确认。";
+      reportPercent.textContent = "0%";
+      reportLabel.textContent = "正在生成诊断报告";
+      reportSubtitle.textContent = "采集宿主机证据";
+      stageLabels.forEach((label) => label.classList.remove("is-active", "is-done"));
+      checkCards.forEach((card) => card.classList.remove("is-active", "is-done", "is-pending"));
+      traceCards.forEach((card) => card.classList.remove("is-active", "is-done"));
+      activityCards.forEach((card) => {
+        card.classList.remove("is-active", "is-done", "is-pending");
+        const label = $("em", card);
+        if (label) label.textContent = "等待中";
+      });
+    }
+
+    function finishReport() {
+      clearReportTimers();
+      reportState.classList.remove("is-live");
+      reportState.classList.remove("is-idle");
+      reportState.classList.add("is-complete");
+      reportPercent.textContent = "100%";
+      reportLabel.textContent = "诊断报告已生成";
+      reportSubtitle.textContent = "可下载或直接确认修复";
+      footerState.textContent = "诊断报告已生成 · 可以继续确认修复或重新诊断。";
+      stageLabels.forEach((label) => label.classList.add("is-done"));
+      checkCards.forEach((card) => {
+        card.classList.remove("is-active", "is-pending");
+        card.classList.add("is-done");
+      });
+      traceCards.forEach((card) => {
+        card.classList.remove("is-active");
+        card.classList.add("is-done");
+      });
+      activityCards.forEach((card) => {
+        card.classList.remove("is-active", "is-pending");
+        card.classList.add("is-done");
+        const label = $("em", card);
+        if (label) label.textContent = "已完成";
+      });
+      reportButton.disabled = false;
+      reportButton.textContent = "重新生成报告";
+      confirmButton.disabled = false;
+      toast("诊断报告已生成");
+      reportFinishTimer = window.setTimeout(resetReportUi, 2200);
+    }
+
+    function runReport() {
+      if (reportRunning) return;
+      reportRunning = true;
+      reportButton.disabled = true;
+      confirmButton.disabled = true;
+      setReportUi(10, "正在生成诊断报告", "采集宿主机证据", "collect", 0, [], []);
+      clearReportTimers();
+      timeline.forEach((step, index) => {
+        reportTimers.push(window.setTimeout(() => {
+          setReportUi(step.percent, step.title, step.subtitle, step.stage, step.active, step.doneChecks, step.doneStages);
+          if (index === timeline.length - 1) {
+            reportRunning = false;
+            reportResetTimer = window.setTimeout(finishReport, 520);
+          }
+        }, index * 620));
+      });
+    }
+
+    function reportConfirm() {
+      if (reportRunning) {
+        toast("请先等待报告生成完成");
+        return;
+      }
+      toast("已确认修复，原型未下发真实任务");
+    }
+
+    reportButton.addEventListener("click", runReport);
+    confirmButton.addEventListener("click", reportConfirm);
+    resetReportUi();
+  }
+
   const page = document.body.dataset.prototype;
   if (page === "resource-list") initResourceList();
   if (page === "vm-resize") initResize();
   if (page === "vm-schedule") initSchedule();
+  if (page === "host-diagnostics") initDiagnostics();
 })();
