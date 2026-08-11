@@ -170,7 +170,7 @@ function confirm() {
 
     <div v-if="loadingList" class="vm-boot-entry-state" role="status">
       <span class="vm-boot-entry-loader"></span>
-      <strong>正在读取虚拟机启动项（内核列表）…</strong>
+      <strong>正在读取启动项…</strong>
     </div>
 
     <div v-else-if="authRequired" class="vm-boot-entry-login">
@@ -178,7 +178,7 @@ function confirm() {
         <el-icon aria-hidden="true"><Warning /></el-icon>
         <span>
           <strong>需要虚拟机系统账号</strong>
-          <small>默认凭据无法登录操作系统，请提供本次读取启动项使用的登录账号和密码；仅能通过 JumpServer 访问时请同时填写跳板连接。</small>
+          <small>默认凭据无法登录，请提供系统账号密码；仅能通过跳板机访问时请同时填写 JumpServer 连接。</small>
         </span>
       </div>
       <div class="vm-boot-entry-login-fields">
@@ -198,7 +198,7 @@ function confirm() {
 
     <div v-else-if="bootEntries && entries.length" class="vm-boot-entry-list">
       <div class="vm-boot-entry-copy">
-        <span><strong>选择下一次启动的内核</strong><small>本次{{ action === "shutdown" ? "关机后再次开机" : "重启" }}进入所选内核；之后仍按系统默认启动项启动。</small></span>
+        <span><strong>选择下一次启动的内核</strong><small>本次{{ action === "shutdown" ? "关机后再次开机" : "重启" }}进入所选内核，之后恢复系统默认启动项。</small></span>
         <code class="vm-boot-entry-config">{{ bootEntries.config }}</code>
       </div>
       <div v-if="bootEntries.message" class="vm-boot-entry-message">
@@ -207,7 +207,7 @@ function confirm() {
       </div>
       <div v-if="bootEntries.oneTimeTool === 'none'" class="vm-boot-entry-message">
         <el-icon aria-hidden="true"><Warning /></el-icon>
-        <span>系统缺少一次性启动工具（grub2-reboot / grub-reboot），无法指定内核，请勾选"不指定"后按系统默认启动。</span>
+        <span>缺少一次性启动工具（grub2-reboot / grub-reboot），无法指定内核；请勾选"不指定"后按系统默认启动。</span>
       </div>
       <div class="vm-boot-entry-radios" role="radiogroup" aria-label="选择下次启动内核">
         <button
@@ -234,7 +234,7 @@ function confirm() {
       <el-icon aria-hidden="true"><Warning /></el-icon>
       <div>
         <strong>无法读取可启动内核</strong>
-        <small>{{ bootEntries.message || "未识别到 GRUB 启动项；不指定启动项将按系统默认启动。" }}</small>
+        <small>{{ bootEntries.message || "未识别到 GRUB 启动项，将按系统默认启动。" }}</small>
       </div>
     </div>
 
@@ -250,11 +250,11 @@ function confirm() {
       <input v-model="skipBootEntry" type="checkbox" :disabled="loading || saving" />
       <span>
         <strong>不指定启动项，按系统默认启动</strong>
-        <small>直接{{ action === "shutdown" ? "关机" : "重启" }}，不修改 GRUB 一次性启动项</small>
+        <small>不修改 GRUB 一次性启动项</small>
       </span>
     </label>
 
-    <div v-if="saving" class="vm-boot-entry-saving" role="status">正在设置下次启动内核并提交{{ action === "shutdown" ? "关机" : "重启" }}…</div>
+    <div v-if="saving" class="vm-boot-entry-saving" role="status">正在设置下次启动内核并{{ action === "shutdown" ? "关机" : "重启" }}…</div>
     <div v-if="error && !authRequired && !bootEntries" class="vm-boot-entry-error">{{ error }}</div>
 
     <template #footer>
@@ -284,19 +284,19 @@ function confirm() {
   border-radius: 5px;
 }
 .vm-boot-entry-target strong { overflow: hidden; font-size: 13px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
-.vm-boot-entry-target small { color: var(--vrc-text-subtle); font-size: 11px; }
-.vm-boot-entry-state { display: flex; align-items: center; justify-content: center; gap: 7px; min-height: 62px; color: var(--vrc-text-muted); font-size: 12px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; }
+.vm-boot-entry-target small { color: var(--vrc-text-muted); font-size: 12px; }
+.vm-boot-entry-state { display: flex; align-items: center; justify-content: center; gap: 7px; min-height: 62px; color: var(--vrc-text-muted); font-size: 13px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; }
 .vm-boot-entry-state strong { font-weight: 400; }
 .vm-boot-entry-state.unavailable { color: var(--vrc-warning); }
 .vm-boot-entry-state.error { color: var(--vrc-danger); }
 .vm-boot-entry-state > div { display: grid; gap: 2px; }
-.vm-boot-entry-state small { color: var(--vrc-text-muted); font-size: 11px; line-height: 16px; }
+.vm-boot-entry-state small { color: var(--vrc-text-muted); font-size: 12px; line-height: 17px; }
 .vm-boot-entry-loader { width: 14px; height: 14px; border: 2px solid var(--vrc-border-strong); border-top-color: var(--vrc-accent); border-radius: 50%; animation: vm-boot-entry-spin 0.8s linear infinite; }
 .vm-boot-entry-login { display: grid; gap: 8px; padding: 9px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; }
 .vm-boot-entry-login-copy { display: flex; align-items: center; gap: 7px; color: var(--vrc-warning); }
 .vm-boot-entry-login-copy > span { display: grid; gap: 2px; }
-.vm-boot-entry-login-copy strong { color: var(--vrc-text); font-size: 12px; font-weight: 400; line-height: 18px; }
-.vm-boot-entry-login-copy small { color: var(--vrc-text-muted); font-size: 11px; font-weight: 400; line-height: 16px; }
+.vm-boot-entry-login-copy strong { color: var(--vrc-text); font-size: 13px; font-weight: 400; line-height: 19px; }
+.vm-boot-entry-login-copy small { color: var(--vrc-text-muted); font-size: 12px; font-weight: 400; line-height: 17px; }
 .vm-boot-entry-login-fields { display: grid; grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1.2fr) 104px; gap: 8px; }
 .vm-boot-entry-login-fields :deep(.el-input), .vm-boot-entry-login-fields :deep(.el-button) { height: var(--vrc-command-height); min-height: var(--vrc-command-height); }
 .vm-boot-entry-login-fields :deep(.el-input__wrapper) { height: var(--vrc-command-height); min-height: var(--vrc-command-height); padding: 0 8px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: var(--vrc-command-radius); box-shadow: none; }
@@ -310,7 +310,7 @@ function confirm() {
 .vm-boot-entry-login-remember, .vm-boot-entry-login-jump { width: max-content; height: 18px; margin: 0; }
 .vm-boot-entry-login-remember { grid-column: 1 / 2; }
 .vm-boot-entry-login-jump { grid-column: 2 / -1; }
-.vm-boot-entry-login-remember :deep(.el-checkbox__label), .vm-boot-entry-login-jump :deep(.el-checkbox__label) { padding-left: 6px; color: var(--vrc-text-muted); font-size: 12px; font-weight: 400; line-height: 18px; }
+.vm-boot-entry-login-remember :deep(.el-checkbox__label), .vm-boot-entry-login-jump :deep(.el-checkbox__label) { padding-left: 6px; color: var(--vrc-text-muted); font-size: 13px; font-weight: 400; line-height: 18px; }
 .vm-boot-entry-jump-fields { display: grid; grid-template-columns: minmax(150px, 1.2fr) 84px minmax(130px, 0.9fr) minmax(180px, 1.2fr); gap: 8px; padding-top: 8px; border-top: 1px solid var(--vrc-border); }
 .vm-boot-entry-jump-fields :deep(.el-input), .vm-boot-entry-jump-fields :deep(.el-input-number) { width: 100%; height: var(--vrc-command-height); }
 .vm-boot-entry-jump-fields :deep(.el-input__wrapper), .vm-boot-entry-jump-fields :deep(.el-input-number .el-input__wrapper) { height: var(--vrc-command-height); min-height: var(--vrc-command-height); padding: 0 8px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: var(--vrc-command-radius); box-shadow: none; }
@@ -319,10 +319,10 @@ function confirm() {
 .vm-boot-entry-list { display: grid; gap: 8px; }
 .vm-boot-entry-copy { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .vm-boot-entry-copy > span { display: grid; gap: 2px; }
-.vm-boot-entry-copy strong { font-size: 13px; font-weight: 500; }
-.vm-boot-entry-copy small { color: var(--vrc-text-muted); font-size: 11px; line-height: 16px; }
-.vm-boot-entry-config { padding: 1px 6px; color: var(--vrc-text-subtle); font-size: 10px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 4px; white-space: nowrap; }
-.vm-boot-entry-message { display: flex; align-items: flex-start; gap: 6px; padding: 7px 9px; color: var(--vrc-warning); font-size: 11px; line-height: 16px; background: var(--vrc-status-warning-soft); border: 1px solid var(--vrc-border); border-radius: 5px; }
+.vm-boot-entry-copy strong { font-size: 14px; font-weight: 500; }
+.vm-boot-entry-copy small { color: var(--vrc-text-muted); font-size: 12px; line-height: 17px; }
+.vm-boot-entry-config { padding: 1px 6px; color: var(--vrc-text-muted); font-size: 11px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 4px; white-space: nowrap; }
+.vm-boot-entry-message { display: flex; align-items: flex-start; gap: 6px; padding: 7px 9px; color: var(--vrc-warning); font-size: 12px; line-height: 17px; background: var(--vrc-status-warning-soft); border: 1px solid var(--vrc-border); border-radius: 5px; }
 .vm-boot-entry-message .el-icon { margin-top: 2px; }
 .vm-boot-entry-radios { display: grid; gap: 6px; max-height: 300px; overflow-y: auto; padding: 2px; }
 .vm-boot-entry-radios > button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 10px; text-align: left; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; cursor: pointer; }
@@ -333,19 +333,20 @@ function confirm() {
 .vm-boot-entry-radios > button.active .vm-boot-entry-radio { border-color: var(--vrc-accent); }
 .vm-boot-entry-radios > button.active .vm-boot-entry-radio::after { position: absolute; inset: 3px; background: var(--vrc-accent); border-radius: 50%; content: ""; }
 .vm-boot-entry-entry-copy { display: grid; gap: 1px; min-width: 0; flex: 1; }
-.vm-boot-entry-entry-copy strong { overflow: hidden; font-size: 12px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
-.vm-boot-entry-entry-copy small { color: var(--vrc-text-subtle); font-size: 10px; }
-.vm-boot-entry-radios > button em { flex: 0 0 auto; padding: 1px 6px; color: var(--vrc-accent); font-size: 10px; font-style: normal; background: var(--vrc-accent-soft); border: 1px solid var(--vrc-border-strong); border-radius: 4px; }
+.vm-boot-entry-entry-copy strong { overflow: hidden; font-size: 13px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+.vm-boot-entry-entry-copy small { color: var(--vrc-text-muted); font-size: 12px; }
+.vm-boot-entry-radios > button em { flex: 0 0 auto; padding: 1px 6px; color: var(--vrc-accent); font-size: 11px; font-style: normal; background: var(--vrc-accent-soft); border: 1px solid var(--vrc-border-strong); border-radius: 4px; }
 .vm-boot-entry-skip { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px; padding: 9px 11px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; cursor: pointer; }
 .vm-boot-entry-skip.active { border-color: var(--vrc-border-strong); background: var(--vrc-surface-raised); }
 .vm-boot-entry-skip input { margin-top: 2px; accent-color: var(--vrc-accent); }
 .vm-boot-entry-skip > span { display: grid; gap: 1px; }
-.vm-boot-entry-skip strong { font-size: 12px; font-weight: 400; }
-.vm-boot-entry-skip small { color: var(--vrc-text-subtle); font-size: 11px; }
-.vm-boot-entry-saving { margin-top: 10px; color: var(--vrc-text-muted); font-size: 12px; }
+.vm-boot-entry-skip strong { font-size: 13px; font-weight: 400; }
+.vm-boot-entry-skip small { color: var(--vrc-text-muted); font-size: 12px; }
+.vm-boot-entry-saving { margin-top: 10px; color: var(--vrc-text-muted); font-size: 13px; }
 .vm-boot-entry-error { margin-top: 10px; color: var(--vrc-danger); font-size: 12px; line-height: 18px; }
 .vm-boot-entry-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.vm-boot-entry-footer-hint { overflow: hidden; color: var(--vrc-text-subtle); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.vm-boot-entry-footer > div { display: flex; align-items: center; gap: 8px; }
+.vm-boot-entry-footer-hint { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--vrc-text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .vm-boot-entry-footer :deep(.el-button) { min-width: 92px; height: var(--vrc-command-height); margin: 0; border-radius: var(--vrc-command-radius); }
 @media (max-width: 760px) {
   .vm-boot-entry-login-fields, .vm-boot-entry-jump-fields { grid-template-columns: 1fr; }
