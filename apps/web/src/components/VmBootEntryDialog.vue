@@ -198,7 +198,7 @@ function confirm() {
 
     <div v-else-if="bootEntries && entries.length" class="vm-boot-entry-list">
       <div class="vm-boot-entry-copy">
-        <span><strong>选择下一次启动的内核</strong><small>本次{{ action === "shutdown" ? "关机后再次开机" : "重启" }}进入所选内核，之后恢复系统默认启动项。</small></span>
+        <strong>选择下一次启动的内核</strong>
         <span class="vm-boot-entry-config">{{ bootEntries.config }}</span>
       </div>
       <div v-if="bootEntries.message" class="vm-boot-entry-message">
@@ -248,10 +248,7 @@ function confirm() {
 
     <label class="vm-boot-entry-skip" :class="{ active: skipBootEntry }">
       <input v-model="skipBootEntry" type="checkbox" :disabled="loading || saving" />
-      <span>
-        <strong>不指定启动项，按系统默认启动</strong>
-        <small>不修改 GRUB 一次性启动项</small>
-      </span>
+      <strong>不指定启动项，按系统默认启动</strong>
     </label>
 
     <div v-if="saving" class="vm-boot-entry-saving" role="status">正在设置下次启动内核并{{ action === "shutdown" ? "关机" : "重启" }}…</div>
@@ -318,9 +315,7 @@ function confirm() {
 .vm-boot-entry-jump-fields :deep(.el-input__wrapper.is-focus) { border-color: var(--vrc-accent); }
 .vm-boot-entry-list { display: grid; gap: 8px; }
 .vm-boot-entry-copy { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-.vm-boot-entry-copy > span { display: grid; gap: 2px; }
 .vm-boot-entry-copy strong { font-size: 14px; font-weight: 500; }
-.vm-boot-entry-copy small { color: var(--vrc-text-muted); font-size: 12px; line-height: 17px; }
 .vm-boot-entry-config { color: var(--vrc-text-muted); font-family: var(--vrc-font-mono); font-size: 12px; white-space: nowrap; user-select: all; }
 .vm-boot-entry-message { display: flex; align-items: flex-start; gap: 6px; padding: 7px 9px; color: var(--vrc-warning); font-size: 12px; line-height: 17px; background: var(--vrc-status-warning-soft); border: 1px solid var(--vrc-border); border-radius: 5px; }
 .vm-boot-entry-message .el-icon { margin-top: 2px; }
@@ -339,9 +334,7 @@ function confirm() {
 .vm-boot-entry-skip { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px; padding: 9px 11px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; cursor: pointer; }
 .vm-boot-entry-skip.active { border-color: var(--vrc-border-strong); background: var(--vrc-surface-raised); }
 .vm-boot-entry-skip input { margin-top: 2px; accent-color: var(--vrc-accent); }
-.vm-boot-entry-skip > span { display: grid; gap: 1px; }
 .vm-boot-entry-skip strong { font-size: 13px; font-weight: 400; }
-.vm-boot-entry-skip small { color: var(--vrc-text-muted); font-size: 12px; }
 .vm-boot-entry-saving { margin-top: 10px; color: var(--vrc-text-muted); font-size: 13px; }
 .vm-boot-entry-error { margin-top: 10px; color: var(--vrc-danger); font-size: 12px; line-height: 18px; }
 .vm-boot-entry-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; text-align: left; }
