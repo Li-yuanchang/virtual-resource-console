@@ -22,6 +22,11 @@ import { isoSourceLabel } from "./domain/provisioningStrategies";
 import { SecureRequestError, secureJsonRequest } from "./domain/secureRequest";
 import { createVmListReconciler } from "./domain/vmListReconciliation";
 import { vmPowerActionRowPatch } from "./domain/vmPowerState";
+import {
+  buildStartKernelReminder,
+  cachedBootEntryKernelCount,
+  rememberBootEntryKernelCount,
+} from "./domain/bootEntryReminder";
 import type {
   HostsResponse,
   GuestBootEntryList,
@@ -778,6 +783,7 @@ const bootEntryList = ref<GuestBootEntryList | null>(null);
 const bootEntryLoading = ref(false);
 const bootEntryError = ref("");
 const bootEntryAuthRequired = ref(false);
+// 内核数本地缓存实现见 domain/bootEntryReminder.ts（只存数量、不存凭据）。
 // 虚拟机诊断功能暂未开放：先整体屏蔽前端入口，功能完善后再放开（改回 true 即恢复）。
 const HOST_DIAGNOSTICS_ENABLED = false;
 const hostDiagnosticsVisible = ref(false);
@@ -5205,22 +5211,44 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
   const vmTarget = `${hostName} / ${vm.name}`;
   const vmActionDetail = `${providerLabel(connection.providerType)} · ${displayVmIp(vm)} · ${displayGuestOs(vm)}`;
 
-  // 关机 / 重启前先让用户选择下次启动内核；确认后走 handleBootEntryConfirm 二次确认并提交。
-  if (action === "shutdown" || action === "forceReboot") {
+  // 仅重启前让用户选择下次启动内核（机器运行中，可真实设置一次性启动项）；
+  // 关机不再选择内核：内核选择只对“下次启动”有意义，开机时再提醒。
+  if (action === "forceReboot") {
     bootEntryDialogVm.value = vm;
     bootEntryDialogAction.value = action;
     bootEntryList.value = null;
     bootEntryError.value = "";
     bootEntryAuthRequired.value = false;
-    bootEntryVisible.value = true;
+    // 先不弹窗：静默读取内核列表后，按数量决定是否弹选择框（多内核才弹）。
+    bootEntryVisible.value = false;
     pushActivity(`请求${meta.label}`, {
       target: vmTarget,
-      detail: "等待选择启动内核",
+      detail: "等待读取启动内核",
       status: "pending",
     });
     void loadVmBootEntries(vm);
     return;
   }
+
+  // 开机确认时，若近期读取过该虚拟机内核列表且多于 1 个，附上“按默认内核启动”的提醒。
+  const detail = action === "start" ? buildStartActionDetail(vm, connection.providerType) : undefined;
+  await handleVmActionPlain(action, vm, detail);
+}
+
+/**
+ * 普通二次确认 + 提交 VM 电源操作（关机 / 开机 / 删除；重启选内核走独立流程）。
+ *
+ * @param action 电源操作类型
+ * @param vm 目标虚拟机
+ * @param detailOverride 可选的确认文案覆盖（如开机时附加内核提醒），缺省用 vmActionDescription
+ */
+async function handleVmActionPlain(action: VmPowerAction, vm: VmNode, detailOverride?: string) {
+  const payload = buildConnectionPayload();
+  if (!payload) return;
+  const meta = vmActionMeta(action);
+  const hostName = selectedHost.value?.name || connection.host;
+  const vmTarget = `${hostName} / ${vm.name}`;
+  const vmActionDetail = `${providerLabel(connection.providerType)} · ${displayVmIp(vm)} · ${displayGuestOs(vm)}`;
 
   try {
     pushActivity(`请求${meta.label}`, {
@@ -5232,7 +5260,7 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
       heading: meta.confirmHeading,
       tone: meta.confirmTone,
       summary: `${hostName} / ${vm.name}`,
-      detail: vmActionDescription(action, connection.providerType),
+      detail: detailOverride ?? vmActionDescription(action, connection.providerType),
       confirmButtonText: meta.confirmButtonText,
       customClass: meta.customClass,
     });
@@ -5255,6 +5283,19 @@ async function handleVmAction(action: VmPowerAction, vm: VmNode) {
   }
 
   await executeVmAction(action, vm);
+}
+
+/**
+ * 组装开机确认文案：近期缓存到该虚拟机有多个启动内核时，附加“按默认内核启动”提醒。
+ *
+ * @param vm 目标虚拟机
+ * @param providerType 平台类型
+ * @returns 确认弹窗详情文案
+ */
+function buildStartActionDetail(vm: VmNode, providerType: ProviderType) {
+  const base = vmActionDescription("start", providerType);
+  const count = cachedBootEntryKernelCount(vm.providerId)?.count ?? null;
+  return buildStartKernelReminder(base, count);
 }
 
 async function handleBootEntryConfirm(
@@ -5334,20 +5375,29 @@ async function loadVmBootEntries(vm: VmNode, systemCredentials?: VmSystemCredent
       systemCredentials,
       rememberSystemCredentials,
     });
-    if (bootEntryDialogVm.value?.providerId === vm.providerId) {
-      bootEntryList.value = response;
-      bootEntryError.value = "";
-      bootEntryAuthRequired.value = false;
+    if (bootEntryDialogVm.value?.providerId !== vm.providerId) return;
+    bootEntryList.value = response;
+    bootEntryError.value = "";
+    bootEntryAuthRequired.value = false;
+    rememberBootEntryKernelCount(vm.providerId, response.entries.length);
+    // 内核列表已拿到：多于 1 个才弹选择框；单内核 / 无可选内核直接按普通重启确认，
+    // 全程不弹启动项对话框，避免“一闪而过”。
+    if (response.entries.length > 1) {
+      bootEntryVisible.value = true;
+    } else {
+      bootEntryVisible.value = false;
+      void handleVmActionPlain(bootEntryDialogAction.value ?? "forceReboot", vm);
     }
   } catch (error) {
-    if (bootEntryDialogVm.value?.providerId === vm.providerId) {
-      if (error instanceof SecureRequestError && error.code === "SYSTEM_AUTHENTICATION_REQUIRED") {
-        bootEntryAuthRequired.value = true;
-        bootEntryError.value = "需要虚拟机系统账号";
-      } else {
-        bootEntryError.value = error instanceof Error ? error.message : "读取虚拟机启动项失败";
-      }
+    if (bootEntryDialogVm.value?.providerId !== vm.providerId) return;
+    if (error instanceof SecureRequestError && error.code === "SYSTEM_AUTHENTICATION_REQUIRED") {
+      bootEntryAuthRequired.value = true;
+      bootEntryError.value = "需要虚拟机系统账号";
+    } else {
+      bootEntryError.value = error instanceof Error ? error.message : "读取虚拟机启动项失败";
     }
+    // 读取失败（含需要系统账号）时需要用户交互：弹窗提供重试或按默认启动继续。
+    bootEntryVisible.value = true;
   } finally {
     if (bootEntryDialogVm.value?.providerId === vm.providerId) {
       bootEntryLoading.value = false;
@@ -5477,8 +5527,8 @@ async function handleBatchVmAction(action: VmPowerAction, rows: VmNode[]) {
     skippedCount ? `跳过：${skippedCount} 台状态不满足条件` : "",
     vmActionDescription(action, connection.providerType),
     action === "start" ? "说明：批量开机不会自动打开多个控制台，可在完成后点击 VM 名称查看。" : "",
-    action === "forceReboot" || action === "shutdown"
-      ? "说明：批量操作不指定下次启动内核，按系统默认启动项启动；如需选择内核请单台操作。"
+    action === "forceReboot"
+      ? "说明：批量重启不指定下次启动内核，按系统默认启动项启动；如需选择内核请单台操作。"
       : "",
     batchVmNames,
     actionableRows.length > 8 ? `... 还有 ${actionableRows.length - 8} 台` : "",

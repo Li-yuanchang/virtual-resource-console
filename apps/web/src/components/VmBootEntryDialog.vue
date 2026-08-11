@@ -199,7 +199,7 @@ function confirm() {
     <div v-else-if="bootEntries && entries.length" class="vm-boot-entry-list">
       <div class="vm-boot-entry-copy">
         <span><strong>选择下一次启动的内核</strong><small>本次{{ action === "shutdown" ? "关机后再次开机" : "重启" }}进入所选内核，之后恢复系统默认启动项。</small></span>
-        <code class="vm-boot-entry-config">{{ bootEntries.config }}</code>
+        <span class="vm-boot-entry-config">{{ bootEntries.config }}</span>
       </div>
       <div v-if="bootEntries.message" class="vm-boot-entry-message">
         <el-icon aria-hidden="true"><Warning /></el-icon>
@@ -321,7 +321,7 @@ function confirm() {
 .vm-boot-entry-copy > span { display: grid; gap: 2px; }
 .vm-boot-entry-copy strong { font-size: 14px; font-weight: 500; }
 .vm-boot-entry-copy small { color: var(--vrc-text-muted); font-size: 12px; line-height: 17px; }
-.vm-boot-entry-config { padding: 1px 6px; color: var(--vrc-text-muted); font-size: 11px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 4px; white-space: nowrap; }
+.vm-boot-entry-config { color: var(--vrc-text-muted); font-family: var(--vrc-font-mono); font-size: 12px; white-space: nowrap; user-select: all; }
 .vm-boot-entry-message { display: flex; align-items: flex-start; gap: 6px; padding: 7px 9px; color: var(--vrc-warning); font-size: 12px; line-height: 17px; background: var(--vrc-status-warning-soft); border: 1px solid var(--vrc-border); border-radius: 5px; }
 .vm-boot-entry-message .el-icon { margin-top: 2px; }
 .vm-boot-entry-radios { display: grid; gap: 6px; max-height: 300px; overflow-y: auto; padding: 2px; }
@@ -344,9 +344,9 @@ function confirm() {
 .vm-boot-entry-skip small { color: var(--vrc-text-muted); font-size: 12px; }
 .vm-boot-entry-saving { margin-top: 10px; color: var(--vrc-text-muted); font-size: 13px; }
 .vm-boot-entry-error { margin-top: 10px; color: var(--vrc-danger); font-size: 12px; line-height: 18px; }
-.vm-boot-entry-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.vm-boot-entry-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; text-align: left; }
 .vm-boot-entry-footer > div { display: flex; align-items: center; gap: 8px; }
-.vm-boot-entry-footer-hint { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--vrc-text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.vm-boot-entry-footer-hint { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--vrc-text-muted); font-size: 12px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .vm-boot-entry-footer :deep(.el-button) { min-width: 92px; height: var(--vrc-command-height); margin: 0; border-radius: var(--vrc-command-radius); }
 @media (max-width: 760px) {
   .vm-boot-entry-login-fields, .vm-boot-entry-jump-fields { grid-template-columns: 1fr; }
