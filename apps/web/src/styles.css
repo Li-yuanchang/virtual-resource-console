@@ -1867,7 +1867,7 @@ textarea,
 .metric-card {
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
   min-height: 78px;
   padding: 9px 12px;
 }
@@ -1875,6 +1875,12 @@ textarea,
 .metric-label {
   color: var(--vrc-text-muted);
   font-size: 11px;
+}
+
+.metric-card > .metric-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 16px;
 }
 
 .metric-label-row {
@@ -1924,7 +1930,7 @@ textarea,
   margin-top: 3px;
   overflow: hidden;
   color: var(--vrc-text-muted);
-  font-size: 11px;
+  font-size: 10px;
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1934,13 +1940,17 @@ textarea,
   background: var(--vrc-surface);
 }
 
+.host-card > strong {
+  margin-top: 6px;
+}
+
 .metric-main {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 
 .metric-main strong,
@@ -1958,11 +1968,11 @@ textarea,
 
 .memory-capacity-primary {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 
 .memory-capacity-primary > span {
@@ -1988,17 +1998,21 @@ textarea,
 }
 
 .memory-capacity-detail {
-  display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr);
-  gap: 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   min-width: 0;
   margin-top: 3px;
+  overflow: hidden;
   color: var(--vrc-text-muted);
-  font-size: 11px;
+  font-size: 10px;
   line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .memory-capacity-detail > span {
+  display: inline;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2020,6 +2034,11 @@ textarea,
   color: var(--vrc-text);
   font-size: 11px;
   line-height: 1.35;
+}
+
+/* 存储卡片：内容顶部固定对齐，避免 1 行/2 行时垂直居中导致布局浮动 */
+.storage-metric-card {
+  justify-content: flex-start;
 }
 
 .storage-metric-card .metric-label-row {
@@ -2107,11 +2126,56 @@ textarea,
   font-weight: var(--vrc-font-weight-regular);
 }
 
+/* 卡片主值旁的百分比：超分/剩余占比着色（V1 原型口径） */
+.metric-pct {
+  flex: 0 0 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-main .metric-pct,
+.memory-capacity-primary .metric-pct {
+  color: var(--vrc-text-muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.metric-pct.is-ok {
+  color: var(--vrc-success);
+}
+
+.metric-pct.is-warn,
+.metric-pct.is-warning {
+  color: var(--vrc-warning);
+}
+
+.metric-pct.is-danger {
+  color: var(--vrc-danger);
+}
+
+.metric-pct.is-info {
+  color: var(--vrc-info);
+}
+
+/* 卡片辅助行内的数字加粗（V1 原型 .sub b） */
+.metric-card small b,
+.memory-capacity-detail b {
+  color: var(--vrc-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .mini-meter {
   display: flex;
   width: 100%;
   height: 4px;
-  margin-top: 6px;
+  margin-top: auto;
   overflow: hidden;
   background: color-mix(in srgb, var(--vrc-accent) 10%, var(--vrc-surface-muted));
   border-radius: 999px;
@@ -7000,6 +7064,18 @@ button:focus-visible,
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.storage-detail-section-title > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-detail-section-title .storage-allocation-filter {
+  flex-shrink: 0;
+}
+
 .resource-detail-summary > div {
   display: grid;
   align-content: center;
@@ -7075,6 +7151,10 @@ button:focus-visible,
 
 .resource-detail-table .resource-detail-nowrap .cell {
   white-space: nowrap;
+}
+
+.storage-resource-detail-table.el-table {
+  width: 100%;
 }
 
 .storage-type-cell {
@@ -12197,6 +12277,47 @@ button:focus-visible,
   background: linear-gradient(90deg, color-mix(in srgb, var(--vrc-warning) 72%, white), var(--vrc-warning));
 }
 
+.overview-resource-cell.danger .overview-resource-meter i {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--vrc-danger) 72%, white), var(--vrc-danger));
+}
+
+/* 总览表格存储列：主行（分类/剩余 + 剩余占比文本） */
+.overview-storage-main {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.overview-storage-main strong {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.overview-storage-pct {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+.overview-storage-pct.is-ok {
+  color: var(--vrc-success);
+}
+
+.overview-storage-pct.is-warn {
+  color: var(--vrc-warning);
+}
+
+.overview-storage-pct.is-danger {
+  color: var(--vrc-danger);
+}
+
 .overview-host-cell {
   display: grid;
   justify-items: start;
@@ -12297,6 +12418,12 @@ button:focus-visible,
   line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.resource-check strong .storage-pct {
+  margin-left: 4px;
+  font-size: 10px;
+  vertical-align: 1px;
 }
 
 .resource-check.is-blocking {
@@ -12742,9 +12869,19 @@ button:focus-visible,
   min-height: 22px;
 }
 
-.provision-auto-start .el-checkbox__label {
+.provision-auto-start-hint {
   color: var(--vrc-text-muted);
   font-size: 12px;
+  line-height: 22px;
+}
+
+.provision-auto-start-fixed::before {
+  content: "\2713";
+  display: inline-block;
+  width: 14px;
+  color: var(--vrc-accent, #409eff);
+  font-size: 12px;
+  margin-right: 4px;
 }
 
 .quick-form-card .el-input__wrapper,
@@ -14114,4 +14251,368 @@ button:focus-visible,
   .overview-metric-strip {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* ===== 存储池详情：汇总对齐 + 分类/剩余高亮 ===== */
+.storage-detail-summary {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.storage-summary-focus {
+  background: color-mix(in srgb, var(--vrc-accent) 8%, transparent);
+}
+
+.storage-summary-focus span {
+  color: var(--vrc-accent) !important;
+  font-weight: 600 !important;
+}
+
+.storage-summary-focus strong {
+  color: var(--vrc-accent) !important;
+  font-size: 17px !important;
+  font-weight: var(--vrc-font-weight-heading) !important;
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-detail-item.storage-detail-hba strong {
+  color: var(--vrc-accent);
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.storage-detail-item.storage-detail-local strong {
+  color: var(--vrc-success);
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.storage-detail-item.storage-detail-file strong {
+  color: var(--vrc-warning);
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.storage-detail-item small {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 存储池详情汇总：剩余占比文本紧跟在剩余数字后（剩余语义，与主卡一致） */
+.storage-detail-item strong .storage-pct {
+  margin-left: 3px;
+  vertical-align: 1px;
+}
+
+/* 存储池详情表格「剩余」列：剩余值 + 剩余占比文本 + 已用占比进度条 */
+.storage-detail-free-cell {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 4px 0;
+}
+
+.storage-detail-free-line {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.storage-detail-free-line .storage-pct {
+  flex: 0 0 auto;
+}
+
+.storage-category-text {
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-category-text.storage-category-hba {
+  color: var(--vrc-accent);
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.storage-category-text.storage-category-local,
+.storage-category-text.storage-category-vm {
+  color: var(--vrc-success);
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.storage-category-text.storage-category-file {
+  color: var(--vrc-warning);
+}
+
+.storage-category-text.storage-category-iso,
+.storage-category-text.storage-category-media,
+.storage-category-text.storage-category-backup,
+.storage-category-text.storage-category-other {
+  color: var(--vrc-text-muted);
+}
+
+.storage-free-value {
+  font-size: 13px;
+  font-weight: var(--vrc-font-weight-heading);
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-free-value.is-ok {
+  color: var(--vrc-success);
+}
+
+.storage-free-value.is-warning {
+  color: var(--vrc-warning);
+}
+
+.storage-free-value.is-danger {
+  color: var(--vrc-danger);
+}
+
+/* ===== 主卡存储卡片：HBA/LVM 明细行（剩余占比文本 + 已用占比进度条 + 健康度着色） ===== */
+.storage-card-rows {
+  display: grid;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.storage-row {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.storage-row-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: nowrap;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--vrc-text-muted);
+  white-space: nowrap;
+}
+
+.storage-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  font-weight: var(--vrc-font-weight-heading);
+  color: var(--vrc-text);
+}
+
+.storage-free {
+  color: var(--vrc-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-free b {
+  font-size: 12px;
+  font-weight: var(--vrc-font-weight-heading);
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-row-hba .storage-free b {
+  color: var(--vrc-accent);
+}
+
+.storage-row-local .storage-free b {
+  color: var(--vrc-success);
+}
+
+.storage-row-file .storage-free b {
+  color: var(--vrc-warning);
+}
+
+.storage-pct {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-pct.is-ok {
+  color: var(--vrc-success);
+}
+
+.storage-pct.is-warn {
+  color: var(--vrc-warning);
+}
+
+.storage-pct.is-danger {
+  color: var(--vrc-danger);
+}
+
+.storage-used {
+  margin-left: auto;
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+}
+
+.storage-remain-bar {
+  display: block;
+  width: 100%;
+  height: 4px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--vrc-accent) 10%, var(--vrc-surface-muted));
+  border-radius: 999px;
+}
+
+.storage-remain-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}
+
+.storage-remain-bar.is-ok i {
+  background: var(--vrc-success);
+}
+
+.storage-remain-bar.is-warn i {
+  background: var(--vrc-warning);
+}
+
+.storage-remain-bar.is-danger i {
+  background: var(--vrc-danger);
+}
+
+/* ===== 主卡存储卡片：仅一项分类存储（HBA/LVM）时同内存容量卡布局 ===== */
+.storage-single {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.storage-single-primary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.storage-single-primary .storage-free {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vrc-text);
+  font-size: 15px;
+  font-weight: var(--vrc-font-weight-heading);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-single-primary .storage-free b {
+  font-size: inherit;
+  font-weight: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-row-hba .storage-single-primary .storage-free b {
+  color: var(--vrc-accent);
+}
+
+.storage-row-local .storage-single-primary .storage-free b {
+  color: var(--vrc-success);
+}
+
+.storage-single-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vrc-text-muted);
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-single-sub > span {
+  display: inline;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-single-sub b {
+  color: var(--vrc-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== 主卡存储卡片：总体模式（剩余 hero + 占比文本 + 已用占比进度条 + HBA/LVM 分布） ===== */
+.storage-overall-hero {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.storage-hero-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: nowrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.storage-hero-line .storage-free {
+  color: var(--vrc-text);
+  font-size: 11px;
+}
+
+.storage-hero-line .storage-free b {
+  font-size: 16px;
+  color: var(--vrc-accent);
+}
+
+.storage-hero-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--vrc-text-muted);
+  white-space: nowrap;
+}
+
+.storage-hero-sub b {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--vrc-text);
+}
+
+.storage-hero-breakdown {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: nowrap;
+  gap: 12px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10.5px;
+  color: var(--vrc-text-muted);
+  white-space: nowrap;
+}
+
+.storage-breakdown-item {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.storage-breakdown-item b {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--vrc-text);
 }

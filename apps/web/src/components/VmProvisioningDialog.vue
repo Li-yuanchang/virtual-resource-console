@@ -133,6 +133,8 @@ const props = defineProps<{
   vms: VmNode[];
   reservedIps: string[];
   storageTotals: StorageTotals;
+  storageDisplayMode?: "overall" | "hba-lvm";
+  storagePoolHighlights?: Array<{ kind: "hba" | "local" | "file"; label: string; note: string; freeGiB: number; usedGiB: number; totalGiB: number; percent: number }>;
   submitting: boolean;
   progress: ProvisioningProgressState | null;
   provisionTask: ProvisionTask | null;
@@ -318,6 +320,7 @@ const effectiveProvisioningSpec = computed<ProvisioningSpecTemplate>(() => {
   };
 });
 const storageFreeGiB = computed(() => Math.max(props.storageTotals.physicalGiB - props.storageTotals.usedGiB, 0));
+const storagePoolHighlights = computed(() => props.storagePoolHighlights ?? []);
 const runningVcpuForCreate = computed(() =>
   props.vms.filter((vm) => vm.powerState === "running").reduce((sum, vm) => sum + vm.cpuCount, 0),
 );
@@ -332,9 +335,44 @@ const cpuResourceCheckText = computed(
 const memoryResourceCheckText = computed(
   () => `${props.host ? formatBytes(props.host.memoryFreeBytes ?? 0) : "-"} · 本次 ${formatNumber(provisioningPlan.value?.items.reduce((sum, item) => sum + item.memoryGiB, 0) ?? 0)} GiB`,
 );
-const storageResourceCheckText = computed(
-  () => `${formatNumber(storageFreeGiB.value)} GiB · 本次 ${formatNumber(provisioningPlan.value?.items.reduce((sum, item) => sum + item.systemDiskGiB + item.dataDiskGiB, 0) ?? 0)} GiB`,
-);
+const provisioningDiskNeedGiB = computed(() => provisioningPlan.value?.items.reduce((sum, item) => sum + item.systemDiskGiB + item.dataDiskGiB, 0) ?? 0);
+const storageResourceCheckText = computed(() => {
+  // HBA+LVM 模式：以可分配主类型（HBA 优先）的剩余容量为准，正常安装虚拟机以 HBA 盘为主
+  if (props.storageDisplayMode === "hba-lvm" && storagePoolHighlights.value.length) {
+    const primary = storagePoolHighlights.value[0];
+    return `${storageHighlightShortLabel(primary.kind)} 剩余 ${formatNumber(primary.freeGiB)} GiB · 本次 ${formatNumber(provisioningDiskNeedGiB.value)} GiB`;
+  }
+  return `${formatNumber(storageFreeGiB.value)} GiB · 本次 ${formatNumber(provisioningDiskNeedGiB.value)} GiB`;
+});
+const storageResourceCheckTooltip = computed(() => {
+  const head =
+    props.storageDisplayMode === "hba-lvm" && storagePoolHighlights.value.length
+      ? storagePoolHighlights.value.map((item) => `${storageHighlightShortLabel(item.kind)} 剩余 ${formatNumber(item.freeGiB)} GiB`).join(" · ")
+      : `总体剩余 ${formatNumber(storageFreeGiB.value)} GiB`;
+  return `${head} · 本次 ${formatNumber(provisioningDiskNeedGiB.value)} GiB`;
+});
+// 存储可用剩余占比（剩余语义，与主卡/总览一致），作为检查卡上的占比徽标
+const storageResourceCheckPercent = computed<number | null>(() => {
+  if (props.storageDisplayMode === "hba-lvm" && storagePoolHighlights.value.length) {
+    const primary = storagePoolHighlights.value[0];
+    return Math.max(100 - primary.percent, 0);
+  }
+  if (!props.storageTotals.physicalGiB) return null;
+  return Math.max(100 - Math.round((props.storageTotals.usedGiB / props.storageTotals.physicalGiB) * 100), 0);
+});
+const storageResourceCheckHealth = computed<"ok" | "warn" | "danger">(() => {
+  const pct = storageResourceCheckPercent.value;
+  if (pct == null) return "ok";
+  const freeGiB = props.storageDisplayMode === "hba-lvm" && storagePoolHighlights.value.length ? storagePoolHighlights.value[0].freeGiB : storageFreeGiB.value;
+  if (pct < 20) return "danger";
+  if (pct < 40 || freeGiB < 500) return "warn";
+  return "ok";
+});
+function storageHighlightShortLabel(kind: "hba" | "local" | "file") {
+  if (kind === "hba") return "虚拟 HBA";
+  if (kind === "local") return "物理 LVM";
+  return "文件存储";
+}
 const provisioningStatusText = computed(() => {
   if (canSubmit.value) return "可提交创建";
   if (provisioningPoolError.value) return "IP 池配置异常";
@@ -817,7 +855,7 @@ function applyEnvironmentTemplate() {
   applyProvisioningSpec();
   selectProvisioningPool(template.ipPoolId);
   provisioningForm.vmNamePrefix = template.vmNamePrefix;
-  provisioningForm.autoStart = template.autoStart;
+  provisioningForm.autoStart = true; // 固定开启：创建后必须自动启动并打开控制台，不允许模板覆盖为关闭
   provisioningForm.installProfile = template.installProfile;
   if (template.sourceType === "iso") {
     provisioningForm.isoId = resolveTemplateIsoId(template);
@@ -1162,7 +1200,7 @@ function submitProvisioning() {
     vmNamePrefix: provisioningForm.vmNamePrefix.trim(),
     count: Math.max(Math.floor(provisioningForm.count), 1),
     ipPool: currentProvisioningPoolDraft(),
-    autoStart: provisioningForm.autoStart,
+    autoStart: true, // 固定开启：创建后自动启动并打开控制台
     planItems: plan.items.map((item) => ({
       name: item.name,
       ip: item.ip,
@@ -1563,9 +1601,11 @@ type ProvisioningSourceType = "iso" | "template";
           <span>内存可用</span>
           <strong data-overflow-target>{{ memoryResourceCheckText }}</strong>
         </VrcOverflowTooltip>
-        <VrcOverflowTooltip :content="storageResourceCheckText" class="resource-check" tabindex="0">
+        <VrcOverflowTooltip :content="storageResourceCheckTooltip" class="resource-check" tabindex="0">
           <span>存储可用</span>
-          <strong data-overflow-target>{{ storageResourceCheckText }}</strong>
+          <strong data-overflow-target>
+            {{ storageResourceCheckText }}<em v-if="storageResourceCheckPercent != null" class="storage-pct" :class="`is-${storageResourceCheckHealth}`">{{ storageResourceCheckPercent }}%</em>
+          </strong>
         </VrcOverflowTooltip>
         <VrcOverflowTooltip
           :content="provisioningStatusTooltip"
@@ -1653,7 +1693,9 @@ type ProvisioningSourceType = "iso" | "template";
               <el-input v-if="provisioningAccountPolicy.requiresUsername" v-model="provisioningForm.loginUsername" placeholder="例如 ubuntu" :disabled="provisioningFormLocked" />
               <el-input v-else :model-value="provisioningAccountPolicy.defaultUsername" readonly :disabled="provisioningFormLocked" />
             </label>
-            <el-checkbox v-model="provisioningForm.autoStart" class="provision-auto-start" :disabled="provisioningFormLocked">创建后启动并打开控制台</el-checkbox>
+            <div class="provision-auto-start provision-auto-start-fixed" title="创建完成后自动启动虚拟机，并自动打开控制台（固定开启，无需手动操作）">
+              <span class="provision-auto-start-hint">创建后自动启动并打开控制台（固定开启）</span>
+            </div>
           </section>
         </div>
 

@@ -121,6 +121,8 @@ export interface StorageRepository {
   usedGiB: number;
   virtualGiB: number | null;
   shared: boolean;
+  hostId?: string;
+  content?: string[];
 }
 
 export interface CapacityBreakdown {

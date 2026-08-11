@@ -42,6 +42,7 @@ import type {
   ProviderDescriptorsResponse,
   ProviderType,
   PowerState,
+  StorageRepository,
   ResourceCapacitySummary,
   StoredConnectionSummary,
   VmInventorySummary,
@@ -277,6 +278,7 @@ type WatermarkScope = "console" | "workspace";
 type WatermarkDensity = "sparse" | "standard" | "dense";
 type WorkspaceMode = "empty" | "overview" | "connection" | "settings";
 type SettingsPanel = "appearance" | "connection" | "templates" | "ipPools" | "chromeExtension" | "updates" | "maintenance" | "logs";
+type StorageDisplayMode = "overall" | "hba-lvm";
 type VmPowerFilter = "all" | "running" | "stopped";
 type TableSortOrder = "ascending" | "descending" | null;
 type HostOverviewSortKey = "hostName" | "cpuUsage" | "memoryFree" | "storageFree" | "vmTotal";
@@ -304,6 +306,7 @@ interface UiPreferences {
   showIconTooltips: boolean;
   truncateLongNames: boolean;
   throttleConsoleResize: boolean;
+  storageDisplayMode: StorageDisplayMode;
   uiFontPreset: UiFontPreset;
   uiFontSize: number;
   reduceMotion: boolean;
@@ -658,6 +661,7 @@ const defaultUiPreferences: UiPreferences = {
   showIconTooltips: true,
   truncateLongNames: true,
   throttleConsoleResize: true,
+  storageDisplayMode: "hba-lvm",
   uiFontPreset: "system",
   uiFontSize: 12,
   reduceMotion: false,
@@ -797,6 +801,8 @@ const connectionFeedbackKind = ref<"" | "success" | "error">("");
 const search = ref("");
 const vmPowerFilter = ref<VmPowerFilter>("all");
 const storageDetailVisible = ref(false);
+// 存储池详情默认只看可分配 VM 磁盘的存储池（ISO 库、可移动介质、备份存储不计入可分配容量）
+const storageAllocationFilter = ref(true);
 const isoDetailVisible = ref(false);
 const loadingIsoImages = ref(false);
 const isoImages = ref<IsoImage[]>([]);
@@ -886,6 +892,119 @@ const vmListReconciler = createVmListReconciler();
 
 const hosts = computed(() => inventory.value?.hosts ?? []);
 const storage = computed(() => inventory.value?.storage ?? []);
+// 可分配 VM 磁盘的存储池（与后端 summarizeResourceCapacity 过滤口径一致）
+const storageForAllocation = computed(() => storage.value.filter((item) => isVmDiskRepositoryForProvider(connection.providerType, item)));
+// 存储池详情展示用：受“仅看可分配”开关控制（只影响表格行，不影响顶部汇总口径）
+const storageForDetail = computed(() => (storageAllocationFilter.value ? storageForAllocation.value : storage.value));
+// 顶部汇总固定为“可分配 VM 磁盘”口径，与主卡存储卡片、物理机汇总保持一致；
+// 镜像库/可移动介质等不可分配池的容量始终不计入，避免切换开关导致数字跳变。
+const storageDetailTotals = computed(() => {
+  const physicalGiB = storageForAllocation.value.reduce((sum, sr) => sum + positive(sr.physicalGiB), 0);
+  const usedGiB = storageForAllocation.value.reduce((sum, sr) => sum + positive(sr.usedGiB), 0);
+  return {
+    physicalGiB,
+    usedGiB,
+    freeGiB: Math.max(physicalGiB - usedGiB, 0),
+    usagePercent: percent(usedGiB, physicalGiB),
+  };
+});
+type StoragePoolHighlightItem = {
+  kind: "hba" | "local" | "file";
+  label: string;
+  note: string;
+  usedGiB: number;
+  totalGiB: number;
+  freeGiB: number;
+  percent: number;
+};
+
+// 可分配存储池按用途归类：虚拟硬盘（HBA/块存储）与本地系统盘（LVM）是 VM 磁盘的主要分配目标
+const storageAllocationBreakdown = computed<{ hba: StoragePoolHighlightItem; local: StoragePoolHighlightItem; file: StoragePoolHighlightItem }>(() => {
+  let hbaUsed = 0;
+  let hbaTotal = 0;
+  let localUsed = 0;
+  let localTotal = 0;
+  let fileUsed = 0;
+  let fileTotal = 0;
+  for (const sr of storageForAllocation.value) {
+    const category = storagePoolCategory(connection.providerType, sr);
+    if (category.kind === "hba") {
+      hbaUsed += positive(sr.usedGiB);
+      hbaTotal += positive(sr.physicalGiB);
+    } else if (category.kind === "local") {
+      localUsed += positive(sr.usedGiB);
+      localTotal += positive(sr.physicalGiB);
+    } else if (category.kind === "file") {
+      fileUsed += positive(sr.usedGiB);
+      fileTotal += positive(sr.physicalGiB);
+    }
+  }
+  return {
+    hba: { kind: "hba", label: "虚拟 HBA", note: "", usedGiB: hbaUsed, totalGiB: hbaTotal, freeGiB: Math.max(hbaTotal - hbaUsed, 0), percent: percent(hbaUsed, hbaTotal) },
+    local: { kind: "local", label: "物理 LVM", note: "", usedGiB: localUsed, totalGiB: localTotal, freeGiB: Math.max(localTotal - localUsed, 0), percent: percent(localUsed, localTotal) },
+    file: { kind: "file", label: "文件存储", note: "", usedGiB: fileUsed, totalGiB: fileTotal, freeGiB: Math.max(fileTotal - fileUsed, 0), percent: percent(fileUsed, fileTotal) },
+  };
+});
+// 主卡存储卡片上的 HBA / LVM 高亮行
+const storagePoolHighlightItems = computed(() => {
+  const { hba, local, file } = storageAllocationBreakdown.value;
+  const items: StoragePoolHighlightItem[] = [];
+  if (hba.totalGiB > 0) items.push(hba);
+  if (local.totalGiB > 0) items.push(local);
+  if (file.totalGiB > 0) items.push(file);
+  return items;
+});
+// 存储池详情顶部卡片：存在 HBA/LVM 分类时，把分类剩余/已用合并进顶部卡片（替代原中间 chips 行）；
+// 无可分类存储池时回退展示整体容量六项。
+type StorageDetailSummaryItem = {
+  key: string;
+  label: string;
+  value: string;
+  kind?: "hba" | "local" | "file" | "focus";
+  sub?: string;
+  /** 剩余占比（剩余语义，与主卡/总览一致），随剩余数字后的徽标展示 */
+  pct?: number;
+  pctClass?: "ok" | "warn" | "danger";
+};
+const storageDetailSummaryItems = computed<StorageDetailSummaryItem[]>(() => {
+  const highlights = storagePoolHighlightItems.value;
+  const capacity = selectedResourceCapacity.value;
+  if (highlights.length) {
+    return [
+      { key: "count", label: "可分配存储池", value: `${storageForAllocation.value.length} 个` },
+      ...highlights.map((item) => {
+        const remaining = storageRemainingPercent(item.percent);
+        return {
+          key: item.kind,
+          label: `${item.label} 剩余`,
+          value: `${formatNumber(item.freeGiB)} GiB`,
+          kind: item.kind,
+          sub: `已用 ${formatNumber(item.usedGiB)} GiB`,
+          pct: remaining,
+          pctClass: storageRemainingHealth(remaining, item.freeGiB),
+        };
+      }),
+      { key: "physical", label: "物理总量", value: `${formatNumber(storageDetailTotals.value.physicalGiB)} GiB` },
+      { key: "virtual", label: "虚拟剩余", value: capacity ? `${formatNumber(capacity.storage.vmConfigurableGiB)} GiB` : "--" },
+    ];
+  }
+  return [
+    { key: "count", label: "可分配存储池", value: `${storageForAllocation.value.length} 个` },
+    { key: "used", label: "物理已使用", value: `${formatNumber(storageDetailTotals.value.usedGiB)} GiB` },
+    {
+      key: "free",
+      label: "物理剩余",
+      value: `${formatNumber(storageDetailTotals.value.freeGiB)} GiB`,
+      kind: "focus",
+      sub: `已用 ${formatNumber(storageDetailTotals.value.usedGiB)} GiB`,
+      pct: storageRemainingPercent(storageDetailTotals.value.usagePercent),
+      pctClass: storageRemainingHealth(storageRemainingPercent(storageDetailTotals.value.usagePercent), storageDetailTotals.value.freeGiB),
+    },
+    { key: "physical", label: "物理总量", value: `${formatNumber(storageDetailTotals.value.physicalGiB)} GiB` },
+    { key: "vm", label: "VM 已配置", value: capacity ? `${formatNumber(capacity.storage.vmConfiguredGiB)} GiB` : "--" },
+    { key: "virtual", label: "虚拟剩余", value: capacity ? `${formatNumber(capacity.storage.vmConfigurableGiB)} GiB` : "--" },
+  ];
+});
 const networks = computed(() => inventory.value?.networks ?? []);
 const selectedHost = computed(() => hosts.value.find((host) => host.providerId === selectedHostId.value) ?? hosts.value[0] ?? null);
 const selectedHostNetworks = computed(() => networks.value.filter((item) => !selectedHost.value || !item.hostId || item.hostId === selectedHost.value.providerId));
@@ -1100,8 +1219,8 @@ const hostUsage = computed(() => {
   const host = selectedHost.value;
   if (!host) return { memoryPercent: 0, storagePercent: 0, memoryUsedBytes: 0 };
   const memoryUsed = Math.max(host.memoryTotalBytes - (host.memoryFreeBytes ?? 0), 0);
-  const storagePhysical = storage.value.reduce((sum, sr) => sum + positive(sr.physicalGiB), 0);
-  const storageUsed = storage.value.reduce((sum, sr) => sum + positive(sr.usedGiB), 0);
+  const storagePhysical = storageForAllocation.value.reduce((sum, sr) => sum + positive(sr.physicalGiB), 0);
+  const storageUsed = storageForAllocation.value.reduce((sum, sr) => sum + positive(sr.usedGiB), 0);
   return {
     memoryUsedBytes: memoryUsed,
     memoryPercent: percent(memoryUsed, host.memoryTotalBytes),
@@ -1110,8 +1229,9 @@ const hostUsage = computed(() => {
 });
 
 const storageTotals = computed(() => {
-  const physicalGiB = storage.value.reduce((sum, sr) => sum + positive(sr.physicalGiB), 0);
-  const usedGiB = storage.value.reduce((sum, sr) => sum + positive(sr.usedGiB), 0);
+  // 只统计可承载 VM 磁盘的存储池，供预配弹窗与磁盘汇总使用
+  const physicalGiB = storageForAllocation.value.reduce((sum, sr) => sum + positive(sr.physicalGiB), 0);
+  const usedGiB = storageForAllocation.value.reduce((sum, sr) => sum + positive(sr.usedGiB), 0);
   return {
     physicalGiB,
     usedGiB,
@@ -1154,8 +1274,12 @@ const resourceSummary = computed(() => {
   const cpuAllocated = positive(vmTotals.value.runningVcpu);
   const memoryTotalGiB = (host?.memoryTotalBytes ?? 0) / 1024 / 1024 / 1024;
   const memoryUsedGiB = hostUsage.value.memoryUsedBytes / 1024 / 1024 / 1024;
-  const storageTotalGiB = storageTotals.value.physicalGiB;
-  const storageUsedGiB = storageTotals.value.usedGiB;
+  // 与后端 vm-summary 的 resourceCapacity.storage 口径对齐（按主机范围 + 仅可分配 VM 磁盘的池），
+  // 未加载到 summary 时退回前端同口径汇总
+  const storageCapacity = selectedResourceCapacity.value?.storage;
+  const storageTotalGiB = storageCapacity?.physicalTotalGiB ?? storageTotals.value.physicalGiB;
+  const storageUsedGiB = storageCapacity?.physicalUsedGiB ?? storageTotals.value.usedGiB;
+  const storageFreeGiB = storageCapacity?.physicalFreeGiB ?? Math.max(storageTotals.value.physicalGiB - storageTotals.value.usedGiB, 0);
 
   return [
     {
@@ -1199,11 +1323,11 @@ const resourceSummary = computed(() => {
       unit: "GiB",
       capacityUnit: "GiB",
       used: storageUsedGiB,
-      free: Math.max(storageTotalGiB - storageUsedGiB, 0),
+      free: storageFreeGiB,
       over: 0,
       total: storageTotalGiB,
       headline: `${formatNumber(storageUsedGiB)} / ${formatNumber(storageTotalGiB)} GiB`,
-      subline: `剩余 ${formatNumber(Math.max(storageTotalGiB - storageUsedGiB, 0))} GiB`,
+      subline: `剩余 ${formatNumber(storageFreeGiB)} GiB`,
       percent: percent(storageUsedGiB, storageTotalGiB),
     },
   ];
@@ -1239,7 +1363,13 @@ const hostOverviewMetricCards = computed(() => {
   const physicalCpuCores = readyRows.reduce((sum, row) => sum + hostCpuPlan(row).cores, 0);
   const runningVcpu = readyRows.reduce((sum, row) => sum + hostCpuPlan(row).allocated, 0);
   const memoryFree = readyRows.reduce((sum, row) => sum + hostMemoryPlan(row).free, 0);
+  // 存储风险口径与展示模式一致：HBA+LVM 模式按主分配盘（HBA 优先）判断，总体模式按可分配物理总体判断
   const storageTight = readyRows.filter((row) => {
+    if (uiPreferences.storageDisplayMode === "hba-lvm") {
+      const highlights = hostStorageHighlights(row);
+      const primary = highlights[0];
+      if (primary) return primary.freeGiB < 500 || primary.percent >= 85;
+    }
     const storagePlan = hostStoragePlan(row);
     return storagePlan.freeGiB < 500 || storagePlan.percent >= 85;
   }).length;
@@ -1652,6 +1782,7 @@ function applyUiPreferences(preferences: Partial<UiPreferences>) {
   uiPreferences.showIconTooltips = preferences.showIconTooltips ?? defaultUiPreferences.showIconTooltips;
   uiPreferences.truncateLongNames = preferences.truncateLongNames ?? defaultUiPreferences.truncateLongNames;
   uiPreferences.throttleConsoleResize = preferences.throttleConsoleResize ?? defaultUiPreferences.throttleConsoleResize;
+  uiPreferences.storageDisplayMode = preferences.storageDisplayMode === "overall" ? "overall" : "hba-lvm";
   uiPreferences.uiFontPreset = normalizeUiFontPreset(preferences.uiFontPreset);
   uiPreferences.uiFontSize = normalizeAppearanceNumber(preferences.uiFontSize, 11, 13, defaultUiPreferences.uiFontSize);
   uiPreferences.reduceMotion = preferences.reduceMotion ?? defaultUiPreferences.reduceMotion;
@@ -5948,8 +6079,23 @@ function hostMemoryPlan(row: HostOverviewRow) {
 }
 
 function hostStoragePlan(row: HostOverviewRow) {
-  const physicalGiB = row.inventory.storage.reduce((sum, sr) => sum + positive(sr.physicalGiB), 0);
-  const usedGiB = row.inventory.storage.reduce((sum, sr) => sum + positive(sr.usedGiB), 0);
+  // 优先使用后端 vm-summary 已按“可承载 VM 磁盘的存储池 + 主机范围”修正过的容量
+  const capacity = row.resourceCapacity?.storage;
+  if (capacity && capacity.physicalTotalGiB > 0) {
+    return {
+      physicalGiB: capacity.physicalTotalGiB,
+      usedGiB: capacity.physicalUsedGiB,
+      freeGiB: capacity.physicalFreeGiB,
+      percent: percent(capacity.physicalUsedGiB, capacity.physicalTotalGiB),
+    };
+  }
+  // 兜底：resourceCapacity 未就绪时按平台过滤（剔除 ISO 库/可移动介质/纯备份存储），并按主机范围收敛
+  const providerType = row.connection.providerType;
+  const rows = row.inventory.storage.filter(
+    (sr) => (!sr.hostId || sr.hostId === row.host.providerId) && isVmDiskRepositoryForProvider(providerType, sr),
+  );
+  const physicalGiB = rows.reduce((sum, sr) => sum + positive(sr.physicalGiB), 0);
+  const usedGiB = rows.reduce((sum, sr) => sum + positive(sr.usedGiB), 0);
   const freeGiB = Math.max(physicalGiB - usedGiB, 0);
   return {
     physicalGiB,
@@ -5957,6 +6103,32 @@ function hostStoragePlan(row: HostOverviewRow) {
     freeGiB,
     percent: percent(usedGiB, physicalGiB),
   };
+}
+
+function hostStorageHighlights(row: HostOverviewRow): Array<{ kind: "hba" | "local" | "file"; label: string; note: string; freeGiB: number; usedGiB: number; totalGiB: number; percent: number }> {
+  // 与主卡存储卡片同口径：按主机范围 + 仅可承载 VM 磁盘的存储池，归类出 HBA / LVM 明细（最多加 HBA 和 LVM）
+  const providerType = row.connection.providerType;
+  const rows = row.inventory.storage.filter(
+    (sr) => (!sr.hostId || sr.hostId === row.host.providerId) && isVmDiskRepositoryForProvider(providerType, sr),
+  );
+  let hbaUsed = 0;
+  let hbaTotal = 0;
+  let localUsed = 0;
+  let localTotal = 0;
+  for (const sr of rows) {
+    const category = storagePoolCategory(providerType, sr);
+    if (category.kind === "hba") {
+      hbaUsed += positive(sr.usedGiB);
+      hbaTotal += positive(sr.physicalGiB);
+    } else if (category.kind === "local") {
+      localUsed += positive(sr.usedGiB);
+      localTotal += positive(sr.physicalGiB);
+    }
+  }
+  const items: Array<{ kind: "hba" | "local" | "file"; label: string; note: string; freeGiB: number; usedGiB: number; totalGiB: number; percent: number }> = [];
+  if (hbaTotal > 0) items.push({ kind: "hba", label: "虚拟 HBA", note: "", freeGiB: Math.max(hbaTotal - hbaUsed, 0), usedGiB: hbaUsed, totalGiB: hbaTotal, percent: percent(hbaUsed, hbaTotal) });
+  if (localTotal > 0) items.push({ kind: "local", label: "物理 LVM", note: "", freeGiB: Math.max(localTotal - localUsed, 0), usedGiB: localUsed, totalGiB: localTotal, percent: percent(localUsed, localTotal) });
+  return items;
 }
 
 function hostRecommendation(row: HostOverviewRow) {
@@ -6062,21 +6234,96 @@ function overviewMemorySubline(row: HostOverviewRow) {
   return `已用 ${formatBytes(memory.used)} / ${formatBytes(memory.total)}`;
 }
 
+/** 剩余占比 = 100 - 已用占比（存储统计统一用剩余语义，避免“剩余 xx GiB 43%”误读） */
+function storageRemainingPercent(usedPercent: number) {
+  return Math.max(100 - usedPercent, 0);
+}
+
+/** 剩余占比健康度：≥40% 正常绿 / 20–40% 偏紧橙 / <20% 告警红；绝对剩余 <500 GiB 至少橙色。 */
+function storageRemainingHealth(remainingPercentValue: number, freeGiB: number) {
+  if (remainingPercentValue < 20) return "danger" as const;
+  if (remainingPercentValue < 40 || freeGiB < 500) return "warn" as const;
+  return "ok" as const;
+}
+
+/** 存储池详情表格单行的剩余占比（剩余语义，与主卡/总览口径一致）。 */
+function storageRowRemainingPercent(row: StorageRepository) {
+  return storageRemainingPercent(percent(positive(row.usedGiB), positive(row.physicalGiB)));
+}
+
+/** 存储池详情表格单行的剩余健康度（与剩余占比文本/进度条同色）。 */
+function storageRowRemainingHealth(row: StorageRepository) {
+  return storageRemainingHealth(storageRowRemainingPercent(row), storageFreeGiB(row));
+}
+
+/** 当前存储展示口径（HBA+LVM 取主分配类型 HBA 优先；总体取可分配物理总体）的剩余占比。 */
+function overviewStoragePercent(row: HostOverviewRow) {
+  if (!hasOverviewInventory(row)) return null;
+  if (uiPreferences.storageDisplayMode === "hba-lvm") {
+    const highlights = hostStorageHighlights(row);
+    const primary = highlights[0];
+    if (primary) return storageRemainingPercent(primary.percent);
+  }
+  return storageRemainingPercent(hostStoragePlan(row).percent);
+}
+
+function overviewStorageHealth(row: HostOverviewRow) {
+  if (!hasOverviewInventory(row)) return "ok" as const;
+  if (uiPreferences.storageDisplayMode === "hba-lvm") {
+    const highlights = hostStorageHighlights(row);
+    const primary = highlights[0];
+    if (primary) return storageRemainingHealth(storageRemainingPercent(primary.percent), primary.freeGiB);
+  }
+  const storagePlan = hostStoragePlan(row);
+  return storageRemainingHealth(storageRemainingPercent(storagePlan.percent), storagePlan.freeGiB);
+}
+
+function overviewStorageCellClass(row: HostOverviewRow) {
+  const health = overviewStorageHealth(row);
+  return { warning: health === "warn", danger: health === "danger" };
+}
+
 function overviewStorageMain(row: HostOverviewRow) {
   if (!hasOverviewInventory(row)) return "-";
   const storagePlan = hostStoragePlan(row);
+  // HBA+LVM 模式：主指标取第一个可分配存储类型（HBA 优先），与存储卡片展示一致
+  if (uiPreferences.storageDisplayMode === "hba-lvm") {
+    const highlights = hostStorageHighlights(row);
+    const primary = highlights[0];
+    if (primary) return `${storageHighlightShortLabel(primary.kind)} 剩余 ${formatNumber(primary.freeGiB)} GiB`;
+  }
   return `剩余 ${formatNumber(storagePlan.freeGiB)} GiB`;
 }
 
 function overviewStorageSubline(row: HostOverviewRow) {
   if (!hasOverviewInventory(row)) return "读取中";
   const storagePlan = hostStoragePlan(row);
-  return `已用 ${formatNumber(storagePlan.usedGiB)} / ${formatNumber(storagePlan.physicalGiB)} GiB`;
+  // HBA+LVM 模式：副行固定展示主分配类型（HBA 优先）的已用量；
+  // LVM 默认不展示剩余/明细（正常分配虚拟机以 HBA 盘为主，LVM 明细在存储卡片与详情弹窗查看）
+  if (uiPreferences.storageDisplayMode === "hba-lvm") {
+    const highlights = hostStorageHighlights(row);
+    if (highlights.length) {
+      const item = highlights[0];
+      return `已用 ${formatNumber(item.usedGiB)} GiB`;
+    }
+  }
+  return `已用 ${formatNumber(storagePlan.usedGiB)} GiB`;
+}
+
+function storageHighlightShortLabel(kind: "hba" | "local" | "file") {
+  if (kind === "hba") return "虚拟 HBA";
+  if (kind === "local") return "物理 LVM";
+  return "文件存储";
 }
 
 function overviewResourceMeterPercent(row: HostOverviewRow, type: "cpu" | "memory" | "storage") {
   if (!hasOverviewInventory(row)) return 0;
-  const value = type === "cpu" ? hostCpuPlan(row).percent : type === "memory" ? hostMemoryPlan(row).percent : hostStoragePlan(row).percent;
+  // 存储列进度条表示「已用占比」（剩余 3% → 进度条 97%，与存储卡片一致），CPU/内存保持已用占比
+  if (type === "storage") {
+    const remainingPct = overviewStoragePercent(row);
+    return remainingPct == null ? 0 : Math.min(Math.max(100 - remainingPct, 0), 100);
+  }
+  const value = type === "cpu" ? hostCpuPlan(row).percent : hostMemoryPlan(row).percent;
   return Math.min(Math.max(value, 0), 100);
 }
 
@@ -6089,8 +6336,8 @@ function overviewResourceMeterWarning(row: HostOverviewRow, type: "cpu" | "memor
     const memory = hostMemoryPlan(row);
     return memory.percent >= 78 || memory.free < 32 * 1024 ** 3;
   }
-  const storagePlan = hostStoragePlan(row);
-  return storagePlan.percent >= 80 || storagePlan.freeGiB < 500;
+  const health = overviewStorageHealth(row);
+  return health === "warn" || health === "danger";
 }
 
 function normalizeOverviewSearchInput(value: string) {
@@ -6576,6 +6823,70 @@ function percent(used: number, total: number) {
   return Math.min(Math.round((used / total) * 100), 999);
 }
 
+/**
+ * 判断存储池是否可承载虚拟机磁盘（与后端 isVmDiskRepository 口径一致）：
+ * - xenserver：排除 iso / udev；
+ * - proxmox：仅保留 content 含 images / rootdir（未声明 content 视为支持）；
+ * - vmware / libvirt：全部视为可承载 VM 磁盘。
+ */
+function isVmDiskRepositoryForProvider(providerType: ProviderType, repository: StorageRepository): boolean {
+  if (providerType === "xenserver") {
+    const type = repository.type.trim().toLowerCase();
+    return type !== "" && type !== "iso" && type !== "udev";
+  }
+  if (providerType === "proxmox") {
+    const content = repository.content ?? [];
+    if (content.length === 0) return true;
+    const normalized = new Set(content.map((item) => item.trim().toLowerCase()));
+    return normalized.has("images") || normalized.has("rootdir");
+  }
+  return true;
+}
+
+type StoragePoolCategoryKind = "hba" | "local" | "file" | "iso" | "media" | "vm" | "backup" | "other";
+
+interface StoragePoolCategory {
+  kind: StoragePoolCategoryKind;
+  label: string;
+  note: string;
+}
+
+/**
+ * 存储池用途分类，用于详情弹窗/主卡区分“虚拟 HBA”“物理 LVM”
+ * 与镜像库、可移动介质等不可分配 VM 磁盘的池；与 isVmDiskRepositoryForProvider 口径配套。
+ */
+function storagePoolCategory(providerType: ProviderType, repository: StorageRepository): StoragePoolCategory {
+  const type = (repository.type ?? "").trim().toLowerCase();
+  if (providerType === "xenserver") {
+    if (["lvmohba", "lvmoiscsi", "lvmofc"].includes(type)) return { kind: "hba", label: "虚拟 HBA", note: "" };
+    if (type === "lvm") return { kind: "local", label: "物理 LVM", note: "" };
+    if (["ext", "nfs", "smb", "cifs"].includes(type)) return { kind: "file", label: "文件存储", note: "" };
+    if (type === "iso") return { kind: "iso", label: "镜像库", note: "不计入可分配" };
+    if (type === "udev") return { kind: "media", label: "可移动介质", note: "不计入可分配" };
+    return { kind: "other", label: "其他存储池", note: "" };
+  }
+  if (providerType === "proxmox") {
+    const content = new Set((repository.content ?? []).map((item) => item.trim().toLowerCase()));
+    if (content.has("images") || content.has("rootdir")) return { kind: "vm", label: "VM 磁盘", note: "可分配" };
+    if (content.has("iso")) return { kind: "iso", label: "镜像库", note: "不计入可分配" };
+    if (content.has("backup")) return { kind: "backup", label: "备份存储", note: "不计入可分配" };
+    return { kind: "vm", label: "VM 磁盘", note: "可分配" };
+  }
+  return { kind: "vm", label: "VM 磁盘", note: "可分配" };
+}
+
+function storageFreeGiB(row: StorageRepository) {
+  return Math.max(positive(row.physicalGiB) - positive(row.usedGiB), 0);
+}
+
+/** 剩余容量醒目色：≥90% 红色告警、≥80% 橙色预警、其余正常绿色。 */
+function storageFreeClass(row: StorageRepository) {
+  const usage = percent(positive(row.usedGiB), positive(row.physicalGiB));
+  if (usage >= 90) return "is-danger";
+  if (usage >= 80) return "is-warning";
+  return "is-ok";
+}
+
 function compareVmByIp(left: VmNode, right: VmNode) {
   const leftIp = vmIpSortValue(left);
   const rightIp = vmIpSortValue(right);
@@ -6873,6 +7184,8 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           :network-count="selectedHostNetworks.length"
           :resource-summary="resourceSummary"
           :resource-capacity="selectedResourceCapacity"
+          :storage-pool-highlights="storagePoolHighlightItems"
+          :storage-display-mode="uiPreferences.storageDisplayMode"
           :vm-totals="vmTotals"
           :has-vm-summary="!!vmSummary"
           :loading-vm-summary="loadingVmSummary"
@@ -7099,10 +7412,13 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </span>
             </template>
           </el-table-column>
-          <el-table-column prop="storageFree" label="存储余量" min-width="150" align="right" sortable="custom">
+          <el-table-column prop="storageFree" label="存储余量" min-width="168" align="right" sortable="custom">
             <template #default="{ row }">
-              <span class="overview-resource-cell" :class="{ warning: overviewResourceMeterWarning(row, 'storage') }">
-                <strong>{{ overviewStorageMain(row) }}</strong>
+              <span class="overview-resource-cell" :class="overviewStorageCellClass(row)">
+                <span class="overview-storage-main">
+                  <strong>{{ overviewStorageMain(row) }}</strong>
+                  <em v-if="overviewStoragePercent(row) != null" class="overview-storage-pct" :class="`is-${overviewStorageHealth(row)}`">{{ overviewStoragePercent(row) }}%</em>
+                </span>
                 <span class="overview-resource-meter" aria-hidden="true">
                   <i :style="{ width: `${overviewResourceMeterPercent(row, 'storage')}%` }"></i>
                 </span>
@@ -7402,6 +7718,25 @@ function normalizePort(value: unknown, providerType: ProviderType) {
                   <strong>pve-production-01</strong>
                   <small>CPU 24% · 内存 18.6 / 32 GiB · 运行中</small>
                 </div>
+              </div>
+            </section>
+
+            <section class="settings-card appearance-resource-settings">
+              <div class="settings-card-head">
+                <div>
+                  <strong>资源展示</strong>
+                  <span>统一存储卡片、物理机总览与创建虚拟机时的存储统计展示方式。</span>
+                </div>
+              </div>
+              <div class="appearance-setting-row">
+                <div><strong>存储卡片</strong><span>「HBA + LVM」按磁盘类型分别统计剩余容量；「总体」合并展示可分配存储池。</span></div>
+                <el-segmented
+                  v-model="uiPreferences.storageDisplayMode"
+                  class="appearance-storage-segmented"
+                  :options="[{ label: 'HBA + LVM', value: 'hba-lvm' }, { label: '总体', value: 'overall' }]"
+                  size="small"
+                  @change="persistAppearancePreference('storageDisplayMode')"
+                />
               </div>
             </section>
 
@@ -8179,6 +8514,8 @@ serverStore: disabled</pre>
           :network-count="selectedHostNetworks.length"
           :resource-summary="resourceSummary"
           :resource-capacity="selectedResourceCapacity"
+          :storage-pool-highlights="storagePoolHighlightItems"
+          :storage-display-mode="uiPreferences.storageDisplayMode"
           :vm-totals="vmTotals"
           :has-vm-summary="!!vmSummary"
           :loading-vm-summary="loadingVmSummary"
@@ -8639,53 +8976,60 @@ serverStore: disabled</pre>
         </div>
       </el-dialog>
 
-      <el-dialog v-model="storageDetailVisible" title="存储池详情" width="1080px" class="resource-detail-dialog storage-resource-detail-dialog" :close-on-click-modal="false">
+      <el-dialog v-model="storageDetailVisible" title="存储池详情" width="980px" class="resource-detail-dialog storage-resource-detail-dialog" :close-on-click-modal="false">
         <div class="resource-detail-body vrc-scroll-container">
         <div class="resource-detail-summary storage-detail-summary">
-          <div>
-            <span>存储池数量</span>
-            <strong>{{ storage.length }} 个</strong>
-          </div>
-          <div>
-            <span>物理已使用</span>
-            <strong>{{ formatNumber(storageTotals.usedGiB) }} GiB</strong>
-          </div>
-          <div>
-            <span>物理总量</span>
-            <strong>{{ formatNumber(storageTotals.physicalGiB) }} GiB</strong>
-          </div>
-          <div>
-            <span>VM 已配置</span>
-            <strong>{{ selectedResourceCapacity ? `${formatNumber(selectedResourceCapacity.storage.vmConfiguredGiB)} GiB` : "--" }}</strong>
+          <div v-for="item in storageDetailSummaryItems" :key="item.key" class="storage-detail-item" :class="[item.kind ? `storage-detail-${item.kind}` : '', item.kind === 'focus' ? 'storage-summary-focus' : '']">
+            <span>{{ item.label }}</span>
+            <strong>
+              {{ item.value }}<em v-if="item.pct != null" class="storage-pct" :class="`is-${item.pctClass || 'ok'}`">{{ item.pct }}%</em>
+            </strong>
+            <small v-if="item.sub">{{ item.sub }}</small>
           </div>
         </div>
-        <div class="dialog-section-title">
+        <div class="dialog-section-title storage-detail-section-title">
           <strong>存储池</strong>
-          <span>每行是一个逻辑存储池，不是物理硬盘，也不是某台 VM 的虚拟磁盘</span>
+          <span>仅统计可承载 VM 磁盘的存储池（HBA / LVM）</span>
+          <el-segmented
+            v-model="storageAllocationFilter"
+            class="storage-allocation-filter"
+            :options="[
+              { label: '仅可分配 VM 磁盘', value: true },
+              { label: '全部存储池', value: false },
+            ]"
+          />
         </div>
-        <el-table class="resource-detail-table storage-resource-detail-table" :data="storage" :max-height="420" row-key="name" stripe empty-text="暂无存储池数据">
-          <el-table-column prop="name" label="存储池名称" min-width="190" align="left" show-overflow-tooltip />
-          <el-table-column prop="purposeLabel" label="用途" width="100" align="center" />
-          <el-table-column label="存储类型" width="132" align="left">
+        <el-table class="resource-detail-table storage-resource-detail-table" :data="storageForDetail" :max-height="420" row-key="name" stripe empty-text="暂无存储池数据">
+          <el-table-column prop="name" label="存储池名称" min-width="200" align="left" show-overflow-tooltip />
+          <el-table-column label="分类" width="110" align="left">
+            <template #default="{ row }">
+              <span class="storage-category-text" :class="`storage-category-${storagePoolCategory(connection.providerType, row).kind}`">{{ storagePoolCategory(connection.providerType, row).label }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="剩余" min-width="150" align="left">
+            <template #default="{ row }">
+              <div class="storage-detail-free-cell">
+                <div class="storage-detail-free-line">
+                  <strong class="storage-free-value" :class="storageFreeClass(row)">{{ formatNumber(storageFreeGiB(row)) }} GiB</strong>
+                  <em class="storage-pct" :class="`is-${storageRowRemainingHealth(row)}`">{{ storageRowRemainingPercent(row) }}%</em>
+                </div>
+                <span class="storage-remain-bar" :class="`is-${storageRowRemainingHealth(row)}`" aria-hidden="true"><i :style="{ width: `${100 - storageRowRemainingPercent(row)}%` }"></i></span>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="已使用" width="110" align="right">
+            <template #default="{ row }">{{ formatNumber(row.usedGiB) }} GiB</template>
+          </el-table-column>
+          <el-table-column label="物理总量" width="110" align="right">
+            <template #default="{ row }">{{ formatNumber(row.physicalGiB) }} GiB</template>
+          </el-table-column>
+          <el-table-column label="存储类型" min-width="150" align="left">
             <template #default="{ row }">
               <div class="storage-type-cell">
                 <strong>{{ row.typeLabel }}</strong>
                 <small>{{ row.type }}</small>
               </div>
             </template>
-          </el-table-column>
-          <el-table-column prop="scopeLabel" label="范围" width="86" align="center" />
-          <el-table-column prop="mediaLabel" label="介质" width="100" align="center" />
-          <el-table-column label="使用率" width="132" align="center">
-            <template #default="{ row }">
-              <el-progress :percentage="percent(positive(row.usedGiB), positive(row.physicalGiB))" :stroke-width="4" />
-            </template>
-          </el-table-column>
-          <el-table-column label="物理总量" width="112" align="right">
-            <template #default="{ row }">{{ formatNumber(row.physicalGiB) }} GiB</template>
-          </el-table-column>
-          <el-table-column label="物理已使用" width="112" align="right">
-            <template #default="{ row }">{{ formatNumber(row.usedGiB) }} GiB</template>
           </el-table-column>
         </el-table>
         </div>
@@ -8772,6 +9116,8 @@ serverStore: disabled</pre>
         :vms="vms?.items ?? []"
         :reserved-ips="provisioningReservedIps"
         :storage-totals="storageTotals"
+        :storage-display-mode="uiPreferences.storageDisplayMode"
+        :storage-pool-highlights="storagePoolHighlightItems"
         :submitting="provisioningSubmitting"
         :progress="provisioningProgress"
         :provision-task="activeProvisionTask"

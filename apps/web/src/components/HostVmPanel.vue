@@ -80,6 +80,8 @@ const props = withDefaults(
     tablePanelClass?: string;
     variant?: HostVmPanelVariant;
     showIconTooltips?: boolean;
+    storagePoolHighlights?: Array<{ kind: "hba" | "local" | "file"; label: string; note: string; freeGiB: number; usedGiB: number; totalGiB: number; percent: number }>;
+    storageDisplayMode?: "overall" | "hba-lvm";
   }>(),
   {
     vmActionStates: () => ({}),
@@ -90,6 +92,8 @@ const props = withDefaults(
     tablePanelClass: "",
     variant: "page",
     showIconTooltips: true,
+    storagePoolHighlights: () => [],
+    storageDisplayMode: "hba-lvm",
   },
 );
 
@@ -113,6 +117,94 @@ const emit = defineEmits<{
   "diagnose-vm": [vm: VmNode];
 }>();
 
+// 存储卡片展示模式由设置开关控制：hba-lvm 按磁盘类型分列，overall 合并展示总体。
+// 百分比文本一律为「剩余占比」并随健康度着色；每行 3px 进度条表示「已用占比」（剩余 3% → 进度条 97%）。
+type StorageDisplayRow = {
+  key: string;
+  kind: string;
+  label: string;
+  usedTerm: string;
+  freeGiB?: number;
+  usedGiB?: number;
+  totalGiB?: number | null;
+  remainingPercent?: number | null;
+  health?: "ok" | "warn" | "danger";
+};
+
+function remainingPercent(used: number, total: number) {
+  return Math.max(100 - percent(used, total), 0);
+}
+
+// 剩余占比健康度：≥40% 正常绿 / 20–40% 偏紧橙 / <20% 告警红；绝对剩余 <500 GiB 至少橙色。
+function remainingHealth(remainingPercentValue: number, freeGiB?: number) {
+  if (remainingPercentValue < 20) return "danger" as const;
+  if (remainingPercentValue < 40 || (freeGiB != null && freeGiB < 500)) return "warn" as const;
+  return "ok" as const;
+}
+
+const storageOverallRow = computed<StorageDisplayRow | null>(() => {
+  const capacity = props.resourceCapacity?.storage;
+  if (!capacity || !capacity.physicalTotalGiB) return null;
+  const remaining = Math.max(Number(capacity.physicalFreeGiB) || 0, 0);
+  const remainingPct = remainingPercent(capacity.physicalUsedGiB, capacity.physicalTotalGiB);
+  return {
+    key: "overall",
+    kind: "overall",
+    label: "总体",
+    usedTerm: "已用",
+    freeGiB: remaining,
+    usedGiB: capacity.physicalUsedGiB,
+    totalGiB: capacity.physicalTotalGiB,
+    remainingPercent: remainingPct,
+    health: remainingHealth(remainingPct, remaining),
+  };
+});
+
+// 总体模式底部 HBA / LVM 分布（色点），与主卡明细同色块语言
+const storageOverallBreakdown = computed(() => {
+  const highlights = props.storagePoolHighlights.filter((item) => item.kind === "hba" || item.kind === "local");
+  return highlights.map((item) => ({
+    key: item.kind,
+    label: item.label,
+    freeGiB: item.freeGiB,
+  }));
+});
+
+const storageHighlightRows = computed(() => {
+  // 卡片分类明细只展示 HBA / LVM（用户口径：最多加 HBA 和 LVM），文件存储等归入总体兜底
+  const highlights = props.storagePoolHighlights.filter((item) => item.kind === "hba" || item.kind === "local");
+  return highlights.map((item) => ({
+    key: item.kind,
+    kind: item.kind,
+    label: item.label,
+    usedTerm: "已用",
+    freeGiB: item.freeGiB,
+    usedGiB: item.usedGiB,
+    totalGiB: item.totalGiB,
+    remainingPercent: remainingPercent(item.usedGiB, item.totalGiB),
+    health: remainingHealth(remainingPercent(item.usedGiB, item.totalGiB), item.freeGiB),
+  }));
+});
+
+const storageDisplayRows = computed<StorageDisplayRow[]>(() => {
+  if (props.storageDisplayMode === "hba-lvm") {
+    const rows = storageHighlightRows.value;
+    if (rows.length) return rows;
+  }
+  // 兜底：没有可分类存储池或总体模式时，回退展示总体（带剩余占比与健康度）
+  const overall = storageOverallRow.value;
+  return overall ? [overall] : [];
+});
+
+// 仅一项存储（HBA/LVM/总体兜底，如 PVE/VMware 无 HBA-LVM 分类）时走「同内存容量卡」布局：
+// 主值剩余 + 百分比 + 已用辅助行 + 全宽进度条，与 XenServer 单一项口径一致
+const storageSingleRow = computed<StorageDisplayRow | null>(() => {
+  if (props.storageDisplayMode !== "hba-lvm") return null;
+  const rows = storageDisplayRows.value;
+  if (rows.length !== 1) return null;
+  return rows[0] ?? null;
+});
+
 const searchModel = computed({
   get: () => props.search,
   set: (value: string) => emit("update:search", value),
@@ -128,6 +220,31 @@ const networkCountLabel = computed(() => `${props.networkCount} 个${props.provi
 
 const cpuSummary = computed(() => props.resourceSummary[0]);
 const storageSummary = computed(() => props.resourceSummary[2]);
+
+// CPU 卡百分比：超分(>100%)显示「超分」前缀并告警红，否则按健康度着色
+const cpuPercentText = computed(() => {
+  const pct = cpuSummary.value?.percent ?? 0;
+  return pct > 100 ? `超分 ${pct}%` : `${pct}%`;
+});
+const cpuPercentClass = computed(() => {
+  const pct = cpuSummary.value?.percent ?? 0;
+  if (pct > 100) return "is-danger";
+  if (pct >= 80) return "is-warning";
+  return "is-ok";
+});
+
+// 内存卡主值剩余占比与健康度（与存储口径一致：剩余占比着色）
+const memoryRemainingPercent = computed(() => {
+  const memory = props.resourceCapacity?.memory;
+  if (!memory?.physicalTotalGiB) return null;
+  return Math.max(100 - percent(memory.physicalUsedGiB, memory.physicalTotalGiB), 0);
+});
+const memoryRemainingClass = computed(() => {
+  const pct = memoryRemainingPercent.value;
+  if (pct == null) return "";
+  // remainingHealth 返回 ok/warn/danger，映射为 is-* 样式类（与存储卡一致）
+  return `is-${remainingHealth(pct, props.resourceCapacity?.memory.physicalFreeGiB)}`;
+});
 const refreshingResources = computed(() => props.loadingVms || props.loadingVmSummary);
 const loadingBrand = computed(() => getProviderBrand(props.connection.providerType));
 const supportsVmResize = computed(() => props.providerDescriptor?.capabilities.vmResize.supported === true);
@@ -371,6 +488,11 @@ function formatVmCardSubline(vmTotals: VmTotals) {
   return `${vmTotals.vcpu} vCPU · ${formatBytes(vmTotals.memoryBytes)} 内存 · ${diskText}`;
 }
 
+/** VM 卡辅助行精简文案：窄列下不展示磁盘段，避免截断破坏对齐；完整信息仍在 tooltip/详情 */
+function formatVmCardSublineCompact(vmTotals: VmTotals) {
+  return `${vmTotals.vcpu} vCPU · ${formatBytes(vmTotals.memoryBytes)} 内存`;
+}
+
 function formatBytes(value: number) {
   if (!Number.isFinite(value)) return "-";
   const gib = value / 1024 / 1024 / 1024;
@@ -384,6 +506,12 @@ function formatNumber(value: number) {
 
 function capacityGiBText(value: number | undefined) {
   if (typeof value === "number" && Number.isFinite(value)) return `${formatNumber(value)} GiB`;
+  return props.loadingVmSummary ? "读取中" : "未获取";
+}
+
+/** 仅返回 GiB 数值文本（不带单位），用于「已用 1,064.1 / 1,534.6 GiB」这类合并单行文案 */
+function capacityGiBNumber(value: number | undefined) {
+  if (typeof value === "number" && Number.isFinite(value)) return formatNumber(value);
   return props.loadingVmSummary ? "读取中" : "未获取";
 }
 
@@ -420,6 +548,14 @@ function capacityMeterClass(capacity: CapacityBreakdown | undefined) {
   return {
     warning: capacity?.physicalStatus === "warning",
     danger: capacity?.physicalStatus === "danger",
+  };
+}
+
+// 存储健康度（ok/warn/danger）映射到 mini-meter 的警示态，颜色语言与内存容量卡一致
+function storageMeterClassForHealth(health?: string) {
+  return {
+    warning: health === "warn",
+    danger: health === "danger",
   };
 }
 
@@ -622,7 +758,7 @@ function openVmConsoleByRow(vm: VmNode) {
           <button class="metric-link" @click="emit('host-detail')">详情</button>
         </div>
         <strong>{{ host.name }}</strong>
-        <small>{{ host.address }} · {{ host.vendor }} {{ host.version }} · {{ networkCountLabel }}</small>
+        <small>{{ host.address }} · {{ host.vendor }} {{ host.version }}</small>
       </article>
       <template #content>
         <div class="metric-card-tooltip-content">
@@ -637,9 +773,9 @@ function openVmConsoleByRow(vm: VmNode) {
         <span class="metric-label">CPU 配置</span>
         <div class="metric-main">
           <strong>{{ formatCpuCount(host.cpuCores) }}</strong>
-          <span>{{ cpuSummary.percent }}%</span>
+          <span class="metric-pct" :class="cpuPercentClass">{{ cpuPercentText }}</span>
         </div>
-        <small>{{ vmTotals.runningVcpu }} 运行 vCPU · 共配置 {{ vmTotals.vcpu }} vCPU</small>
+        <small>已分配 <b>{{ vmTotals.vcpu }}</b> vCPU · 运行 <b>{{ vmTotals.runningVcpu }}</b></small>
         <div class="mini-meter">
           <span class="used" :style="{ width: barWidth(cpuSummary, 'used') }"></span>
           <span class="free" :style="{ width: barWidth(cpuSummary, 'free') }"></span>
@@ -647,8 +783,8 @@ function openVmConsoleByRow(vm: VmNode) {
       </article>
       <template #content>
         <div class="metric-card-tooltip-content">
-          <strong>CPU · {{ formatCpuCount(host.cpuCores) }} · {{ cpuSummary.percent }}%</strong>
-          <span>{{ vmTotals.runningVcpu }} 运行 vCPU · 共配置 {{ vmTotals.vcpu }} vCPU</span>
+          <strong>CPU · {{ formatCpuCount(host.cpuCores) }} · {{ cpuPercentText }}</strong>
+          <span>已分配 {{ vmTotals.vcpu }} vCPU · 运行 {{ vmTotals.runningVcpu }}</span>
         </div>
       </template>
     </el-tooltip>
@@ -662,12 +798,11 @@ function openVmConsoleByRow(vm: VmNode) {
           </span>
         </div>
         <div class="memory-capacity-primary">
-          <span>当前可用</span>
-          <strong :class="{ 'is-unavailable': capacityValueUnavailable(resourceCapacity?.memory.physicalFreeGiB) }">{{ capacityGiBText(resourceCapacity?.memory.physicalFreeGiB) }}</strong>
+          <strong :class="{ 'is-unavailable': capacityValueUnavailable(resourceCapacity?.memory.physicalFreeGiB) }">剩余 {{ capacityGiBText(resourceCapacity?.memory.physicalFreeGiB) }}</strong>
+          <span v-if="memoryRemainingPercent != null" class="metric-pct" :class="memoryRemainingClass">{{ memoryRemainingPercent }}%</span>
         </div>
         <div class="memory-capacity-detail">
-          <span>已用 {{ capacityGiBText(resourceCapacity?.memory.physicalUsedGiB) }} / {{ capacityGiBText(resourceCapacity?.memory.physicalTotalGiB) }}</span>
-          <span>未开机 {{ capacityGiBText(resourceCapacity?.memory.haltedConfiguredGiB) }}</span>
+          <span>已用 <b>{{ capacityGiBNumber(resourceCapacity?.memory.physicalUsedGiB) }} / {{ capacityGiBNumber(resourceCapacity?.memory.physicalTotalGiB) }} GiB</b> · 未开机 {{ capacityGiBNumber(resourceCapacity?.memory.haltedConfiguredGiB) }}</span>
         </div>
         <div class="mini-meter" :class="capacityMeterClass(resourceCapacity?.memory)">
           <span class="used" :style="{ width: physicalCapacityBarWidth(resourceCapacity?.memory, 'used') }"></span>
@@ -676,14 +811,14 @@ function openVmConsoleByRow(vm: VmNode) {
       </article>
       <template #content>
         <div class="metric-card-tooltip-content capacity-tooltip-content memory-tooltip-content">
-          <strong>内存 · 当前可用 {{ capacityGiBText(resourceCapacity?.memory.physicalFreeGiB) }}{{ capacityStateSuffix(resourceCapacity?.memory) }}</strong>
+          <strong>内存 · 剩余 {{ capacityGiBText(resourceCapacity?.memory.physicalFreeGiB) }}{{ capacityStateSuffix(resourceCapacity?.memory) }}</strong>
           <table class="metric-tooltip-table" aria-label="内存容量明细">
             <tbody>
               <tr>
                 <th scope="row">物理</th>
                 <td class="metric-tooltip-term">已用</td>
                 <td class="metric-tooltip-value">{{ capacityGiBText(resourceCapacity?.memory.physicalUsedGiB) }}</td>
-                <td class="metric-tooltip-term">当前可用</td>
+                <td class="metric-tooltip-term">剩余</td>
                 <td class="metric-tooltip-value">{{ capacityGiBText(resourceCapacity?.memory.physicalFreeGiB) }}</td>
                 <td class="metric-tooltip-term">总量</td>
                 <td class="metric-tooltip-value">{{ capacityGiBText(resourceCapacity?.memory.physicalTotalGiB) }}</td>
@@ -716,25 +851,52 @@ function openVmConsoleByRow(vm: VmNode) {
             <button class="metric-link" @click="emit('storage-detail')">详情</button>
           </span>
         </div>
-        <div class="resource-capacity-rows">
-          <div class="resource-capacity-row">
-            <strong>物理</strong>
-            <span class="capacity-term">已分配</span>
-            <b class="capacity-value" :class="{ 'is-unavailable': capacityValueUnavailable(resourceCapacity?.storage.physicalUsedGiB) }">{{ capacityGiBText(resourceCapacity?.storage.physicalUsedGiB) }}</b>
-            <span class="capacity-term">剩余</span>
-            <b class="capacity-value" :class="{ 'is-unavailable': capacityValueUnavailable(resourceCapacity?.storage.physicalFreeGiB) }">{{ capacityGiBText(resourceCapacity?.storage.physicalFreeGiB) }}</b>
-          </div>
-          <div class="resource-capacity-row">
-            <strong>虚拟</strong>
-            <span class="capacity-term">已分配</span>
-            <b class="capacity-value" :class="{ 'is-unavailable': capacityValueUnavailable(resourceCapacity?.storage.vmConfiguredGiB) }">{{ capacityGiBText(resourceCapacity?.storage.vmConfiguredGiB) }}</b>
-            <span class="capacity-term" :class="{ 'is-overcommitted': resourceCapacity?.storage.vmStatus === 'overconfigured' }">{{ vmCapacityTerm(resourceCapacity?.storage) }}</span>
-            <b class="capacity-value" :class="{ 'is-unavailable': capacityValueUnavailable(vmCapacityValue(resourceCapacity?.storage)), 'is-overcommitted': resourceCapacity?.storage.vmStatus === 'overconfigured' }">{{ capacityGiBText(vmCapacityValue(resourceCapacity?.storage)) }}</b>
-          </div>
-        </div>
-        <div class="mini-meter" :class="capacityMeterClass(resourceCapacity?.storage)">
-          <span class="used" :style="{ width: barWidth(storageSummary, 'used') }"></span>
-          <span class="free" :style="{ width: barWidth(storageSummary, 'free') }"></span>
+        <div class="storage-card-rows">
+          <template v-if="storageDisplayMode === 'hba-lvm'">
+            <template v-if="storageSingleRow">
+              <div class="storage-single" :class="[`storage-row-${storageSingleRow.kind}`, `is-${storageSingleRow.health || 'ok'}`]">
+                <div class="storage-single-primary">
+                  <span class="storage-free">剩余 <b>{{ capacityGiBText(storageSingleRow.freeGiB) }}</b></span>
+                  <em v-if="storageSingleRow.remainingPercent != null" class="metric-pct" :class="`is-${storageSingleRow.health || 'ok'}`">{{ storageSingleRow.remainingPercent }}%</em>
+                </div>
+                <div class="storage-single-sub">
+                  <span><template v-if="storageSingleRow.kind !== 'overall'">{{ storageSingleRow.label }} · </template>已用 <b>{{ capacityGiBNumber(storageSingleRow.usedGiB) }} GiB</b></span>
+                </div>
+                <div class="mini-meter" :class="storageMeterClassForHealth(storageSingleRow.health)">
+                  <span class="used" :style="{ width: `${100 - (storageSingleRow.remainingPercent ?? 0)}%` }"></span>
+                  <span class="free" :style="{ width: `${storageSingleRow.remainingPercent ?? 0}%` }"></span>
+                </div>
+              </div>
+            </template>
+            <template v-else>
+              <div v-for="row in storageDisplayRows" :key="row.key" class="storage-row" :class="[`storage-row-${row.kind}`, `is-${row.health || 'ok'}`]">
+                <div class="storage-row-line">
+                  <span class="storage-chip" :class="`chip-${row.kind}`">{{ row.label }}</span>
+                  <span class="storage-free">剩余 <b>{{ capacityGiBText(row.freeGiB) }}</b></span>
+                  <em v-if="row.remainingPercent != null" class="storage-pct" :class="`is-${row.health || 'ok'}`">{{ row.remainingPercent }}%</em>
+                  <span class="storage-used">{{ row.usedTerm }} {{ capacityGiBText(row.usedGiB) }}</span>
+                </div>
+                <span v-if="row.remainingPercent != null" class="storage-remain-bar" :class="`is-${row.health || 'ok'}`" aria-hidden="true"><i :style="{ width: `${100 - row.remainingPercent}%` }"></i></span>
+              </div>
+            </template>
+          </template>
+          <template v-else>
+            <div v-if="storageOverallRow" class="storage-overall-hero">
+              <div class="storage-hero-line">
+                <span class="storage-free">剩余 <b>{{ capacityGiBText(storageOverallRow.freeGiB) }}</b></span>
+                <em v-if="storageOverallRow.remainingPercent != null" class="storage-pct" :class="`is-${storageOverallRow.health || 'ok'}`">{{ storageOverallRow.remainingPercent }}%</em>
+              </div>
+              <span v-if="storageOverallRow.remainingPercent != null" class="storage-remain-bar" :class="`is-${storageOverallRow.health || 'ok'}`" aria-hidden="true"><i :style="{ width: `${100 - storageOverallRow.remainingPercent}%` }"></i></span>
+              <div class="storage-hero-sub">
+                <span>已用 <b>{{ capacityGiBText(storageOverallRow.usedGiB) }}</b></span>
+              </div>
+              <div v-if="storageOverallBreakdown.length" class="storage-hero-breakdown">
+                <span v-for="item in storageOverallBreakdown" :key="item.key" class="storage-breakdown-item">
+                  {{ item.label }} <b>{{ capacityGiBText(item.freeGiB) }}</b>
+                </span>
+              </div>
+            </div>
+          </template>
         </div>
       </article>
       <template #content>
@@ -769,7 +931,7 @@ function openVmConsoleByRow(vm: VmNode) {
           <strong>{{ vmTotals.running }} / {{ vmTotals.all }}</strong>
           <span>{{ percent(vmTotals.running, vmTotals.all) }}%</span>
         </div>
-        <small>{{ loadingVmSummary && !hasVmSummary ? "VM 汇总加载中" : formatVmCardSubline(vmTotals) }}</small>
+        <small>{{ loadingVmSummary && !hasVmSummary ? "VM 汇总加载中" : formatVmCardSublineCompact(vmTotals) }}</small>
         <div class="mini-meter vm-meter">
           <span class="used" :style="{ width: `${percent(vmTotals.running, vmTotals.all)}%` }"></span>
           <span class="free" :style="{ width: `${100 - Math.min(percent(vmTotals.running, vmTotals.all), 100)}%` }"></span>

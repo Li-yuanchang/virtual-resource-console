@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VRC 虚拟机信息指标卡 · 三版原型</title>
+    <style>
+      :root {
+        --bg: #f5f6f2;
+        --surface: #fbfbf7;
+        --surface-muted: #eef1e8;
+        --surface-raised: #f8f9f3;
+        --border: #d9ded0;
+        --border-strong: #b8c2ae;
+        --text: #27302a;
+        --muted: #747b70;
+        --subtle: #92988d;
+        --accent: #426b57;
+        --accent-soft: #e5eee6;
+        --info: #4d6f73;
+        --success: #477a45;
+        --warning: #b77935;
+        --danger: #a5483d;
+        --danger-soft: #f5e6e3;
+        --warning-soft: #f4ecdf;
+        --success-soft: #e6efe4;
+        --info-soft: #e6edef;
+        --font: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body { font-family: var(--font); }
+      body { background: #e9ece5; color: var(--text); }
+
+      .proto-wrap {
+        width: min(1300px, calc(100vw - 48px));
+        margin: 24px auto 60px;
+        display: grid;
+        gap: 22px;
+      }
+      .proto-head h1 { font-size: 17px; font-weight: 700; }
+      .proto-head p { margin-top: 4px; color: var(--muted); font-size: 12px; }
+      .version {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 16px 18px 20px;
+      }
+      .version-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+      .version-head h2 { font-size: 14px; font-weight: 700; }
+      .version-head span { color: var(--muted); font-size: 11px; }
+      .dialog {
+        background: var(--surface);
+        border: 1px solid var(--border-strong);
+        border-radius: 8px;
+        box-shadow: 0 10px 24px rgba(35, 42, 35, 0.06);
+        padding: 14px 14px 16px;
+      }
+      .dialog-title { font-size: 14px; font-weight: 700; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+      .dialog-title small { color: var(--subtle); font-weight: 400; font-size: 11px; }
+      .metric-grid { display: grid; grid-template-columns: minmax(150px, 1.05fr) minmax(120px, 0.78fr) minmax(230px, 1.3fr) minmax(260px, 1.45fr) minmax(130px, 0.85fr); gap: 8px; align-items: stretch; }
+
+      /* ---------- shared primitives ---------- */
+      .pct { font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .pct.ok { color: var(--success); }
+      .pct.warn { color: var(--warning); }
+      .pct.danger { color: var(--danger); }
+      .pct.info { color: var(--info); }
+      .link { color: var(--info); font-size: 10px; cursor: pointer; }
+      .badge {
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 0 7px; height: 17px; border-radius: 999px;
+        font-size: 10px; font-weight: 600;
+      }
+      .badge i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+      .badge.danger { color: var(--danger); background: var(--danger-soft); }
+      .badge.warn { color: var(--warning); background: var(--warning-soft); }
+      .badge.ok { color: var(--success); background: var(--success-soft); }
+      .badge.info { color: var(--info); background: var(--info-soft); }
+
+      /* =========================================================
+         V1 对齐精修版：五卡严格同构（标题行 / 主值+百分比 / 辅助行 / 进度条）
+         ========================================================= */
+      .v1 .card {
+        display: flex; flex-direction: column;
+        padding: 11px 12px 10px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        min-width: 0;
+      }
+      .v1 .card-head {
+        display: flex; align-items: center; justify-content: space-between; gap: 6px;
+        min-height: 15px;
+      }
+      .v1 .card-head .t { font-size: 10.5px; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
+      .v1 .card-head .cap { font-size: 10px; color: var(--subtle); font-weight: 400; }
+      .v1 .primary { display: flex; align-items: baseline; gap: 6px; min-width: 0; margin-top: 9px; }
+      .v1 .primary b { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .v1 .sub { font-size: 10px; color: var(--muted); line-height: 1.45; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; }
+      .v1 .sub b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+      .v1 .bar { height: 4px; border-radius: 999px; background: color-mix(in srgb, var(--border) 60%, var(--surface-muted)); overflow: hidden; margin-top: auto; }
+      .v1 .bar i { display: block; height: 100%; border-radius: 999px; }
+      .v1 .bar.used i { background: var(--accent); }
+      .v1 .bar.warn i { background: var(--warning); }
+      .v1 .bar.danger i { background: var(--danger); }
+      .v1 .bar.info i { background: var(--info); }
+      .v1 .bar.ok i { background: var(--success); }
+      .v1 .host-card .primary b { color: var(--text); }
+      /* storage breakdown rows: 与主值同一起点，保证元素位置固定 */
+      .v1 .storage-rows { display: grid; gap: 6px; margin-top: 9px; }
+      .v1 .srow { display: grid; gap: 4px; min-width: 0; }
+      .v1 .srow-line { display: flex; align-items: baseline; gap: 5px; min-width: 0; font-size: 10px; color: var(--muted); white-space: nowrap; }
+      .v1 .srow-line .nm { font-weight: 600; color: var(--text); }
+      .v1 .srow-line .free { color: var(--text); }
+      .v1 .srow-line .free b { font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
+      .v1 .srow-line .used { margin-left: auto; color: var(--subtle); overflow: hidden; text-overflow: ellipsis; }
+      .v1 .srow .bar { margin-top: 0; }
+
+      /* =========================================================
+         V2 存储主值版：大主值“剩余/可用” + 百分比 + 右对齐已用 + 细条
+         ========================================================= */
+      .v2 .card {
+        display: flex; flex-direction: column; gap: 7px;
+        padding: 13px 14px 12px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        min-width: 0;
+      }
+      .v2 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+      .v2 .card-head .t { font-size: 10.5px; font-weight: 600; color: var(--muted); letter-spacing: 0.03em; }
+      .v2 .hero { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+      .v2 .hero b { font-size: 19px; font-weight: 750; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+      .v2 .hero .unit { font-size: 11px; color: var(--subtle); }
+      .v2 .hero .pct { font-size: 12px; }
+      .v2 .meta { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; color: var(--subtle); min-width: 0; }
+      .v2 .meta b { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+      .v2 .bar { height: 3px; border-radius: 999px; background: color-mix(in srgb, var(--border) 60%, var(--surface-muted)); overflow: hidden; margin-top: auto; }
+      .v2 .bar i { display: block; height: 100%; border-radius: 999px; }
+      .v2 .bar.used i { background: var(--accent); }
+      .v2 .bar.warn i { background: var(--warning); }
+      .v2 .bar.danger i { background: var(--danger); }
+      .v2 .bar.info i { background: var(--info); }
+      .v2 .bar.ok i { background: var(--success); }
+      .v2 .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+      .v2 .chip {
+        display: inline-flex; align-items: baseline; gap: 3px;
+        padding: 2px 7px;
+        background: var(--surface-muted);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        font-size: 10px; color: var(--muted);
+      }
+      .v2 .chip b { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+      .v2 .storage-rows { display: grid; gap: 8px; margin-top: 2px; }
+      .v2 .srow { display: grid; gap: 4px; min-width: 0; }
+      .v2 .srow-line { display: flex; align-items: baseline; gap: 6px; font-size: 10.5px; color: var(--muted); }
+      .v2 .srow-line .nm { font-weight: 600; color: var(--text); }
+      .v2 .srow-line .free b { font-size: 13px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+      .v2 .srow-line .used { margin-left: auto; color: var(--subtle); }
+      .v2 .srow .bar { margin-top: 0; }
+
+      /* =========================================================
+         V3 仪表分段版：左侧类型色条 + 分段刻度仪表 + 健康徽章
+         ========================================================= */
+      .v3 .card {
+        position: relative;
+        display: flex; flex-direction: column; gap: 6px;
+        padding: 12px 12px 11px 15px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        min-width: 0;
+        overflow: hidden;
+      }
+      .v3 .card::before {
+        content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+        background: var(--accent);
+      }
+      .v3 .card.host::before { background: var(--info); }
+      .v3 .card.cpu::before { background: var(--accent); }
+      .v3 .card.mem::before { background: var(--info); }
+      .v3 .card.sto::before { background: var(--warning); }
+      .v3 .card.vm::before { background: var(--success); }
+      .v3 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+      .v3 .card-head .t { font-size: 10px; font-weight: 700; color: var(--subtle); letter-spacing: 0.06em; }
+      .v3 .primary { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+      .v3 .primary b { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+      .v3 .primary .unit { font-size: 10px; color: var(--subtle); }
+      .v3 .sub { font-size: 10px; color: var(--muted); line-height: 1.45; }
+      .v3 .sub b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+      .v3 .seg-meter {
+        position: relative;
+        height: 7px; margin-top: auto;
+        background:
+          linear-gradient(90deg, transparent calc(50% - 0.5px), color-mix(in srgb, var(--text) 16%, transparent) 0 calc(50% + 0.5px), transparent 0),
+          color-mix(in srgb, var(--border) 55%, var(--surface-muted));
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .v3 .seg-meter i { display: block; height: 100%; border-radius: 999px; }
+      .v3 .seg-meter.used i { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 78%, white), var(--accent)); }
+      .v3 .seg-meter.warn i { background: linear-gradient(90deg, color-mix(in srgb, var(--warning) 78%, white), var(--warning)); }
+      .v3 .seg-meter.danger i { background: linear-gradient(90deg, color-mix(in srgb, var(--danger) 78%, white), var(--danger)); }
+      .v3 .seg-meter.info i { background: linear-gradient(90deg, color-mix(in srgb, var(--info) 78%, white), var(--info)); }
+      .v3 .seg-meter.ok i { background: linear-gradient(90deg, color-mix(in srgb, var(--success) 78%, white), var(--success)); }
+      .v3 .cap-rows { display: grid; gap: 5px; margin-top: 2px; }
+      .v3 .cap-row { display: grid; grid-template-columns: 58px 1fr 44px; align-items: center; gap: 8px; font-size: 10px; color: var(--muted); }
+      .v3 .cap-row .k { white-space: nowrap; }
+      .v3 .cap-row .v { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text); }
+      .v3 .storage-rows { display: grid; gap: 7px; margin-top: 2px; }
+      .v3 .srow { display: grid; gap: 4px; min-width: 0; }
+      .v3 .srow-line { display: flex; align-items: baseline; gap: 6px; font-size: 10px; color: var(--muted); }
+      .v3 .srow-line .nm { font-weight: 600; color: var(--text); }
+      .v3 .srow-line .free b { font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+      .v3 .srow-line .used { margin-left: auto; color: var(--subtle); }
+      .v3 .srow .seg-meter { margin-top: 0; }
+
+      @media (max-width: 900px) {
+        .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="proto-wrap">
+      <div class="proto-head">
+        <h1>虚拟机信息 · 指标卡三版原型</h1>
+        <p>以存储卡为基准统一五卡骨架：标题行 / 主值（剩余/可用）+ 百分比 / 已用辅助 / 已用占比进度条。示例数据：xenserver-12。</p>
+      </div>
+
+      <!-- ==================== V1 ==================== -->
+      <section class="version v1">
+        <div class="version-head">
+          <h2>V1 对齐精修版</h2>
+          </div>
+        <div class="dialog">
+          <div class="dialog-title">虚拟机信息 <small>xenserver-12 · 192.168.2.22</small></div>
+          <div class="metric-grid">
+            <article class="card host-card">
+              <div class="card-head"><span class="t">物理机</span><span class="link">详情</span></div>
+              <div class="primary"><b>xenserver-12</b></div>
+              <div class="sub">192.168.2.22 · XenServer 7.1 CU1</div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><span class="t">CPU 配置</span></div>
+              <div class="primary"><b>48 核</b><span class="pct danger">超分 1063%</span></div>
+              <div class="sub">已分配 <b>510</b> vCPU · 运行 <b>510</b></div>
+              <div class="bar danger"><i style="width: 100%"></i></div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><span class="t">内存容量</span></div>
+              <div class="primary"><b>剩余 470.5 GiB</b><span class="pct warn">31%</span></div>
+              <div class="sub">已用 <b>1,064.1 / 1,534.6 GiB</b> · 未开机 0</div>
+              <div class="bar warn"><i style="width: 69%"></i></div>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <span class="t">存储 · 物理总量 30,658.2 GiB</span>
+                <span class="link">ISO · 详情</span>
+              </div>
+              <div class="storage-rows">
+                <div class="srow">
+                  <div class="srow-line"><span class="nm">虚拟 HBA</span><span class="free">剩余 <b>844.8 GiB</b></span><span class="pct danger">3%</span><span class="used">已用 28,961.2 GiB</span></div>
+                  <div class="bar danger"><i style="width: 97%"></i></div>
+                </div>
+                <div class="srow">
+                  <div class="srow-line"><span class="nm">物理 LVM</span><span class="free">剩余 <b>648.6 GiB</b></span><span class="pct ok">76%</span><span class="used">已用 203.6 GiB</span></div>
+                  <div class="bar ok"><i style="width: 24%"></i></div>
+                </div>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><span class="t">VM</span></div>
+              <div class="primary"><b>22 / 22</b><span class="pct info">100%</span></div>
+              <div class="sub">510 vCPU · 448 GiB 内存</div>
+              <div class="bar info"><i style="width: 100%"></i></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== V2 ==================== -->
+      <section class="version v2">
+        <div class="version-head">
+          <h2>V2 存储主值版</h2>
+          </div>
+        <div class="dialog">
+          <div class="dialog-title">虚拟机信息 <small>xenserver-12 · 192.168.2.22</small></div>
+          <div class="metric-grid">
+            <article class="card">
+              <div class="card-head"><span class="t">物理机</span><span class="link">详情</span></div>
+              <div class="hero"><b>xenserver-12</b></div>
+              <div class="meta"><span>192.168.2.22 · XenServer 7.1 CU1</span><b>5 网络</b></div>
+              <div class="chips">
+                <span class="chip">CPU <b>48 核</b></span>
+                <span class="chip">内存 <b>1,534.6 GiB</b></span>
+                <span class="chip">存储 <b>30,658.2 GiB</b></span>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><span class="t">CPU 配置</span></div>
+              <div class="hero"><b>48</b><span class="unit">物理核</span><span class="pct danger">超分 1063%</span></div>
+              <div class="meta"><span>已分配</span><b>510 vCPU</b></div>
+              <div class="bar danger"><i style="width: 100%"></i></div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><span class="t">内存容量</span></div>
+              <div class="hero"><b>470.5</b><span class="unit">GiB 可用</span><span class="pct warn">31%</span></div>
+              <div class="meta"><span>已用 1,064.1 / 1,534.6 GiB</span><b>未开机 0</b></div>
+              <div class="bar warn"><i style="width: 69%"></i></div>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <span class="t">存储 · 30,658.2 GiB</span>
+                <span class="link">ISO · 详情</span>
+              </div>
+              <div class="hero"><b>844.8</b><span class="unit">GiB 可分配</span><span class="pct danger">3%</span></div>
+              <div class="storage-rows">
+                <div class="srow">
+                  <div class="srow-line"><span class="nm">虚拟 HBA</span><span class="free"><b>844.8 GiB</b> 剩余</span><span class="used">已用 28,961.2 GiB</span></div>
+                  <div class="bar danger"><i style="width: 97%"></i></div>
+                </div>
+                <div class="srow">
+                  <div class="srow-line"><span class="nm">物理 LVM</span><span class="free"><b>648.6 GiB</b> 剩余</span><span class="used">已用 203.6 GiB</span></div>
+                  <div class="bar ok"><i style="width: 24%"></i></div>
+                </div>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><span class="t">VM</span></div>
+              <div class="hero"><b>22 / 22</b><span class="pct info">100% 运行</span></div>
+              <div class="meta"><span>510 vCPU · 448 GiB 内存 · 4.8 TB 磁盘</span></div>
+              <div class="bar info"><i style="width: 100%"></i></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== V3 ==================== -->
+      <section class="version v3">
+        <div class="version-head">
+          <h2>V3 仪表分段版</h2>
+          </div>
+        <div class="dialog">
+          <div class="dialog-title">虚拟机信息 <small>xenserver-12 · 192.168.2.22</small></div>
+          <div class="metric-grid">
+            <article class="card host">
+              <div class="card-head"><span class="t">物理机</span><span class="badge ok"><i></i>运行中</span></div>
+              <div class="primary"><b>xenserver-12</b></div>
+              <div class="sub">192.168.2.22 · XenServer 7.1 CU1</div>
+              <div class="cap-rows">
+                <div class="cap-row"><span class="k">CPU</span><span class="seg-meter used"><i style="width: 100%"></i></span><span class="v">48 核</span></div>
+                <div class="cap-row"><span class="k">内存</span><span class="seg-meter warn"><i style="width: 69%"></i></span><span class="v">1,534 GiB</span></div>
+                <div class="cap-row"><span class="k">存储</span><span class="seg-meter danger"><i style="width: 97%"></i></span><span class="v">30,658 GiB</span></div>
+              </div>
+            </article>
+
+            <article class="card cpu">
+              <div class="card-head"><span class="t">CPU 配置</span><span class="badge danger"><i></i>超分</span></div>
+              <div class="primary"><b>48</b><span class="unit">物理核</span></div>
+              <div class="sub">已分配 <b>510</b> vCPU · 超分 <b>1063%</b></div>
+              <div class="seg-meter danger"><i style="width: 100%"></i></div>
+            </article>
+
+            <article class="card mem">
+              <div class="card-head"><span class="t">内存容量</span><span class="badge warn"><i></i>偏紧</span></div>
+              <div class="primary"><b>470.5</b><span class="unit">GiB 可用</span><span class="pct warn">31%</span></div>
+              <div class="sub">已用 <b>1,064.1 / 1,534.6 GiB</b> · 未开机 0</div>
+              <div class="seg-meter warn"><i style="width: 69%"></i></div>
+            </article>
+
+            <article class="card sto">
+              <div class="card-head"><span class="t">存储</span><span class="badge danger"><i></i>告警</span></div>
+              <div class="primary"><b>844.8</b><span class="unit">GiB 可分配</span><span class="pct danger">3%</span></div>
+              <div class="storage-rows">
+                <div class="srow">
+                  <div class="srow-line"><span class="nm">虚拟 HBA</span><span class="free"><b>844.8 GiB</b></span><span class="used">已用 28,961.2 GiB</span></div>
+                  <div class="seg-meter danger"><i style="width: 97%"></i></div>
+                </div>
+                <div class="srow">
+                  <div class="srow-line"><span class="nm">物理 LVM</span><span class="free"><b>648.6 GiB</b></span><span class="used">已用 203.6 GiB</span></div>
+                  <div class="seg-meter ok"><i style="width: 24%"></i></div>
+                </div>
+              </div>
+            </article>
+
+            <article class="card vm">
+              <div class="card-head"><span class="t">VM</span><span class="badge ok"><i></i>全部运行</span></div>
+              <div class="primary"><b>22 / 22</b></div>
+              <div class="sub">510 vCPU · 448 GiB 内存 · 4.8 TB 磁盘</div>
+              <div class="seg-meter ok"><i style="width: 100%"></i></div>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
