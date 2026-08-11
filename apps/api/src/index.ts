@@ -223,6 +223,7 @@ const uiPreferencesSchema = z.object({
   uiFontPreset: z.enum(["system", "inter", "humanist", "lxgw-wenkai", "compact"]).optional(),
   uiFontSize: z.coerce.number().int().min(11).max(13).optional(),
   reduceMotion: z.boolean().optional(),
+  storageDisplayMode: z.enum(["hba-lvm", "overall"]).optional(),
   consoleTheme: z.enum(["vrc", "tokyo-night", "catppuccin", "dracula", "nord", "rose-pine", "solarized", "light"]).optional(),
   consoleFontPreset: z.enum(["system-mono", "jetbrains", "cascadia", "menlo"]).optional(),
   consoleFontSize: z.coerce.number().min(11).max(18).optional(),
@@ -621,7 +622,7 @@ const provisionVmsSchema = connectionSchema.extend({
   vmNamePrefix: z.string().min(1),
   count: z.coerce.number().int().positive().max(20),
   ipPool: ipPoolSchema,
-  autoStart: z.boolean().default(false),
+  autoStart: z.boolean().default(true), // 固定开启：旧客户端不传该字段时也默认自动启动
   planItems: z.array(provisionVmItemSchema).min(1).max(20),
   confirmToken: z.literal("CONFIRMED"),
 });
@@ -3557,7 +3558,7 @@ function buildProvisionRequestData(
       ...input.ipPool,
       id: input.ipPool.id || `provision-${input.hostId || connectionHost}`,
     },
-    autoStart: input.autoStart,
+    autoStart: true, // 固定开启：创建后必须自动启动，不允许任何调用方传入 false
     planItems: input.planItems,
   };
 }

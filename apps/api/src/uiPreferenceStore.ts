@@ -36,6 +36,7 @@ export interface UiPreferences {
   uiFontPreset: UiFontPreference;
   uiFontSize: number;
   reduceMotion: boolean;
+  storageDisplayMode: "hba-lvm" | "overall";
   consoleTheme: ConsoleThemePreference;
   consoleFontPreset: ConsoleFontPreference;
   consoleFontSize: number;
@@ -91,6 +92,7 @@ const defaultUiPreferences: UiPreferences = {
   uiFontPreset: "system",
   uiFontSize: 12,
   reduceMotion: false,
+  storageDisplayMode: "hba-lvm",
   consoleTheme: "vrc",
   consoleFontPreset: "system-mono",
   consoleFontSize: 13,
@@ -240,6 +242,7 @@ function normalizeUiPreferences(input: Partial<UiPreferences>): UiPreferences {
     uiFontPreset: normalizeUiFontPreset(input.uiFontPreset),
     uiFontSize: normalizeNumber(input.uiFontSize, 11, 13, defaultUiPreferences.uiFontSize),
     reduceMotion: typeof input.reduceMotion === "boolean" ? input.reduceMotion : defaultUiPreferences.reduceMotion,
+    storageDisplayMode: input.storageDisplayMode === "overall" ? "overall" : "hba-lvm",
     consoleTheme: normalizeConsoleTheme(input.consoleTheme),
     consoleFontPreset: normalizeConsoleFontPreset(input.consoleFontPreset),
     consoleFontSize: normalizeNumber(input.consoleFontSize, 11, 18, defaultUiPreferences.consoleFontSize),

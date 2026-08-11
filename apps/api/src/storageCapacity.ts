@@ -7,6 +7,34 @@ export interface NativeStorageCapacity {
 }
 
 /**
+ * 判断存储池是否可承载虚拟机磁盘（即能否作为新虚拟机磁盘的分配目标）。
+ * 与各平台预配选盘逻辑保持一致，避免把 ISO 镜像库、可移动介质、纯备份存储等
+ * 不可分配 VM 磁盘的仓库混入“可分配容量”：
+ * - xenserver：排除 iso / udev 类型（对应 find_sr 中 type=iso 跳过）；
+ * - proxmox：仅保留 content 含 images / rootdir 的存储（对应 pickProxmoxVmStorage）；
+ * - vmware：vSphere Datastore 无结构化“仅 ISO/仅备份”类型，全部视为可承载 VM 磁盘。
+ *
+ * @param providerType 平台类型。
+ * @param repository 存储仓库（含 type、content 等平台原生元数据）。
+ * @return true 表示该仓库可承载 VM 磁盘，应计入可分配容量；false 表示应排除。
+ */
+export function isVmDiskRepository(providerType: ProviderType, repository: StorageRepository): boolean {
+  if (providerType === "xenserver") {
+    const type = repository.type.trim().toLowerCase();
+    // lvmohba / lvmoiscsi / lvm / ext / nfs / smb / cifs 等均可承载 VM 磁盘
+    return type !== "" && type !== "iso" && type !== "udev";
+  }
+  if (providerType === "proxmox") {
+    const content = repository.content ?? [];
+    // PVE 未声明 content 时按 PVE 默认视为支持所有内容类型（与 storageSupportsContent 一致）
+    if (content.length === 0) return true;
+    const normalized = new Set(content.map((item) => item.trim().toLowerCase()));
+    return normalized.has("images") || normalized.has("rootdir");
+  }
+  return true;
+}
+
+/**
  * Normalizes provider-native storage metrics into the shared inventory contract.
  * Missing provisioned capacity remains null instead of reusing physical usage.
  */
@@ -24,6 +52,8 @@ export function normalizeStorageCapacity(
  * Builds the platform-neutral memory and storage values consumed by the resource UI.
  * Provider-specific collection stays inside each provider; this policy layer only
  * converts those native readings into the shared no-overcommit contract.
+ * 存储侧只统计可承载 VM 磁盘的仓库（isVmDiskRepository），保证“剩余/可分配”口径
+ * 反映真实可分配虚拟机磁盘的空间，而非全部存储池（含 ISO 库、可移动介质）的加总。
  */
 export function summarizeResourceCapacity(
   providerType: ProviderType,
@@ -34,7 +64,10 @@ export function summarizeResourceCapacity(
 ): ResourceCapacitySummary {
   const policy = providerCapacityPolicies[providerType];
   const scopedHosts = hosts.filter((item) => !hostId || item.providerId === hostId);
-  const scopedRepositories = repositories.filter((item) => !hostId || !item.hostId || item.hostId === hostId);
+  // 先按主机/节点范围过滤，再剔除不可承载 VM 磁盘的仓库
+  const scopedRepositories = repositories.filter(
+    (item) => (!hostId || !item.hostId || item.hostId === hostId) && isVmDiskRepository(providerType, item),
+  );
   const memoryTotalBytes = scopedHosts.reduce((sum, item) => sum + finiteCapacity(item.memoryTotalBytes), 0);
   const memoryFreeBytes = scopedHosts.reduce((sum, item) => sum + finiteCapacity(item.memoryFreeBytes ?? 0), 0);
 
