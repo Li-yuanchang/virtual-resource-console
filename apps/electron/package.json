@@ -29,7 +29,7 @@
     "publish": [
       {
         "provider": "generic",
-        "url": "http://YOUR_UPDATE_HOST:3988/desktop-updates"
+        "url": "${env.VRC_UPDATE_URL}"
       }
     ],
     "releaseInfo": {
