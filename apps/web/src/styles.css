@@ -6494,14 +6494,14 @@ button:focus-visible,
   min-width: 26px;
   min-height: 26px;
   height: 26px;
-  color: var(--vrc-text-muted);
+  /* 与列表 bar 按钮主色一致（深色），避免操作列图标偏浅 */
+  color: var(--vrc-accent);
   background: transparent;
   border-color: transparent;
-  opacity: 0.78;
 }
 
 .host-vm-panel-table .vm-action-link:hover:not(:disabled) {
-  opacity: 1;
+  color: var(--vrc-accent-hover);
   background: var(--vrc-surface);
   border-color: var(--vrc-border);
 }
@@ -14259,7 +14259,7 @@ button:focus-visible,
 }
 
 .storage-summary-focus {
-  background: color-mix(in srgb, var(--vrc-accent) 8%, transparent);
+  /* 与 XS 卡片一致：去掉背景色，仅保留文字强调 */
 }
 
 .storage-summary-focus span {

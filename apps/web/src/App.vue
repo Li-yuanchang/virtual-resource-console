@@ -6336,11 +6336,11 @@ function overviewStorageCellClass(row: HostOverviewRow) {
 function overviewStorageMain(row: HostOverviewRow) {
   if (!hasOverviewInventory(row)) return "-";
   const storagePlan = hostStoragePlan(row);
-  // HBA+LVM 模式：主指标取第一个可分配存储类型（HBA 优先），与存储卡片展示一致
+  // HBA+LVM 模式：主指标取第一个可分配存储类型（HBA 优先）的剩余，分类名移到副行展示
   if (uiPreferences.storageDisplayMode === "hba-lvm") {
     const highlights = hostStorageHighlights(row);
     const primary = highlights[0];
-    if (primary) return `${storageHighlightShortLabel(primary.kind)} 剩余 ${formatNumber(primary.freeGiB)} GiB`;
+    if (primary) return `剩余 ${formatNumber(primary.freeGiB)} GiB`;
   }
   return `剩余 ${formatNumber(storagePlan.freeGiB)} GiB`;
 }
@@ -6348,21 +6348,22 @@ function overviewStorageMain(row: HostOverviewRow) {
 function overviewStorageSubline(row: HostOverviewRow) {
   if (!hasOverviewInventory(row)) return "读取中";
   const storagePlan = hostStoragePlan(row);
-  // HBA+LVM 模式：副行固定展示主分配类型（HBA 优先）的已用量；
-  // LVM 默认不展示剩余/明细（正常分配虚拟机以 HBA 盘为主，LVM 明细在存储卡片与详情弹窗查看）
+  // HBA+LVM 模式：副行展示 HBA / LVM 分类已用量（如「HBA 已用 x GiB，LVM 已用 y GiB」），主行只保留剩余；
+  // 没有实际用量的分类（已用 0 GiB）不展示
   if (uiPreferences.storageDisplayMode === "hba-lvm") {
-    const highlights = hostStorageHighlights(row);
+    const highlights = hostStorageHighlights(row).filter((item) => item.usedGiB > 0);
     if (highlights.length) {
-      const item = highlights[0];
-      return `已用 ${formatNumber(item.usedGiB)} GiB`;
+      return highlights
+        .map((item) => `${storageHighlightShortLabel(item.kind)} 已用 ${formatNumber(item.usedGiB)} GiB`)
+        .join("，");
     }
   }
   return `已用 ${formatNumber(storagePlan.usedGiB)} GiB`;
 }
 
 function storageHighlightShortLabel(kind: "hba" | "local" | "file") {
-  if (kind === "hba") return "虚拟 HBA";
-  if (kind === "local") return "物理 LVM";
+  if (kind === "hba") return "HBA";
+  if (kind === "local") return "LVM";
   return "文件存储";
 }
 
@@ -7462,7 +7463,7 @@ function normalizePort(value: unknown, providerType: ProviderType) {
               </span>
             </template>
           </el-table-column>
-          <el-table-column prop="storageFree" label="存储余量" min-width="168" align="right" sortable="custom">
+          <el-table-column prop="storageFree" label="存储余量" min-width="240" align="right" sortable="custom">
             <template #default="{ row }">
               <span class="overview-resource-cell" :class="overviewStorageCellClass(row)">
                 <span class="overview-storage-main">
