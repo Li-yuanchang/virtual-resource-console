@@ -91,6 +91,8 @@ interface ProvisionConsoleTargetItem {
 const IP_CANDIDATE_PREVIEW_LIMIT = 48;
 const VRC_TOAST_DURATION_MS = 3000;
 const SUPPORTED_WINDOWS_ISO_PATTERN = /windows_server_2008_r2|windows_server_2012_r2/i;
+// Ubuntu autoinstall 仅适配带 casper 引导结构的 Desktop 原版镜像（当前已验证 24.04 Desktop）。
+const SUPPORTED_UBUNTU_DESKTOP_ISO_PATTERN = /ubuntu[^/]*[-_.\s]desktop/i;
 
 function defaultRuntimePolicy(): RuntimePolicy {
   return {
@@ -240,7 +242,9 @@ const installProfileOptions = computed(() => {
   if (!image) return [{ label: "CLI", value: "server" as const }];
   const availableProfiles = isSupportedWindowsIso(image)
     ? (["server", "desktop"] as const)
-    : (image.installProfileHint?.available ?? ["server"]);
+    : isSupportedUbuntuDesktopIso(image)
+      ? (["desktop"] as const)
+      : (image.installProfileHint?.available ?? ["server"]);
   return availableProfiles.map((profile) => ({
     label: profile === "desktop" ? "Desktop" : "CLI",
     value: profile,
@@ -248,8 +252,9 @@ const installProfileOptions = computed(() => {
 });
 const effectiveInstallStrategy = computed(() => {
   if (selectedEnvironmentTemplate.value?.installStrategy) return selectedEnvironmentTemplate.value.installStrategy;
-  if (props.connection.providerType === "xenserver" && provisioningForm.sourceType === "iso" && isSupportedWindowsIso(selectedIsoImage.value)) {
-    return "windows-unattended";
+  if (props.connection.providerType === "xenserver" && provisioningForm.sourceType === "iso") {
+    if (isSupportedWindowsIso(selectedIsoImage.value)) return "windows-unattended";
+    if (isSupportedUbuntuDesktopIso(selectedIsoImage.value)) return "ubuntu-autoinstall";
   }
   return "manual-iso";
 });
@@ -894,8 +899,14 @@ function isSupportedWindowsIso(image: IsoImage | null | undefined): boolean {
   return SUPPORTED_WINDOWS_ISO_PATTERN.test(`${image.name} ${image.id}`);
 }
 
+function isSupportedUbuntuDesktopIso(image: IsoImage | null | undefined): boolean {
+  if (!image) return false;
+  return SUPPORTED_UBUNTU_DESKTOP_ISO_PATTERN.test(`${image.name} ${image.id}`);
+}
+
 function recommendedInstallProfile(image: IsoImage | null | undefined): "server" | "desktop" {
   if (isSupportedWindowsIso(image)) return "desktop";
+  if (isSupportedUbuntuDesktopIso(image)) return "desktop";
   return image?.installProfileHint?.recommended ?? "server";
 }
 
@@ -1053,6 +1064,7 @@ function installStrategyLabel(template: EnvironmentProvisioningTemplate | null) 
   if (template.installStrategy === "template-clone") return "克隆安装";
   if (template.installStrategy === "kickstart") return template.installProfile === "desktop" ? "无人值守 · 桌面" : "无人值守";
   if (template.installStrategy === "windows-unattended") return "Windows 无人值守";
+  if (template.installStrategy === "ubuntu-autoinstall") return "Ubuntu 无人值守 · 桌面";
   return "手动 ISO";
 }
 
