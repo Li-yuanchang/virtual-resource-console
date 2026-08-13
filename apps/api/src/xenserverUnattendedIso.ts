@@ -333,8 +333,9 @@ export async function prepareXenUbuntuAutoinstallIso(input: XenUnattendedIsoInpu
 
 /**
  * 生成 Ubuntu cloud-init user-data（autoinstall 应答文件）。
- * 网络按 input.ipPool / input.vm 生成静态配置；密码使用已在 XenServer 6.5 验证的
- * SHA-512 crypt 哈希（r19 同款，账号 vrcadmin），不依赖 snap 安装 openssh-server。
+ * 网络按 input.ipPool / input.vm 生成静态配置；登录账号取界面「新建用户名」
+ *（input.vm.loginUsername，缺省 ubuntu）；密码使用已在 XenServer 6.5 验证的
+ * SHA-512 crypt 哈希（r19 同款），不依赖 snap 安装 openssh-server。
  * late-commands 把磁盘引导必需内核参数固化到 /etc/default/grub，并在安装完成时
  * 尝试回调 installedUrl 上报（XenServer dom0 未放行端口时由 `|| true` 吞掉失败）。
  */
@@ -346,6 +347,8 @@ export function buildUbuntuAutoinstallUserData(input: XenUnattendedIsoInput): st
   const dns = input.ipPool.dns.find(Boolean)?.trim() || "";
   if (!dns) throw new Error("Ubuntu 无人值守安装缺少 DNS。");
   const hostname = buildUbuntuHostname(input.vm.name);
+  // 账号取界面「新建用户名」（前端 Ubuntu 账号策略必填，缺省按 ubuntu 兜底）。
+  const username = input.vm.loginUsername?.trim() || "ubuntu";
   const installedUrl = input.installSource?.installedUrl?.trim().replace(/["\\]/g, "") || "";
   const lines: string[] = [
     "#cloud-config",
@@ -356,7 +359,7 @@ export function buildUbuntuAutoinstallUserData(input: XenUnattendedIsoInput): st
     "    layout: us",
     "  identity:",
     `    hostname: ${hostname}`,
-    "    username: vrcadmin",
+    `    username: ${username}`,
     `    password: "${ubuntuAutoinstallUserPasswordHash}"`,
     '    realname: "VRC Autoinstall User"',
     "  ssh:",
