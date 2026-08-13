@@ -549,7 +549,7 @@ const environmentTemplateSchema = z.object({
   ipPoolId: z.string().default(""),
   vmNamePrefix: z.string().min(1),
   autoStart: z.boolean().default(true),
-  installStrategy: z.enum(["template-clone", "kickstart", "windows-unattended", "manual-iso"]).default("kickstart"),
+  installStrategy: z.enum(["template-clone", "kickstart", "windows-unattended", "manual-iso", "ubuntu-autoinstall"]).default("kickstart"),
   installProfile: z.enum(["server", "desktop"]).optional(),
   description: z.string().optional(),
 });
@@ -613,7 +613,7 @@ const provisionVmsSchema = connectionSchema.extend({
   scopeKey: z.string().optional(),
   environmentTemplateId: z.string().optional(),
   sourceType: z.enum(["iso", "template"]),
-  installStrategy: z.enum(["template-clone", "kickstart", "windows-unattended", "manual-iso"]).optional(),
+  installStrategy: z.enum(["template-clone", "kickstart", "windows-unattended", "manual-iso", "ubuntu-autoinstall"]).optional(),
   installProfile: z.enum(["server", "desktop"]).optional(),
   isoId: z.string().optional(),
   isoName: z.string().optional(),
@@ -3837,6 +3837,17 @@ async function runProvisionIsoPreflight(
           : tools
             ? `将生成包含 Autounattend 的任务级启动 ISO，并使用 ${tools.name} 安装监控工具`
             : "未找到 xs-tools.iso，无法完成 Windows 监控工具安装",
+    });
+  }
+  if (request.installStrategy === "ubuntu-autoinstall") {
+    checks.push({
+      key: "ubuntu-answer-media",
+      label: "Ubuntu 自动安装介质",
+      status: selected?.sourceType === "iso-library" ? "success" : "error",
+      message:
+        selected?.sourceType !== "iso-library"
+          ? "Ubuntu 无人值守必须使用可写 ISO 库中的原版镜像，不能使用本机 DVD"
+          : "将生成包含 autoinstall user-data 的任务级启动 ISO，并复用原版桌面 ISO 作为安装源",
     });
   }
   return checks;

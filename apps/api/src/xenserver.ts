@@ -1253,6 +1253,11 @@ prepare_unattended_install() {
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
     return
   fi
+  if [ "$VRC_INSTALL_MEDIA_MODE" = "ubuntu-autoinstall" ]; then
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=ubuntu-autoinstall >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
+    return
+  fi
   if [ "$VRC_INSTALL_MEDIA_MODE" = "offline-iso" ]; then
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=offline-iso >/dev/null 2>&1 || true
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
@@ -1373,6 +1378,14 @@ elif [ "$VRC_INSTALL_MEDIA_MODE" = "windows-unattended" ]; then
   # Windows PV drivers rely on the Windows device id and template CPU topology after XenServer Tools is installed.
   # Missing Windows platform keys can put Windows Server 2008 R2 into a BSOD recovery loop after Tools reboot.
   xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:device_id=0002 platform:viridian=true platform:cores-per-socket=1 >/dev/null 2>&1 || true
+elif [ "$VRC_INSTALL_MEDIA_MODE" = "ubuntu-autoinstall" ]; then
+  xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
+  prepare_unattended_install "$vm_uuid" "$template_name"
+  # CIDATA 启动盘必须可引导且先于原版桌面 ISO；GRUB 通过 search 从任一挂载光驱加载 casper 内核，
+  # 桌面 ISO 由 subiquity 识别为安装源。Ubuntu 不走 PV 参数，保持 viridian=false。
+  attach_iso_auto "$vm_uuid" "$VRC_AUX_ISO_UUID" true
+  attach_iso_auto "$vm_uuid" "$VRC_ISO_UUID" false
+  xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false >/dev/null 2>&1 || true
 elif should_use_unattended_install "$template_name"; then
   xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
   prepare_unattended_install "$vm_uuid" "$template_name"

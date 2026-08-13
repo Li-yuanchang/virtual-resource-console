@@ -593,7 +593,7 @@ export interface EnvironmentProvisioningTemplate {
   ipPoolId: string;
   vmNamePrefix: string;
   autoStart: boolean;
-  installStrategy: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso";
+  installStrategy: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso" | "ubuntu-autoinstall";
   installProfile: "server" | "desktop";
   description?: string;
 }
@@ -679,7 +679,7 @@ export interface VmCreateRequest {
   scopeKey?: string;
   environmentTemplateId?: string;
   sourceType: "iso" | "template";
-  installStrategy?: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso";
+  installStrategy?: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso" | "ubuntu-autoinstall";
   installProfile?: "server" | "desktop";
   isoId?: string;
   isoName?: string;

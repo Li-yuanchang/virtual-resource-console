@@ -61,6 +61,13 @@ class XenServerProvisioningPlanPolicy implements ProvisioningPlanPolicy {
         errors.push("Windows 无人值守当前仅支持已校验的 Windows Server 2008 R2 / 2012 R2 原版 ISO");
       }
     }
+    if (request.installStrategy === "ubuntu-autoinstall") {
+      const isoIdentity = `${request.isoName || ""} ${request.isoId || ""}`.toLowerCase();
+      if (request.sourceType !== "iso") errors.push("Ubuntu 无人值守必须使用 XenServer ISO 安装策略");
+      if (!isoIdentity.includes("ubuntu")) {
+        errors.push("Ubuntu 无人值守必须选择 Ubuntu Desktop 原版 ISO（镜像名需包含 ubuntu，当前仅验证 Ubuntu 24.04 Desktop）");
+      }
+    }
     return errors;
   }
 

@@ -246,7 +246,7 @@ export interface EnvironmentProvisioningTemplate {
   ipPoolId: string;
   vmNamePrefix: string;
   autoStart: boolean;
-  installStrategy: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso";
+  installStrategy: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso" | "ubuntu-autoinstall";
   installProfile: "server" | "desktop";
   description?: string;
 }
@@ -510,11 +510,13 @@ export interface VmProvisionInstallSourceRef {
   ksUrl: string;
   repoUrl: string;
   installedUrl: string;
+  autoinstallUrl?: string;
+  autoinstallMetaUrl?: string;
 }
 
 export interface VmProvisionRequest {
   taskId?: string;
-  installStrategy?: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso";
+  installStrategy?: "template-clone" | "kickstart" | "windows-unattended" | "manual-iso" | "ubuntu-autoinstall";
   installProfile?: "server" | "desktop";
   connectionId?: string;
   scopeKey?: string;

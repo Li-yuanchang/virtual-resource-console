@@ -1,6 +1,7 @@
 import type { ProvisionProgressReporter } from "./providers/provider.js";
 import {
   prepareXenCentosUnattendedIso,
+  prepareXenUbuntuAutoinstallIso,
   prepareXenWindowsUnattendIso,
   resolveXenInstallMediaMode,
 } from "./xenserverUnattendedIso.js";
@@ -90,6 +91,24 @@ xenInstallStrategies.register({
 });
 
 xenInstallStrategies.register({
+  id: "ubuntu-autoinstall",
+  matches: ({ request, sourceIsoName }) => request.sourceType === "iso" && request.installStrategy === "ubuntu-autoinstall" && isUbuntuImage(sourceIsoName),
+  prepare: async (context) => {
+    const generated = await prepareUbuntuAutoinstallIso(context);
+    return {
+      installMediaMode: "ubuntu-autoinstall",
+      unattended: true,
+      requiresInstallSource: false,
+      originalIsoId: context.request.isoId || "",
+      originalIsoName: context.sourceIsoName,
+      auxiliaryIsoId: generated.isoId,
+      auxiliaryIsoName: generated.isoName,
+      generatedIsoRegistryId: generated.registryId,
+    };
+  },
+});
+
+xenInstallStrategies.register({
   id: "manual-iso",
   matches: () => true,
   prepare: async ({ request, sourceIsoName }) => ({
@@ -117,6 +136,10 @@ function isCentosImage(name: string): boolean {
   return /centos/i.test(name);
 }
 
+function isUbuntuImage(name: string): boolean {
+  return /ubuntu/i.test(name);
+}
+
 function resolveCentosMediaMode(context: XenInstallStrategyContext): XenInstallMediaMode {
   return context.sourceType === "host-dvd" ? "native-http" : resolveXenInstallMediaMode();
 }
@@ -133,6 +156,10 @@ async function prepareCentosSmallIso(context: XenInstallStrategyContext): Promis
   return prepareXenCentosUnattendedIso(toIsoInput(context));
 }
 
+async function prepareUbuntuAutoinstallIso(context: XenInstallStrategyContext): Promise<XenUnattendedIsoResult> {
+  return prepareXenUbuntuAutoinstallIso(toIsoInput(context));
+}
+
 function toIsoInput(context: XenInstallStrategyContext): XenUnattendedIsoInput {
   return {
     connection: context.connection,
@@ -140,7 +167,7 @@ function toIsoInput(context: XenInstallStrategyContext): XenUnattendedIsoInput {
     taskId: context.request.taskId,
     sourceIsoId: context.request.isoId || "",
     sourceIsoName: context.sourceIsoName,
-    installProfile: context.request.installProfile ?? (isWindowsImage(context.sourceIsoName) ? "desktop" : "server"),
+    installProfile: context.request.installProfile ?? (isWindowsImage(context.sourceIsoName) || isUbuntuImage(context.sourceIsoName) ? "desktop" : "server"),
     hostId: context.request.hostId,
     vm: context.item,
     ipPool: context.request.ipPool,

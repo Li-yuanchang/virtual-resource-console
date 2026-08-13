@@ -29,8 +29,11 @@ const generatedDir = getVrcDataFile("generated-isos");
 const centosBootIsoLabel = "VRCCENTOS7";
 const centosKickstartIsoLabel = "VRCKS";
 const windowsUnattendedIsoLabel = "VRCWIN";
+const ubuntuAutoinstallIsoLabel = "CIDATA";
+// r19 在 XenServer 6.5 上验证通过的 Ubuntu 24.04 Desktop 默认账号密码哈希（$6$ SHA-512 crypt）。
+const ubuntuAutoinstallUserPasswordHash = "$6$vrcu24$d7Xj.Oe5YwPbM3uwzhomhKAr5qWPUZbErqdjQIC3cHI4nSHr9dDJXlQpatpwxFXDtMWmTnWGc2BeBidvM.ICd.";
 
-export type XenInstallMediaMode = "offline-iso" | "http-boot-iso" | "cdrom-http-ks" | "native-http" | "windows-unattended";
+export type XenInstallMediaMode = "offline-iso" | "http-boot-iso" | "cdrom-http-ks" | "native-http" | "windows-unattended" | "ubuntu-autoinstall";
 
 interface SourceIsoInfo {
   srUuid: string;
@@ -244,6 +247,277 @@ export async function prepareXenWindowsUnattendIso(input: XenUnattendedIsoInput)
     rmSync(localOutputIso, { force: true });
     rmSync(workDir, { recursive: true, force: true });
   }
+}
+
+// ============================================================================
+// Ubuntu Desktop autoinstall（CIDATA 双光驱方案）
+//
+// 原版 Ubuntu Desktop ISO 保持不变；任务级生成一个小型 CIDATA 启动 ISO：
+//   - boot/grub（含 i386-pc 模块与 eltorito.img，GRUB BIOS 引导，从源 ISO 整体打包下载）
+//   - casper/vmlinuz + casper/initrd（与桌面 ISO 同名文件，GRUB search 可兜底命中）
+//   - meta-data + user-data（cloud-init ds=nocloud 数据源）
+// GRUB 通过 `search --file /casper/vmlinuz` 从任一挂载光驱找到内核后，subiquity
+// 以原版桌面 ISO 作为安装源完成无人值守安装。该方案在 XenServer 6.5 上以
+// Ubuntu 24.04 Desktop 验证通过：磁盘引导必须携带 nopv/xen_emul_unplug=never
+// 等内核参数，late-commands 必须把同一组参数固化到 /etc/default/grub，否则
+// 安装完成后磁盘无法启动。
+// ============================================================================
+
+/**
+ * 生成 Ubuntu Desktop autoinstall 的任务级 CIDATA 启动 ISO 并上传到 XenServer ISO SR。
+ * 流程与 Windows 应答盘一致：登记 -> 组装小 ISO -> 上传 -> 扫描登记 -> 打标 -> 本地清理。
+ */
+export async function prepareXenUbuntuAutoinstallIso(input: XenUnattendedIsoInput): Promise<XenUnattendedIsoResult> {
+  ensureDir(generatedDir);
+  input.onProgress?.("准备 Ubuntu 无人值守启动 ISO");
+  await assertIsoGeneratorAvailable();
+  const source = await readSourceIsoInfo(input.connection, input.sourceIsoId, true, "ubuntu");
+  const isoName = `vrc-${safeFileName(input.vm.name)}-ubuntu-cidata-${Date.now().toString(36)}.iso`;
+  const remotePath = `${dirname(source.remotePath)}/${isoName}`;
+  const registry = registerGeneratedIso({
+    taskId: input.taskId || input.installSource?.taskId || input.installSource?.id || `xen-ubuntu-${Date.now().toString(36)}`,
+    providerType: "xenserver",
+    connectionId: input.connectionId,
+    hostId: input.hostId,
+    vmName: input.vm.name,
+    vmIp: input.vm.ip,
+    sourceIsoId: input.sourceIsoId,
+    sourceIsoName: input.sourceIsoName,
+    isoSrUuid: source.srUuid,
+    isoName,
+    isoPath: remotePath,
+  });
+  const localOutputIso = join(generatedDir, isoName);
+  const workDir = join(generatedDir, `${safeFileName(input.vm.name)}-ubuntu-cidata-work`);
+  try {
+    rmSync(workDir, { recursive: true, force: true });
+    rmSync(localOutputIso, { force: true });
+    ensureDir(workDir);
+    input.onProgress?.("缓存 Ubuntu casper 内核与 GRUB 引导文件");
+    const bootFiles = await ensureLocalUbuntuBootFiles(input.connection, source);
+    const casperDir = join(workDir, "casper");
+    ensureDir(casperDir);
+    ensureDir(join(workDir, "boot"));
+    copyFileSync(bootFiles.vmlinuz, join(casperDir, "vmlinuz"));
+    copyFileSync(bootFiles.initrd, join(casperDir, "initrd"));
+    await copyLocalDirectory(bootFiles.grubDir, join(workDir, "boot"));
+    writeFileSync(join(workDir, "boot", "grub", "grub.cfg"), buildUbuntuBootGrubConfig(input), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(join(workDir, "meta-data"), buildUbuntuMetaData(input), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(join(workDir, "user-data"), buildUbuntuAutoinstallUserData(input), { encoding: "utf8", mode: 0o600 });
+    input.onProgress?.("生成 Ubuntu autoinstall CIDATA 启动 ISO");
+    await generateUbuntuAutoinstallIso(workDir, localOutputIso);
+    chmodSync(localOutputIso, 0o600);
+    input.onProgress?.("上传 Ubuntu autoinstall 启动 ISO 到 XenServer ISO SR");
+    await uploadIso(input.connection, localOutputIso, remotePath);
+    input.onProgress?.("扫描 ISO SR 并登记 Ubuntu autoinstall 启动 ISO");
+    const isoId = await scanAndFindUploadedIso(input.connection, source.srUuid, isoName);
+    await markGeneratedIsoOnXen(input.connection, {
+      isoId,
+      registryId: registry.id,
+      taskId: registry.taskId,
+      vmName: input.vm.name,
+    });
+    markGeneratedIsoUploaded(registry.id, {
+      isoVdiUuid: isoId,
+      message: "Ubuntu autoinstall 启动 ISO 已上传并登记",
+    });
+    return { isoId, isoName, registryId: registry.id };
+  } catch (error) {
+    markGeneratedIsoStatus(registry.id, "failed", error instanceof Error ? error.message : "Ubuntu autoinstall 启动 ISO 生成失败");
+    throw error;
+  } finally {
+    rmSync(localOutputIso, { force: true });
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 生成 Ubuntu cloud-init user-data（autoinstall 应答文件）。
+ * 网络按 input.ipPool / input.vm 生成静态配置；密码使用已在 XenServer 6.5 验证的
+ * SHA-512 crypt 哈希（r19 同款，账号 vrcadmin），不依赖 snap 安装 openssh-server。
+ * late-commands 把磁盘引导必需内核参数固化到 /etc/default/grub，并在安装完成时
+ * 尝试回调 installedUrl 上报（XenServer dom0 未放行端口时由 `|| true` 吞掉失败）。
+ */
+export function buildUbuntuAutoinstallUserData(input: XenUnattendedIsoInput): string {
+  const netmask = cidrToNetmask(input.ipPool.cidr);
+  if (!netmask) throw new Error("Ubuntu 无人值守安装缺少有效 CIDR 子网掩码。");
+  const prefixLength = cidrPrefixLength(input.ipPool.cidr);
+  if (prefixLength == null) throw new Error("Ubuntu 无人值守安装缺少有效 CIDR 前缀长度。");
+  const dns = input.ipPool.dns.find(Boolean)?.trim() || "";
+  if (!dns) throw new Error("Ubuntu 无人值守安装缺少 DNS。");
+  const hostname = buildUbuntuHostname(input.vm.name);
+  const installedUrl = input.installSource?.installedUrl?.trim().replace(/["\\]/g, "") || "";
+  const lines: string[] = [
+    "#cloud-config",
+    "autoinstall:",
+    "  version: 1",
+    "  locale: en_US.UTF-8",
+    "  keyboard:",
+    "    layout: us",
+    "  identity:",
+    `    hostname: ${hostname}`,
+    "    username: vrcadmin",
+    `    password: "${ubuntuAutoinstallUserPasswordHash}"`,
+    '    realname: "VRC Autoinstall User"',
+    "  ssh:",
+    "    install-server: false",
+    "  network:",
+    "    version: 2",
+    "    ethernets:",
+    "      eth0:",
+    "        dhcp4: false",
+    "        addresses:",
+    `          - ${input.vm.ip}/${prefixLength}`,
+    "        routes:",
+    "          - to: default",
+    `            via: ${input.ipPool.gateway}`,
+    "        nameservers:",
+    "          addresses:",
+    `            - ${dns}`,
+    "  storage:",
+    "    layout:",
+    "      name: lvm",
+    "  late-commands:",
+  ];
+  if (installedUrl) {
+    lines.push(`    - "curl -fs ${installedUrl} || true"`);
+  }
+  lines.push(`    - ${ubuntuGrubPersistCommand}`);
+  lines.push("  shutdown: poweroff");
+  lines.push("");
+  return lines.join("\n");
+}
+
+/**
+ * 生成 CIDATA 启动 ISO 的 GRUB 菜单。内核参数必须与 late-commands 固化到
+ * /etc/default/grub 的参数保持一致；ip=/dns= 由任务 IP 池生成，与 r19 验证一致。
+ */
+export function buildUbuntuBootGrubConfig(input: XenUnattendedIsoInput): string {
+  const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
+  const dns = input.ipPool.dns.find(Boolean)?.trim() || "";
+  const hostname = buildUbuntuHostname(input.vm.name);
+  return [
+    "serial --unit=0 --speed=115200",
+    "terminal_input --append serial",
+    "terminal_output --append serial",
+    'set default="0"',
+    "set timeout=5",
+    'echo "VRC-GRUB-START"',
+    'menuentry "VRC Ubuntu autoinstall (kernel from desktop ISO)" {',
+    '    echo "VRC-GRUB: searching desktop ISO"',
+    "    search --no-floppy --set=root --file /casper/vmlinuz",
+    '    echo "VRC-GRUB: root=$root"',
+    '    echo "VRC-GRUB: loading linux"',
+    `    linux /casper/vmlinuz autoinstall ds=nocloud ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:${hostname}:eth0:none dns=${dns} net.ifnames=0 biosdevname=0 nomodeset nopv xen_emul_unplug=never notsc clocksource=hpet acpi_skip_timer_override console=tty0 console=ttyS0,115200n8 initcall_debug loglevel=8 ignore_loglevel printk.time=1 ---`,
+    '    echo "VRC-GRUB: loading initrd"',
+    "    initrd /casper/initrd",
+    '    echo "VRC-GRUB: boot"',
+    "}",
+    "",
+  ].join("\n");
+}
+
+// cloud-init user-data 的 late-commands 项，与 r19 在 XenServer 6.5 上验证通过的写法逐字一致。
+const ubuntuGrubPersistCommand = String.raw`"curtin in-target -- bash -c 'sed -i \"s/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=\\\"net.ifnames=0 biosdevname=0 console=ttyS0,115200n8 nopv xen_emul_unplug=never notsc clocksource=hpet acpi_skip_timer_override\\\"/\" /etc/default/grub; sed -i \"s/^#\\?GRUB_TERMINAL=.*/GRUB_TERMINAL=serial/\" /etc/default/grub; grep -q \"^GRUB_TERMINAL=\" /etc/default/grub || echo GRUB_TERMINAL=serial >> /etc/default/grub; update-grub || true'"`;
+
+function buildUbuntuMetaData(input: XenUnattendedIsoInput): string {
+  const hostname = buildUbuntuHostname(input.vm.name);
+  return `instance-id: iid-vrc-ubu-${hostname}\nlocal-hostname: ${hostname}\n`;
+}
+
+// Ubuntu hostname 只允许 [a-z0-9-]，最长 63 字符；这里压缩到 40 字符并去掉首尾连字符。
+function buildUbuntuHostname(vmName: string): string {
+  const normalized = vmName
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return normalized || "vrc-ubu-auto";
+}
+
+interface LocalUbuntuBootFiles {
+  vmlinuz: string;
+  initrd: string;
+  grubDir: string;
+}
+
+async function ensureLocalUbuntuBootFiles(connection: XenConnectionInput, source: SourceIsoInfo): Promise<LocalUbuntuBootFiles> {
+  const sourceKey = `${safeFileName(source.srUuid)}__${safeFileName(source.location)}__ubuntu`;
+  const localDir = join(cacheDir, sourceKey);
+  if (existsSync(localDir) && !statSync(localDir).isDirectory()) {
+    rmSync(localDir, { force: true });
+  }
+  ensureDir(localDir);
+  const files = {
+    vmlinuz: join(localDir, "casper", "vmlinuz"),
+    initrd: join(localDir, "casper", "initrd"),
+    grubDir: join(localDir, "boot", "grub"),
+  };
+  const grubReady = existsSync(files.grubDir) && listLocalFiles(files.grubDir).length > 10;
+  if (existsSync(files.vmlinuz) && existsSync(files.initrd) && grubReady) {
+    return files;
+  }
+  ensureDir(dirname(files.vmlinuz));
+  await downloadFile(connection, `${source.mountDir}/casper/vmlinuz`, files.vmlinuz);
+  await downloadFile(connection, `${source.mountDir}/casper/initrd`, files.initrd);
+  if (!grubReady) {
+    await downloadRemoteDirectory(connection, `${source.mountDir}/boot/grub`, join(localDir, "boot"));
+  }
+  return files;
+}
+
+// boot/grub 下有数百个 GRUB 模块文件，逐个 SFTP 拉取会建立大量 SSH 连接；
+// 改为在 dom0 上先打成单个 tar 再下载，最后本地解压到目标目录。
+async function downloadRemoteDirectory(connection: XenConnectionInput, remoteDir: string, localParentDir: string): Promise<void> {
+  const remoteBase = remoteDir.split("/").filter(Boolean).pop() || "grub";
+  const remoteParent = remoteDir.slice(0, Math.max(0, remoteDir.length - remoteBase.length - 1)) || "/";
+  const remoteTar = `/tmp/vrc-grub-${process.pid}-${Date.now().toString(36)}.tar`;
+  const localTar = join(cacheDir, `vrc-grub-${process.pid}-${Date.now().toString(36)}.tar`);
+  ensureDir(localParentDir);
+  try {
+    await runRemoteCommand(
+      connection,
+      [
+        `remote_dir='${escapeShellValue(remoteDir)}'`,
+        `remote_tar='${escapeShellValue(remoteTar)}'`,
+        'tar -C "$(dirname "$remote_dir")" -cf "$remote_tar" "$(basename "$remote_dir")"',
+        '[ -s "$remote_tar" ] || { echo "无法在 XenServer 上打包启动目录：$remote_dir" >&2; exit 8; }',
+      ].join("\n"),
+    );
+    await downloadFile(connection, remoteTar, localTar);
+    await execFileAsync("tar", ["-xf", localTar, "-C", localParentDir]);
+  } finally {
+    rmSync(localTar, { force: true });
+    await runRemoteCommand(connection, `rm -f '${escapeShellValue(remoteTar)}'`).catch(() => undefined);
+  }
+}
+
+async function copyLocalDirectory(sourceDir: string, destinationParent: string): Promise<void> {
+  await execFileAsync("cp", ["-R", sourceDir, destinationParent]);
+}
+
+async function generateUbuntuAutoinstallIso(workDir: string, outputIso: string): Promise<void> {
+  const xorriso = resolveXorrisoPath();
+  await execFileAsync(xorriso, [
+    "-as",
+    "mkisofs",
+    "-o",
+    outputIso,
+    "-b",
+    "boot/grub/i386-pc/eltorito.img",
+    "-c",
+    "boot.catalog",
+    "-no-emul-boot",
+    "-boot-load-size",
+    "4",
+    "-boot-info-table",
+    "-R",
+    "-J",
+    "-V",
+    ubuntuAutoinstallIsoLabel,
+    workDir,
+  ]);
 }
 
 /** Builds macOS hdiutil arguments for a small Windows answer ISO. */
@@ -725,7 +999,26 @@ export function buildXenGeneratedIsoCleanupScript(record: GeneratedIsoRecord): s
   ].join("\n");
 }
 
-async function readSourceIsoInfo(connection: XenConnectionInput, sourceIsoId: string, mountForBootFiles: boolean): Promise<SourceIsoInfo> {
+export type XenSourceIsoBootStyle = "centos" | "ubuntu";
+
+async function readSourceIsoInfo(
+  connection: XenConnectionInput,
+  sourceIsoId: string,
+  mountForBootFiles: boolean,
+  bootStyle: XenSourceIsoBootStyle = "centos",
+): Promise<SourceIsoInfo> {
+  const bootFilesCheck =
+    bootStyle === "ubuntu"
+      ? [
+          '[ -f "$mount_dir/casper/vmlinuz" ] || { echo "源 ISO 缺少 casper/vmlinuz（Ubuntu Desktop 安装内核）" >&2; exit 6; }',
+          '[ -f "$mount_dir/casper/initrd" ] || { echo "源 ISO 缺少 casper/initrd（Ubuntu Desktop 安装 initrd）" >&2; exit 6; }',
+          '[ -f "$mount_dir/boot/grub/i386-pc/eltorito.img" ] || { echo "源 ISO 缺少 boot/grub/i386-pc/eltorito.img（Ubuntu GRUB 引导镜像）" >&2; exit 6; }',
+        ]
+      : [
+          '[ -f "$mount_dir/isolinux/isolinux.bin" ] || { echo "源 ISO 缺少 isolinux.bin" >&2; exit 6; }',
+          '[ -f "$mount_dir/isolinux/vmlinuz" ] || [ -f "$mount_dir/images/pxeboot/vmlinuz" ] || { echo "源 ISO 缺少 vmlinuz" >&2; exit 6; }',
+          '[ -f "$mount_dir/isolinux/initrd.img" ] || [ -f "$mount_dir/images/pxeboot/initrd.img" ] || { echo "源 ISO 缺少 initrd.img" >&2; exit 6; }',
+        ];
   const output = await runRemoteCommand(
     connection,
     [
@@ -742,13 +1035,11 @@ async function readSourceIsoInfo(connection: XenConnectionInput, sourceIsoId: st
             'current_source="$(mount | awk -v dir="$mount_dir" \'$3 == dir {print $1; exit}\')"',
             '[ -z "$current_source" ] || [ "$current_source" = "$remote_path" ] || umount "$mount_dir" >/dev/null 2>&1 || true',
             'mountpoint -q "$mount_dir" || mount -o loop,ro "$remote_path" "$mount_dir"',
-            '[ -f "$mount_dir/isolinux/isolinux.bin" ] || { echo "源 ISO 缺少 isolinux.bin" >&2; exit 6; }',
-            '[ -f "$mount_dir/isolinux/vmlinuz" ] || [ -f "$mount_dir/images/pxeboot/vmlinuz" ] || { echo "源 ISO 缺少 vmlinuz" >&2; exit 6; }',
-            '[ -f "$mount_dir/isolinux/initrd.img" ] || [ -f "$mount_dir/images/pxeboot/initrd.img" ] || { echo "源 ISO 缺少 initrd.img" >&2; exit 6; }',
+            ...bootFilesCheck,
           ].join("\n")
         : 'mount_dir=""',
-      'printf "SIZE\\t%s\\n" "$(stat -c %s "$remote_path" 2>/dev/null || wc -c < "$remote_path")"',
-      'printf "ISO\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$sr_uuid" "$location" "$remote_path" "$mount_dir" "$volume_label"',
+      'printf "SIZE\t%s\n" "$(stat -c %s "$remote_path" 2>/dev/null || wc -c < "$remote_path")"',
+      'printf "ISO\t%s\t%s\t%s\t%s\t%s\n" "$sr_uuid" "$location" "$remote_path" "$mount_dir" "$volume_label"',
     ].join("\n"),
   );
   const line = output.split(/\r?\n/).find((item) => item.startsWith("ISO\t"));
