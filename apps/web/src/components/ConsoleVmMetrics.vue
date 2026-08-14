@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import VrcOverflowTooltip from "./VrcOverflowTooltip.vue";
 import type { ConsoleMetricKey } from "../domain/consoleStrategies";
 
 const props = defineProps<{
@@ -160,8 +161,12 @@ function clamp(value: number, min: number, max: number) {
       <template v-else>
         <article class="console-vm-metric-tile" :class="{ 'is-fallback': cpuPercent == null }">
           <label>CPU</label>
-          <strong>{{ cpuValue }}</strong>
-          <small>{{ cpuDetail }}</small>
+          <VrcOverflowTooltip :content="cpuValue" placement="bottom" class="console-vm-metric-value">
+            <strong data-overflow-target>{{ cpuValue }}</strong>
+          </VrcOverflowTooltip>
+          <VrcOverflowTooltip :content="cpuDetail" placement="bottom" class="console-vm-metric-detail">
+            <small data-overflow-target>{{ cpuDetail }}</small>
+          </VrcOverflowTooltip>
           <span class="console-vm-metric-meter" aria-hidden="true"><i :style="{ width: `${cpuPercent ?? 0}%` }"></i></span>
         </article>
 
@@ -175,15 +180,23 @@ function clamp(value: number, min: number, max: number) {
             <svg viewBox="0 0 1000 140" preserveAspectRatio="none"><path ref="memoryPathRef"></path></svg>
           </span>
           <label>{{ mode === "overlay" ? "MEM" : "内存" }}</label>
-          <strong>{{ memoryValue }}</strong>
-          <small>{{ memoryDetail }}</small>
+          <VrcOverflowTooltip :content="memoryValue" placement="bottom" class="console-vm-metric-value">
+            <strong data-overflow-target>{{ memoryValue }}</strong>
+          </VrcOverflowTooltip>
+          <VrcOverflowTooltip :content="memoryDetail" placement="bottom" class="console-vm-metric-detail">
+            <small data-overflow-target>{{ memoryDetail }}</small>
+          </VrcOverflowTooltip>
           <span v-if="memoryPercent == null" class="console-vm-metric-meter" aria-hidden="true"><i></i></span>
         </article>
 
         <article class="console-vm-metric-tile" :class="{ 'is-fallback': networkRate === '--' }">
           <label>{{ mode === "overlay" ? "NET" : "网络" }}</label>
-          <strong>{{ networkRate }}</strong>
-          <small>{{ networkDetail }}</small>
+          <VrcOverflowTooltip :content="networkRate" placement="bottom" class="console-vm-metric-value">
+            <strong data-overflow-target>{{ networkRate }}</strong>
+          </VrcOverflowTooltip>
+          <VrcOverflowTooltip :content="networkDetail" placement="bottom" class="console-vm-metric-detail">
+            <small data-overflow-target>{{ networkDetail }}</small>
+          </VrcOverflowTooltip>
           <span class="console-vm-metric-meter" aria-hidden="true"><i :style="{ width: `${networkBarPercent}%` }"></i></span>
         </article>
 
@@ -197,8 +210,12 @@ function clamp(value: number, min: number, max: number) {
             <svg viewBox="0 0 1000 140" preserveAspectRatio="none"><path ref="diskPathRef"></path></svg>
           </span>
           <label>{{ mode === "overlay" ? "DISK" : "磁盘" }}</label>
-          <strong>{{ diskValue }}</strong>
-          <small>{{ diskDetail }}</small>
+          <VrcOverflowTooltip :content="diskValue" placement="bottom" class="console-vm-metric-value">
+            <strong data-overflow-target>{{ diskValue }}</strong>
+          </VrcOverflowTooltip>
+          <VrcOverflowTooltip :content="diskDetail" placement="bottom" class="console-vm-metric-detail">
+            <small data-overflow-target>{{ diskDetail }}</small>
+          </VrcOverflowTooltip>
           <span v-if="diskPercent == null" class="console-vm-metric-meter" aria-hidden="true"><i :style="{ width: `${diskActivityPercent}%` }"></i></span>
         </article>
       </template>

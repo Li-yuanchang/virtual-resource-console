@@ -8140,6 +8140,17 @@ button:focus-visible,
   white-space: nowrap;
 }
 
+.console-vm-metric-tile .console-vm-metric-value,
+.console-vm-metric-tile .console-vm-metric-detail {
+  display: block;
+  min-width: 0;
+}
+
+.console-vm-metric-tile .console-vm-metric-value > strong,
+.console-vm-metric-tile .console-vm-metric-detail > small {
+  display: block;
+}
+
 .console-vm-metric-tile strong {
   min-width: 0;
   overflow: hidden;
