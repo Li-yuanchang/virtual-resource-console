@@ -1,6 +1,6 @@
 {
   "name": "virtual-resource-console",
-  "version": "0.1.68",
+  "version": "0.1.69",
   "private": true,
   "description": "Cross-platform virtualization resource overview and recovery analysis console.",
   "workspaces": [
