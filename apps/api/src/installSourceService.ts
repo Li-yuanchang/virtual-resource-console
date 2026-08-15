@@ -473,11 +473,19 @@ async function publishKickstartToXenHost(connection: XenConnectionInput, source:
       '  :',
       'else',
       "  cat > \"$server_script\" <<'PYHTTP'",
-      'import BaseHTTPServer, os, posixpath, urllib, mimetypes, subprocess, sys',
+      'import BaseHTTPServer, SocketServer, os, posixpath, urllib, mimetypes, subprocess, sys, socket',
       'ROOT = os.path.abspath(sys.argv[1])',
       'PORT = int(sys.argv[2])',
       'class Handler(BaseHTTPServer.BaseHTTPRequestHandler):',
       '    server_version = "VRCInstallHTTP/1.0"',
+      '    timeout = 300',
+      '    protocol_version = "HTTP/1.0"',
+      '    def setup(self):',
+      '        BaseHTTPServer.BaseHTTPRequestHandler.setup(self)',
+      '        try:',
+      '            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)',
+      '        except Exception:',
+      '            pass',
       '    def translate_path(self, path):',
       '        path = path.split("?", 1)[0].split("#", 1)[0]',
       '        path = posixpath.normpath(urllib.unquote(path))',
@@ -494,9 +502,13 @@ async function publishKickstartToXenHost(connection: XenConnectionInput, source:
       '        if not f: return',
       '        try:',
       '            while True:',
-      '                chunk = f.read(1024 * 256)',
+      '                chunk = f.read(1024 * 64)',
       '                if not chunk: break',
-      '                self.wfile.write(chunk)',
+      '                try:',
+      '                    self.wfile.write(chunk)',
+      '                    self.wfile.flush()',
+      '                except Exception:',
+      '                    break',
       '        except Exception:',
       '            pass',
       '        try:',
@@ -557,9 +569,13 @@ async function publishKickstartToXenHost(connection: XenConnectionInput, source:
       '        self.send_header("Content-Length", str(end - start + 1))',
       '        if status == 206:',
       '            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))',
+      '        self.send_header("Connection", "close")',
       '        self.end_headers()',
       '        return f',
-      'BaseHTTPServer.HTTPServer(("", PORT), Handler).serve_forever()',
+      'class ThreadingServer(SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer):',
+      '    daemon_threads = True',
+      '    allow_reuse_address = True',
+      'ThreadingServer(("", PORT), Handler).serve_forever()',
       'PYHTTP',
       "  cat > \"$starter\" <<'EOF'",
       '#!/bin/sh',
@@ -889,7 +905,7 @@ function buildKickstart(source: InstallSourceRecord): string {
   const rootPasswordValue = shellSingleQuote(rootPassword || "changeme");
   const rootPasswordHashValue = md5Crypt(rootPassword || "changeme");
   const rootPasswordHash = shellSingleQuote(rootPasswordHashValue);
-  const hostname = sanitizeKickstartValue(source.vm.name);
+  const hostname = sanitizeHostname(source.vm.name, ip);
   const installedUrl = sanitizeKickstartValue(source.installedUrl);
   // Rocky 9 与旧 CentOS 7 走差异化无人值守配置，
   // 与 offline ISO 的 buildOfflineCentosKickstart 保持一致。
@@ -897,6 +913,11 @@ function buildKickstart(source: InstallSourceRecord): string {
   const installSourceLine = source.installMediaMode === "cdrom-http-ks" ? "cdrom" : `url --url="${source.repoUrl}"`;
   const rebootDirective = xenInstallRebootDirective(source.sourceInfo?.sourceType ?? "iso-library");
   const rootPasswordDirective = rocky9 ? "rootpw --lock" : `rootpw --iscrypted ${rootPasswordHashValue}`;
+  // RHEL9 已废弃 authconfig：保留 auth 指令会让 Anaconda 强依赖 authselect-compat 包
+  // （minimal 安装源不含该包），安装到 "Authconfig configuration" 任务直接硬失败
+  // （127.37 实测：SecurityInstallationError: /usr/sbin/authconfig is missing）。
+  // Rocky9 密码由 rootpw --lock + %post chpasswd 写入，无需 auth 指令；CentOS7 保留历史行为。
+  const authDirective = rocky9 ? "" : "auth --enableshadow --passalgo=sha512";
   const partitioning = rocky9
     ? buildRedHatPlainPartitioning(source.vm.diskGiB)
     : buildCentosLvmPartitioning(source.vm.diskGiB);
@@ -913,14 +934,13 @@ function buildKickstart(source: InstallSourceRecord): string {
         installedUrl,
       });
 return `#version=DEVEL
-install
 text
 ${installSourceLine}
 lang en_US.UTF-8
 keyboard us
 timezone Asia/Shanghai --isUtc
 ${rootPasswordDirective}
-auth --enableshadow --passalgo=sha512
+${authDirective}
 selinux --disabled
 firewall --disabled
 firstboot --disabled
@@ -928,7 +948,7 @@ network --bootproto=static --device=eth0 --ip=${ip} --netmask=${netmask} --gatew
 bootloader --location=mbr
 ${partitioning}
 ${rebootDirective}
-${buildCentosPackageSelection()}
+${buildCentosPackageSelection([], { excludeVmFirmware: rocky9 })}
 ${postBlock}
 `;
 }
@@ -958,6 +978,28 @@ function isPackageRpmPath(path: string): boolean {
 
 function safePathSegment(value: string): string {
   return value.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120) || "source";
+}
+
+/**
+ * 生成合法的 kickstart hostname。
+ * Anaconda 的 network --hostname 只允许 a-zA-Z0-9 与 '-'，且每段不能以 '-' 开头或结尾；
+ * VM 业务名称常含中文、下划线、空格等非法字符，不能直接写入 ks.cfg（会导致安装器解析失败）。
+ * 这里保留名称中的合法字符，非法字符折叠为 '-'，纯非法名或空名则回退为 IP 派生名。
+ * @param name VM 业务名称（仅用于派生 hostname，不影响 name-label 展示）
+ * @param ip VM 静态 IP，用于纯中文/空名称时的回退
+ */
+function sanitizeHostname(name: string, ip: string): string {
+  const cleaned = (name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 63);
+  if (cleaned && /[a-z0-9]/.test(cleaned)) {
+    return cleaned;
+  }
+  const ipPart = (ip || "").toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "");
+  return `vm-${ipPart || "host"}`;
 }
 
 function sanitizeKickstartValue(value: string): string {

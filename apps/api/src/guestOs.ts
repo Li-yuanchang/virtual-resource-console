@@ -59,3 +59,27 @@ function normalizeWindowsLabel(raw: string): string | undefined {
 function looksLikeKernelVersion(value: string): boolean {
   return /^(?:linux\s+)?\d+\.\d+\.\d+(?:[-._+][a-z0-9]+)+/i.test(value) || /\bx86_64\b|\baarch64\b/i.test(value);
 }
+
+/**
+ * 从安装 ISO 文件名推导系统标识（如 "Rocky-9.6-x86_64-minimal.iso" → "Rocky Linux 9.6"）。
+ * 仅命中已知发行版关键词才返回，避免把自定义 ISO 名当作系统名写进 VM 元数据；
+ * 该结果只是占位，安装验收 SSH 探测到 /etc/os-release 真实系统后会覆盖。
+ */
+export function normalizeGuestOsLabelFromIsoName(isoName: string): string | undefined {
+  const stem = String(isoName ?? "")
+    .replace(/\.iso$/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!stem) return undefined;
+  const lowerStem = stem.toLowerCase();
+  const knownKeywords = [
+    "rocky", "centos", "rhel", "red hat", "alma", "fedora",
+    "ubuntu", "debian", "kylin", "openeuler", "euleros",
+    "windows", "suse", "opensuse", "sles", "oracle linux",
+    "linux mint", "uos", "deepin",
+  ];
+  if (!knownKeywords.some((keyword) => lowerStem.includes(keyword))) return undefined;
+  // 保留原名大小写（如 openEuler 的 LTS），关键词判定用 lowerStem 即可
+  return normalizeGuestOsLabel(stem);
+}

@@ -9,6 +9,7 @@ import { isRocky9Image } from "./centosKickstart.js";
 import { enableAndVerifyProxmoxGuestAgent } from "./proxmox.js";
 import { verifyVmwareGuestTools } from "./vmware.js";
 import { prepareXenVmForInstalledBoot } from "./installSourceService.js";
+import { normalizeGuestOsLabel } from "./guestOs.js";
 import { resolveGuestMonitoringPolicy } from "./guestMonitoringPolicy.js";
 import { resolveProvisioningReadinessStrategy } from "./provisioningReadinessStrategy.js";
 import type { ProvisioningReadinessResult } from "./provisioningReadinessStrategy.js";
@@ -35,6 +36,8 @@ interface GuestVerifyResult {
   vm?: VmProvisionCreatedVm;
   ok: boolean;
   message: string;
+  /** SSH 登录时从 /etc/os-release 探测到的系统标识（如 Rocky Linux 9.6），用于写回 other-config:vrc-guest-os */
+  guestOs?: string;
   reasonCode?: string;
   readiness?: Pick<ProvisioningReadinessResult, "state" | "networkVisible" | "ready">;
 }
@@ -223,6 +226,9 @@ async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<
       return;
     }
     markProvisionTaskStep(input.taskId, "verify-login", "success", isWindowsUnattended(input.request) ? "Administrator NTLM 登录验证通过" : "账号密码验证通过");
+    if (input.request.providerType === "xenserver") {
+      await writeXenVmGuestOsLabels(input, loginResults);
+    }
   }
 
   markProvisionTaskStep(input.taskId, "finalize", "running", "收尾启动配置");
@@ -370,7 +376,17 @@ async function waitForGuestNetwork(input: RunProvisioningVerifierInput): Promise
           readiness: toTaskReadiness(readiness),
         });
       }
-      const serviceReady = readiness.ready;
+      // Linux ISO Kickstart（http-boot-iso / cdrom-http-ks / native-http）启动参数带 inst.sshd，
+      // 安装器环境本身就会开放 sshd 并接受 kickstart 的 root 口令，直接把“SSH 可读”当作装好
+      // 会把任务误判成 complete（127.37 实测：rpm 还没开始下载任务已报成功）。
+      // 这类安装必须等安装器 %post 回调 installed 钩子（宿主机日志出现 INSTALLED、install-guest 成功）
+      // 之后才接受 SSH；offline-iso 没有 installSource，不应用此门控，保持历史验收行为。
+      const linuxIsoTrackedInstall =
+        input.request.sourceType === "iso" &&
+        !isWindowsUnattended(input.request) &&
+        Boolean(item.installSource) &&
+        tracksIsoInstall;
+      const serviceReady = readiness.ready && !linuxIsoTrackedInstall;
       if (windows && readiness.state === "protocol-ready") {
         updateProvisionTaskVm(input.taskId, item.name, {
           status: "running",
@@ -582,19 +598,24 @@ async function verifyGuestLogin(item: VmProvisionPlanItem, jumpHost?: XenConnect
     const username = item.loginUsername || "root";
     const client = new Client();
     let settled = false;
-    const finish = (ok: boolean, message: string) => {
+    const finish = (ok: boolean, message: string, guestOs?: string) => {
       if (settled) return;
       settled = true;
       client.end();
       transport.close();
-      resolve({ item, ok, message });
+      resolve({ item, ok, message, guestOs });
     };
     client
       .on("ready", () => {
         const gatewayProbe = gateway?.trim()
           ? `; echo VRC_GATEWAY_CHECK; ping -c 2 -W 2 ${escapeShellArg(gateway.trim())} >/dev/null 2>&1`
           : "";
-        client.exec(`cat /etc/os-release 2>/dev/null | head -5; uname -r${gatewayProbe}`, (error, stream) => {
+        // Linux ISO 无人值守启动参数带 inst.sshd，Anaconda 安装器环境本身会开 sshd 且接受
+        // kickstart 的 root 口令。离线安装阶段直接能 SSH 登录，但系统还没装完，绝不能放行。
+        // /run/install、/run/rootfsbase、/tmp/anaconda.log 都是安装器环境的特征标记，
+        // 命中即返回非零（retryable），直到重装完成后目标系统 sshd 起来才视为登录成功。
+        const installerProbe = `if [ -d /run/install ] || [ -d /run/rootfsbase ] || [ -e /tmp/anaconda.log ]; then printf 'VRC_INSTALLER_RUNNING\\n'; exit 3; fi`;
+        client.exec(`${installerProbe}; cat /etc/os-release 2>/dev/null | head -5; uname -r${gatewayProbe}`, (error, stream) => {
           if (error) {
             finish(false, `${item.name} SSH 已连接但命令执行失败`);
             return;
@@ -603,12 +624,27 @@ async function verifyGuestLogin(item: VmProvisionPlanItem, jumpHost?: XenConnect
           let stderr = "";
           stream
             .on("close", (code: number) => {
-              const output = stdout.trim().split(/\r?\n/).filter((line) => line !== "VRC_GATEWAY_CHECK" && Boolean(line)).slice(0, 2).join(" · ");
+              const output = stdout.trim().split(/\r?\n/).filter((line) => line !== "VRC_GATEWAY_CHECK" && line !== "VRC_INSTALLER_RUNNING" && Boolean(line)).slice(0, 2).join(" · ");
+              if (stdout.includes("VRC_INSTALLER_RUNNING")) {
+                finish(false, `${item.name} 安装器仍在运行（SSH 来自 Anaconda 环境，系统尚未安装完成），继续等待`);
+                return;
+              }
+              // 从 /etc/os-release 解析 PRETTY_NAME，作为平台“系统”列的标识来源（other-config:vrc-guest-os）。
+              // 只在登录验证通过时携带；安装器环境探测到 VRC_INSTALLER_RUNNING 时不会走到这里。
+              let detectedGuestOs: string | undefined;
+              if (code === 0) {
+                const osReleaseLine = stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => line.startsWith("PRETTY_NAME="));
+                if (osReleaseLine) {
+                  const prettyName = osReleaseLine.replace(/^PRETTY_NAME=/, "").replace(/^["']|["']$/g, "").trim();
+                  detectedGuestOs = normalizeGuestOsLabel(prettyName);
+                }
+              }
               finish(
                 code === 0,
                 code === 0
                   ? `登录验证通过：${output || "系统已响应"}`
                   : stderr.trim() || `${item.name} 登录成功但网关 ${gateway || ""} 不可达`,
+                detectedGuestOs,
               );
             })
             .on("data", (chunk: Buffer) => {
@@ -632,6 +668,40 @@ async function verifyGuestLogin(item: VmProvisionPlanItem, jumpHost?: XenConnect
         algorithms: buildGuestSshAlgorithms(),
       });
   });
+}
+
+async function writeXenVmGuestOsLabels(input: RunProvisioningVerifierInput, loginResults: GuestVerifyResult[]): Promise<void> {
+  // 平台“系统”列读 other-config:vrc-guest-os；无人值守 ISO 安装基于 “Other install media” 模板，
+  // 不写该字段就显示 “-”。这里用 SSH 验证时从 /etc/os-release 探测到的真实系统标识补齐：
+  // 字段为空或为创建时 ISO 名占位（source=iso）时覆盖；人工/模板既有的标识（source 非 iso）保留。
+  const commands = loginResults
+    .map((result) => {
+      if (!result.ok || !result.guestOs) return undefined;
+      const vm = input.created.find((created) => created.name === result.item.name);
+      const vmId = vm?.id || vm?.providerId;
+      if (!vmId) return undefined;
+      const label = result.guestOs;
+      return [
+        `vm_uuid='${escapeShellValue(vmId)}'`,
+        `os_label='${escapeShellValue(label)}'`,
+        '[ -n "$vm_uuid" ] || exit 0',
+        'existing="$(xe vm-param-get uuid="$vm_uuid" param-name=other-config param-key=vrc-guest-os 2>/dev/null | tr -d "\r\n")"',
+        'source="$(xe vm-param-get uuid="$vm_uuid" param-name=other-config param-key=vrc-guest-os-source 2>/dev/null | tr -d "\r\n")"',
+        // 占位（source=iso，创建时按 ISO 名预写）或字段为空时，用 SSH 探测到的真实系统覆盖；
+        // 人工/模板既有的标识（source 非 iso）保留，避免覆盖更准确的手工设置。
+        'if [ -z "$existing" ] || [ "$existing" = "<not in database>" ] || [ "$source" = "iso" ]; then',
+        '  xe vm-param-set uuid="$vm_uuid" other-config:vrc-guest-os="$os_label" >/dev/null 2>&1 || true',
+        '  xe vm-param-set uuid="$vm_uuid" other-config:vrc-guest-os-source=ssh >/dev/null 2>&1 || true',
+        'fi',
+      ].join("\n");
+    })
+    .filter((command): command is string => Boolean(command));
+  if (!commands.length) return;
+  try {
+    await runHostCommand(input.connection, commands.join("\n"));
+  } catch (error) {
+    console.warn(`[provision] 写入 vrc-guest-os 失败（不影响安装结果）：${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 async function verifyWindowsGuestLogin(item: VmProvisionPlanItem, gateway?: string): Promise<GuestVerifyResult> {

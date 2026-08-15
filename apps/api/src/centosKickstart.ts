@@ -67,7 +67,7 @@ part / --fstype=xfs --size=1 --grow`;
 /** Builds a non-interactive CentOS package selection that tolerates packages absent from older DVD media. */
 export function buildCentosPackageSelection(
   additionalPackages: string[] = [],
-  options: { environmentGroup?: string } = {},
+  options: { environmentGroup?: string; excludeVmFirmware?: boolean } = {},
 ): string {
   const environmentGroup = options.environmentGroup?.trim();
   if (environmentGroup && !/^[A-Za-z0-9._-]+$/.test(environmentGroup)) {
@@ -79,6 +79,10 @@ export function buildCentosPackageSelection(
     "net-tools",
     "openssh-server",
     ...additionalPackages.map((item) => item.trim()).filter(Boolean),
+    // 虚拟机不需要固件驱动包。linux-firmware（约 476MB）/ iwl7260-firmware（约 61MB）是
+    // 老 XenServer 6.5 rtl8139 网络在超大单文件传输时接收窗口冻结的最大触发源；
+    // Rocky 9 HTTP 安装排除后，剩余最大 RPM 约 57MB（llvm-libs），可显著降低安装中断概率。
+    ...(options.excludeVmFirmware ? ["-linux-firmware", "-iwl7260-firmware"] : []),
     "-dracut-config-rescue",
     "%end",
   ].join("\n");

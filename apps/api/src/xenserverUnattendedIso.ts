@@ -111,7 +111,7 @@ export async function prepareXenCentosUnattendedIso(input: XenUnattendedIsoInput
       await generateCentosOfflineUnattendedIso(localSourceIso, localOutputIso, input);
     } else {
       input.onProgress?.("缓存启动文件并生成 HTTP Boot ISO");
-      const bootFiles = await ensureLocalBootFiles(input.connection, source);
+      const bootFiles = await ensureLocalBootLoaderFiles(input.connection, source);
       await generateCentosHttpBootIso(bootFiles, localOutputIso, input);
     }
     input.onProgress?.("上传无人值守 ISO 到 XenServer ISO SR");
@@ -1065,38 +1065,11 @@ async function readSourceIsoInfo(
   };
 }
 
-interface LocalBootFiles {
-  isolinuxBin: string;
-  vmlinuz: string;
-  initrd: string;
-}
-
 interface LocalBootLoaderFiles {
   isolinuxBin: string;
   vmlinuz: string;
   initrd: string;
   isolinuxFiles: string[];
-}
-
-async function ensureLocalBootFiles(connection: XenConnectionInput, source: SourceIsoInfo): Promise<LocalBootFiles> {
-  const sourceKey = `${safeFileName(source.srUuid)}__${safeFileName(source.location)}`;
-  const localDir = join(cacheDir, sourceKey);
-  if (existsSync(localDir) && !statSync(localDir).isDirectory()) {
-    rmSync(localDir, { force: true });
-  }
-  ensureDir(localDir);
-  const files = {
-    isolinuxBin: join(localDir, "isolinux.bin"),
-    vmlinuz: join(localDir, "vmlinuz"),
-    initrd: join(localDir, "initrd.img"),
-  };
-  if (existsSync(files.isolinuxBin) && existsSync(files.vmlinuz) && existsSync(files.initrd)) {
-    return files;
-  }
-  await downloadFile(connection, `${source.mountDir}/isolinux/isolinux.bin`, files.isolinuxBin);
-  await downloadFirstExisting(connection, [`${source.mountDir}/images/pxeboot/vmlinuz`, `${source.mountDir}/isolinux/vmlinuz`], files.vmlinuz);
-  await downloadFirstExisting(connection, [`${source.mountDir}/images/pxeboot/initrd.img`, `${source.mountDir}/isolinux/initrd.img`], files.initrd);
-  return files;
 }
 
 async function ensureLocalBootLoaderFiles(connection: XenConnectionInput, source: SourceIsoInfo): Promise<LocalBootLoaderFiles> {
@@ -1130,7 +1103,7 @@ async function ensureLocalBootLoaderFiles(connection: XenConnectionInput, source
 }
 
 async function generateCentosHttpBootIso(
-  bootFiles: LocalBootFiles,
+  bootFiles: LocalBootLoaderFiles,
   outputIso: string,
   input: XenUnattendedIsoInput,
 ): Promise<void> {
@@ -1141,6 +1114,12 @@ async function generateCentosHttpBootIso(
   ensureDir(workDir);
   ensureDir(isolinuxDir);
   ensureDir(pxebootDir);
+  // RHEL 系（含 Rocky 9）isolinux.bin 是 syslinux 6.x 引导扇区，必须同目录携带
+  // ldlinux.c32 等运行时模块，否则 BIOS 加载后黑屏无输出（127.37 实测卡死）。
+  // 这里整体拷贝源 ISO isolinux/ 目录文件，与 offline-iso 原样保留引导结构一致。
+  for (const isolinuxFile of bootFiles.isolinuxFiles) {
+    copyFileSync(isolinuxFile, join(isolinuxDir, isolinuxFile.split("/").pop() || "isolinux-file"));
+  }
   copyFileSync(bootFiles.isolinuxBin, join(isolinuxDir, "isolinux.bin"));
   copyFileSync(bootFiles.vmlinuz, join(isolinuxDir, "vmlinuz"));
   copyFileSync(bootFiles.initrd, join(isolinuxDir, "initrd.img"));
@@ -1174,12 +1153,19 @@ async function generateCentosHttpBootIso(
     const installArgs = isRocky9Image(input.sourceIsoName)
       ? buildRocky9BootArgs(input)
       : buildLegacyRedHatBootArgs(input);
+    // Rocky 9：stage2（install.img 约 1GB）改由 dracut 从本地 CD 加载（原版 ISO 作为第二光驱
+    // 挂载，见 xenserver.ts 的 http-boot-iso 分支），避免 1GB 级 HTTP 大文件传输触发
+    // XenServer 6.5 rtl8139 接收窗口冻结；kickstart 仍走 HTTP 集中安装源。
+    // CentOS 7 保持 inst.repo 原逻辑（其 stage2 依赖 HTTP 拉取）。
+    const repoArg = isRocky9Image(input.sourceIsoName)
+      ? "inst.stage2=cdrom"
+      : `inst.repo=${installUrls.repoUrl}`;
     return `default linux
 prompt 0
 timeout 10
 label linux
   kernel vmlinuz
-  append initrd=initrd.img inst.repo=${installUrls.repoUrl} inst.ks=${installUrls.ksUrl} ${installArgs}
+  append initrd=initrd.img ${repoArg} inst.ks=${installUrls.ksUrl} ${installArgs}
 `;
   }
 }
@@ -1326,10 +1312,14 @@ function buildLegacyRedHatBootArgs(input: XenUnattendedIsoInput): string {
 // 配合 platform:device_id=0001 规避 xen-platform-pci / PV 驱动在 "Probing EDD" 处卡死（127.33 实测）。
 // 老 Xen 官方不支持 RHEL9 tools，Rocky 9 不安装 xe-guest-utilities / xs-tools；
 // notsc clocksource=hpet 等时钟参数与 xen_emul_unplug=never 保留以固定模拟设备路径。
+// inst.cmdline（不用 inst.text）：无人值守必须全自动。inst.text 会进交互式 SummaryHub，
+// 存储模块为摘要预览创建 playground 设备树（全部设备 incomplete/hidden），cdrom 安装源此时
+// 执行 FindOpticalMedia 拿到空列表直接抛 "Found no CD-ROM"（127.37 offline-iso 实测）。
+// cmdline 模式直接按 kickstart 执行分区与安装，不创建预览树；%post 里再写回重启所需参数。
 function buildRocky9BootArgs(input: XenUnattendedIsoInput): string {
   const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
   const macBinding = input.macAddress ? ` ifname=eth0:${input.macAddress}` : "";
-  return `inst.text net.ifnames=0 biosdevname=0 xen_emul_unplug=never console=tty0 console=ttyS0,115200n8 inst.sshd random.trust_cpu=1 notsc clocksource=hpet acpi_skip_timer_override lapic=notscdeadline xen_nopv rd.neednet=1${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0`;
+  return `inst.cmdline net.ifnames=0 biosdevname=0 xen_emul_unplug=never console=tty0 console=ttyS0,115200n8 inst.sshd random.trust_cpu=1 notsc clocksource=hpet acpi_skip_timer_override lapic=notscdeadline xen_nopv rd.neednet=1${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0`;
 }
 
 function buildOfflineCentosIsolinuxConfig(input: XenUnattendedIsoInput, volumeId: string): string {
@@ -1389,13 +1379,18 @@ export function buildOfflineCentosKickstart(
   const rootPasswordValue = shellSingleQuote(rootPassword || "changeme");
   const rootPasswordHashValue = md5Crypt(rootPassword || "changeme");
   const rootPasswordHash = shellSingleQuote(rootPasswordHashValue);
-  const hostname = sanitizeKickstartValue(input.vm.name);
+  const hostname = sanitizeHostname(input.vm.name, ip);
   // Rocky 9 与旧 CentOS 7 走差异化无人值守配置：
   // Rocky 9 使用非 LVM 分区、rootpw --lock + %post chpasswd，并持久化 Xen 4.4 兼容内核参数。
   const rocky9 = isRocky9Image(input.sourceIsoName ?? "");
   const monitoringPackage = options.monitoringTool === "proxmox" ? "qemu-guest-agent" : options.monitoringTool === "vmware" ? "open-vm-tools" : "";
   const monitoringService = options.monitoringTool === "proxmox" ? "qemu-guest-agent" : options.monitoringTool === "vmware" ? "vmtoolsd" : "";
   const rootPasswordDirective = rocky9 ? "rootpw --lock" : `rootpw --iscrypted ${rootPasswordHashValue}`;
+  // RHEL9 已废弃 authconfig：保留 auth 指令会让 Anaconda 强依赖 authselect-compat 包
+  // （minimal 安装源不含该包），安装到 "Authconfig configuration" 任务直接硬失败
+  // （127.37 实测：SecurityInstallationError: /usr/sbin/authconfig is missing）。
+  // Rocky9 密码由 rootpw --lock + %post chpasswd 写入，无需 auth 指令；CentOS7 保留历史行为。
+  const authDirective = rocky9 ? "" : "auth --enableshadow --passalgo=sha512";
   const partitioning = rocky9
     ? buildRedHatPlainPartitioning(input.vm.diskGiB, { firmware: options.firmware })
     : buildCentosLvmPartitioning(input.vm.diskGiB, { firmware: options.firmware });
@@ -1413,13 +1408,12 @@ export function buildOfflineCentosKickstart(
         graphicalTarget: options.graphicalTarget,
       });
   return `#version=DEVEL
-install
 cdrom
 lang en_US.UTF-8
 keyboard us
 timezone Asia/Shanghai --isUtc
 ${rootPasswordDirective}
-auth --enableshadow --passalgo=sha512
+${authDirective}
 selinux --disabled
 firewall --disabled
 firstboot --disabled
@@ -1427,7 +1421,7 @@ network --bootproto=static --device=eth0 --ip=${ip} --netmask=${netmask} --gatew
 bootloader --location=mbr
 ${partitioning}
 reboot --eject
-${buildCentosPackageSelection([monitoringPackage], { environmentGroup: options.packageEnvironment })}
+${buildCentosPackageSelection([monitoringPackage], { environmentGroup: options.packageEnvironment, excludeVmFirmware: isRocky9Image(input.sourceIsoName ?? "") })}
 ${postBlock}
 %post --nochroot --log=/tmp/vrc-kickstart-eject.log
 eject /dev/sr0 >/dev/null 2>&1 || true
@@ -1826,6 +1820,28 @@ function cidrToNetmask(cidr: string | undefined): string {
 
 function escapeAnacondaLabel(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/ /g, "\\x20");
+}
+
+/**
+ * 生成合法的 kickstart hostname。
+ * Anaconda 的 network --hostname 只允许 a-zA-Z0-9 与 '-'，且每段不能以 '-' 开头或结尾；
+ * VM 业务名称常含中文、下划线、空格等非法字符，不能直接写入 ks.cfg（会导致安装器解析失败）。
+ * 这里保留名称中的合法字符，非法字符折叠为 '-'，纯非法名或空名则回退为 IP 派生名。
+ * @param name VM 业务名称（仅用于派生 hostname，不影响 name-label 展示）
+ * @param ip VM 静态 IP，用于纯中文/空名称时的回退
+ */
+function sanitizeHostname(name: string, ip: string): string {
+  const cleaned = (name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 63);
+  if (cleaned && /[a-z0-9]/.test(cleaned)) {
+    return cleaned;
+  }
+  const ipPart = (ip || "").toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "");
+  return `vm-${ipPart || "host"}`;
 }
 
 function sanitizeKickstartValue(value: string): string {

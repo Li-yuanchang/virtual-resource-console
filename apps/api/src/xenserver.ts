@@ -49,7 +49,7 @@ import {
   resolveXenInstallMediaMode,
 } from "./xenserverUnattendedIso.js";
 import type { XenInstallMediaMode } from "./xenserverUnattendedIso.js";
-import { normalizeGuestOsLabel } from "./guestOs.js";
+import { normalizeGuestOsLabel, normalizeGuestOsLabelFromIsoName } from "./guestOs.js";
 import { isXenGuestToolsIsoName } from "./installMediaPolicy.js";
 import { isRocky9Image } from "./centosKickstart.js";
 import { prepareXenInstallMedia } from "./xenserverProvisionStrategies.js";
@@ -1005,14 +1005,15 @@ is_number() {
 # 时钟兼容参数（notsc clocksource=hpet）并带 xen_nopv 让 5.14 内核完全走模拟设备（配合创建时
 # platform:device_id=0001），否则首次重启会在 "Probing EDD" 卡死（127.33 实测）。Rocky 9
 # 不安装 xe-guest-utilities / xs-tools，老 Xen 官方不支持 RHEL9 tools。RHEL/Alma/Oracle/CentOS
-# 不套用该策略，避免一刀切。
+# 不套用该策略，避免一刀切。注意宿主机 XenServer 6.5 的 GNU sed 4.1.5 不支持 -E，
+# 只能使用 -r 扩展正则，否则 Rocky 分支会静默失效（走 CentOS 分支导致 127.37 首次验证失败）。
 is_rocky9() {
   iso_name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$iso_name" in
     *rocky*) ;;
     *) return 1 ;;
   esac
-  major="$(printf '%s' "$iso_name" | sed -nE 's/.*rocky[^0-9]*([0-9]+).*/\1/p')"
+  major="$(printf '%s' "$iso_name" | sed -nr 's/.*rocky[^0-9]*([0-9]+).*/\1/p')"
   [ "$major" = "9" ]
 }
 is_pif_usable() {
@@ -1263,6 +1264,12 @@ prepare_unattended_install() {
   require_value "网关" "$VRC_GATEWAY"
   require_value "DNS" "$VRC_DNS"
   require_value "root 密码" "$VRC_ROOT_PASSWORD"
+  if [ -n "$VRC_GUEST_OS_LABEL" ]; then
+    # 创建时按 ISO 名预写系统标识占位（vrc-guest-os-source=iso），供平台“系统”列展示；
+    # 安装验收 SSH 探测到 /etc/os-release 真实系统后再覆盖该占位。
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-guest-os="$VRC_GUEST_OS_LABEL" >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" other-config:vrc-guest-os-source=iso >/dev/null 2>&1 || true
+  fi
   if [ "$VRC_INSTALL_MEDIA_MODE" = "windows-unattended" ]; then
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=windows-unattended >/dev/null 2>&1 || true
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
@@ -1419,12 +1426,24 @@ elif should_use_unattended_install "$template_name"; then
   if [ -n "$VRC_AUX_ISO_UUID" ]; then
     boot_iso_uuid="$VRC_AUX_ISO_UUID"
   fi
-  attach_iso "$vm_uuid" "$boot_iso_uuid"
+  if is_rocky9 "$VRC_ISO_NAME" && [ -n "$VRC_AUX_ISO_UUID" ] && [ "$VRC_INSTALL_MEDIA_MODE" = "http-boot-iso" ]; then
+    # Rocky9 http-boot-iso：辅助 ISO（无人值守启动参数 inst.stage2=cdrom inst.ks=http）作为第一光驱，
+    # 原版 Rocky ISO 作为第二光驱提供 stage2(install.img)。这样 1GB 级 install.img 走 CD 而不是
+    # HTTP，规避老 XenServer 6.5 qemu rtl8139 大包传输接收窗口冻结；软件包仍走 HTTP 集中源。
+    attach_iso_auto "$vm_uuid" "$boot_iso_uuid" true
+    attach_iso_auto "$vm_uuid" "$VRC_ISO_UUID" false
+  else
+    attach_iso "$vm_uuid" "$boot_iso_uuid"
+  fi
   # Rocky 9（当前唯一部署的现代 RHEL）需要 device_id=0001 暴露 Xen 平台设备；配合内核
   # xen_nopv 参数让 5.14 内核完全走模拟设备（127.33 实测重启通过），不安装 xe-guest-utilities。
-  # CentOS 7 老模板保持继承的 0000 不变，避免一刀切影响老系统。
+  # 引导顺序用 cd（硬盘优先、CD 兜底）：首启空盘无引导扇区自动落回 CD 进安装器；装完 grub 写入
+  # MBR 后重启直接进硬盘。不能用 dc——Xen 模拟光驱上 kickstart 的 reboot --eject 弹不出（stage2
+  # 源 /run/install/sources 挂载 busy），CD 仍优先生效会再次进安装器重分区，形成安装死循环
+  # （127.37 实测第一遍装完重启又回安装器）。
+  # CentOS 7 老模板保持继承的 0000 与 dc 不变，避免一刀切影响老系统。
   if is_rocky9 "$VRC_ISO_NAME"; then
-    xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false platform:device_id=0001 >/dev/null 2>&1 || true
+    xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=cd platform:viridian=false platform:device_id=0001 >/dev/null 2>&1 || true
   else
     xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false >/dev/null 2>&1 || true
   fi
@@ -1996,6 +2015,7 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
             VRC_HOST_UUID: sanitizeUuid(request.hostId),
             VRC_ISO_UUID: sanitizeUuid(preparedMedia.originalIsoId),
             VRC_ISO_NAME: sanitizePlainText(preparedMedia.originalIsoName),
+            VRC_GUEST_OS_LABEL: normalizeGuestOsLabelFromIsoName(preparedMedia.originalIsoName) ?? "",
             VRC_AUX_ISO_UUID: sanitizeUuid(preparedMedia.auxiliaryIsoId),
             VRC_INSTALL_REPO_URL: sanitizeUrl(item.installSource?.repoUrl),
             VRC_INSTALL_KS_URL: sanitizeUrl(item.installSource?.ksUrl),
