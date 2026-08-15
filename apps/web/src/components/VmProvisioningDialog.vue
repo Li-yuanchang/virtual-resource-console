@@ -93,6 +93,7 @@ const VRC_TOAST_DURATION_MS = 3000;
 const SUPPORTED_WINDOWS_ISO_PATTERN = /windows_server_2008_r2|windows_server_2012_r2/i;
 // Ubuntu autoinstall 仅适配带 casper 引导结构的 Desktop 原版镜像（当前已验证 24.04 Desktop）。
 const SUPPORTED_UBUNTU_DESKTOP_ISO_PATTERN = /ubuntu[^/]*[-_.\s]desktop/i;
+const SUPPORTED_REDHAT_LINUX_ISO_PATTERN = /rocky|centos|rhel|red hat|redhat|alma|oracle/i;
 
 function defaultRuntimePolicy(): RuntimePolicy {
   return {
@@ -255,6 +256,7 @@ const effectiveInstallStrategy = computed(() => {
   if (props.connection.providerType === "xenserver" && provisioningForm.sourceType === "iso") {
     if (isSupportedWindowsIso(selectedIsoImage.value)) return "windows-unattended";
     if (isSupportedUbuntuDesktopIso(selectedIsoImage.value)) return "ubuntu-autoinstall";
+    if (isSupportedRedHatLinuxIso(selectedIsoImage.value)) return "kickstart";
   }
   return "manual-iso";
 });
@@ -902,6 +904,11 @@ function isSupportedWindowsIso(image: IsoImage | null | undefined): boolean {
 function isSupportedUbuntuDesktopIso(image: IsoImage | null | undefined): boolean {
   if (!image) return false;
   return SUPPORTED_UBUNTU_DESKTOP_ISO_PATTERN.test(`${image.name} ${image.id}`);
+}
+
+function isSupportedRedHatLinuxIso(image: IsoImage | null | undefined): boolean {
+  if (!image) return false;
+  return SUPPORTED_REDHAT_LINUX_ISO_PATTERN.test(`${image.name} ${image.id}`);
 }
 
 function recommendedInstallProfile(image: IsoImage | null | undefined): "server" | "desktop" {
