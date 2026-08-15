@@ -108,3 +108,60 @@ test("uses one SSH policy for modern ARM guests and legacy CentOS guests", () =>
   assert.ok(algorithms.serverHostKey.includes("rsa-sha2-512"));
   assert.ok(algorithms.serverHostKey.includes("ssh-rsa"));
 });
+
+
+test("routes Rocky 9 unattended to the Rocky 9 kickstart with Xen PV compatibility", () => {
+  const input = {
+    vm: { name: "rocky9", ip: "192.168.127.33", rootPassword: "secret", cpu: 8, memoryGiB: 16, diskGiB: 500 },
+    ipPool: {
+      id: "pool",
+      name: "pool",
+      cidr: "192.168.127.0/24",
+      gateway: "192.168.127.254",
+      dns: ["202.102.152.3"],
+      startIp: "192.168.127.20",
+      endIp: "192.168.127.250",
+      reservedIps: [],
+    },
+    sourceIsoName: "Rocky-9.6-x86_64-minimal.iso",
+  };
+  const kickstart = buildOfflineCentosKickstart(input);
+
+  assert.match(kickstart, /rootpw --lock/);
+  assert.doesNotMatch(kickstart, /rootpw --iscrypted/);
+  assert.match(kickstart, /part \/boot --fstype=xfs --size=1024/);
+  assert.doesNotMatch(kickstart, /logvol/);
+  assert.doesNotMatch(kickstart, /ifcfg-eth0/);
+  assert.doesNotMatch(kickstart, /systemctl enable network/);
+  // Rocky 9 使用 BLS 引导，必须用 grubby 把 xen_nopv 写入每个启动项，否则首次重启不带
+  // xen_nopv 会在 "Probing EDD" 卡死（127.33 实测根因）；xen_nopv 让内核走模拟设备，不装 tools。
+  assert.match(kickstart, /grubby --update-kernel=ALL --args='xen_nopv/);
+  assert.match(kickstart, /xen_nopv/);
+  assert.match(kickstart, /notsc clocksource=hpet acpi_skip_timer_override/);
+  assert.match(kickstart, /nmcli con up eth0/);
+  assert.match(kickstart, /chpasswd/);
+});
+
+test("keeps CentOS 7 unattended on the legacy LVM kickstart", () => {
+  const input = {
+    vm: { name: "centos7", ip: "192.168.127.34", rootPassword: "secret", cpu: 4, memoryGiB: 8, diskGiB: 120 },
+    ipPool: {
+      id: "pool",
+      name: "pool",
+      cidr: "192.168.127.0/24",
+      gateway: "192.168.127.254",
+      dns: ["202.102.152.3"],
+      startIp: "192.168.127.20",
+      endIp: "192.168.127.250",
+      reservedIps: [],
+    },
+    sourceIsoName: "CentOS-7-x86_64-DVD-1511.iso",
+  };
+  const kickstart = buildOfflineCentosKickstart(input);
+
+  assert.match(kickstart, /rootpw --iscrypted/);
+  assert.match(kickstart, /logvol \/ --fstype=xfs/);
+  assert.match(kickstart, /ifcfg-eth0/);
+  assert.doesNotMatch(kickstart, /xen_nopv/);
+  assert.match(kickstart, /systemctl enable network/);
+});

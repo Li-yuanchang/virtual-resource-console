@@ -5,9 +5,11 @@ import {
   buildXenInstalledHook,
   isXenInstallHostInProvisioningNetwork,
   selectXenInstallHostAddress,
+  shouldUseXenKickstart,
   summarizeXenProvisioningNetworkProbe,
   xenInstallRebootDirective,
 } from "../src/installSourceService.js";
+import type { VmProvisionRequest } from "../src/types.js";
 
 test("physical DVD completion switches to disk boot and prepares guest tools", () => {
   const hook = buildXenInstalledHook("129.20_test");
@@ -92,4 +94,27 @@ test("allows provisioning with a warning when routing exists but ICMP is disable
 
   assert.equal(result.status, "route-only");
   assert.match(result.message, /允许继续创建/);
+});
+
+
+test("routes Rocky ISO installs to the XenServer kickstart install source", () => {
+  const rocky = {
+    providerType: "xenserver",
+    sourceType: "iso",
+    isoName: "Rocky-9.6-x86_64-minimal.iso",
+    isoId: "rocky-9.6",
+  } as unknown as VmProvisionRequest;
+
+  assert.equal(shouldUseXenKickstart(rocky), true);
+});
+
+test("keeps non-RHEL ISO installs off the kickstart install source", () => {
+  const windows = {
+    providerType: "xenserver",
+    sourceType: "iso",
+    isoName: "windows_server_2012_r2.iso",
+    isoId: "win-2012",
+  } as unknown as VmProvisionRequest;
+
+  assert.equal(shouldUseXenKickstart(windows), false);
 });
