@@ -7,6 +7,7 @@ import {
 } from "./xenserverUnattendedIso.js";
 import type { XenInstallMediaMode, XenUnattendedIsoInput, XenUnattendedIsoResult } from "./xenserverUnattendedIso.js";
 import type { IsoImage, VmProvisionPlanItem, VmProvisionRequest, XenConnectionInput } from "./types.js";
+import { isRedHatFamilyImage } from "./centosKickstart.js";
 
 export interface XenInstallStrategyContext {
   connection: XenConnectionInput;
@@ -70,8 +71,8 @@ xenInstallStrategies.register({
 });
 
 xenInstallStrategies.register({
-  id: "centos-kickstart",
-  matches: ({ request, sourceIsoName }) => request.sourceType === "iso" && isCentosImage(sourceIsoName),
+  id: "redhat-kickstart",
+  matches: ({ request, sourceIsoName }) => request.sourceType === "iso" && isRedHatFamilyImage(sourceIsoName),
   prepare: async (context) => {
     const mediaMode = resolveCentosMediaMode(context);
     const generated = shouldPrepareXenSmallIso(mediaMode)
@@ -130,10 +131,6 @@ export async function prepareXenInstallMedia(context: XenInstallStrategyContext)
 
 function isWindowsImage(name: string): boolean {
   return /windows|winserver|win[_ -]?server/i.test(name);
-}
-
-function isCentosImage(name: string): boolean {
-  return /centos/i.test(name);
 }
 
 function isUbuntuImage(name: string): boolean {

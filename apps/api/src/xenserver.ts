@@ -51,6 +51,7 @@ import {
 import type { XenInstallMediaMode } from "./xenserverUnattendedIso.js";
 import { normalizeGuestOsLabel } from "./guestOs.js";
 import { isXenGuestToolsIsoName } from "./installMediaPolicy.js";
+import { isRocky9Image } from "./centosKickstart.js";
 import { prepareXenInstallMedia } from "./xenserverProvisionStrategies.js";
 
 const HOST_INVENTORY_SCRIPT = String.raw`
@@ -1000,6 +1001,20 @@ require_value() {
 is_number() {
   echo "$1" | awk '{ exit !($1 ~ /^[0-9]+$/ && $1 > 0) }'
 }
+# Rocky 9 识别：当前老 Xen 环境唯一特殊处理的现代 RHEL。老 XenServer 6.5（Xen 4.4）需
+# 时钟兼容参数（notsc clocksource=hpet）并带 xen_nopv 让 5.14 内核完全走模拟设备（配合创建时
+# platform:device_id=0001），否则首次重启会在 "Probing EDD" 卡死（127.33 实测）。Rocky 9
+# 不安装 xe-guest-utilities / xs-tools，老 Xen 官方不支持 RHEL9 tools。RHEL/Alma/Oracle/CentOS
+# 不套用该策略，避免一刀切。
+is_rocky9() {
+  iso_name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$iso_name" in
+    *rocky*) ;;
+    *) return 1 ;;
+  esac
+  major="$(printf '%s' "$iso_name" | sed -nE 's/.*rocky[^0-9]*([0-9]+).*/\1/p')"
+  [ "$major" = "9" ]
+}
 is_pif_usable() {
   pif_uuid="$1"
   pif_device="$(xe pif-param-get uuid="$pif_uuid" param-name=device 2>/dev/null | clean_one_line)"
@@ -1288,7 +1303,12 @@ prepare_unattended_install() {
   fi
   if [ "$VRC_INSTALL_MEDIA_MODE" = "cdrom-http-ks" ]; then
     require_value "Kickstart URL" "$VRC_INSTALL_KS_URL"
-    xe vm-param-set uuid="$vm_uuid" PV-args="inst.stage2=cdrom inst.ks=$VRC_INSTALL_KS_URL rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
+    if is_rocky9 "$VRC_ISO_NAME"; then
+      modern_args="inst.text net.ifnames=0 biosdevname=0 xen_emul_unplug=never console=tty0 console=ttyS0,115200n8 inst.sshd random.trust_cpu=1 notsc clocksource=hpet acpi_skip_timer_override lapic=notscdeadline xen_nopv"
+      xe vm-param-set uuid="$vm_uuid" PV-args="inst.stage2=cdrom inst.ks=$VRC_INSTALL_KS_URL $modern_args rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
+    else
+      xe vm-param-set uuid="$vm_uuid" PV-args="inst.stage2=cdrom inst.ks=$VRC_INSTALL_KS_URL rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
+    fi
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=cdrom-http-ks >/dev/null 2>&1 || true
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
     xe vm-param-set uuid="$vm_uuid" other-config:vrc-ks-url="$VRC_INSTALL_KS_URL" >/dev/null 2>&1 || true
@@ -1298,7 +1318,12 @@ prepare_unattended_install() {
   require_value "安装源 URL" "$VRC_INSTALL_REPO_URL"
   xe vm-param-set uuid="$vm_uuid" other-config:install-repository="$VRC_INSTALL_REPO_URL" >/dev/null 2>&1 || true
   xe vm-param-add uuid="$vm_uuid" param-name=other-config install-repository="$VRC_INSTALL_REPO_URL" >/dev/null 2>&1 || true
-  xe vm-param-set uuid="$vm_uuid" PV-args="inst.repo=$VRC_INSTALL_REPO_URL inst.ks=$VRC_INSTALL_KS_URL rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
+  if is_rocky9 "$VRC_ISO_NAME"; then
+    modern_args="inst.text net.ifnames=0 biosdevname=0 xen_emul_unplug=never console=tty0 console=ttyS0,115200n8 inst.sshd random.trust_cpu=1 notsc clocksource=hpet acpi_skip_timer_override lapic=notscdeadline xen_nopv"
+    xe vm-param-set uuid="$vm_uuid" PV-args="inst.repo=$VRC_INSTALL_REPO_URL inst.ks=$VRC_INSTALL_KS_URL $modern_args rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
+  else
+    xe vm-param-set uuid="$vm_uuid" PV-args="inst.repo=$VRC_INSTALL_REPO_URL inst.ks=$VRC_INSTALL_KS_URL rd.neednet=1 $ifname_arg ip=$VRC_IP::$VRC_GATEWAY:$VRC_NETMASK:vrc:eth0:none bootdev=eth0 ksdevice=eth0" >/dev/null 2>&1 || true
+  fi
   xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-mode=kickstart >/dev/null 2>&1 || true
   xe vm-param-set uuid="$vm_uuid" other-config:vrc-ip="$VRC_IP" >/dev/null 2>&1 || true
   xe vm-param-set uuid="$vm_uuid" other-config:vrc-ks-url="$VRC_INSTALL_KS_URL" >/dev/null 2>&1 || true
@@ -1395,7 +1420,14 @@ elif should_use_unattended_install "$template_name"; then
     boot_iso_uuid="$VRC_AUX_ISO_UUID"
   fi
   attach_iso "$vm_uuid" "$boot_iso_uuid"
-  xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false >/dev/null 2>&1 || true
+  # Rocky 9（当前唯一部署的现代 RHEL）需要 device_id=0001 暴露 Xen 平台设备；配合内核
+  # xen_nopv 参数让 5.14 内核完全走模拟设备（127.33 实测重启通过），不安装 xe-guest-utilities。
+  # CentOS 7 老模板保持继承的 0000 不变，避免一刀切影响老系统。
+  if is_rocky9 "$VRC_ISO_NAME"; then
+    xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false platform:device_id=0001 >/dev/null 2>&1 || true
+  else
+    xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false >/dev/null 2>&1 || true
+  fi
 else
   xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true
   attach_iso "$vm_uuid" "$VRC_ISO_UUID"
@@ -1974,6 +2006,7 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
                     ip: item.ip,
                     gateway: request.ipPool.gateway,
                     netmask: cidrToNetmask(request.ipPool.cidr) || "255.255.255.0",
+                    rocky9: isRocky9Image(preparedMedia.originalIsoName),
                   })
                 : "",
             VRC_SOURCE_ISO_UUID: "",
@@ -2940,15 +2973,31 @@ export function shouldPrepareXenUnattendedIso(installMediaMode: XenInstallMediaM
   return installMediaMode === "http-boot-iso" || installMediaMode === "offline-iso";
 }
 
+/**
+ * 拼接 XenServer 原生 HTTP 安装（native-http，eliloader）的内核引导参数。
+ * rocky9 为 true 时（仅 Rocky 9 镜像）追加 Xen 4.4 兼容参数：xen_nopv 让 5.14 内核完全走模拟设备
+ * （配合 device_id=0001，127.33 实测），notsc clocksource=hpet 等时钟参数规避 PV 时钟假死；
+ * 其他发行版保持基础网络参数不变。
+ * @param input.ksUrl Kickstart 地址，非空。
+ * @param input.ip 虚拟机静态 IP。
+ * @param input.gateway 网关地址。
+ * @param input.netmask 子网掩码。
+ * @param input.rocky9 是否 Rocky Linux 9 镜像（唯一走 xen_nopv 模拟设备 / device_id=0001 的发行版）。
+ * @returns 拼接后的引导参数字符串。
+ */
 export function buildXenNativeInstallArgs(input: {
   ksUrl: string;
   ip: string;
   gateway: string;
   netmask: string;
+  rocky9?: boolean;
 }): string {
   return [
     `inst.ks=${input.ksUrl.trim()}`,
     "inst.text",
+    ...(input.rocky9
+      ? ["xen_emul_unplug=never", "console=tty0", "console=ttyS0,115200n8", "inst.sshd", "random.trust_cpu=1", "notsc", "clocksource=hpet", "acpi_skip_timer_override", "lapic=notscdeadline", "xen_nopv"]
+      : []),
     "rd.neednet=1",
     "net.ifnames=0",
     "biosdevname=0",

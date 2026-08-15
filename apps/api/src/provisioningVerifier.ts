@@ -5,6 +5,7 @@ import type { Algorithms } from "ssh2";
 import { runCommand as runWinRmCommand } from "winrm-client";
 import type { ProviderType, ProvisionTaskStepKey, VmProvisionCreatedVm, VmProvisionPlanItem, VmProvisionRequest, XenConnectionInput } from "./types.js";
 import { startProxmoxVmFromDiskIfStopped } from "./proxmox.js";
+import { isRocky9Image } from "./centosKickstart.js";
 import { enableAndVerifyProxmoxGuestAgent } from "./proxmox.js";
 import { verifyVmwareGuestTools } from "./vmware.js";
 import { prepareXenVmForInstalledBoot } from "./installSourceService.js";
@@ -729,6 +730,10 @@ async function installGuestTools(input: RunProvisioningVerifierInput): Promise<G
   if (input.request.providerType !== "xenserver") {
     return installPackageGuestMonitoringTools(input);
   }
+  // Rocky 9：老 XenServer 6.5（Xen 4.4）官方不支持 RHEL9 tools，EPEL 的 xe-guest-utilities 即使装上
+  // PV 驱动也起不来，重启即卡死。Rocky 9 已用 xen_nopv 走模拟设备，直接跳过工具安装；
+  // CentOS 7 / Ubuntu / Windows 保持原有路径，避免一刀切影响老系统。
+  const rocky9 = isRocky9Image(input.request.isoName ?? "");
   const results: GuestVerifyResult[] = [];
   for (const item of input.request.planItems) {
     const vm = input.created.find((created) => created.name === item.name);
@@ -738,6 +743,16 @@ async function installGuestTools(input: RunProvisioningVerifierInput): Promise<G
     }
     if (isWindowsUnattended(input.request)) {
       results.push(await installWindowsXenTools(input, item, vm));
+      continue;
+    }
+    if (rocky9) {
+      // 老 Xen 官方不支持 RHEL9 tools，跳过安装视为通过；Rocky 9 走 xen_nopv 模拟设备，无需 guest 内工具。
+      updateProvisionTaskVm(input.taskId, item.name, {
+        status: "running",
+        currentStep: "guest-tools",
+        message: "Rocky 9 走 xen_nopv 模拟设备，跳过 XenServer Tools 安装",
+      });
+      results.push({ item, vm, ok: true, message: `${item.name} Rocky 9 走 xen_nopv 模拟设备，跳过 xs-tools 安装` });
       continue;
     }
     try {

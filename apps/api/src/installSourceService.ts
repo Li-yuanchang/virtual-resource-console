@@ -4,11 +4,22 @@ import { createReadStream, existsSync, mkdirSync, readFileSync, statSync } from 
 import { dirname, join, posix } from "node:path";
 import { Client } from "ssh2";
 import type { ConnectConfig, SFTPWrapper } from "ssh2";
-import { buildCentosLvmPartitioning, buildCentosPackageSelection } from "./centosKickstart.js";
+import {
+  buildCentosLvmPartitioning,
+  buildCentosPackageSelection,
+  buildRedHatPlainPartitioning,
+  isRocky9Image,
+  isRedHatFamilyImage,
+} from "./centosKickstart.js";
 import { getVrcDataFile } from "./appPaths.js";
 import { markProvisionTaskStep, updateProvisionTaskVm } from "./provisionTaskStore.js";
 import type { IpPoolConfig, ProviderType, VmProvisionInstallSourceRef, VmProvisionPlanItem, VmProvisionRequest, XenConnectionInput } from "./types.js";
-import { resolveXenInstallMediaMode, type XenInstallMediaMode } from "./xenserverUnattendedIso.js";
+import {
+  buildLegacyCentosKickstartPost,
+  buildRocky9KickstartPost,
+  resolveXenInstallMediaMode,
+  type XenInstallMediaMode,
+} from "./xenserverUnattendedIso.js";
 
 // XenServer 安装源编排：在目标物理机上按任务租约发布 ks.cfg/repo，并负责端口和残留清理。
 interface InstallSourceRecord {
@@ -232,7 +243,7 @@ export function shouldUseXenKickstart(request: VmProvisionRequest): boolean {
   return (
     request.providerType === "xenserver" &&
     request.sourceType === "iso" &&
-    sourceName.includes("centos") &&
+    isRedHatFamilyImage(sourceName) &&
     ["http-boot-iso", "cdrom-http-ks", "native-http"].includes(resolveXenInstallMediaMode())
   );
 }
@@ -880,8 +891,27 @@ function buildKickstart(source: InstallSourceRecord): string {
   const rootPasswordHash = shellSingleQuote(rootPasswordHashValue);
   const hostname = sanitizeKickstartValue(source.vm.name);
   const installedUrl = sanitizeKickstartValue(source.installedUrl);
+  // Rocky 9 与旧 CentOS 7 走差异化无人值守配置，
+  // 与 offline ISO 的 buildOfflineCentosKickstart 保持一致。
+  const rocky9 = isRocky9Image(source.sourceIsoName);
   const installSourceLine = source.installMediaMode === "cdrom-http-ks" ? "cdrom" : `url --url="${source.repoUrl}"`;
   const rebootDirective = xenInstallRebootDirective(source.sourceInfo?.sourceType ?? "iso-library");
+  const rootPasswordDirective = rocky9 ? "rootpw --lock" : `rootpw --iscrypted ${rootPasswordHashValue}`;
+  const partitioning = rocky9
+    ? buildRedHatPlainPartitioning(source.vm.diskGiB)
+    : buildCentosLvmPartitioning(source.vm.diskGiB);
+  const postBlock = rocky9
+    ? buildRocky9KickstartPost({ rootPasswordEntry, installedUrl })
+    : buildLegacyCentosKickstartPost({
+        rootPasswordEntry,
+        rootPasswordValue,
+        rootPasswordHash,
+        ip,
+        netmask,
+        gateway,
+        dns,
+        installedUrl,
+      });
 return `#version=DEVEL
 install
 text
@@ -889,55 +919,17 @@ ${installSourceLine}
 lang en_US.UTF-8
 keyboard us
 timezone Asia/Shanghai --isUtc
-rootpw --iscrypted ${rootPasswordHashValue}
+${rootPasswordDirective}
 auth --enableshadow --passalgo=sha512
 selinux --disabled
 firewall --disabled
 firstboot --disabled
 network --bootproto=static --device=eth0 --ip=${ip} --netmask=${netmask} --gateway=${gateway} --nameserver=${dns} --hostname=${hostname} --onboot=on --activate
 bootloader --location=mbr
-${buildCentosLvmPartitioning(source.vm.diskGiB)}
+${partitioning}
 ${rebootDirective}
 ${buildCentosPackageSelection()}
-%post --log=/root/vrc-kickstart-post.log
-cat > /etc/sysconfig/network-scripts/ifcfg-eth0 <<'VRC_IFCFG'
-TYPE=Ethernet
-DEVICE=eth0
-NAME=eth0
-BOOTPROTO=none
-ONBOOT=yes
-IPADDR=${ip}
-NETMASK=${netmask}
-GATEWAY=${gateway}
-DNS1=${dns}
-DEFROUTE=yes
-IPV6INIT=no
-VRC_IFCFG
-authconfig --enableshadow --passalgo=sha512 --update || true
-printf '%s\\n' ${rootPasswordEntry} | chpasswd || true
-printf '%s\\n' ${rootPasswordValue} | passwd --stdin root || true
-usermod -p ${rootPasswordHash} root || true
-passwd --unlock root || true
-for key in PermitRootLogin PasswordAuthentication UsePAM; do
-  case "$key" in
-    PermitRootLogin) value=yes ;;
-    PasswordAuthentication) value=yes ;;
-    UsePAM) value=yes ;;
-  esac
-  if grep -Eq "^[#[:space:]]*$key[[:space:]]+" /etc/ssh/sshd_config; then
-    sed -ri "s|^[#[:space:]]*$key[[:space:]]+.*|$key $value|" /etc/ssh/sshd_config
-  else
-    printf '%s %s\\n' "$key" "$value" >> /etc/ssh/sshd_config
-  fi
-done
-systemctl enable network || true
-systemctl disable firewalld || true
-systemctl enable sshd
-/usr/bin/python - <<'PY' || true
-import urllib2
-urllib2.urlopen('${installedUrl}', timeout=10).read()
-PY
-%end
+${postBlock}
 `;
 }
 

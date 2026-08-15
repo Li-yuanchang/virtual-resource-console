@@ -17,7 +17,12 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { Client } from "ssh2";
 import type { ConnectConfig, SFTPWrapper } from "ssh2";
-import { buildCentosLvmPartitioning, buildCentosPackageSelection } from "./centosKickstart.js";
+import {
+  buildCentosLvmPartitioning,
+  buildCentosPackageSelection,
+  buildRedHatPlainPartitioning,
+  isRocky9Image,
+} from "./centosKickstart.js";
 import { getVrcDataFile } from "./appPaths.js";
 import { getGeneratedIso, markGeneratedIsoStatus, markGeneratedIsoUploaded, registerGeneratedIso } from "./generatedIsoStore.js";
 import type { GeneratedIsoRecord } from "./generatedIsoStore.js";
@@ -1166,14 +1171,15 @@ async function generateCentosHttpBootIso(
   ]);
 
   function buildCentosIsolinuxConfig(): string {
-    const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
-    const macBinding = input.macAddress ? ` ifname=eth0:${input.macAddress}` : "";
+    const installArgs = isRocky9Image(input.sourceIsoName)
+      ? buildRocky9BootArgs(input)
+      : buildLegacyRedHatBootArgs(input);
     return `default linux
 prompt 0
 timeout 10
 label linux
   kernel vmlinuz
-  append initrd=initrd.img inst.repo=${installUrls.repoUrl} inst.ks=${installUrls.ksUrl} rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0
+  append initrd=initrd.img inst.repo=${installUrls.repoUrl} inst.ks=${installUrls.ksUrl} ${installArgs}
 `;
   }
 }
@@ -1224,13 +1230,19 @@ function buildKickstartBootIsolinuxConfig(input: XenUnattendedIsoInput, sourceVo
   const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
   const macBinding = input.macAddress ? ` ifname=eth0:${input.macAddress}` : "";
   const stage2Label = escapeAnacondaLabel(sourceVolumeLabel);
+  const installArgs = isRocky9Image(input.sourceIsoName)
+    ? buildRocky9BootArgs(input)
+    : `rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0`;
+  const stage2Source = isRocky9Image(input.sourceIsoName)
+    ? `inst.stage2=cdrom inst.ks=cdrom:/ks.cfg`
+    : `inst.stage2=hd:LABEL=${stage2Label} inst.ks=hd:LABEL=${centosKickstartIsoLabel}:/ks.cfg`;
   return `default linux
 prompt 0
 timeout 10
 label linux
   menu label Install ${input.vm.name}
   kernel vmlinuz
-  append initrd=initrd.img inst.stage2=hd:LABEL=${stage2Label} inst.ks=hd:LABEL=${centosKickstartIsoLabel}:/ks.cfg rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0
+  append initrd=initrd.img ${stage2Source} ${installArgs}
 `;
 }
 
@@ -1304,17 +1316,39 @@ async function readIsoVolumeId(sourceIso: string): Promise<string> {
   }
 }
 
+function buildLegacyRedHatBootArgs(input: XenUnattendedIsoInput): string {
+  const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
+  const macBinding = input.macAddress ? ` ifname=eth0:${input.macAddress}` : "";
+  return `rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0`;
+}
+
+// Rocky 9 内核 5.14 在 XenServer 6.5（Xen 4.4）上必须带 xen_nopv：让内核完全走模拟设备，
+// 配合 platform:device_id=0001 规避 xen-platform-pci / PV 驱动在 "Probing EDD" 处卡死（127.33 实测）。
+// 老 Xen 官方不支持 RHEL9 tools，Rocky 9 不安装 xe-guest-utilities / xs-tools；
+// notsc clocksource=hpet 等时钟参数与 xen_emul_unplug=never 保留以固定模拟设备路径。
+function buildRocky9BootArgs(input: XenUnattendedIsoInput): string {
+  const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
+  const macBinding = input.macAddress ? ` ifname=eth0:${input.macAddress}` : "";
+  return `inst.text net.ifnames=0 biosdevname=0 xen_emul_unplug=never console=tty0 console=ttyS0,115200n8 inst.sshd random.trust_cpu=1 notsc clocksource=hpet acpi_skip_timer_override lapic=notscdeadline xen_nopv rd.neednet=1${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0`;
+}
+
 function buildOfflineCentosIsolinuxConfig(input: XenUnattendedIsoInput, volumeId: string): string {
   const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
   const macBinding = input.macAddress ? ` ifname=eth0:${input.macAddress}` : "";
   const stage2Label = escapeAnacondaLabel(volumeId);
+  const installArgs = isRocky9Image(input.sourceIsoName)
+    ? buildRocky9BootArgs(input)
+    : `rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0`;
+  const stage2Source = isRocky9Image(input.sourceIsoName)
+    ? "inst.stage2=cdrom inst.ks=cdrom:/ks.cfg"
+    : `inst.stage2=hd:LABEL=${stage2Label} inst.ks=cdrom:/ks.cfg`;
   return `default linux
 prompt 0
 timeout 10
 label linux
   menu label Install ${input.vm.name}
   kernel vmlinuz
-  append initrd=initrd.img inst.stage2=hd:LABEL=${stage2Label} inst.ks=cdrom:/ks.cfg rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0
+  append initrd=initrd.img ${stage2Source} ${installArgs}
 `;
 }
 
@@ -1322,17 +1356,23 @@ function buildOfflineCentosGrubConfig(input: XenUnattendedIsoInput, volumeId: st
   const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
   const macBinding = input.macAddress ? ` ifname=eth0:${input.macAddress}` : "";
   const stage2Label = escapeAnacondaLabel(volumeId);
+  const installArgs = isRocky9Image(input.sourceIsoName)
+    ? buildRocky9BootArgs(input)
+    : `rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0`;
+  const stage2Source = isRocky9Image(input.sourceIsoName)
+    ? "inst.stage2=cdrom inst.ks=cdrom:/ks.cfg"
+    : `inst.stage2=hd:LABEL=${stage2Label} inst.ks=cdrom:/ks.cfg`;
   return `set default="0"
 set timeout=1
 menuentry 'Install ${input.vm.name}' {
-  linuxefi /images/pxeboot/vmlinuz inst.stage2=hd:LABEL=${stage2Label} inst.ks=cdrom:/ks.cfg rd.neednet=1 net.ifnames=0 biosdevname=0${macBinding} ip=${input.vm.ip}::${input.ipPool.gateway}:${netmask}:vrc:eth0:none bootdev=eth0 ksdevice=eth0
+  linuxefi /images/pxeboot/vmlinuz ${stage2Source} ${installArgs}
   initrdefi /images/pxeboot/initrd.img
 }
 `;
 }
 
 export function buildOfflineCentosKickstart(
-  input: Pick<XenUnattendedIsoInput, "vm" | "ipPool">,
+  input: Pick<XenUnattendedIsoInput, "vm" | "ipPool"> & { sourceIsoName?: string },
   options: {
     monitoringTool?: "proxmox" | "vmware";
     firmware?: "bios" | "uefi";
@@ -1350,42 +1390,86 @@ export function buildOfflineCentosKickstart(
   const rootPasswordHashValue = md5Crypt(rootPassword || "changeme");
   const rootPasswordHash = shellSingleQuote(rootPasswordHashValue);
   const hostname = sanitizeKickstartValue(input.vm.name);
+  // Rocky 9 与旧 CentOS 7 走差异化无人值守配置：
+  // Rocky 9 使用非 LVM 分区、rootpw --lock + %post chpasswd，并持久化 Xen 4.4 兼容内核参数。
+  const rocky9 = isRocky9Image(input.sourceIsoName ?? "");
   const monitoringPackage = options.monitoringTool === "proxmox" ? "qemu-guest-agent" : options.monitoringTool === "vmware" ? "open-vm-tools" : "";
   const monitoringService = options.monitoringTool === "proxmox" ? "qemu-guest-agent" : options.monitoringTool === "vmware" ? "vmtoolsd" : "";
+  const rootPasswordDirective = rocky9 ? "rootpw --lock" : `rootpw --iscrypted ${rootPasswordHashValue}`;
+  const partitioning = rocky9
+    ? buildRedHatPlainPartitioning(input.vm.diskGiB, { firmware: options.firmware })
+    : buildCentosLvmPartitioning(input.vm.diskGiB, { firmware: options.firmware });
+  const postBlock = rocky9
+    ? buildRocky9KickstartPost({ rootPasswordEntry, monitoringService, graphicalTarget: options.graphicalTarget })
+    : buildLegacyCentosKickstartPost({
+        rootPasswordEntry,
+        rootPasswordValue,
+        rootPasswordHash,
+        ip,
+        netmask,
+        gateway,
+        dns,
+        monitoringService,
+        graphicalTarget: options.graphicalTarget,
+      });
   return `#version=DEVEL
 install
 cdrom
 lang en_US.UTF-8
 keyboard us
 timezone Asia/Shanghai --isUtc
-rootpw --iscrypted ${rootPasswordHashValue}
+${rootPasswordDirective}
 auth --enableshadow --passalgo=sha512
 selinux --disabled
 firewall --disabled
 firstboot --disabled
 network --bootproto=static --device=eth0 --ip=${ip} --netmask=${netmask} --gateway=${gateway} --nameserver=${dns} --hostname=${hostname} --onboot=on --activate
 bootloader --location=mbr
-${buildCentosLvmPartitioning(input.vm.diskGiB, { firmware: options.firmware })}
+${partitioning}
 reboot --eject
 ${buildCentosPackageSelection([monitoringPackage], { environmentGroup: options.packageEnvironment })}
-%post --log=/root/vrc-kickstart-post.log
+${postBlock}
+%post --nochroot --log=/tmp/vrc-kickstart-eject.log
+eject /dev/sr0 >/dev/null 2>&1 || true
+eject /dev/sr1 >/dev/null 2>&1 || true
+%end
+`;
+}
+
+/**
+ * 生成旧 CentOS 7 的 %post 块：network-scripts 静态网卡配置 + md5 root 口令回写，
+ * 并保留 network 服务。与历史验收过的 CentOS 7 无人值守行为保持一致。
+ */
+export function buildLegacyCentosKickstartPost(options: {
+  rootPasswordEntry: string;
+  rootPasswordValue: string;
+  rootPasswordHash: string;
+  ip: string;
+  netmask: string;
+  gateway: string;
+  dns: string;
+  monitoringService?: string;
+  graphicalTarget?: boolean;
+  installedUrl?: string;
+}): string {
+  return `%post --log=/root/vrc-kickstart-post.log
 cat > /etc/sysconfig/network-scripts/ifcfg-eth0 <<'VRC_IFCFG'
 TYPE=Ethernet
 DEVICE=eth0
 NAME=eth0
 BOOTPROTO=none
 ONBOOT=yes
-IPADDR=${ip}
-NETMASK=${netmask}
-GATEWAY=${gateway}
-DNS1=${dns}
+IPADDR=${options.ip}
+NETMASK=${options.netmask}
+GATEWAY=${options.gateway}
+DNS1=${options.dns}
 DEFROUTE=yes
 IPV6INIT=no
 VRC_IFCFG
 authconfig --enableshadow --passalgo=sha512 --update || true
-printf '%s\\n' ${rootPasswordEntry} | chpasswd || true
-printf '%s\\n' ${rootPasswordValue} | passwd --stdin root || true
-usermod -p ${rootPasswordHash} root || true
+printf '%s\\n' ${options.rootPasswordEntry} | chpasswd || true
+printf '%s\\n' ${options.rootPasswordValue} | passwd --stdin root || true
+usermod -p ${options.rootPasswordHash} root || true
 passwd --unlock root || true
 for key in PermitRootLogin PasswordAuthentication UsePAM; do
   case "$key" in
@@ -1402,12 +1486,60 @@ done
 systemctl enable network || true
 systemctl disable firewalld || true
 systemctl enable sshd
-${monitoringService ? `systemctl enable ${monitoringService} || true` : ""}
+${options.monitoringService ? `systemctl enable ${options.monitoringService} || true` : ""}
 ${options.graphicalTarget ? "systemctl set-default graphical.target" : ""}
+${options.installedUrl ? `/usr/bin/python - <<'PY' || true
+import urllib2
+urllib2.urlopen('${options.installedUrl}', timeout=10).read()
+PY` : ""}
 %end
-%post --nochroot --log=/tmp/vrc-kickstart-eject.log
-eject /dev/sr0 >/dev/null 2>&1 || true
-eject /dev/sr1 >/dev/null 2>&1 || true
+`;
+}
+
+/**
+ * 生成 Rocky 9 的 %post 块：
+ * NetworkManager 接管网卡，root 口令通过 chpasswd 设置，并用 grubby 把 xen_nopv 持久化到
+ * 每个 BLS 启动项，配合 platform:device_id=0001 让 5.14 内核完全走模拟设备，规避老
+ * XenServer 6.5（Xen 4.4）首次重启卡死；Rocky 9 不安装 xe-guest-utilities / xs-tools。
+ */
+export function buildRocky9KickstartPost(options: {
+  rootPasswordEntry: string;
+  monitoringService?: string;
+  graphicalTarget?: boolean;
+  installedUrl?: string;
+}): string {
+  return `%post --log=/root/vrc-kickstart-post.log
+# RHEL9 的 rootpw --lock 仅满足 anaconda 约束，实际口令在 %post 用 chpasswd 写入
+printf '%s\\n' ${options.rootPasswordEntry} | chpasswd || true
+passwd --unlock root || true
+for key in PermitRootLogin PasswordAuthentication UsePAM; do
+  case "$key" in
+    PermitRootLogin) value=yes ;;
+    PasswordAuthentication) value=yes ;;
+    UsePAM) value=yes ;;
+  esac
+  if grep -Eq "^[#[:space:]]*$key[[:space:]]+" /etc/ssh/sshd_config; then
+    sed -ri "s|^[#[:space:]]*$key[[:space:]]+.*|$key $value|" /etc/ssh/sshd_config
+  else
+    printf '%s %s\\n' "$key" "$value" >> /etc/ssh/sshd_config
+  fi
+done
+systemctl disable firewalld || true
+systemctl enable sshd
+# 老 XenServer 6.5（Xen 4.4）兼容：Rocky 9 使用 BLS 引导，实际生效的是 /boot/loader/entries/*.conf
+# 里的显式 options，而不是 /etc/default/grub 或 grub.cfg 的 kernelopts。必须用 grubby 把 xen_nopv
+# 写入每个 BLS 项，否则首次重启不带 xen_nopv 会在 "Probing EDD" 处卡死（127.33 实测根因）。
+# xen_nopv 让 5.14 内核完全走模拟设备（配合 platform:device_id=0001）；Rocky 9 不安装
+# xe-guest-utilities / xs-tools，老 Xen 官方不支持 RHEL9 tools。
+grubby --update-kernel=ALL --args='xen_nopv notsc clocksource=hpet acpi_skip_timer_override net.ifnames=0 biosdevname=0 xen_emul_unplug=never' >/dev/null 2>&1 || true
+# NetworkManager 接管 eth0，静态地址由 kickstart network 指令写入
+nmcli con up eth0 >/dev/null 2>&1 || true
+${options.monitoringService ? `systemctl enable ${options.monitoringService} || true` : ""}
+${options.graphicalTarget ? "systemctl set-default graphical.target" : ""}
+${options.installedUrl ? `/usr/bin/python3 - <<'PY' || true
+import urllib.request
+urllib.request.urlopen('${options.installedUrl}', timeout=10).read()
+PY` : ""}
 %end
 `;
 }
