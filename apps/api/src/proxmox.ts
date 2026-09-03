@@ -483,7 +483,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
           action,
           accepted: true,
           command: `POST ${vmPath}/status/stop`,
-          message: `关机完成：${vmId}`,
+          message: `关机完成（已强制断电）：${vmId}`,
         };
       }
     } else if (action === "forceReboot") {

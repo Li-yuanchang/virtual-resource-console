@@ -1063,9 +1063,8 @@ const activeConsoleProvisionTask = computed(() =>
 );
 const activeProvisioningConsoleVmIds = computed(() => {
   const task = activeProvisionTask.value;
-  if (!task || task.status === "success") return [];
+  if (!task) return [];
   return task.vms
-    .filter((vm) => shouldUseProvisionGraphConsole(vm))
     .flatMap((vm) => [vm.providerId, vm.id, vm.name].filter((value): value is string => Boolean(value)));
 });
 function buildProvisionConsoleTargets(task: ProvisionTask | null) {
@@ -1093,15 +1092,15 @@ const activeProvisionConsoleAvailable = computed(() => {
   return activeProvisionConsoleTargets.value.some((item) => !!item.target);
 });
 watch(
-  () => [activeProvisionTask.value?.id, activeProvisionConsoleTargets.value.map((item) => item.target?.vmId || item.key).join("|")] as const,
+  () => [activeProvisionTask.value?.id, activeProvisionConsoleTargets.value.map((item) => `${item.target?.vmId || item.key}:${item.target?.mode || ""}`).join("|")] as const,
   () => {
     if (!activeProvisionTask.value) {
       provisionInlineConsoleTarget.value = null;
       return;
     }
     const targets = activeProvisionConsoleTargets.value;
-    const currentVmId = provisionInlineConsoleTarget.value?.vmId;
-    if (currentVmId && targets.some((item) => item.target?.vmId === currentVmId)) return;
+    const currentTarget = provisionInlineConsoleTarget.value;
+    if (currentTarget && targets.some((item) => item.target?.vmId === currentTarget.vmId && item.target?.mode === currentTarget.mode)) return;
     provisionInlineConsoleTarget.value = targets.find((item) => item.target)?.target ?? null;
   },
   { immediate: true },
@@ -4580,7 +4579,7 @@ function openCreatedVmConsole(created: VmProvisionCreatedVm) {
       reclaimLevel: "KEEP",
       reclaimReason: "新建虚拟机",
     };
-  const target = resolveVmConsoleTarget({
+  const context = {
     connection: {
       id: selectedConnectionId.value,
       providerType: connection.providerType,
@@ -4589,10 +4588,12 @@ function openCreatedVmConsole(created: VmProvisionCreatedVm) {
       username: connection.username,
       password: persistentConnectionsEnabled.value ? undefined : connection.password,
     },
-    vm: { ...consoleVm, powerState: "running" },
+    vm: { ...consoleVm, powerState: "running" as const },
     hostName: selectedHost.value?.name,
     hostAddress: selectedHost.value?.address,
-  });
+  };
+  // 创建完成后的首个控制台用于确认启动与安装画面，优先保留平台 VNC 通道。
+  const target = resolveVmGraphConsoleTarget(context) ?? resolveVmConsoleTarget(context);
   if (!target) {
     showToast("warning", "虚拟机已创建，但当前平台还没有可用控制台入口。");
     return;
@@ -4637,19 +4638,14 @@ function resolveProvisionTaskVmConsoleTarget(taskVm: ProvisionTask["vms"][number
     hostName: selectedHost.value?.name,
     hostAddress: selectedHost.value?.address,
   };
-  return shouldUseProvisionGraphConsole(taskVm)
-    ? resolveVmGraphConsoleTarget(context) ?? resolveVmConsoleTarget(context)
-    : resolveVmConsoleTarget(context);
-}
-
-function shouldUseProvisionGraphConsole(taskVm: ProvisionTask["vms"][number]) {
-  if (taskVm.status === "success" && taskVm.currentStep === "complete") return false;
-  return taskVm.status === "pending" || taskVm.status === "running" || taskVm.status === "failed" || taskVm.currentStep !== "complete";
+  // 创建窗口必须保持平台图形控制台，安装程序、重启画面和异常现场均依赖 VNC；
+  // 关闭创建窗口后，普通 VM 列表才按来宾系统策略选择 xterm 或 noVNC。
+  return resolveVmGraphConsoleTarget(context) ?? resolveVmConsoleTarget(context);
 }
 
 function openProvisionTaskConsole(task: ProvisionTask, notifyIfUnavailable = true) {
   consoleProvisionTaskId.value = task.id;
-  const firstTarget = task.vms.map((vm) => resolveProvisionTaskVmConsoleTarget(vm)).find(Boolean) ?? null;
+  const firstTarget = buildProvisionConsoleTargets(task).map((item) => item.target).find(Boolean) ?? null;
   if (!firstTarget) {
     if (notifyIfUnavailable) showToast("warning", "创建任务已提交，但 VM 控制台入口还未就绪。");
     return false;
@@ -5390,14 +5386,17 @@ async function loadVmBootEntries(vm: VmNode, systemCredentials?: VmSystemCredent
     }
   } catch (error) {
     if (bootEntryDialogVm.value?.providerId !== vm.providerId) return;
-    if (error instanceof SecureRequestError && error.code === "SYSTEM_AUTHENTICATION_REQUIRED") {
-      bootEntryAuthRequired.value = true;
-      bootEntryError.value = "需要虚拟机系统账号";
-    } else {
-      bootEntryError.value = error instanceof Error ? error.message : "读取虚拟机启动项失败";
-    }
-    // 读取失败（含需要系统账号）时需要用户交互：弹窗提供重试或按默认启动继续。
-    bootEntryVisible.value = true;
+    const bootEntryFailure =
+      error instanceof SecureRequestError && error.code === "SYSTEM_AUTHENTICATION_REQUIRED"
+        ? "需要虚拟机系统账号"
+        : error instanceof Error
+          ? error.message
+          : "读取虚拟机启动项失败";
+    // 读取启动内核失败不应阻断重启：降级为按系统默认内核重启，并给出明确提示，
+    // 避免“点重启无反应”。成功读取到多个内核时仍会弹选择框。
+    bootEntryVisible.value = false;
+    showToast("warning", `未读取到启动内核（${bootEntryFailure}），将按系统默认内核重启`);
+    void handleVmActionPlain(bootEntryDialogAction.value ?? "forceReboot", vm);
   } finally {
     if (bootEntryDialogVm.value?.providerId === vm.providerId) {
       bootEntryLoading.value = false;

@@ -1853,7 +1853,7 @@ export class XenServerProvider implements VirtualizationProvider<XenConnectionIn
       command: xenVmActionCommand(vmId, action, forced === "true"),
       message:
         action === "shutdown" && forced === "true"
-          ? `关机完成：${name}`
+          ? `关机完成（已强制断电）：${name}`
           : action === "forceReboot"
             ? `强制重启完成：${name}`
           : action === "start" && forced === "true"

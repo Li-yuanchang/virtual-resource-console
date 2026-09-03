@@ -380,22 +380,25 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
       } else if (action === "shutdown") {
         if (vm.powerState !== "running") throw new Error("虚拟机未运行，无需关机。");
         const forceOnFailure = options?.forceOnShutdownFailure ?? true;
+        let forced = false;
         try {
           if (vm.toolsStatus === "missing") {
             throw new Error("VMware Tools unavailable before guest shutdown");
           }
           await session.shutdownGuest(vmMoid);
           command = `SOAP ShutdownGuest vm=${vmMoid}`;
-          const gracefullyPoweredOff = await session.waitForVmPowerState(vmMoid, "halted", options?.shutdownTimeoutMs ?? 18_000);
+          const gracefullyPoweredOff = await session.waitForVmPowerState(vmMoid, "halted", options?.shutdownTimeoutMs ?? 120_000);
           if (!gracefullyPoweredOff) {
             if (!forceOnFailure) throw new Error("VMware 客户机关机超时，当前策略不允许强制关机。");
             await session.powerOffVm(vmMoid);
+            forced = true;
             command = `SOAP ShutdownGuest vm=${vmMoid}\nSOAP PowerOffVM_Task vm=${vmMoid}`;
           }
         } catch (error) {
           if (!isVmwareGuestShutdownUnavailable(error)) throw error;
           if (!forceOnFailure) throw new Error("VMware Tools 不可用，当前策略不允许强制关机。");
           await session.powerOffVm(vmMoid);
+          forced = true;
           command = `SOAP PowerOffVM_Task vm=${vmMoid}`;
         }
         return {
@@ -403,7 +406,7 @@ export class VmwareProvider implements VirtualizationProvider<XenConnectionInput
           action,
           accepted: true,
           command,
-          message: `${vmwareActionLabel(action)}完成：${vm.name}`,
+          message: `${vmwareActionLabel(action)}完成${forced ? "（已强制断电）" : ""}：${vm.name}`,
         };
       } else if (action === "forceReboot") {
         if (vm.powerState !== "running") throw new Error("虚拟机未运行，不能强制重启。");

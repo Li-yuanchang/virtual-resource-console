@@ -70,6 +70,20 @@ export class AuditStore {
 
   /** 追加一条审计记录并持久化；返回写入后的记录。 */
   record(input: AuditRecordInput): AuditRecord {
+    const file = this.read();
+    // 抑制同一 action + 相同请求摘要在极短时间内的重复写入（前端防抖保存与直接调用叠加
+    // 会导致连接偏好等高频偏好更新被双写），避免审计日志被噪音刷屏、真实操作被淹没。
+    const last = file.entries[file.entries.length - 1];
+    if (
+      last &&
+      input.action &&
+      last.action === input.action &&
+      input.request !== undefined &&
+      last.request === input.request &&
+      Date.now() - new Date(last.time).getTime() < 1000
+    ) {
+      return last;
+    }
     const entry: AuditRecord = {
       id: randomUUID(),
       time: new Date().toISOString(),
@@ -84,7 +98,6 @@ export class AuditStore {
       ...(input.command ? { command: input.command } : {}),
       ...(input.detail ? { detail: input.detail } : {}),
     };
-    const file = this.read();
     file.entries.push(entry);
     if (file.entries.length > MAX_AUDIT_ENTRIES) {
       file.entries = file.entries.slice(file.entries.length - MAX_AUDIT_ENTRIES);

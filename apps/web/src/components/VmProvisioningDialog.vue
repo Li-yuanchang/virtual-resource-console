@@ -34,6 +34,7 @@ import type {
 } from "../types";
 import type { VmConsoleTarget } from "../domain/consoleStrategies";
 import { validateProvisioningIpPool } from "../domain/ipPoolValidation";
+import { replaceVmNameIpPrefix, vmNamePrefixFromIp as buildVmNamePrefixFromIp } from "../domain/vmNamePrefix";
 import { matchesIsoNamePattern } from "../domain/isoTemplateMatch";
 import { getProviderBrand } from "../domain/providerBrand";
 import { groupIsoImagesBySource, isoSourceLabel, resolveProvisioningStrategy } from "../domain/provisioningStrategies";
@@ -1454,18 +1455,13 @@ function resolveVmNameForAssignedIp(name: string | undefined, ip: string, index:
   if (!currentName) return defaultVmNameForIp(ip, index);
   const assignedPrefix = vmNamePrefixFromIp(ip);
   if (!assignedPrefix) return currentName;
-  const currentIpPrefix = currentName.match(/^(?:\d{1,3}\.){1,3}\d{1,3}_/)?.[0];
+  const synchronizedName = replaceVmNameIpPrefix(currentName, assignedPrefix);
   // The IP-derived prefix remains authoritative while the user-owned suffix is preserved.
-  return currentIpPrefix ? `${assignedPrefix}${currentName.slice(currentIpPrefix.length)}` : currentName;
+  return synchronizedName;
 }
 
 function vmNamePrefixFromIp(ip: string) {
-  if (!isIpv4(ip)) return "";
-  const parts = ip.split(".");
-  const subnet = parts[2];
-  const host = parts[3];
-  if ((subnet === "2" || subnet === "127" || subnet === "129") && host) return `${subnet}.${host}_`;
-  return `${ip}_`;
+  return buildVmNamePrefixFromIp(ip, ipPoolPolicy.value.ipPools.map((pool) => pool.prefix));
 }
 
 function splitIpList(value: string) {

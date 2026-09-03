@@ -1427,6 +1427,22 @@ function persistProvisionExecutionContext(
 }
 
 /**
+ * 启动时兜底：把没有恢复上下文的 running/pending 创建任务标记为失败。
+ * 有恢复上下文的由 {@link resumeProvisioningExecutions} 异步恢复；没有上下文的若继续保留，
+ * 会在服务重启后永久停在“进行中”，因此统一收尾为失败并提示重新提交。
+ */
+function finalizeOrphanedProvisionTasks(): void {
+  const recoverableIds = new Set(provisionExecutionStore.list().map((context) => context.taskId));
+  for (const task of listProvisionTasks(10_000)) {
+    if ((task.status === "running" || task.status === "pending") && !recoverableIds.has(task.id)) {
+      markProvisionTaskStep(task.id, task.currentStep, "failed", "服务重启后任务恢复上下文已丢失，无法继续验收。");
+      finishProvisionTask(task.id, "failed", "任务恢复上下文已丢失，无法继续验收，请重新提交。");
+      server.log.warn({ taskId: task.id }, "finalized orphaned provisioning task without recovery context");
+    }
+  }
+}
+
+/**
  * Restarts verification for encrypted local tasks left active by an API process restart.
  * Recovery never calls Provider.createVms; it must identify every existing VM first.
  */
@@ -2813,6 +2829,7 @@ writeApiStartupLog("api fastify listen done", {
   phaseElapsedMs: Date.now() - apiModuleLoadedAt,
 });
 if (persistentConnectionStoreEnabled) {
+  finalizeOrphanedProvisionTasks();
   vmScheduleRunner.start();
   writeApiStartupLog("api schedule runner started", {
     phaseElapsedMs: Date.now() - apiModuleLoadedAt,
