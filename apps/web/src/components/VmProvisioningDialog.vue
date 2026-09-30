@@ -234,6 +234,8 @@ const provisioningForm = reactive({
   rootPassword: "",
   loginUsername: "",
   autoStart: true,
+  // 默认勾选：绑定堡垒机访问限制，用户可在本次创建中取消；实际初值在初始化时按策略覆盖。
+  bastionAccessEnabled: true,
 });
 
 const selectedProvisioningSpec = computed(() => provisioningConfig.value.specTemplates.find((item) => item.id === provisioningForm.specId) ?? null);
@@ -275,6 +277,19 @@ const provisioningAccountPolicy = computed(() =>
     toolsIsoName: selectedToolsIsoImage.value?.name,
   }),
 );
+// 白名单优先取运行时策略（其来源即 IP 池配置），回落到 IP 池配置本身，
+// 保证设置页改动后创建弹框展示与提交的一致。
+const bastionAllowFrom = computed(() => {
+  const fromPolicy = runtimePolicy.value.provisioning?.bastionAllowFrom ?? [];
+  if (fromPolicy.length) return fromPolicy.filter((ip) => isIpv4(ip));
+  return (ipPoolPolicy.value.bastionAllowFrom ?? []).filter((ip) => isIpv4(ip));
+});
+// 卡片窄，摘要只保留当前生效的白名单；完整说明放在 title 悬浮里。
+const bastionAllowSummary = computed(() => (bastionAllowFrom.value.length ? bastionAllowFrom.value.join("、") : "未配置白名单"));
+const bastionAccessTooltip = computed(() => {
+  if (!bastionAllowFrom.value.length) return "未配置白名单地址：开启后仅写入 sshd 限制，不含任何放行来源。";
+  return `仅允许 ${bastionAllowFrom.value.join("、")} 登录本机 SSH；装完并通过登录验证后锁定 sshd 配置，防止绕过堡垒机直连。`;
+});
 const provisioningOccupiedIps = computed(() => {
   const ips = new Set<string>();
   for (const ip of props.reservedIps) {
@@ -306,10 +321,13 @@ const visibleIpCandidates = computed(() => {
 const provisioningPoolError = computed(() =>
   validateProvisioningIpPool(currentProvisioningPoolDraft()),
 );
-const provisioningNetworkError = computed(() =>
+// 创建网络预检失败只影响"发布安装源"这一步，不能证明 IP 池或某个地址有问题，
+// 因此不再并入 provisioningCandidateError：否则网络探测一失败就会清空候选 IP，
+// 用户输入的自定义 IP 也会被连带判成"未确认可用"。它与 route-only 一样按告警处理。
+const provisioningNetworkAdvisory = computed(() =>
   provisioningNetworkProbe.value?.status === "unreachable" ? provisioningNetworkProbe.value.message : "",
 );
-const provisioningCandidateError = computed(() => provisioningPoolError.value || provisioningNetworkError.value);
+const provisioningCandidateError = computed(() => provisioningPoolError.value);
 const ipCandidateEmptyText = computed(() =>
   ipCandidateFilter.value === "available" ? "暂无可用 IP，可切换全部查看占用情况。" : "当前 IP 池没有可展示的候选地址。",
 );
@@ -384,7 +402,6 @@ function storageHighlightShortLabel(kind: "hba" | "local" | "file") {
 const provisioningStatusText = computed(() => {
   if (canSubmit.value) return "可提交创建";
   if (provisioningPoolError.value) return "IP 池配置异常";
-  if (provisioningNetworkError.value) return "创建网络异常";
   return blockingWarningSummary.value || "待完成校验";
 });
 const provisioningStatusTooltip = computed(() => {
@@ -536,10 +553,14 @@ watch(
   },
 );
 
+// 自定义 IP 一输入就立即触发 ping 探测：否则该地址没有探测结果，
+// 预案会因"未确认可用"被阻断，用户只能干等或误以为地址被占用。
 watch(
   () => provisioningForm.preferredIp,
-  () => {
+  (ip) => {
     syncRootPasswordDefault();
+    // 只对合法 IPv4 触发，避免输入过程中的半截地址刷探测请求。
+    if (props.visible && isIpv4(ip)) scheduleIpProbe();
   },
 );
 
@@ -864,6 +885,10 @@ function applyEnvironmentTemplate() {
   selectProvisioningPool(template.ipPoolId);
   provisioningForm.vmNamePrefix = template.vmNamePrefix;
   provisioningForm.autoStart = true; // 固定开启：创建后必须自动启动并打开控制台，不允许模板覆盖为关闭
+  // 绑定堡垒机默认勾选：重置会话时回到默认值，避免上一次取消后遗留。
+  // 默认勾选状态以设置页的策略为准（旧配置缺字段时按开启处理）。
+  provisioningForm.bastionAccessEnabled =
+    runtimePolicy.value.provisioning?.bastionAccessEnabled ?? ipPoolPolicy.value.bastionAccessEnabled ?? true;
   provisioningForm.installProfile = template.installProfile;
   if (template.sourceType === "iso") {
     provisioningForm.isoId = resolveTemplateIsoId(template);
@@ -990,6 +1015,11 @@ function buildProvisioningPlan(): ProvisioningPlanResult | null {
   if (poolError) warnings.push(blockingProvisioningWarning(poolError, "IP_POOL_INVALID"));
   if (provisioningNetworkProbe.value?.status === "route-only") {
     warnings.push(advisoryProvisioningWarning(provisioningNetworkProbe.value.message, "NETWORK_ROUTE_ONLY"));
+  }
+  // 创建网络预检失败不阻断预案：它只影响宿主机发布安装源，与 IP 是否空闲无关。
+  // 真正的网络问题会在提交创建时由服务端预检单独拦下。
+  if (provisioningNetworkAdvisory.value) {
+    warnings.push(advisoryProvisioningWarning(provisioningNetworkAdvisory.value, "NETWORK_PROBE_UNAVAILABLE"));
   }
   if (!source) warnings.push(blockingProvisioningWarning(provisioningForm.sourceType === "iso" ? "未读取到可用 ISO，当前仅能先生成 IP 预览。" : "请填写克隆源名称。", "SOURCE_REQUIRED"));
   if (templateIsoMismatchMessage.value) warnings.push(blockingProvisioningWarning(templateIsoMismatchMessage.value, "SOURCE_TEMPLATE_MISMATCH"));
@@ -1221,6 +1251,9 @@ function submitProvisioning() {
     count: Math.max(Math.floor(provisioningForm.count), 1),
     ipPool: currentProvisioningPoolDraft(),
     autoStart: true, // 固定开启：创建后自动启动并打开控制台
+    // 默认勾选绑定堡垒机；取消时不传，服务端按"未开启"处理，%post 不写 sshd 限制。
+    bastionAccessEnabled: provisioningForm.bastionAccessEnabled,
+    bastionAllowFrom: provisioningForm.bastionAccessEnabled ? bastionAllowFrom.value : undefined,
     planItems: plan.items.map((item) => ({
       name: item.name,
       ip: item.ip,
@@ -1343,7 +1376,11 @@ async function probeProvisioningIps(sessionId = dialogSessionId, notifyValidatio
     if (notifyValidationError) showMessage(poolError, "error");
     return;
   }
-  const ips = Array.from(new Set([...rawProvisioningAvailableIps.value.slice(0, IP_CANDIDATE_PREVIEW_LIMIT), provisioningForm.preferredIp].filter(isIpv4)));
+  // 自定义 IP 必须一起探测：预案会逐行校验，任何一行没有探测结果都会被判为"未确认可用"。
+  const customIps = Object.values(vmDraftOverrides).map((override) => override?.ip?.trim() ?? "");
+  const ips = Array.from(
+    new Set([...rawProvisioningAvailableIps.value.slice(0, IP_CANDIDATE_PREVIEW_LIMIT), ...customIps, provisioningForm.preferredIp].filter(isIpv4)),
+  );
   if (!ips.length) {
     ipProbeResults.value = {};
     provisioningNetworkProbe.value = null;
@@ -1371,17 +1408,19 @@ async function probeProvisioningIps(sessionId = dialogSessionId, notifyValidatio
     });
     if (!isActiveDialogSession(sessionId)) return;
     provisioningNetworkProbe.value = result.network ?? null;
-    if (result.network?.status === "unreachable") {
-      ipProbeResults.value = {};
-      provisioningForm.preferredIp = "";
-      if (notifyValidationError) showMessage(result.network.message, "error");
-      return;
-    }
+    // 逐 IP 的 ping 结果与"创建网络预检"是两件独立的事：后端始终返回 results，
+    // 网络预检失败（例如宿主机不可达/认证失败）不应连带丢掉已经拿到的 IP 结果，
+    // 否则用户输入的自定义 IP 会永远停在"未确认可用"而被阻断。
     ipProbeResults.value = {
       ...ipProbeResults.value,
       ...Object.fromEntries(result.results.map((item) => [item.ip, item])),
     };
     syncPreferredIpAfterProbe(result.results);
+    if (result.network?.status === "unreachable") {
+      // 不清理 preferredIp：IP 本身已判定可用，阻断交给创建网络预检单独提示。
+      if (notifyValidationError) showMessage(result.network.message, "error");
+      return;
+    }
   } catch (error) {
     if (!isActiveDialogSession(sessionId)) return;
     provisioningNetworkProbe.value = null;
@@ -1708,8 +1747,23 @@ type ProvisioningSourceType = "iso" | "template";
               <el-input v-if="provisioningAccountPolicy.requiresUsername" v-model="provisioningForm.loginUsername" placeholder="例如 ubuntu" :disabled="provisioningFormLocked" />
               <el-input v-else :model-value="provisioningAccountPolicy.defaultUsername" readonly :disabled="provisioningFormLocked" />
             </label>
-            <div class="provision-auto-start provision-auto-start-fixed" title="创建完成后自动启动虚拟机，并自动打开控制台（固定开启，无需手动操作）">
-              <span class="provision-auto-start-hint">创建后自动启动并打开控制台（固定开启）</span>
+            <!-- 参数网格右侧空位：放堡垒机绑定开关（默认勾选，可在本次创建取消）。
+                 结构对齐左侧 form-field（标签行 + 控件行），使控件高度与输入框一致。 -->
+            <div class="form-field provision-bastion-field">
+              <span>堡垒机</span>
+              <el-tooltip :content="bastionAccessTooltip" placement="top" :show-after="300">
+                <label class="provision-bastion-control">
+                  <el-switch
+                    v-model="provisioningForm.bastionAccessEnabled"
+                    :disabled="provisioningFormLocked"
+                    aria-label="绑定堡垒机访问"
+                  />
+                  <span class="provision-bastion-copy">
+                    <strong>绑定堡垒机</strong>
+                    <small>{{ bastionAllowSummary }}</small>
+                  </span>
+                </label>
+              </el-tooltip>
             </div>
           </section>
         </div>
@@ -1795,12 +1849,15 @@ type ProvisioningSourceType = "iso" | "template";
                 <div v-if="provisioningCandidateError" class="ip-candidate-validation-error" role="alert">
                   <el-icon><WarningFilled /></el-icon>
                   <span>
-                    <strong>{{ provisioningPoolError ? "IP 池配置不可用" : "创建网络不可用" }}</strong>
+                    <strong>IP 池配置不可用</strong>
                     <small>{{ provisioningCandidateError }}</small>
                   </span>
                 </div>
                 <template v-else-if="visibleIpCandidates.length">
-                  <div v-if="provisioningNetworkProbe?.status === 'route-only'" class="ip-candidate-network-warning" role="status">
+                  <div v-if="provisioningNetworkAdvisory" class="ip-candidate-network-warning" role="status">
+                    {{ provisioningNetworkAdvisory }}
+                  </div>
+                  <div v-else-if="provisioningNetworkProbe?.status === 'route-only'" class="ip-candidate-network-warning" role="status">
                     {{ provisioningNetworkProbe.message }}
                   </div>
                   <div class="ip-candidate-list">

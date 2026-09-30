@@ -1128,11 +1128,26 @@ textarea,
   justify-self: start;
 }
 
-.settings-log-actions {
+.settings-card-head > .settings-log-actions {
   display: flex;
-  align-items: center;
-  gap: 8px;
   flex: 0 0 auto;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: var(--vrc-settings-action-gap, 8px);
+}
+
+.settings-log-actions .el-button {
+  height: 30px;
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.settings-log-actions .el-button + .el-button {
+  margin-left: 0;
 }
 
 .settings-log-loading {
@@ -10930,6 +10945,12 @@ button:focus-visible,
   gap: 12px;
 }
 
+/* 堡垒机为全局设置，独立成卡；表单沿用 IP 池编辑器的两列布局与内边距。 */
+.ip-bastion-card .settings-field-hint {
+  margin: -4px 0 0;
+  padding: 0 12px 12px;
+}
+
 .ip-pool-card {
   gap: 0;
   overflow: hidden;
@@ -12875,24 +12896,57 @@ button:focus-visible,
   min-width: 0;
 }
 
-.provision-auto-start {
-  grid-column: 1 / -1;
-  min-height: 22px;
-}
-
-.provision-auto-start-hint {
+/* 设置项标签内的小问号：说明文字较长时改用 tooltip，避免常驻段落挤压表单。 */
+.settings-field-help {
+  margin-left: 4px;
   color: var(--vrc-text-muted);
   font-size: 12px;
-  line-height: 22px;
+  vertical-align: -2px;
+  cursor: help;
 }
 
-.provision-auto-start-fixed::before {
-  content: "\2713";
-  display: inline-block;
-  width: 14px;
-  color: var(--vrc-accent, #409eff);
+.settings-field-hint {
+  margin: 8px 0 0;
+  color: var(--vrc-text-muted);
   font-size: 12px;
-  margin-right: 4px;
+  line-height: 1.5;
+}
+
+/* 参数网格右侧空位：堡垒机开关。沿用 form-field 结构（标签行 + 控件行），
+   控件行高度对齐 --vrc-control-height，与同排输入框严格等高。 */
+.provision-bastion-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--vrc-control-height, 30px);
+  min-width: 0;
+  cursor: pointer;
+}
+
+.provision-bastion-copy {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.provision-bastion-copy strong {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--vrc-text);
+  line-height: 1.2;
+}
+
+/* IP 说明单行省略：完整内容由 el-tooltip 展示，避免撑破网格列宽。 */
+.provision-bastion-copy small {
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .quick-form-card .el-input__wrapper,

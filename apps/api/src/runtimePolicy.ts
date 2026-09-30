@@ -12,6 +12,10 @@ export interface RuntimePolicy {
   };
   provisioning: {
     rootPasswordTemplate: string;
+    /** 新建 VM 默认是否绑定堡垒机访问限制（可在创建弹框中单次取消）。 */
+    bastionAccessEnabled: boolean;
+    /** 允许 SSH 登录 VM 的来源地址，用于生成 sshd 的 AllowUsers 白名单。 */
+    bastionAllowFrom: string[];
   };
   xenserver: {
     networkDeviceRules: Array<{
@@ -22,6 +26,10 @@ export interface RuntimePolicy {
 }
 
 const defaultRootPasswordTemplate = "root@{third}.{fourth}";
+
+// 堡垒机地址与 VRC 本机地址：绑定后 sshd 只放行这些来源，
+// 必须包含 VRC 自身的访问来源，否则安装收尾的 SSH 验证会被自己拦掉。
+const defaultBastionAllowFrom = ["192.168.130.3", "192.168.19.14"];
 
 /**
  * Returns the runtime policy derived from the current IP pool configuration.
@@ -63,6 +71,11 @@ export function createRuntimePolicy(ipPoolPolicy?: IpPoolPolicy): RuntimePolicy 
     },
     provisioning: {
       rootPasswordTemplate: defaultRootPasswordTemplate,
+      // 优先用 IP 池配置（设置页可改）；旧配置文件缺字段时回落到默认值。
+      bastionAccessEnabled: ipPoolPolicy?.bastionAccessEnabled ?? true,
+      bastionAllowFrom: ipPoolPolicy?.bastionAllowFrom?.length
+        ? [...ipPoolPolicy.bastionAllowFrom]
+        : [...defaultBastionAllowFrom],
     },
     xenserver: {
       networkDeviceRules: [],

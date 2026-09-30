@@ -61,6 +61,11 @@ export interface XenUnattendedIsoInput {
   ipPool: IpPoolConfig;
   macAddress?: string;
   installSource?: VmProvisionInstallSourceRef;
+  /**
+   * 允许 SSH 登录 VM 的来源白名单（堡垒机 + VRC 本机）。
+   * 非空时在 %post 写入 sshd AllowUsers，使 VM 只能经堡垒机访问；空表示不限制。
+   */
+  bastionAllowFrom?: string[];
   onProgress?: (message: string) => void;
 }
 
@@ -1188,7 +1193,7 @@ async function generateCentosKickstartBootIso(
   copyFileSync(bootFiles.isolinuxBin, join(isolinuxDir, "isolinux.bin"));
   copyFileSync(bootFiles.vmlinuz, join(isolinuxDir, "vmlinuz"));
   copyFileSync(bootFiles.initrd, join(isolinuxDir, "initrd.img"));
-  writeFileSync(join(workDir, "ks.cfg"), buildOfflineCentosKickstart(input), "utf8");
+  writeFileSync(join(workDir, "ks.cfg"), buildOfflineCentosKickstart(input, { bastionAllowFrom: input.bastionAllowFrom }), "utf8");
   writeFileSync(join(isolinuxDir, "isolinux.cfg"), buildKickstartBootIsolinuxConfig(input, sourceVolumeLabel), "utf8");
   const xorriso = resolveXorrisoPath();
   await execFileAsync(xorriso, [
@@ -1266,7 +1271,7 @@ async function generateCentosOfflineUnattendedIso(sourceIso: string, outputIso: 
   const ksPath = join(workDir, "ks.cfg");
   const isolinuxPath = join(workDir, "isolinux.cfg");
   const grubPath = join(workDir, "grub.cfg");
-  writeFileSync(ksPath, buildOfflineCentosKickstart(input), "utf8");
+  writeFileSync(ksPath, buildOfflineCentosKickstart(input, { bastionAllowFrom: input.bastionAllowFrom }), "utf8");
   writeFileSync(isolinuxPath, buildOfflineCentosIsolinuxConfig(input, volumeId), "utf8");
   writeFileSync(grubPath, buildOfflineCentosGrubConfig(input, volumeId), "utf8");
   const xorriso = resolveXorrisoPath();
@@ -1368,6 +1373,8 @@ export function buildOfflineCentosKickstart(
     firmware?: "bios" | "uefi";
     packageEnvironment?: string;
     graphicalTarget?: boolean;
+    /** 允许 SSH 登录 VM 的来源白名单；非空时写入 sshd AllowUsers，见 buildBastionSshdBlock。 */
+    bastionAllowFrom?: string[];
   } = {},
 ): string {
   const netmask = cidrToNetmask(input.ipPool.cidr) || "255.255.255.0";
@@ -1395,7 +1402,12 @@ export function buildOfflineCentosKickstart(
     ? buildRedHatPlainPartitioning(input.vm.diskGiB, { firmware: options.firmware })
     : buildCentosLvmPartitioning(input.vm.diskGiB, { firmware: options.firmware });
   const postBlock = rocky9
-    ? buildRocky9KickstartPost({ rootPasswordEntry, monitoringService, graphicalTarget: options.graphicalTarget })
+    ? buildRocky9KickstartPost({
+        rootPasswordEntry,
+        monitoringService,
+        graphicalTarget: options.graphicalTarget,
+        bastionAllowFrom: options.bastionAllowFrom,
+      })
     : buildLegacyCentosKickstartPost({
         rootPasswordEntry,
         rootPasswordValue,
@@ -1406,6 +1418,7 @@ export function buildOfflineCentosKickstart(
         dns,
         monitoringService,
         graphicalTarget: options.graphicalTarget,
+        bastionAllowFrom: options.bastionAllowFrom,
       });
   return `#version=DEVEL
 cdrom
@@ -1445,6 +1458,12 @@ export function buildLegacyCentosKickstartPost(options: {
   monitoringService?: string;
   graphicalTarget?: boolean;
   installedUrl?: string;
+  /**
+   * 允许 SSH 登录 VM 的来源白名单。非空时写入 sshd 的 AllowUsers（并关闭 UseDNS 反解），
+   * 使 VM 只接受堡垒机与 VRC 本机访问；空数组/未传表示不限制。
+   * 此处只写配置，不加 chattr 锁：VRC 收尾还要用同一条通道验证登录，加锁放在验证通过之后。
+   */
+  bastionAllowFrom?: string[];
 }): string {
   return `%post --log=/root/vrc-kickstart-post.log
 cat > /etc/sysconfig/network-scripts/ifcfg-eth0 <<'VRC_IFCFG'
@@ -1486,8 +1505,46 @@ ${options.installedUrl ? `/usr/bin/python - <<'PY' || true
 import urllib2
 urllib2.urlopen('${options.installedUrl}', timeout=10).read()
 PY` : ""}
-%end
+${buildBastionSshdBlock(options.bastionAllowFrom)}%end
 `;
+}
+
+/**
+ * 生成绑定堡垒机访问所用的 sshd 配置片段。
+ *
+ * 绑定后 VM 只接受白名单来源的 SSH，避免绕过堡垒机直连。白名单必须包含 VRC 自身的访问来源，
+ * 否则安装收尾的 SSH 验证会被自己拦下，任务会误判失败。
+ *
+ * 这里只写配置并 reload sshd，**不加 chattr 锁**：VRC 还要用这条通道完成验证登录，
+ * 加锁由验证通过后的收尾步骤执行。UseDNS no 用于规避无反向解析时的登录卡顿。
+ *
+ * @param bastionAllowFrom 允许登录的来源地址；空数组或未传表示不做限制
+ * @return 追加到 %post 末尾的 shell 片段，无限制时返回空字符串
+ */
+export function buildBastionSshdBlock(bastionAllowFrom?: string[]): string {
+  const allowFrom = Array.from(new Set((bastionAllowFrom ?? []).map((item) => item.trim()).filter(isIpv4Address)));
+  if (!allowFrom.length) return "";
+  const allowUsersValue = allowFrom.map((ip) => `*@${ip}`).join(" ");
+  return `
+# 绑定堡垒机访问：sshd 仅放行白名单来源（堡垒机 + VRC 本机），并关闭 DNS 反解避免登录卡顿。
+if grep -Eq "^[#[:space:]]*AllowUsers[[:space:]]+" /etc/ssh/sshd_config; then
+  sed -ri "s|^[#[:space:]]*AllowUsers[[:space:]]+.*|AllowUsers ${allowUsersValue}|" /etc/ssh/sshd_config
+else
+  printf '%s\\n' 'AllowUsers ${allowUsersValue}' >> /etc/ssh/sshd_config
+fi
+if grep -Eq "^[#[:space:]]*UseDNS[[:space:]]+" /etc/ssh/sshd_config; then
+  sed -ri "s|^[#[:space:]]*UseDNS[[:space:]]+.*|UseDNS no|" /etc/ssh/sshd_config
+else
+  printf '%s\\n' 'UseDNS no' >> /etc/ssh/sshd_config
+fi
+# 先 reload 让限制生效；不重启 sshd 以免中断当前安装会话。
+systemctl reload sshd 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+`;
+}
+
+function isIpv4Address(value: string): boolean {
+  const parts = value.split(".");
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
 }
 
 /**
@@ -1501,6 +1558,12 @@ export function buildRocky9KickstartPost(options: {
   monitoringService?: string;
   graphicalTarget?: boolean;
   installedUrl?: string;
+  /**
+   * 允许 SSH 登录 VM 的来源白名单。非空时写入 sshd 的 AllowUsers（并关闭 UseDNS 反解），
+   * 使 VM 只接受堡垒机与 VRC 本机访问；空数组/未传表示不限制。
+   * 此处只写配置，不加 chattr 锁：VRC 收尾还要用同一条通道验证登录，加锁放在验证通过之后。
+   */
+  bastionAllowFrom?: string[];
 }): string {
   return `%post --log=/root/vrc-kickstart-post.log
 # RHEL9 的 rootpw --lock 仅满足 anaconda 约束，实际口令在 %post 用 chpasswd 写入
@@ -1534,7 +1597,7 @@ ${options.installedUrl ? `/usr/bin/python3 - <<'PY' || true
 import urllib.request
 urllib.request.urlopen('${options.installedUrl}', timeout=10).read()
 PY` : ""}
-%end
+${buildBastionSshdBlock(options.bastionAllowFrom)}%end
 `;
 }
 

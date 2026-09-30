@@ -57,6 +57,10 @@ export interface RuntimePolicy {
   };
   provisioning: {
     rootPasswordTemplate: string;
+    /** 新建 VM 默认是否绑定堡垒机访问限制。 */
+    bastionAccessEnabled?: boolean;
+    /** 允许 SSH 登录 VM 的来源白名单（堡垒机 + VRC 本机）。 */
+    bastionAllowFrom?: string[];
   };
   xenserver: {
     networkDeviceRules: Array<{
@@ -85,6 +89,10 @@ export interface RuntimeIpPoolPolicy {
 
 export interface IpPoolPolicy {
   defaultDns: string[];
+  /** 新建 VM 默认是否绑定堡垒机访问限制。 */
+  bastionAccessEnabled?: boolean;
+  /** 允许 SSH 登录 VM 的来源白名单（堡垒机 + VRC 本机）。 */
+  bastionAllowFrom?: string[];
   ipPools: RuntimeIpPoolPolicy[];
 }
 
@@ -689,6 +697,10 @@ export interface VmCreateRequest {
   count: number;
   ipPool: IpPoolConfig;
   autoStart: boolean;
+  /** 是否绑定堡垒机访问；默认开启，取消时传 false。 */
+  bastionAccessEnabled?: boolean;
+  /** 允许 SSH 登录的来源白名单；仅在开启绑定时传。 */
+  bastionAllowFrom?: string[];
   planItems?: Array<{
     name: string;
     ip: string;

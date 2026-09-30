@@ -170,6 +170,8 @@ function toIsoInput(context: XenInstallStrategyContext): XenUnattendedIsoInput {
     ipPool: context.request.ipPool,
     macAddress: context.macAddress,
     installSource: context.item.installSource,
+    // 绑定堡垒机时由创建请求带入白名单；未开启则为空，%post 不写 sshd 限制。
+    bastionAllowFrom: context.request.bastionAccessEnabled ? context.request.bastionAllowFrom : undefined,
     onProgress: (message) => {
       context.reporter?.markStep("create-vm", "running", `${context.item.name}：${message}`);
       context.reporter?.updateVm(context.item.name, {

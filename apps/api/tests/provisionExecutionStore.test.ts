@@ -66,9 +66,13 @@ test("provision execution context is updated and deleted by task ID", () => {
   }
 });
 
-test("provision hard wait is opt-in and parsed as hours", () => {
-  assert.equal(resolveProvisionHardWaitMs(undefined), undefined);
-  assert.equal(resolveProvisionHardWaitMs("0"), undefined);
-  assert.equal(resolveProvisionHardWaitMs("invalid"), undefined);
+test("provision hard wait parses hours and always stays bounded", () => {
+  // 未配置或配置非法时必须回落到有限默认值：无上限会让 guest 永不就绪的任务无限期挂在 running。
+  const fallbackHours = 4;
+  assert.equal(resolveProvisionHardWaitMs(undefined), fallbackHours * 60 * 60 * 1000);
+  assert.equal(resolveProvisionHardWaitMs("   "), fallbackHours * 60 * 60 * 1000);
+  assert.equal(resolveProvisionHardWaitMs("0"), fallbackHours * 60 * 60 * 1000);
+  assert.equal(resolveProvisionHardWaitMs("-1"), fallbackHours * 60 * 60 * 1000);
+  assert.equal(resolveProvisionHardWaitMs("invalid"), fallbackHours * 60 * 60 * 1000);
   assert.equal(resolveProvisionHardWaitMs("2"), 2 * 60 * 60 * 1000);
 });

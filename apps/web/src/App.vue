@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { ArrowLeft, Brush, Check, Connection, Delete, Download, Loading, Picture, Plus, Refresh, Search, Setting, Tickets, Upload } from "@element-plus/icons-vue";
+import { ArrowLeft, Brush, Check, Connection, Delete, Download, InfoFilled, Loading, Picture, Plus, Refresh, Search, Setting, Tickets, Upload } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import ActivityLogTable from "./components/ActivityLogTable.vue";
 import ConsoleDialog from "./components/ConsoleDialog.vue";
@@ -833,6 +833,19 @@ const settingsPanel = ref<SettingsPanel>("appearance");
 const appearanceConsolePreviewMode = ref<ConsolePreviewMode>("graphical");
 const ipPoolPolicy = ref<IpPoolPolicy>({ defaultDns: [], ipPools: [] });
 const ipPoolDefaultDnsText = ref("");
+// 堡垒机绑定：默认开启；白名单必须含 VRC 自身来源。
+const ipPoolBastionEnabled = ref(true);
+const ipPoolBastionAllowFromText = ref("");
+// 展示保存后创建弹框会使用的白名单，便于核对 VRC 来源是否已包含在内。
+// 说明文字较长，放 tooltip 而不是常驻段落，避免挤压设置表单。
+const ipPoolBastionHelpText =
+  "开启后，新建 VM 会在安装时写入 sshd 白名单，只允许下列来源登录，并在装完通过验证后锁定配置。" +
+  "必须包含 VRC 自身的访问来源，否则安装收尾的 SSH 验证会被白名单拦下、任务误判失败。";
+const ipPoolBastionEffectiveHint = computed(() => {
+  if (!ipPoolBastionEnabled.value) return "未开启";
+  const list = parseCsvList(ipPoolBastionAllowFromText.value);
+  return list.length ? list.join("、") : "未配置";
+});
 const ipPoolSelectedId = ref("");
 const ipPoolSearch = ref("");
 const ipPoolLoading = ref(false);
@@ -2086,6 +2099,8 @@ async function deleteChromeExtensionLocalConnection(item: ChromeExtensionLocalCo
 function defaultIpPoolPolicy(): IpPoolPolicy {
   return {
     defaultDns: [],
+    bastionAccessEnabled: true,
+    bastionAllowFrom: [],
     ipPools: [],
   };
 }
@@ -2119,6 +2134,9 @@ function normalizeIpPoolPolicyForEditor(input: Partial<IpPoolPolicy> | undefined
   const ipPools = Array.isArray(input?.ipPools) ? input.ipPools.map(normalizeIpPoolItem).filter(Boolean) as RuntimeIpPoolPolicy[] : [];
   return {
     defaultDns: defaultDns.length ? defaultDns : defaultPolicy.defaultDns,
+    // 旧配置不含该字段时默认开启绑定。
+    bastionAccessEnabled: input?.bastionAccessEnabled !== false,
+    bastionAllowFrom: Array.isArray(input?.bastionAllowFrom) ? input.bastionAllowFrom.map(String) : [],
     ipPools: ipPools.length ? ipPools : defaultPolicy.ipPools,
   };
 }
@@ -2169,6 +2187,8 @@ function applyIpPoolPolicy(policy: Partial<IpPoolPolicy> | undefined, selectedId
   const normalized = normalizeIpPoolPolicyForEditor(policy);
   ipPoolPolicy.value = normalized;
   ipPoolDefaultDnsText.value = normalized.defaultDns.join(", ");
+  ipPoolBastionEnabled.value = normalized.bastionAccessEnabled !== false;
+  ipPoolBastionAllowFromText.value = (normalized.bastionAllowFrom ?? []).join(", ");
   ipPoolSelectedId.value = selectedId && normalized.ipPools.some((item) => item.id === selectedId) ? selectedId : normalized.ipPools[0]?.id ?? "";
   ipPoolPolicyRevision.value += 1;
   syncIpPoolDraftFromSelection();
@@ -2180,8 +2200,10 @@ async function loadIpPoolPolicy() {
     const result = await postJson<IpPoolPolicyResponse>("/api/ip-pools/policy", undefined, "GET");
     applyIpPoolPolicy(result.policy, ipPoolSelectedId.value);
   } catch (error) {
-    ipPoolPolicy.value = { defaultDns: [], ipPools: [] };
+    ipPoolPolicy.value = { defaultDns: [], bastionAccessEnabled: true, bastionAllowFrom: [], ipPools: [] };
     ipPoolDefaultDnsText.value = "";
+    ipPoolBastionEnabled.value = true;
+    ipPoolBastionAllowFromText.value = "";
     ipPoolSelectedId.value = "";
     syncIpPoolDraftFromSelection();
     setErrorMessage(error instanceof Error ? `读取 IP 池失败：${error.message}` : "读取 IP 池失败", false);
@@ -2315,19 +2337,28 @@ function buildIpPoolPolicyForSave(validate: boolean): IpPoolPolicy | null {
   if (!commitIpPoolDraftToMemory(validate)) return null;
   const defaultDns = parseCsvList(ipPoolDefaultDnsText.value);
   const ipPools = ipPoolPolicy.value.ipPools.map((item) => normalizeIpPoolItem(item)).filter(Boolean) as RuntimeIpPoolPolicy[];
+  const bastionAllowFrom = Array.from(new Set(parseCsvList(ipPoolBastionAllowFromText.value)));
   if (validate && !defaultDns.length) return showIpPoolValidationError("请填写默认 DNS") as null;
   if (validate && !ipPools.length) return showIpPoolValidationError("至少保留一个 IP 池") as null;
+  if (validate && ipPoolBastionEnabled.value && !bastionAllowFrom.length) {
+    return showIpPoolValidationError("绑定堡垒机时必须填写允许登录的来源 IP") as null;
+  }
   if (validate) {
-    const validationMessage = validateIpPoolPolicyForSave({ defaultDns, ipPools });
+    const validationMessage = validateIpPoolPolicyForSave({ defaultDns, bastionAccessEnabled: ipPoolBastionEnabled.value, bastionAllowFrom, ipPools });
     if (validationMessage) return showIpPoolValidationError(validationMessage) as null;
   }
   return {
     defaultDns,
+    bastionAccessEnabled: ipPoolBastionEnabled.value,
+    bastionAllowFrom,
     ipPools,
   };
 }
 
 function validateIpPoolPolicyForSave(policy: IpPoolPolicy): string | null {
+  // 白名单必须含 VRC 自身来源，否则装完的 SSH 验证会被自己拦下。
+  const invalidAllowFrom = (policy.bastionAllowFrom ?? []).filter((item) => !isIpv4(item));
+  if (invalidAllowFrom.length) return `堡垒机白名单格式不正确：${invalidAllowFrom.join("、")}`;
   const invalidDefaultDns = policy.defaultDns.filter((item) => !isIpv4(item));
   if (invalidDefaultDns.length) return `默认 DNS 格式不正确：${invalidDefaultDns.join("、")}`;
   const ids = new Set<string>();
@@ -8134,6 +8165,36 @@ function normalizePort(value: unknown, providerType: ProviderType) {
           </section>
 
           <section v-else-if="settingsPanel === 'ipPools'" class="settings-workspace-content ip-pool-settings">
+            <section class="settings-card ip-pool-card ip-bastion-card">
+              <div class="settings-card-head ip-pool-card-head">
+                <div>
+                  <strong>堡垒机访问限制</strong>
+                  <span>全局设置：新建 VM 时默认写入 sshd 白名单，创建弹框中仍可单次取消。</span>
+                </div>
+              </div>
+              <div class="ip-pool-form">
+                <label class="settings-field">
+                  <span>
+                    默认绑定堡垒机
+                    <el-tooltip :content="ipPoolBastionHelpText" placement="top" :show-after="300">
+                      <el-icon class="settings-field-help" aria-label="堡垒机配置说明"><InfoFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-switch v-model="ipPoolBastionEnabled" aria-label="默认绑定堡垒机访问" />
+                </label>
+                <label class="settings-field is-full">
+                  <span>允许登录的来源 IP</span>
+                  <el-input
+                    v-model="ipPoolBastionAllowFromText"
+                    placeholder="堡垒机与 VRC 本机 IP，多个用逗号分隔"
+                    autocomplete="off"
+                    :disabled="!ipPoolBastionEnabled"
+                  />
+                </label>
+              </div>
+              <p class="settings-field-hint">当前生效：{{ ipPoolBastionEffectiveHint }}</p>
+            </section>
+
             <section class="settings-card ip-pool-card">
               <div class="settings-card-head ip-pool-card-head">
                 <div>

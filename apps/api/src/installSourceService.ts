@@ -68,6 +68,15 @@ export interface XenProvisioningNetworkProbe {
   respondingTarget?: string;
 }
 
+/** Result of layer-2 (ARP) occupancy probing for candidate VM addresses on a XenServer host. */
+export interface XenIpArpProbeResult {
+  status: "checked" | "skipped";
+  occupiedIps: string[];
+  message: string;
+  installHost?: string;
+  probeInterface?: string;
+}
+
 const installSourceRecords = new Map<string, InstallSourceRecord>();
 const xenHostInstallLeases = new Map<string, { connection: XenConnectionInput; port: string; sourceIds: string[]; vmCidr?: string }>();
 const cacheRoot = getVrcDataFile("install-source-cache");
@@ -81,15 +90,18 @@ export function buildXenInstalledHook(vmName: string): string {
     "set -e",
     `vm_name='${escapeShellValue(vmName)}'`,
     'vm_uuid="$(xe vm-list name-label="$vm_name" --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
-    '[ -n "$vm_uuid" ] || { echo "未找到已安装 VM：$vm_name" >&2; exit 6; }',
-    'xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=c >/dev/null',
+    // 系统已装完并回调时按名字找不到 VM，说明 VM 在安装收尾前被删除或改名。
+    // 输出带标记的诊断信息，便于从安装源日志直接定位（此前只有一句"未找到已安装 VM"，界面上看不到）。
+    '[ -n "$vm_uuid" ] || { echo "VRC_INSTALL_HOOK_ERROR=vm_missing 未找到已安装 VM：$vm_name（疑似 VM 在安装完成前被删除或改名，导致无法切换为硬盘启动）" >&2; exit 6; }',
+    // 装完切回"硬盘优先"：安装期是 cd（光驱优先），维持 cd 会在重启后再次进入安装器并重新分区。
+    'xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc >/dev/null',
     'tools_iso=""',
     'for candidate in $(xe cd-list --minimal 2>/dev/null | tr "," " "); do',
     '  label="$(xe vdi-param-get uuid="$candidate" param-name=name-label 2>/dev/null | tr -d "\\r\\n")"',
     '  if [ "$label" = "xs-tools.iso" ] || [ "$label" = "guest-tools.iso" ]; then tools_iso="$candidate"; break; fi',
     'done',
+    'cd_vbd="$(xe vbd-list vm-uuid="$vm_uuid" type=CD --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
     'if [ -n "$tools_iso" ]; then',
-    '  cd_vbd="$(xe vbd-list vm-uuid="$vm_uuid" type=CD --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
     '  if [ -n "$cd_vbd" ]; then',
     '    current_vdi="$(xe vbd-param-get uuid="$cd_vbd" param-name=vdi-uuid 2>/dev/null | tr -d "\\r\\n")"',
     '    if [ "$current_vdi" != "$tools_iso" ]; then',
@@ -102,6 +114,9 @@ export function buildXenInstalledHook(vmName: string): string {
     '  attached="$(xe vbd-param-get uuid="$cd_vbd" param-name=currently-attached 2>/dev/null | tr -d "\\r\\n")"',
     '  [ "$attached" = "true" ] || xe vbd-plug uuid="$cd_vbd" >/dev/null 2>&1 || true',
     '  xe vm-param-set uuid="$vm_uuid" other-config:vrc-tools-media-ready=true >/dev/null 2>&1 || true',
+    'elif [ -n "$cd_vbd" ]; then',
+    '  # 没有 Tools 光盘时必须弹出安装 ISO，否则重启会被光驱里的安装盘再次引导进安装器。',
+    '  xe vbd-eject uuid="$cd_vbd" >/dev/null 2>&1 || { xe vbd-unplug uuid="$cd_vbd" force=true >/dev/null 2>&1 || true; xe vbd-eject uuid="$cd_vbd" >/dev/null 2>&1 || true; }',
     'fi',
     'xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-complete=true >/dev/null 2>&1 || true',
   ].join("\n");
@@ -377,10 +392,138 @@ export async function probeXenProvisioningNetwork(input: {
   });
 }
 
+/**
+ * Probes candidate VM IPs for link-layer occupancy by running ARP requests on the XenServer host.
+ *
+ * ICMP ping cannot prove an address is free: a device that simply drops ICMP (firewalled host, or a
+ * guest on another virtualization platform) never answers ping, so ping-only checks report "free"
+ * and the create proceeds into an IP conflict. ARP is answered by any live NIC at layer 2, so it is
+ * the reliable occupancy signal. Requests are broadcast from the host bridge that owns the VM
+ * network, which is the same broadcast domain the VM will join.
+ */
+export async function probeXenIpArpConflicts(input: {
+  connection: XenConnectionInput;
+  hostId: string;
+  cidr: string;
+  candidateIps: string[];
+}): Promise<XenIpArpProbeResult> {
+  const candidates = Array.from(new Set(input.candidateIps.filter(isIpv4)));
+  if (!candidates.length) return { status: "skipped", occupiedIps: [], message: "没有可探测的 IP。" };
+  const installHost = await findXenHostIpInVmNetwork(input.connection, input.hostId, input.cidr, candidates);
+  if (!installHost) {
+    return { status: "skipped", occupiedIps: [], message: "目标 XenServer 物理机没有可用于 ARP 探测的 IPv4 地址。" };
+  }
+  // 选择承载目标网段的宿主机接口：同网段时直接用该地址所在网桥，否则交给内核选路。
+  const probeInterface = await resolveArpProbeInterface(input.connection, installHost);
+  const script = buildXenIpArpProbeScript({ candidates, probeInterface });
+  const output = await runRemoteCommand(input.connection, script, 60000, "probe-xen-ip-arp-conflicts");
+  const parsed = parseXenIpArpProbeOutput(output);
+  if (parsed.status === "skipped") {
+    return { status: "skipped", occupiedIps: [], message: parsed.message };
+  }
+  return {
+    status: "checked",
+    occupiedIps: parsed.occupiedIps,
+    installHost,
+    probeInterface: probeInterface || undefined,
+    message: parsed.occupiedIps.length
+      ? `以下 IP 在二层已被占用：${parsed.occupiedIps.join("、")}`
+      : "候选 IP 在二层均无应答",
+  };
+}
+
+/**
+ * Builds the remote shell script that classifies each candidate address as OCCUPIED or FREE.
+ *
+ * Extracted so the decision contract stays unit-testable: the script must only report OCCUPIED on a
+ * fresh ARP reply from the probed address itself. Regression context — a free address was blocked
+ * because the probe trusted weak signals: a residual `STALE` neighbour entry left over from earlier
+ * traffic, and a bare "Unicast reply" match that also fires for replies belonging to other hosts on
+ * the shared bridge.
+ *
+ * @param input candidate IPv4 addresses and the host interface carrying the VM network, when known
+ * @return the shell script to run on the XenServer host
+ */
+export function buildXenIpArpProbeScript(input: { candidates: string[]; probeInterface: string }): string {
+  return [
+    `probe_iface='${escapeShellValue(input.probeInterface)}'`,
+    `probe_ips='${escapeShellValue(input.candidates.join(" "))}'`,
+    'has_arping=false',
+    'if command -v arping >/dev/null 2>&1; then has_arping=true; fi',
+    'for ip in $probe_ips; do',
+    '  occupied=false',
+    '  # 先清掉该地址的历史邻居表项：残留的 STALE 记录来自很久以前的通信，',
+    '  # 不代表此刻仍有主机应答，必须先丢弃再重新观测。',
+    '  if [ -n "$probe_iface" ]; then',
+    '    ip neigh del "$ip" dev "$probe_iface" 2>/dev/null || true',
+    '  else',
+    '    ip neigh del "$ip" 2>/dev/null || true',
+    '  fi',
+    '  if [ "$has_arping" = "true" ]; then',
+    '    # -c 2 兼顾速度与丢包：单包偶发丢失不应误判为空闲。',
+    '    # 必须匹配 "Unicast reply from <ip>"：网桥是共享广播域，arping 的原始输出里',
+    '    # 可能夹带其他主机的应答，只匹配 "Unicast reply" 会把空闲地址误判为占用。',
+    '    # 用 grep -F 固定串匹配，避免 IP 里的点被当作正则通配符。',
+    '    if [ -n "$probe_iface" ]; then',
+    '      if arping -c 2 -w 2 -I "$probe_iface" "$ip" 2>/dev/null | grep -qF "Unicast reply from $ip"; then occupied=true; fi',
+    '    else',
+    '      if arping -c 2 -w 2 "$ip" 2>/dev/null | grep -qF "Unicast reply from $ip"; then occupied=true; fi',
+    '    fi',
+    '  fi',
+    '  # arping 不可用时退回邻居表判断，但只认刚建立的强状态：',
+    '  # REACHABLE 表示近期收到过该地址的应答，DELAY/PROBE 表示内核正在确认。',
+    '  # 不能把 STALE 当占用：Linux 的 STALE 只是"久未确认"，主机下线后会长期保留，',
+    '  # 空闲地址会因此被误判为已占用并阻断创建。',
+    '  if [ "$occupied" = "false" ]; then',
+    '    if ip neigh show "$ip" 2>/dev/null | grep -qE "REACHABLE|DELAY|PROBE"; then occupied=true; fi',
+    '  fi',
+    '  if [ "$occupied" = "true" ]; then printf "OCCUPIED\\t%s\\n" "$ip"; else printf "FREE\\t%s\\n" "$ip"; fi',
+    'done',
+  ].join("\n");
+}
+
+/**
+ * Parses the classification lines emitted by {@link buildXenIpArpProbeScript}.
+ *
+ * @param output raw stdout from the remote probe script
+ * @return occupied addresses, or a skipped result when the script produced no classification
+ */
+export function parseXenIpArpProbeOutput(output: string):
+  | { status: "checked"; occupiedIps: string[] }
+  | { status: "skipped"; occupiedIps: string[]; message: string } {
+  const lines = output.split(/\r?\n/);
+  const occupiedIps = lines
+    .filter((line) => line.startsWith("OCCUPIED\t"))
+    .map((line) => line.split("\t")[1])
+    .filter(Boolean);
+  const probedIps = lines
+    .filter((line) => line.startsWith("OCCUPIED\t") || line.startsWith("FREE\t"))
+    .map((line) => line.split("\t")[1])
+    .filter(Boolean);
+  if (!probedIps.length) {
+    return { status: "skipped", occupiedIps: [], message: "ARP 探测未返回结果，跳过该检查。" };
+  }
+  return { status: "checked", occupiedIps };
+}
+
+/** Picks the host interface whose bridge carries the provisioning network, falling back to kernel routing. */
+async function resolveArpProbeInterface(connection: XenConnectionInput, installHost: string): Promise<string> {
+  const output = await runRemoteCommand(
+    connection,
+    [
+      `target_ip='${escapeShellValue(installHost)}'`,
+      'iface="$(ip -4 -o addr show 2>/dev/null | awk -v ip="$target_ip" \'{ split($4, a, "/"); if (a[1] == ip) { print $2; exit } }\')"',
+      '[ -n "$iface" ] && printf "IFACE\\t%s\\n" "$iface"',
+    ].join("\n"),
+    15000,
+    "resolve-arp-probe-interface",
+  );
+  return output.split(/\r?\n/).find((line) => line.startsWith("IFACE\t"))?.split("\t")[1] ?? "";
+}
+
 /** Returns whether the selected XenServer host address already belongs to the VM provisioning network. */
 export function isXenInstallHostInProvisioningNetwork(installHost: string, cidr: string): boolean {
-  return cidrContainsIp(cidr, installHost);
-}
+  return cidrContainsIp(cidr, installHost);}
 
 /** Converts route and ICMP evidence into the creation policy used by the API and UI. */
 export function summarizeXenProvisioningNetworkProbe(input: {
@@ -837,14 +980,16 @@ export async function prepareXenVmForInstalledBoot(connection: XenConnectionInpu
       `vm_name='${escapeShellValue(vmName)}'`,
       'vm_uuid="$(xe vm-list name-label="$vm_name" --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
       '[ -n "$vm_uuid" ] || { echo "未找到已安装 VM：$vm_name" >&2; exit 6; }',
-      'xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=c >/dev/null 2>&1 || true',
+      // 装完必须把引导顺序切回"硬盘优先"：安装期用的是 cd（光驱优先），维持 cd 会在重启后
+      // 再次进入安装器并重新分区，形成装不完的死循环。dc 才是已装系统的正确顺序。
+      'xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc >/dev/null 2>&1 || true',
       'tools_iso=""',
       'for candidate in $(xe cd-list --minimal 2>/dev/null | tr "," " "); do',
       '  label="$(xe vdi-param-get uuid="$candidate" param-name=name-label 2>/dev/null | tr -d "\\r\\n")"',
       '  if [ "$label" = "xs-tools.iso" ] || [ "$label" = "guest-tools.iso" ]; then tools_iso="$candidate"; break; fi',
       'done',
+      'cd_vbd="$(xe vbd-list vm-uuid="$vm_uuid" type=CD --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
       'if [ -n "$tools_iso" ]; then',
-      '  cd_vbd="$(xe vbd-list vm-uuid="$vm_uuid" type=CD --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"',
       '  if [ -n "$cd_vbd" ]; then',
       '    current_vdi="$(xe vbd-param-get uuid="$cd_vbd" param-name=vdi-uuid 2>/dev/null | tr -d "\\r\\n")"',
       '    if [ "$current_vdi" != "$tools_iso" ]; then',
@@ -857,6 +1002,9 @@ export async function prepareXenVmForInstalledBoot(connection: XenConnectionInpu
       '  attached="$(xe vbd-param-get uuid="$cd_vbd" param-name=currently-attached 2>/dev/null | tr -d "\\r\\n")"',
       '  [ "$attached" = "true" ] || xe vbd-plug uuid="$cd_vbd" >/dev/null 2>&1 || true',
       '  xe vm-param-set uuid="$vm_uuid" other-config:vrc-tools-media-ready=true >/dev/null 2>&1 || true',
+      'elif [ -n "$cd_vbd" ]; then',
+      '  # 没有 Tools 光盘时必须弹出安装 ISO：否则光驱里仍挂着安装盘，重启会被再次引导进安装器。',
+      '  xe vbd-eject uuid="$cd_vbd" >/dev/null 2>&1 || { xe vbd-unplug uuid="$cd_vbd" force=true >/dev/null 2>&1 || true; xe vbd-eject uuid="$cd_vbd" >/dev/null 2>&1 || true; }',
       'fi',
       'xe vm-param-set uuid="$vm_uuid" other-config:vrc-install-complete=true >/dev/null 2>&1 || true',
     ].join("\n"),

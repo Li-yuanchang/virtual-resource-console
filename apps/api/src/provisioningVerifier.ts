@@ -59,10 +59,14 @@ const windowsRemoteInitializationWaitMs = 15 * 60 * 1000;
 const windowsWinRmPort = 5985;
 const windowsWinRmReadyConfirmations = 3;
 
+// 兜底硬等待上限：管理员未配置时必须有一个有限上限，否则 guest 永远不就绪的异常任务
+// 会无限期挂在 running（实测出现过白等 610 分钟），既污染任务列表也占着安装源端口。
+const defaultHardWaitHours = 4;
+
 export function resolveProvisionHardWaitMs(value = process.env.VRC_PROVISION_HARD_WAIT_HOURS): number | undefined {
-  if (!value?.trim()) return undefined;
+  if (!value?.trim()) return defaultHardWaitHours * 60 * 60 * 1000;
   const hours = Number(value);
-  return Number.isFinite(hours) && hours > 0 ? hours * 60 * 60 * 1000 : undefined;
+  return Number.isFinite(hours) && hours > 0 ? hours * 60 * 60 * 1000 : defaultHardWaitHours * 60 * 60 * 1000;
 }
 
 function hardWaitDeadline(startedAt: number): number {
@@ -226,6 +230,11 @@ async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<
       return;
     }
     markProvisionTaskStep(input.taskId, "verify-login", "success", isWindowsUnattended(input.request) ? "Administrator NTLM 登录验证通过" : "账号密码验证通过");
+    // 账号验证已通过，此时才锁定 sshd 白名单：加锁后 VRC 仍能登录（白名单含本机来源），
+    // 但用户无法再自行改动该文件，防止绕过堡垒机直连。必须放在验证之后，否则会把自己拦失败。
+    if (input.request.bastionAccessEnabled && !isWindowsUnattended(input.request)) {
+      await lockBastionSshdConfig(input, loginResults);
+    }
     if (input.request.providerType === "xenserver") {
       await writeXenVmGuestOsLabels(input, loginResults);
     }
@@ -434,10 +443,16 @@ async function waitForGuestNetwork(input: RunProvisioningVerifierInput): Promise
     if (pending.size) await delay(networkProbeIntervalMs);
   }
   for (const item of pending.values()) {
+    // ISO 无人值守安装若始终等不到 SSH，最常见原因是 VM 在安装收尾前被删除/改名：
+    // 装完系统后的 installed 回调找不到 VM，无法切换为硬盘启动，于是反复重启回安装器。
+    const trackedIsoInstall =
+      input.request.sourceType === "iso" && !isWindowsUnattended(input.request) && Boolean(item.installSource);
     results.push({
       item,
       ok: false,
-      message: `${item.name} (${item.ip}) 超时未响应${isWindowsUnattended(input.request) ? " WinRM 服务" : " SSH 服务"}`,
+      message: trackedIsoInstall
+        ? `${item.name} (${item.ip}) 超时未响应 SSH 服务（若安装已完成，请检查 VM 是否在收尾前被删除或改名，导致无法切换为硬盘启动）`
+        : `${item.name} (${item.ip}) 超时未响应${isWindowsUnattended(input.request) ? " WinRM 服务" : " SSH 服务"}`,
       reasonCode: "GUEST_OFFLINE",
       readiness: { state: "offline", networkVisible: false, ready: false },
     });
@@ -522,6 +537,15 @@ async function refreshXenHostInstallProgress(input: RunProvisioningVerifierInput
           `log_file='/tmp/vrc-install-source-${escapeShellValue(probe.port)}.log'`,
           `source_id='${escapeShellValue(probe.sourceId)}'`,
           `vm_name='${escapeShellValue(probe.vmName)}'`,
+          // 先报电源状态：VM 若已 halted，说明安装根本没跑起来（例如空盘引导失败被 XenServer
+          // 判定 crashed too quickly 后自动关机），此时日志里永远不会有 ks.cfg 请求。
+          // 之前只看 HTTP 日志，于是任务会一直空转到硬超时，用户看到的是"安装中"的假象。
+          '# shellcheck disable=SC2016',
+          '{ vm_uuid="$(xe vm-list name-label="$vm_name" --minimal 2>/dev/null | tr "," " " | awk \'{print $1}\')"; } || true',
+          'if [ -n "$vm_uuid" ]; then',
+          '  power_state="$(xe vm-param-get uuid="$vm_uuid" param-name=power-state 2>/dev/null | tr -d "\\r\\n")"',
+          '  printf "POWER\\t%s\\t%s\\n" "$vm_name" "$power_state"',
+          'fi',
           '[ -f "$log_file" ] || exit 0',
           '{ grep -q "GET /$source_id/ks.cfg " "$log_file" && printf "FETCH\\t%s\\n" "$vm_name"; } || true',
           '{ grep -Eq "GET /$source_id/repo/Packages/.*\\.rpm " "$log_file" && printf "PACKAGE\\t%s\\n" "$vm_name"; } || true',
@@ -533,11 +557,22 @@ async function refreshXenHostInstallProgress(input: RunProvisioningVerifierInput
   const fetched = new Set<string>();
   const installing = new Set<string>();
   const installed = new Set<string>();
+  const halted = new Map<string, string>();
   for (const line of output.split(/\r?\n/)) {
-    const [kind, vmName] = line.split("\t");
+    const [kind, vmName, extra] = line.split("\t");
     if (kind === "FETCH" && vmName) fetched.add(vmName);
     if (kind === "PACKAGE" && vmName) installing.add(vmName);
     if (kind === "INSTALLED" && vmName) installed.add(vmName);
+    if (kind === "POWER" && vmName && extra && extra !== "Running") halted.set(vmName, extra);
+  }
+  // 还没开始装（没有 ks.cfg 请求）却已不在运行，说明安装器没能起来：
+  // 空盘引导失败时 XenServer 会在数秒内把 VM 关机，若继续等待只会拖到硬超时。
+  for (const [vmName, powerState] of halted) {
+    if (fetched.has(vmName) || installed.has(vmName) || installing.has(vmName)) continue;
+    throw new Error(
+      `虚拟机 ${vmName} 未进入安装流程就已停止（电源状态：${powerState}）。` +
+        "通常是从空系统盘引导失败导致，请检查安装介质与引导顺序后重试。",
+    );
   }
   if (fetched.size === refs.length) {
     markProvisionTaskStepIfUnfinished(input.taskId, "fetch-source", "success", "安装器已拉取 Kickstart 配置");
@@ -670,8 +705,56 @@ async function verifyGuestLogin(item: VmProvisionPlanItem, jumpHost?: XenConnect
   });
 }
 
-async function writeXenVmGuestOsLabels(input: RunProvisioningVerifierInput, loginResults: GuestVerifyResult[]): Promise<void> {
-  // 平台“系统”列读 other-config:vrc-guest-os；无人值守 ISO 安装基于 “Other install media” 模板，
+/**
+ * Locks the guest's sshd bastion allowlist after login verification has already succeeded.
+ *
+ * The allowlist itself is written by the installer's %post; this step adds the immutable attribute so
+ * a user with root inside the VM cannot silently drop the bastion restriction. It runs only after
+ * verification, because the same VRC channel must be able to log in first — locking earlier would make
+ * a successful install fail its own verification. `chattr +i` requires a Linux filesystem with the
+ * immutable feature; when unavailable the step reports a warning instead of failing the task.
+ *
+ * @param input verifier context carrying the create request and connection
+ * @param loginResults per-VM verification results; only VMs that verified are locked
+ */
+async function lockBastionSshdConfig(input: RunProvisioningVerifierInput, loginResults: GuestVerifyResult[]): Promise<void> {
+  const targets = loginResults.filter((result) => result.ok);
+  if (!targets.length) return;
+  const allowFrom = (input.request.bastionAllowFrom ?? []).map((ip) => ip.trim()).filter(Boolean);
+  if (!allowFrom.length) return;
+  const allowUsersValue = allowFrom.map((ip) => `*@${ip}`).join(" ");
+  // 已加锁时重复 chattr 会失败，先解锁再设置，保证幂等（重跑任务不会因已锁而报错）。
+  const script = [
+    "set -e",
+    "if [ ! -f /etc/ssh/sshd_config ]; then echo VRC_BASTION_MISSING; exit 0; fi",
+    "if command -v chattr >/dev/null 2>&1; then",
+    "  chattr -i /etc/ssh/sshd_config 2>/dev/null || true",
+    "  if chattr +i /etc/ssh/sshd_config 2>/dev/null; then echo VRC_BASTION_LOCKED; else echo VRC_BASTION_LOCK_UNSUPPORTED; fi",
+    "else",
+    "  echo VRC_BASTION_LOCK_UNSUPPORTED",
+    "fi",
+    `printf 'VRC_BASTION_ALLOW\\t%s\\n' '${allowUsersValue.replace(/'/g, "'\\''")}'`,
+  ].join("\n");
+  const failures: string[] = [];
+  await Promise.all(
+    targets.map(async (result) => {
+      const jumpHost = resolveProvisioningReadinessStrategy(input.request.providerType).resolveJumpHost(input.connection);
+      const output = await runGuestCommand(result.item, script, 20000, jumpHost).catch((error) => {
+        failures.push(`${result.item.name}：${error instanceof Error ? error.message : String(error)}`);
+        return "";
+      });
+      if (output.includes("VRC_BASTION_LOCK_UNSUPPORTED")) {
+        // 文件系统不支持 immutable 时限制仍然生效（白名单已在 %post 写入），只是防不住手动改。
+        console.warn(`[provision] ${result.item.name} 文件系统不支持 chattr +i，堡垒机白名单未加锁`);
+      }
+    }),
+  );
+  if (failures.length) {
+    console.warn(`[provision] 堡垒机 sshd 加锁未完成（不影响安装结果）：${failures.join("；")}`);
+  }
+}
+
+async function writeXenVmGuestOsLabels(input: RunProvisioningVerifierInput, loginResults: GuestVerifyResult[]): Promise<void> {  // 平台“系统”列读 other-config:vrc-guest-os；无人值守 ISO 安装基于 “Other install media” 模板，
   // 不写该字段就显示 “-”。这里用 SSH 验证时从 /etc/os-release 探测到的真实系统标识补齐：
   // 字段为空或为创建时 ISO 名占位（source=iso）时覆盖；人工/模板既有的标识（source 非 iso）保留。
   const commands = loginResults
@@ -778,7 +861,7 @@ async function finalizeVmBoot(input: RunProvisioningVerifierInput): Promise<void
     .map(
       (vmId) => `
 vm_uuid='${escapeShellValue(vmId)}'
-xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=c >/dev/null 2>&1 || true
+xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc >/dev/null 2>&1 || true
 for vbd in $(xe vbd-list vm-uuid="$vm_uuid" type=CD --minimal 2>/dev/null | tr ',' ' '); do
   vdi="$(xe vbd-param-get uuid="$vbd" param-name=vdi-uuid 2>/dev/null | tr -d '\\r\\n')"
   label="$(xe vdi-param-get uuid="$vdi" param-name=name-label 2>/dev/null | tr -d '\\r\\n')"

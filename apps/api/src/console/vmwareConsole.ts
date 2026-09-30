@@ -32,7 +32,7 @@ export async function registerVmwareConsoleRoutes(server: FastifyInstance): Prom
         expiresAt: session.expiresAt,
       };
     } catch (error) {
-      server.log.warn({ error }, "failed to prepare vmware console session");
+      server.log.warn({ error: error instanceof Error ? { message: error.message, code: (error as NodeJS.ErrnoException).code } : { message: String(error) || "（无错误详情）" } }, "failed to prepare vmware console session");
       return reply.status(502).send({
         message: error instanceof Error ? error.message : "VMware 控制台会话准备失败",
       });

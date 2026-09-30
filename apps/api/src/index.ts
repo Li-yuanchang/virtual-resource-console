@@ -35,7 +35,7 @@ import type { InventoryCacheScope } from "./inventoryCache.js";
 import { InventorySnapshotStore } from "./inventorySnapshotStore.js";
 import { VmSearchIndexStore } from "./vmSearchIndexStore.js";
 import { listInventoryEventsAfter, publishInventoryEvent, subscribeInventoryEvents } from "./inventoryEvents.js";
-import { cleanupXenInstallSources, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
+import { cleanupXenInstallSources, probeXenIpArpConflicts, publishXenInstallSources, registerInstallSourceRoutes, shouldUseXenKickstart } from "./installSourceService.js";
 import { listIpLeases, releaseIpLeases, reserveIpLeases } from "./ipLeaseStore.js";
 import { getIpPoolPolicy, saveIpPoolPolicy } from "./ipPoolPolicy.js";
 import { buildIsoImageCacheKey, getIsoImageCache, saveIsoImageCache } from "./isoImageStore.js";
@@ -57,7 +57,7 @@ import {
 import { provisionExecutionStore, type ProvisionExecutionContext } from "./provisionExecutionStore.js";
 import { ProvisionRecoveryVmMissingError, resolveProvisionRecoveryVms } from "./provisionRecovery.js";
 import { runProvisioningVerifier } from "./provisioningVerifier.js";
-import { buildIpLeasePreflightResult, buildIpReachabilityPreflightResult } from "./provisioningPreflight.js";
+import { buildIpArpConflictPreflightResult, buildIpLeasePreflightResult, buildIpReachabilityPreflightResult } from "./provisioningPreflight.js";
 import { resolveProvisioningNetworkProbeStrategy } from "./provisioningNetworkProbeStrategy.js";
 import { resolveProvisioningPlanPolicy, validateProvisionPlan } from "./provisioningPlanPolicy.js";
 import { defaultPortForProvider, getProviderDescriptor, listProviderDescriptors, providerLabel } from "./providerCatalog.js";
@@ -535,6 +535,9 @@ const runtimeIpPoolPolicySchema = z.object({
 
 const ipPoolPolicySchema = z.object({
   defaultDns: z.array(z.string()).default([]),
+  // 堡垒机绑定：缺字段时按开启处理（旧客户端不传时保持默认开启）。
+  bastionAccessEnabled: z.boolean().optional(),
+  bastionAllowFrom: z.array(z.string()).max(20).optional(),
   ipPools: z.array(runtimeIpPoolPolicySchema).default([]),
 });
 
@@ -623,6 +626,10 @@ const provisionVmsSchema = connectionSchema.extend({
   count: z.coerce.number().int().positive().max(20),
   ipPool: ipPoolSchema,
   autoStart: z.boolean().default(true), // 固定开启：旧客户端不传该字段时也默认自动启动
+  // 默认绑定堡垒机访问：开启后 VM 的 sshd 只放行 bastionAllowFrom 中的来源。
+  // 前端弹框默认勾选，用户可单次取消；旧客户端不传时沿用策略默认值（开启）。
+  bastionAccessEnabled: z.boolean().optional(),
+  bastionAllowFrom: z.array(z.string()).max(20).optional(),
   planItems: z.array(provisionVmItemSchema).min(1).max(20),
   confirmToken: z.literal("CONFIRMED"),
 });
@@ -3576,8 +3583,31 @@ function buildProvisionRequestData(
       id: input.ipPool.id || `provision-${input.hostId || connectionHost}`,
     },
     autoStart: true, // 固定开启：创建后必须自动启动，不允许任何调用方传入 false
+    // 绑定堡垒机默认开启：调用方未显式传值（旧客户端）时沿用策略默认，白名单也回落到策略配置，
+    // 但始终保证包含 VRC 自身来源，否则安装收尾的 SSH 验证会被自己写的限制拦掉。
+    bastionAccessEnabled: input.bastionAccessEnabled ?? getRuntimePolicy().provisioning.bastionAccessEnabled,
+    bastionAllowFrom: resolveBastionAllowFrom(input.bastionAllowFrom),
     planItems: input.planItems,
   };
+}
+
+/**
+ * Normalizes the bastion SSH allowlist for a create request.
+ *
+ * The list must always contain the VRC access source: the installer writes it into sshd's
+ * AllowUsers, and the same VRC channel is what performs the post-install login verification.
+ * Omitting it would make a successful install fail its own verification.
+ *
+ * @param requested allowlist sent by the caller; omitted falls back to the configured policy list
+ * @return de-duplicated IPv4 allowlist that always includes the configured VRC source
+ */
+function resolveBastionAllowFrom(requested: string[] | undefined): string[] {
+  const policyList = getRuntimePolicy().provisioning.bastionAllowFrom;
+  const merged = [...(requested?.length ? requested : policyList)];
+  for (const ip of policyList) {
+    if (!merged.includes(ip)) merged.push(ip);
+  }
+  return Array.from(new Set(merged.map((ip) => ip.trim()).filter(isIpv4)));
 }
 
 function reserveProvisionedVmIps(request: VmProvisionRequest, created: VmProvisionCreatedVm[]): void {
@@ -3667,6 +3697,9 @@ async function runProvisionPreflight(
   checks.push(await measureProvisionPreflightCheck(timingContext, "ip-conflict", async () => runProvisionIpConflictPreflight(request, currentVms.items)));
   checks.push(runProvisionIpLeasePreflight(request));
   checks.push(await measureProvisionPreflightCheck(timingContext, "ip-ping", () => runProvisionIpReachabilityPreflight(request)));
+  // 二层占用检查独立于 ICMP：不响应 ping 的设备（例如其他虚拟化平台上的 guest）会被 ping 检查
+  // 误判为空闲，进而造成 IP 冲突并把无人值守安装拖到 %post 阶段失败。
+  checks.push(await measureProvisionPreflightCheck(timingContext, "ip-arp", () => runProvisionIpArpConflictPreflight(connection, providerType, request)));
   server.log.info({ ...timingContext, phase: "preflight-total", elapsedMs: Date.now() - startedAt }, "provision preflight timing");
 
   return checks;
@@ -3923,8 +3956,44 @@ async function runProvisionIpReachabilityPreflight(request: VmProvisionRequest):
   const result = buildIpReachabilityPreflightResult(reachableIps);
   return {
     key: "ip-ping",
-    label: "IP 探测",
+    // 文案限定为 ICMP，避免被读成"地址未被占用"。
+    label: "IP 探测 (ICMP)",
     ...result,
+  };
+}
+
+/**
+ * Blocks creation when a candidate address already answers ARP on the target network.
+ *
+ * Runs on the XenServer host so the probe shares the VM's broadcast domain. Providers without an
+ * ARP probe implementation report the check as skipped rather than failing the preflight.
+ */
+async function runProvisionIpArpConflictPreflight(
+  connection: XenConnectionInput,
+  providerType: ProviderType,
+  request: VmProvisionRequest,
+): Promise<ProvisionPreflightCheck> {
+  const ips = Array.from(new Set(request.planItems.map((item) => item.ip.trim()).filter(isIpv4)));
+  if (providerType !== "xenserver" || !request.hostId || !ips.length) {
+    return { key: "ip-arp", label: "IP 占用 (ARP)", status: "success", message: "当前平台跳过二层占用检查。" };
+  }
+  let result;
+  try {
+    result = await probeXenIpArpConflicts({
+      connection,
+      hostId: request.hostId,
+      cidr: request.ipPool.cidr,
+      candidateIps: ips,
+    });
+  } catch (error) {
+    // 探测失败不应阻断创建：宿主 arping 缺失或 SSH 抖动时退化为仅 ICMP 判定。
+    server.log.warn({ providerType, hostId: request.hostId, error }, "provision ip arp preflight failed");
+    return { key: "ip-arp", label: "IP 占用 (ARP)", status: "success", message: "ARP 占用探测不可用，已跳过（建议人工确认 IP 未被占用）。" };
+  }
+  return {
+    key: "ip-arp",
+    label: "IP 占用 (ARP)",
+    ...buildIpArpConflictPreflightResult(result),
   };
 }
 

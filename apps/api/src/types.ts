@@ -532,6 +532,13 @@ export interface VmProvisionRequest {
   count: number;
   ipPool: IpPoolConfig;
   autoStart: boolean;
+  /**
+   * 是否绑定堡垒机访问（默认开启，可在创建弹框取消）。
+   * 开启后 VM 的 sshd 仅放行 bastionAllowFrom 中的来源。
+   */
+  bastionAccessEnabled?: boolean;
+  /** 允许 SSH 登录的来源白名单（堡垒机 + VRC 本机）。 */
+  bastionAllowFrom?: string[];
   planItems: VmProvisionPlanItem[];
 }
 

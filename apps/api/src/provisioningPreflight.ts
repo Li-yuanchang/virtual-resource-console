@@ -23,8 +23,35 @@ export function buildIpReachabilityPreflightResult(reachableIps: string[]): IpRe
       }
     : {
         status: "success",
-        message: "目标 IP ping 无响应",
+        // 明确本检查只覆盖 ICMP：不响应 ping 不等于地址空闲，二层占用由 ARP 检查负责。
+        message: "目标 IP 无 ICMP 响应（不代表地址空闲，二层占用另由 ARP 检查判定）",
       };
+}
+
+/**
+ * Converts layer-2 ARP probe results into a blocking provisioning decision.
+ *
+ * Unlike ICMP, a live NIC always answers ARP, so this catches devices that drop ping — most notably
+ * guests on other virtualization platforms sharing the same subnet, which is exactly the case that
+ * silently passed the ping-only check and then failed the install with an IP conflict.
+ *
+ * @param result ARP probe outcome, including the probed addresses that answered
+ * @return blocking error details when any address is taken, otherwise a successful availability result
+ */
+export function buildIpArpConflictPreflightResult(result: {
+  status: "checked" | "skipped";
+  occupiedIps: string[];
+  message: string;
+}): IpReachabilityPreflightResult {
+  if (result.status === "skipped") {
+    return { status: "success", message: result.message };
+  }
+  return result.occupiedIps.length
+    ? {
+        status: "error",
+        message: `以下 IP 在二层已被占用（ARP 有应答），禁止创建：${result.occupiedIps.join("、")}`,
+      }
+    : { status: "success", message: "候选 IP 二层无应答" };
 }
 
 /**

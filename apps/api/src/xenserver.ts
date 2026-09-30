@@ -1435,17 +1435,20 @@ elif should_use_unattended_install "$template_name"; then
   else
     attach_iso "$vm_uuid" "$boot_iso_uuid"
   fi
-  # Rocky 9（当前唯一部署的现代 RHEL）需要 device_id=0001 暴露 Xen 平台设备；配合内核
-  # xen_nopv 参数让 5.14 内核完全走模拟设备（127.33 实测重启通过），不安装 xe-guest-utilities。
-  # 引导顺序用 cd（硬盘优先、CD 兜底）：首启空盘无引导扇区自动落回 CD 进安装器；装完 grub 写入
-  # MBR 后重启直接进硬盘。不能用 dc——Xen 模拟光驱上 kickstart 的 reboot --eject 弹不出（stage2
-  # 源 /run/install/sources 挂载 busy），CD 仍优先生效会再次进安装器重分区，形成安装死循环
-  # （127.37 实测第一遍装完重启又回安装器）。
-  # CentOS 7 老模板保持继承的 0000 与 dc 不变，避免一刀切影响老系统。
+  # 引导顺序必须是 cd（光驱优先），对所有无人值守安装一致：
+  # 新建 VM 的系统盘是空的，没有任何引导扇区。dc 会先尝试空盘，Xen 不会"落回 CD"，而是
+  # 直接判定引导失败并把 VM 关机（xenopsd 记录 crashed too quickly after start），
+  # 表现为任务卡在"拉取安装源"、控制台全黑、ks.cfg 从未被请求（2.136 实测 7.44 秒崩溃）。
+  # 用 cd 则首启进安装器；装完由 prepareXenVmForInstalledBoot 切回 d 优先再重启进硬盘，
+  # 不会重装循环。
+  # 注：已装好系统的 VM 保持 dc（光驱空着，dc 正确），此处只针对正在安装的新 VM。
+  # Rocky 9 额外需要 device_id=0001 暴露 Xen 平台设备；配合内核 xen_nopv 让 5.14 内核完全走
+  # 模拟设备（127.33 实测重启通过），不安装 xe-guest-utilities。
   if is_rocky9 "$VRC_ISO_NAME"; then
     xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=cd platform:viridian=false platform:device_id=0001 >/dev/null 2>&1 || true
   else
-    xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=dc platform:viridian=false >/dev/null 2>&1 || true
+    # 非 Rocky 的无人值守安装（CentOS 7 等）同样必须 cd 优先，否则空盘引导即崩溃。
+    xe vm-param-set uuid="$vm_uuid" HVM-boot-params:order=cd platform:viridian=false >/dev/null 2>&1 || true
   fi
 else
   xe vm-param-set uuid="$vm_uuid" HVM-boot-policy="BIOS order" >/dev/null 2>&1 || true

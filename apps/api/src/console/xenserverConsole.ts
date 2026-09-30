@@ -164,13 +164,13 @@ export async function registerXenServerConsoleRoutes(server: FastifyInstance): P
           void openedSession.logout();
         });
         tunnel.on("error", (error) => {
-          server.log.warn({ error }, "xenserver console tunnel failed");
+          server.log.warn({ error: consoleErrorDetail(error) }, "xenserver console tunnel failed");
           closeWithError(socket, "XenServer 控制台流连接失败");
           void openedSession.logout();
         });
       })
       .catch((error) => {
-        server.log.warn({ error }, "failed to open xenserver console");
+        server.log.warn({ error: consoleErrorDetail(error) }, "failed to open xenserver console");
         closeWithError(socket, error instanceof Error ? error.message : "XenServer 控制台打开失败");
       });
   });
@@ -235,7 +235,7 @@ async function openConsoleTunnel(session: XenConsoleSession, server?: FastifyIns
       lastError = error;
       server?.log.warn(
         {
-          error,
+          error: consoleErrorDetail(error),
           host,
           consoleHost: session.consoleUrl.hostname,
           apiHost: session.apiHost,
@@ -343,7 +343,7 @@ function openConsoleTunnelOnce(session: XenConsoleSession, host: string, forcePl
       if (!settled) {
         clearTimeout(timeout);
         settled = true;
-        reject(error);
+        reject(error instanceof Error ? error : new Error(`XenServer 控制台流连接失败：${String(error)}`));
       }
     });
   });
@@ -577,6 +577,17 @@ function cleanupTunnel(tunnel: Socket | null): void {
 function closeWithError(socket: WebSocket, message: string): void {
   if (socket.readyState !== socket.OPEN && socket.readyState !== socket.CONNECTING) return;
   socket.close(1011, truncateCloseReason(message));
+}
+
+/**
+ * 把控制台连接的未知错误规范化为 pino 可序列化的结构，避免日志出现无信息量的 `error:{}`。
+ * Node 的 TLS/Net socket 错误事件在个别路径会 emit 非 Error 对象，这里统一兜底，确保下次
+ * 打开控制台失败时能从日志看到真实原因（ECONNREFUSED / 超时 / 握手失败等）。
+ */
+function consoleErrorDetail(error: unknown): unknown {
+  if (error instanceof Error) return { message: error.message, code: (error as NodeJS.ErrnoException).code };
+  if (error && typeof error === "object" && Object.keys(error as object).length > 0) return error;
+  return { message: String(error) || "（无错误详情）" };
 }
 
 function isUnsupportedTlsProtocol(error: unknown): boolean {

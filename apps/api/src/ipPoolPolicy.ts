@@ -15,11 +15,23 @@ export interface RuntimeIpPoolPolicy {
 
 export interface IpPoolPolicy {
   defaultDns: string[];
+  /**
+   * 新建 VM 默认是否绑定堡垒机访问（创建弹框默认勾选，可单次取消）。
+   * 缺省为 true：旧配置文件不含该字段时仍按默认开启处理。
+   */
+  bastionAccessEnabled: boolean;
+  /**
+   * 允许 SSH 登录 VM 的来源白名单，用于生成 sshd 的 AllowUsers。
+   * 必须包含 VRC 自身的访问来源，否则安装收尾的 SSH 验证会被自己拦下。
+   */
+  bastionAllowFrom: string[];
   ipPools: RuntimeIpPoolPolicy[];
 }
 
 type IpPoolPolicyInput = Partial<{
   defaultDns: string[];
+  bastionAccessEnabled: boolean;
+  bastionAllowFrom: string[];
   ipPools: RuntimeIpPoolPolicy[];
 }>;
 
@@ -62,8 +74,18 @@ function normalizeIpPoolPolicy(input: IpPoolPolicyInput): IpPoolPolicy {
   if (!ipPools.length) {
     throw new Error("IP 池配置缺少 ipPools");
   }
+  // 堡垒机白名单：非法项直接报错，避免写进 sshd 后把自己锁在外面。
+  const bastionAllowFrom = Array.isArray(input.bastionAllowFrom)
+    ? Array.from(new Set(input.bastionAllowFrom.map(String).map((item) => item.trim()).filter(Boolean)))
+    : [];
+  const invalidAllowFrom = bastionAllowFrom.filter((item) => !isIpv4(item));
+  if (invalidAllowFrom.length) {
+    throw new Error(`堡垒机白名单格式不正确：${invalidAllowFrom.join("、")}`);
+  }
   return {
     defaultDns,
+    bastionAccessEnabled: input.bastionAccessEnabled !== false,
+    bastionAllowFrom,
     ipPools,
   };
 }
