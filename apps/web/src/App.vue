@@ -5194,9 +5194,9 @@ function describeVmResizeChanges(vm: VmNode, request: VmResizeRequest) {
     if (request.disk.mode === "extend") {
       const disk = vmResizeDisks.value.find((item) => item.id === request.disk?.diskId);
       if (disk && request.disk.sizeBytes <= disk.virtualSizeBytes) {
-        changes.push(`磁盘：完成 ${disk.device || disk.name} 的未分配容量`);
+        changes.push(`磁盘 ${disk.device || disk.name}：完成未分配容量，生效至 ${formatBytes(disk.virtualSizeBytes)}`);
       } else {
-        changes.push(`磁盘：扩展 ${disk?.device || disk?.name || request.disk.diskId} 至 ${formatBytes(request.disk.sizeBytes)}`);
+        changes.push(`磁盘 ${disk?.device || disk?.name || request.disk.diskId}：${formatBytes(disk?.virtualSizeBytes ?? 0)} → ${formatBytes(request.disk.sizeBytes)}`);
       }
     } else {
       changes.push(`磁盘：新增 ${formatBytes(request.disk.sizeBytes)}`);
