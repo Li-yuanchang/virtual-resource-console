@@ -1,6 +1,6 @@
 {
   "name": "@vrc/electron",
-  "version": "0.1.72",
+  "version": "0.1.73",
   "private": true,
   "description": "Desktop shell for Virtual Resource Console.",
   "main": "main.cjs",
