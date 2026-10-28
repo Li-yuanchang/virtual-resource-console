@@ -12,6 +12,7 @@ import {
   xenInstallRebootDirective,
 } from "../src/installSourceService.js";
 import { buildBastionSshdBlock } from "../src/xenserverUnattendedIso.js";
+import { buildBastionEnforceScript } from "../src/provisioningVerifier.js";
 import type { VmProvisionRequest } from "../src/types.js";
 
 test("physical DVD completion switches to disk boot and prepares guest tools", () => {
@@ -62,6 +63,32 @@ test("bastion block drops invalid and duplicate addresses", () => {
 
   assert.match(block, /AllowUsers \*@192\.168\.130\.3 \*@192\.168\.19\.14/);
   assert.doesNotMatch(block, /not-an-ip|999\.1\.1\.1/);
+});
+
+test("bastion enforcement writes the allowlist and verifies it before locking", () => {
+  // 回归用例：2.50 安装完成但 sshd_config 里根本没有 AllowUsers，
+  // 任务却显示成功。这里锁定" 先写入、再回读校验、最后才加锁" 的契约。
+  const script = buildBastionEnforceScript(["192.168.130.3", "192.168.19.14"]);
+
+  // 必须自己写入，不能假设 %post 已经写过。
+  assert.match(script, /AllowUsers \$want/);
+  assert.match(script, /UseDNS no/);
+  // 回读校验 + 重复检测，任一不满足都必须报 FAIL。
+  assert.match(script, /VRC_BASTION_FAIL allow-users mismatch/);
+  assert.match(script, /VRC_BASTION_FAIL allow-users duplicated/);
+  assert.match(script, /VRC_BASTION_FAIL sshd config invalid/);
+  // 先验证再排查 sshd 语法，避免写坏配置锁死自己。
+  assert.ok(script.indexOf("sshd -t") < script.indexOf("chattr +i"), "必须先做 sshd -t 自检再加锁");
+  // 收尾必须报告结果，且 OK 标记在加锁之后。
+  assert.match(script, /VRC_BASTION_OK locked/);
+  assert.equal(spawnSync("sh", ["-n"], { input: script, encoding: "utf8" }).status, 0);
+});
+
+test("bastion enforcement escapes single quotes in the allowlist", () => {
+  const script = buildBastionEnforceScript(["192.168.130.3"]);
+  // 单引号已转义的变量引用形式：不应出现裸的 ${...} 未展开。
+  assert.match(script, /want='\*@192\.168\.130\.3'/);
+  assert.equal(spawnSync("sh", ["-n"], { input: script, encoding: "utf8" }).status, 0);
 });
 
 test("prefers an install-source address in the VM subnet", () => {

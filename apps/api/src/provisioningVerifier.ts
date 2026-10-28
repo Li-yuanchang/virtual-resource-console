@@ -230,10 +230,18 @@ async function verifyProvisioning(input: RunProvisioningVerifierInput): Promise<
       return;
     }
     markProvisionTaskStep(input.taskId, "verify-login", "success", isWindowsUnattended(input.request) ? "Administrator NTLM 登录验证通过" : "账号密码验证通过");
-    // 账号验证已通过，此时才锁定 sshd 白名单：加锁后 VRC 仍能登录（白名单含本机来源），
-    // 但用户无法再自行改动该文件，防止绕过堡垒机直连。必须放在验证之后，否则会把自己拦失败。
+    // 账号验证已通过，此时才强制并校验 sshd 白名单：加锁后 VRC 仍能登录（白名单含本机来源）。
+    // 必须放在验证之后，否则会把自己拦失败。校验不通过即任务失败，
+    // 避免“显示成功但实际没绑定”——那正是 2.50 遇到的情况。
     if (input.request.bastionAccessEnabled && !isWindowsUnattended(input.request)) {
-      await lockBastionSshdConfig(input, loginResults);
+      const bastionFailures = await enforceBastionSshdConfig(input, loginResults);
+      if (bastionFailures.length) {
+        const detail = bastionFailures.join("；");
+        markProvisionTaskStep(input.taskId, "verify-login", "failed", `堡垒机绑定校验未通过：${detail}`);
+        finishProvisionTask(input.taskId, "failed", `系统已安装但堡垒机白名单未生效：${detail}`);
+        return;
+      }
+      markProvisionTaskStep(input.taskId, "verify-login", "success", "账号密码验证通过，堡垒机白名单已生效并锁定");
     }
     if (input.request.providerType === "xenserver") {
       await writeXenVmGuestOsLabels(input, loginResults);
@@ -706,52 +714,96 @@ async function verifyGuestLogin(item: VmProvisionPlanItem, jumpHost?: XenConnect
 }
 
 /**
- * Locks the guest's sshd bastion allowlist after login verification has already succeeded.
+ * Applies and verifies the guest sshd bastion allowlist after login verification has already succeeded.
  *
- * The allowlist itself is written by the installer's %post; this step adds the immutable attribute so
- * a user with root inside the VM cannot silently drop the bastion restriction. It runs only after
- * verification, because the same VRC channel must be able to log in first — locking earlier would make
- * a successful install fail its own verification. `chattr +i` requires a Linux filesystem with the
- * immutable feature; when unavailable the step reports a warning instead of failing the task.
+ * The installer's %post normally writes the allowlist, but a boot-path change, an aborted %post, or an
+ * older running build can silently skip it — the task still reported success while the VM had no
+ * bastion restriction at all. This step therefore re-writes the rule itself, then re-reads sshd_config
+ * to confirm the exact allowlist is present, and only locks the file once verification passes.
  *
  * @param input verifier context carrying the create request and connection
- * @param loginResults per-VM verification results; only VMs that verified are locked
+ * @param loginResults per-VM verification results; only VMs that verified are enforced
+ * @return failure messages for VMs where the allowlist could not be confirmed
  */
-async function lockBastionSshdConfig(input: RunProvisioningVerifierInput, loginResults: GuestVerifyResult[]): Promise<void> {
-  const targets = loginResults.filter((result) => result.ok);
-  if (!targets.length) return;
-  const allowFrom = (input.request.bastionAllowFrom ?? []).map((ip) => ip.trim()).filter(Boolean);
-  if (!allowFrom.length) return;
+/**
+ * Builds the guest script that enforces and then verifies the bastion allowlist.
+ *
+ * Extracted as a pure function so the decision contract is unit-testable: the script must write the
+ * rule, re-read sshd_config and only report VRC_BASTION_OK when the allowlist matches exactly and
+ * appears exactly once. A silent no-op here is what let a VM finish provisioning with no bastion
+ * restriction while the task still reported success.
+ *
+ * @param allowFrom source addresses permitted to log in
+ * @return shell script to run inside the guest
+ */
+export function buildBastionEnforceScript(allowFrom: string[]): string {
   const allowUsersValue = allowFrom.map((ip) => `*@${ip}`).join(" ");
-  // 已加锁时重复 chattr 会失败，先解锁再设置，保证幂等（重跑任务不会因已锁而报错）。
-  const script = [
-    "set -e",
-    "if [ ! -f /etc/ssh/sshd_config ]; then echo VRC_BASTION_MISSING; exit 0; fi",
-    "if command -v chattr >/dev/null 2>&1; then",
-    "  chattr -i /etc/ssh/sshd_config 2>/dev/null || true",
-    "  if chattr +i /etc/ssh/sshd_config 2>/dev/null; then echo VRC_BASTION_LOCKED; else echo VRC_BASTION_LOCK_UNSUPPORTED; fi",
-    "else",
-    "  echo VRC_BASTION_LOCK_UNSUPPORTED",
-    "fi",
-    `printf 'VRC_BASTION_ALLOW\\t%s\\n' '${allowUsersValue.replace(/'/g, "'\\''")}'`,
+  const quoted = allowUsersValue.replace(/'/g, "'\\''");
+  // 1) 幂等写入 AllowUsers / UseDNS；2) 回读校验完全匹配；3) 仅在校验通过后加锁。
+  // 全部用 || true 保证脚本自身返回 0，结果由 VRC_BASTION_* 标记决定，避免 sshd 细节中断流程。
+  return [
+    'if [ ! -f /etc/ssh/sshd_config ]; then echo "VRC_BASTION_FAIL missing sshd_config"; exit 0; fi',
+    'if command -v chattr >/dev/null 2>&1; then chattr -i /etc/ssh/sshd_config 2>/dev/null || true; fi',
+    `want='${quoted}'`,
+    'if grep -Eq "^[#[:space:]]*AllowUsers[[:space:]]+" /etc/ssh/sshd_config; then',
+    '  sed -i.vrcbak "s|^[#[:space:]]*AllowUsers[[:space:]]*.*|AllowUsers $want|" /etc/ssh/sshd_config && rm -f /etc/ssh/sshd_config.vrcbak || true',
+    'else',
+    '  printf "%s\\n" "AllowUsers $want" >> /etc/ssh/sshd_config || true',
+    'fi',
+    'if grep -Eq "^[#[:space:]]*UseDNS[[:space:]]+" /etc/ssh/sshd_config; then',
+    '  sed -i.vrcbak "s|^[#[:space:]]*UseDNS[[:space:]]*.*|UseDNS no|" /etc/ssh/sshd_config && rm -f /etc/ssh/sshd_config.vrcbak || true',
+    'else',
+    '  printf "%s\\n" "UseDNS no" >> /etc/ssh/sshd_config || true',
+    'fi',
+    // 回读校验：必须恰好有一条 AllowUsers 且内容与期望完全一致。
+    'got="$(grep -E "^AllowUsers[[:space:]]+" /etc/ssh/sshd_config | head -1 | sed "s/^AllowUsers[[:space:]]*//;s/[[:space:]]*$//")"',
+    'if [ "$got" != "$want" ]; then echo "VRC_BASTION_FAIL allow-users mismatch:[$got]"; exit 0; fi',
+    'count="$(grep -cE "^AllowUsers[[:space:]]+" /etc/ssh/sshd_config)"',
+    'if [ "$count" != "1" ]; then echo "VRC_BASTION_FAIL allow-users duplicated:$count"; exit 0; fi',
+    // sshd 语法自检：配置写坏会导致重启后无法登录，必须先验证再 reload。
+    'if command -v sshd >/dev/null 2>&1 && ! sshd -t 2>/dev/null; then echo "VRC_BASTION_FAIL sshd config invalid"; exit 0; fi',
+    'systemctl reload sshd >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true',
+    'if command -v chattr >/dev/null 2>&1; then',
+    '  if chattr +i /etc/ssh/sshd_config 2>/dev/null; then echo "VRC_BASTION_OK locked"; else echo "VRC_BASTION_OK unlocked"; fi',
+    'else',
+    '  echo "VRC_BASTION_OK unlocked"',
+    'fi',
   ].join("\n");
+}
+
+async function enforceBastionSshdConfig(
+  input: RunProvisioningVerifierInput,
+  loginResults: GuestVerifyResult[],
+): Promise<string[]> {
+  const targets = loginResults.filter((result) => result.ok);
+  if (!targets.length) return [];
+  const allowFrom = (input.request.bastionAllowFrom ?? []).map((ip) => ip.trim()).filter(Boolean);
+  if (!allowFrom.length) return [];
+  const script = buildBastionEnforceScript(allowFrom);
+
   const failures: string[] = [];
   await Promise.all(
     targets.map(async (result) => {
       const jumpHost = resolveProvisioningReadinessStrategy(input.request.providerType).resolveJumpHost(input.connection);
-      const output = await runGuestCommand(result.item, script, 20000, jumpHost).catch((error) => {
+      let output = "";
+      try {
+        output = await runGuestCommand(result.item, script, 30000, jumpHost);
+      } catch (error) {
         failures.push(`${result.item.name}：${error instanceof Error ? error.message : String(error)}`);
-        return "";
-      });
-      if (output.includes("VRC_BASTION_LOCK_UNSUPPORTED")) {
-        // 文件系统不支持 immutable 时限制仍然生效（白名单已在 %post 写入），只是防不住手动改。
-        console.warn(`[provision] ${result.item.name} 文件系统不支持 chattr +i，堡垒机白名单未加锁`);
+        return;
+      }
+      if (output.includes("VRC_BASTION_OK unlocked")) {
+        // 白名单已确认生效，只是文件系统不支持 immutable，防不住有 root 的人手动改。
+        console.warn(`[provision] ${result.item.name} 文件系统不支持 chattr +i，堡垒机白名单已生效但未加锁`);
+        return;
+      }
+      if (!output.includes("VRC_BASTION_OK")) {
+        const detail = output.split("\n").find((line) => line.startsWith("VRC_BASTION_FAIL")) ?? "未返回校验结果";
+        failures.push(`${result.item.name}：${detail.replace("VRC_BASTION_FAIL", "").trim()}`);
       }
     }),
   );
-  if (failures.length) {
-    console.warn(`[provision] 堡垒机 sshd 加锁未完成（不影响安装结果）：${failures.join("；")}`);
-  }
+  return failures;
 }
 
 async function writeXenVmGuestOsLabels(input: RunProvisioningVerifierInput, loginResults: GuestVerifyResult[]): Promise<void> {  // 平台“系统”列读 other-config:vrc-guest-os；无人值守 ISO 安装基于 “Other install media” 模板，
