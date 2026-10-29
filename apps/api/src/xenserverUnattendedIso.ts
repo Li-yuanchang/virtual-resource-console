@@ -21,6 +21,8 @@ import {
   buildCentosLvmPartitioning,
   buildCentosPackageSelection,
   buildRedHatPlainPartitioning,
+  isRedHatFamilyImage,
+  isRhel9FamilyImage,
   isRocky9Image,
 } from "./centosKickstart.js";
 import { getVrcDataFile } from "./appPaths.js";
@@ -1387,21 +1389,23 @@ export function buildOfflineCentosKickstart(
   const rootPasswordHashValue = md5Crypt(rootPassword || "changeme");
   const rootPasswordHash = shellSingleQuote(rootPasswordHashValue);
   const hostname = sanitizeHostname(input.vm.name, ip);
-  // Rocky 9 与旧 CentOS 7 走差异化无人值守配置：
-  // Rocky 9 使用非 LVM 分区、rootpw --lock + %post chpasswd，并持久化 Xen 4.4 兼容内核参数。
-  const rocky9 = isRocky9Image(input.sourceIsoName ?? "");
+  // RHEL 9 世代（Rocky 9 / CentOS Stream 9 / RHEL 9 / Alma 9 / Oracle 9）与旧 CentOS 7 走差异化无人值守配置：
+  // 语法层使用非 LVM 分区、rootpw --lock + %post chpasswd；Rocky 9 额外持久化 Xen 4.4 兼容内核参数。
+  // 语法判定必须用 isRhel9FamilyImage，不能用 isRocky9Image：后者只代表 Xen 4.4 硬件兼容策略，
+  // 若拿它做语法判定，CentOS Stream 9 会落回 CentOS 7 分支，生成 auth 指令并在安装器中硬失败。
+  const rhel9 = isRhel9FamilyImage(input.sourceIsoName ?? "");
   const monitoringPackage = options.monitoringTool === "proxmox" ? "qemu-guest-agent" : options.monitoringTool === "vmware" ? "open-vm-tools" : "";
   const monitoringService = options.monitoringTool === "proxmox" ? "qemu-guest-agent" : options.monitoringTool === "vmware" ? "vmtoolsd" : "";
-  const rootPasswordDirective = rocky9 ? "rootpw --lock" : `rootpw --iscrypted ${rootPasswordHashValue}`;
+  const rootPasswordDirective = rhel9 ? "rootpw --lock" : `rootpw --iscrypted ${rootPasswordHashValue}`;
   // RHEL9 已废弃 authconfig：保留 auth 指令会让 Anaconda 强依赖 authselect-compat 包
   // （minimal 安装源不含该包），安装到 "Authconfig configuration" 任务直接硬失败
   // （127.37 实测：SecurityInstallationError: /usr/sbin/authconfig is missing）。
-  // Rocky9 密码由 rootpw --lock + %post chpasswd 写入，无需 auth 指令；CentOS7 保留历史行为。
-  const authDirective = rocky9 ? "" : "auth --enableshadow --passalgo=sha512";
-  const partitioning = rocky9
+  // RHEL9 密码由 rootpw --lock + %post chpasswd 写入，无需 auth 指令；CentOS7 保留历史行为。
+  const authDirective = rhel9 ? "" : "auth --enableshadow --passalgo=sha512";
+  const partitioning = rhel9
     ? buildRedHatPlainPartitioning(input.vm.diskGiB, { firmware: options.firmware })
     : buildCentosLvmPartitioning(input.vm.diskGiB, { firmware: options.firmware });
-  const postBlock = rocky9
+  const postBlock = rhel9
     ? buildRocky9KickstartPost({
         rootPasswordEntry,
         monitoringService,

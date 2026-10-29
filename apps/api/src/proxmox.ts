@@ -15,6 +15,7 @@ import {
   prepareProxmoxArmKickstartArtifacts,
   resolveProxmoxArmDistribution,
 } from "./proxmoxUnattended.js";
+import type { ProxmoxArmDistribution } from "./proxmoxUnattended.js";
 import { inferIpv4FromName, isManagedIpv4 } from "./runtimePolicy.js";
 import { normalizeStorageCapacity } from "./storageCapacity.js";
 import { describeStorageRepository } from "./storageRepositoryProfile.js";
@@ -641,7 +642,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     const iso = images.find((item) => item.id === request.isoId || item.providerId === request.isoId);
     if (!iso) throw new Error(`未找到 PVE 系统 ISO：${request.isoName || request.isoId}`);
     const distribution = resolveProxmoxArmDistribution(iso.name);
-    if (!distribution) throw new Error("当前 PVE Kickstart 策略仅支持 openEuler/Kylin ARM64 ISO。");
+    if (!distribution) throw new Error("当前 PVE Kickstart 策略仅支持 openEuler / Kylin / CentOS Stream 9 的 ARM64 ISO。");
     const client = await ProxmoxClient.login(input);
     const targetNode = request.hostId || await pickProxmoxNode(client);
     const storage = await pickProxmoxVmStorage(client, targetNode, plannedDiskGiB(request));
@@ -729,7 +730,7 @@ export class ProxmoxProvider implements VirtualizationProvider<XenConnectionInpu
     return {
       accepted: true,
       providerType: this.type,
-      message: `PVE ${distribution === "kylin" ? "Kylin" : "openEuler"} 无人值守安装已启动：${created.length} 台 VM`,
+      message: `PVE ${proxmoxArmDistributionLabel(distribution)} 无人值守安装已启动：${created.length} 台 VM`,
       created,
     };
   }
@@ -1898,6 +1899,13 @@ function normalizeProxmoxGuestOs(value: unknown): string | undefined {
 
 function normalizeUsername(username: string): string {
   return username.includes("@") ? username : `${username}@pam`;
+}
+
+/** 供安装结果文案使用：把内部发行版标识翻译成用户可读名称。 */
+function proxmoxArmDistributionLabel(distribution: ProxmoxArmDistribution): string {
+  if (distribution === "kylin") return "Kylin";
+  if (distribution === "centos-stream9") return "CentOS Stream 9";
+  return "openEuler";
 }
 
 function connectionKey(input: XenConnectionInput): string {

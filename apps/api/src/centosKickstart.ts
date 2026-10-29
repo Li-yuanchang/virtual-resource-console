@@ -29,6 +29,30 @@ export function isRocky9Image(name: string): boolean {
   return major === 9;
 }
 
+/**
+ * 判断镜像名是否属于 RHEL 9 世代（Rocky 9 / CentOS Stream 9 / RHEL 9 / AlmaLinux 9 / Oracle Linux 9）。
+ *
+ * 与 {@link isRocky9Image} 的区别必须严格区分，不能互相替代：
+ * - 本函数只决定 **kickstart 语法分支**：RHEL 9 的 Anaconda 已删除 `install` 与 `auth` 指令，
+ *   保留 `auth` 会让 Anaconda 强依赖 `authselect-compat`（minimal 源不含该包），
+ *   安装到 "Authconfig configuration" 任务直接硬失败（127.37 实测 SecurityInstallationError）。
+ *   语法层统一走非 LVM 分区 + `rootpw --lock` + `%post chpasswd`。
+ * - `isRocky9Image` 决定的是 **Xen 4.4 硬件兼容策略**（`xen_nopv` 模拟设备、不装 xe-tools），
+ *   只对 Rocky 9 成立，禁止外溢到 CentOS/Alma/Oracle。
+ *
+ * 注意：CentOS Stream 9 的版本号位于 "stream" 之后，需单独匹配，不能只按 `centos*9` 判断，
+ * 否则 `CentOS-Stream-8` 之类的旧版本会被误判。
+ */
+export function isRhel9FamilyImage(name: string): boolean {
+  const normalized = String(name || "").toLowerCase();
+  if (!isRedHatFamilyImage(normalized)) return false;
+  if (/centos\s*stream[^0-9]*9/.test(normalized)) return true;
+  if (/\bstream\b[^0-9]*9/.test(normalized) && normalized.includes("centos")) return true;
+  const versionMatch = normalized.match(/(?:rocky|rhel|red hat|redhat|almalinux|alma|oraclelinux|oracle|centos)[^0-9]*([0-9]+)/);
+  const major = versionMatch ? Number(versionMatch[1]) : 0;
+  return major === 9;
+}
+
 export function buildCentosLvmPartitioning(
   diskGiB: number,
   options: { firmware?: "bios" | "uefi" } = {},

@@ -168,6 +168,20 @@ function defaultProvisioningConfig(): ProvisioningConfig {
         installProfile: "desktop",
         description: "按所选麒麟 ISO 的桌面环境组安装 UKUI 图形界面。",
       },
+      {
+        id: "pve-centos9-kickstart-standard",
+        name: "PVE CentOS Stream 9 ARM 标准环境",
+        providerType: "proxmox",
+        sourceType: "iso",
+        isoNamePattern: "CentOS-Stream-9-latest-aarch64-dvd1.iso",
+        specId: "linux-standard",
+        ipPoolId: "",
+        vmNamePrefix: "centos9",
+        autoStart: true,
+        installStrategy: "kickstart",
+        installProfile: "server",
+        description: "使用 PVE 宿主机原版 CentOS Stream 9 ARM ISO 与任务级 Kickstart 介质执行无人值守安装。",
+      },
     ],
     specTemplates: [
       {

@@ -13,12 +13,25 @@ export interface ProxmoxKickstartArtifacts {
   sourceLabel: string;
 }
 
-export type ProxmoxArmDistribution = "openeuler" | "kylin";
+export type ProxmoxArmDistribution = "openeuler" | "kylin" | "centos-stream9";
+
+/**
+ * 判断 ISO 是否为 aarch64 架构的 CentOS Stream 9 安装盘。
+ * CentOS Stream 9 属 RHEL 9 世代：Anaconda 已删除 install/auth 指令，
+ * 必须走非 LVM 分区 + rootpw --lock + %post chpasswd，与 Kylin/openEuler 的装配方式不同。
+ */
+export function isCentosStream9Aarch64(isoName: string): boolean {
+  const normalized = isoName.toLowerCase();
+  if (!normalized.includes("centos")) return false;
+  if (!(normalized.includes("aarch64") || normalized.includes("arm64"))) return false;
+  return /centos[^0-9]*stream[^0-9]*9|centos[^0-9]*9/.test(normalized);
+}
 
 export function resolveProxmoxArmDistribution(isoName: string): ProxmoxArmDistribution | undefined {
   const normalized = isoName.toLowerCase();
   if (normalized.includes("openeuler") && normalized.includes("aarch64")) return "openeuler";
   if (normalized.includes("kylin") && (normalized.includes("arm64") || normalized.includes("aarch64"))) return "kylin";
+  if (isCentosStream9Aarch64(normalized)) return "centos-stream9";
   return undefined;
 }
 
@@ -34,6 +47,9 @@ export async function prepareProxmoxArmKickstartArtifacts(input: {
   const distribution = resolveProxmoxArmDistribution(sourceIsoName);
   if (input.installProfile === "desktop" && distribution !== "kylin") {
     throw new Error("PVE ARM 桌面安装当前仅支持包含 UKUI 环境组的麒麟 ISO。");
+  }
+  if (distribution === "centos-stream9" && input.installProfile === "desktop") {
+    throw new Error("PVE ARM CentOS Stream 9 暂只支持服务器安装，未提供桌面环境组。");
   }
   const safeKey = safeFileName(`${input.taskId}-${input.vm.name}`);
   const taskDir = `/var/lib/vz/vrc-provision/${safeKey}`;
@@ -96,6 +112,7 @@ PY`,
     vm: { ...input.vm, name: safeGuestHostname(input.vm.name) },
     ipPool: input.ipPool,
     packageEnvironment,
+    sourceIsoName,
   });
   await writeProxmoxHostFile(input.connection, `${configDir}/ks.cfg`, kickstart);
   await runProxmoxHostCommand(input.connection, [
@@ -127,16 +144,39 @@ PY`,
   };
 }
 
-function buildProxmoxArmKickstart(input: { vm: VmProvisionPlanItem; ipPool: IpPoolConfig; packageEnvironment?: string }): string {
-  return buildOfflineCentosKickstart(input, {
-    monitoringTool: "proxmox",
-    firmware: "uefi",
-    packageEnvironment: input.packageEnvironment,
-    graphicalTarget: Boolean(input.packageEnvironment),
-  })
+function buildProxmoxArmKickstart(input: {
+  vm: VmProvisionPlanItem;
+  ipPool: IpPoolConfig;
+  packageEnvironment?: string;
+  sourceIsoName?: string;
+}): string {
+  const centosStream9 = isCentosStream9Aarch64(input.sourceIsoName ?? "");
+  const kickstart = buildOfflineCentosKickstart(
+    { vm: input.vm, ipPool: input.ipPool, sourceIsoName: input.sourceIsoName },
+    {
+      monitoringTool: "proxmox",
+      firmware: "uefi",
+      packageEnvironment: input.packageEnvironment,
+      graphicalTarget: Boolean(input.packageEnvironment),
+    },
+  )
     .replace(/^install\n/m, "")
     .replace(/^auth\s+.*\n/m, "")
     .replace(/^reboot --eject$/m, "poweroff");
+  // CentOS Stream 9 由 buildOfflineCentosKickstart 的 RHEL9 分支生成，但其 %post 会写入
+  // xen_nopv / platform 等 Xen 4.4 专属内核参数，在 PVE(KVM) 上属于无效甚至有害的引导参数，必须剥离。
+  return centosStream9 ? stripXenSpecificKernelArgs(kickstart) : kickstart;
+}
+
+/** 剥离 RHEL9 %post 中仅适用于 XenServer 6.5 的内核参数，避免污染 PVE(KVM) 客户机引导项。 */
+export function stripXenSpecificKernelArgs(kickstart: string): string {
+  return kickstart
+    // 先移除整段 Xen 兼容注释（含其换行续写的说明行），避免 PVE 任务日志里残留误导性的 xen_nopv 说明。
+    .replace(/^#.*(?:xen_nopv|Xen 4\.4|XenServer 6\.5|platform:device_id|xe-guest-utilities|xs-tools).*\n/gm, "")
+    .replace(
+      /grubby --update-kernel=ALL --args='[^']*'[^\n]*\n/g,
+      "grubby --update-kernel=ALL --args='net.ifnames=0 biosdevname=0' >/dev/null 2>&1 || true\n",
+    );
 }
 
 export async function cleanupProxmoxKickstartArtifacts(
