@@ -4195,6 +4195,58 @@ textarea,
   line-height: 26px;
 }
 
+/* 镜像下拉面板头部的刷新入口：宿主机新增/删除 ISO 后缓存不会自动感知，
+   且必须放在面板内，镜像为空（列表为空）时用户仍能点到刷新。 */
+.vrc-provision-iso-dropdown .iso-dropdown-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 32px;
+  padding: 0 6px 0 10px;
+  color: var(--vrc-text-subtle);
+  background: var(--vrc-surface);
+  border-bottom: 1px solid var(--vrc-border);
+}
+
+.vrc-provision-iso-dropdown .iso-dropdown-header-label {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 400;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.vrc-provision-iso-dropdown .iso-dropdown-header .iso-refresh-button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: var(--vrc-text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.vrc-provision-iso-dropdown .iso-dropdown-header .iso-refresh-button:hover:not(:disabled) {
+  color: var(--vrc-text);
+  background: var(--vrc-surface-muted);
+  border-color: var(--vrc-border);
+}
+
+.vrc-provision-iso-dropdown .iso-dropdown-header .iso-refresh-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .vrc-provision-iso-dropdown .el-select-group__wrap:not(:last-of-type)::after {
   right: 10px;
   left: 10px;

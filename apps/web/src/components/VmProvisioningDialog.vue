@@ -5,6 +5,7 @@ import { ArrowDown, ArrowUp, Close, Loading, WarningFilled } from "@element-plus
 import { ElMessage } from "element-plus";
 import ConsoleDialog from "./ConsoleDialog.vue";
 import VrcOverflowTooltip from "./VrcOverflowTooltip.vue";
+import VrcToolbarIcon from "./VrcToolbarIcon.vue";
 import type {
   HostNode,
   IpLease,
@@ -178,6 +179,9 @@ const runtimePolicy = ref<RuntimePolicy>(defaultRuntimePolicy());
 const ipPoolPolicy = ref<IpPoolPolicy>(defaultIpPoolPolicy());
 const isoImages = ref<IsoImage[]>([]);
 const toolsIsoImage = ref<IsoImage | null>(null);
+/** 用于在面板内点击刷新后让下拉保持展开，避免刷新一次就要重新点开。 */
+const isoSelectRef = ref<{ focus: () => void; blur: () => void } | null>(null);
+const isoSelectOpen = ref(false);
 const loadingProvisioningConfig = ref(false);
 const loadingIsoImages = ref(false);
 const loadingIpLeases = ref(false);
@@ -778,7 +782,25 @@ async function loadIsoImages(sessionId = dialogSessionId, options: { forceRefres
   }
 }
 
+/** 手动刷新宿主机镜像清单：宿主机新增/删除 ISO 后，缓存不会自动感知，必须由用户显式触发。 */
+function refreshIsoImages() {
+  if (loadingIsoImages.value) return;
+  void loadIsoImages(dialogSessionId, { forceRefresh: true }).then(() => {
+    // 面板内点击刷新会让 el-select 失焦收起，这里重新聚焦以保持列表可见，
+    // 用户不用为每次刷新重新展开下拉。
+    if (isoSelectOpen.value) isoSelectRef.value?.focus();
+  });
+}
+
+/** 下拉面板标题：镜像为空时也要给出可读说明，避免用户误以为没有刷新入口。 */
+const isoDropdownHeaderLabel = computed(() => {
+  const count = isoImages.value.length;
+  if (loadingIsoImages.value) return "正在读取镜像资源";
+  return count ? `系统镜像 · ${count} 个` : "当前平台未读到 ISO";
+});
+
 function handleIsoSelectVisibleChange(open: boolean) {
+  isoSelectOpen.value = open;
   if (!open || provisioningForm.sourceType !== "iso") return;
   if (!isoImages.value.length && !loadingIsoImages.value) {
     void loadIsoImages(dialogSessionId, { forceRefresh: true });
@@ -1683,6 +1705,7 @@ type ProvisioningSourceType = "iso" | "template";
             <label v-if="provisioningForm.sourceType === 'iso'" class="form-field iso-field">
               <span>系统镜像</span>
               <el-select
+                ref="isoSelectRef"
                 v-model="provisioningForm.isoId"
                 placeholder="选择 ISO"
                 filterable
@@ -1697,6 +1720,22 @@ type ProvisioningSourceType = "iso" | "template";
                 no-data-text="当前平台未读到 ISO"
                 @visible-change="handleIsoSelectVisibleChange"
               >
+                <template #header>
+                  <div class="iso-dropdown-header">
+                    <span class="iso-dropdown-header-label">{{ isoDropdownHeaderLabel }}</span>
+                    <button
+                      type="button"
+                      class="iso-refresh-button"
+                      :disabled="loadingIsoImages"
+                      aria-label="刷新系统镜像"
+                      title="重新读取宿主机镜像"
+                      @click.stop="refreshIsoImages"
+                    >
+                      <el-icon v-if="loadingIsoImages" class="inline-loading"><Loading /></el-icon>
+                      <VrcToolbarIcon v-else name="refresh" />
+                    </button>
+                  </div>
+                </template>
                 <el-option-group v-for="group in isoOptionGroups" :key="group.label" :label="group.label">
                   <el-option v-for="image in group.options" :key="image.id" :label="image.name" :value="image.id">
                     <span class="option-title">{{ image.name }}</span>
