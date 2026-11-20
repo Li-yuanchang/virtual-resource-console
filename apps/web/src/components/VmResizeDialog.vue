@@ -3,7 +3,7 @@ import { ArrowRight, CircleCheck, Coin, Cpu, Files, FolderOpened, Minus, Plus, W
 import { computed, ref, watch } from "vue";
 import type { GuestStorageInventory, HostNode, ProviderDescriptor, VmDisk, VmNode, VmResizeRequest, VmSystemCredentials } from "../types";
 
-type ResourceKey = "cpu" | "memory" | "disk";
+type ResourceKey = "cpu" | "memory";
 
 const props = withDefaults(
   defineProps<{
@@ -46,10 +46,12 @@ const emit = defineEmits<{
 const gib = 1024 ** 3;
 const cpuDelta = ref(0);
 const memoryDelta = ref(0);
-const diskDelta = ref(0);
+// 新增磁盘模式的容量；扩展原盘时总增量由下方各目录的增量自动汇总。
+const manualDiskDelta = ref(0);
+const mountDeltas = ref<Record<string, number>>({});
 const diskMode = ref<"extend" | "add">("extend");
 const selectedDiskId = ref("");
-const selectedMountPath = ref("");
+const selectedMountPaths = ref<string[]>([]);
 const newMountPath = ref("/data");
 const systemLogin = ref("root");
 const systemPassword = ref("");
@@ -62,7 +64,7 @@ const rememberSystemCredentials = ref(false);
 
 const cpuDeltaInput = normalizedModel(cpuDelta);
 const memoryDeltaInput = normalizedModel(memoryDelta);
-const diskDeltaInput = normalizedModel(diskDelta);
+const manualDiskDeltaInput = normalizedModel(manualDiskDelta);
 const currentMemoryGiB = computed(() => Math.round((props.vm?.memoryBytes ?? 0) / gib));
 const currentDiskTotalGiB = computed(() => Math.round(props.disks.reduce((sum, disk) => sum + disk.virtualSizeBytes, 0) / gib));
 const diskSizeSummary = computed(() => props.disks.map((disk) => formatGiB(disk.virtualSizeBytes)).join(" + "));
@@ -70,11 +72,28 @@ const selectedDisk = computed(() => props.disks.find((disk) => disk.id === selec
 const matchingGuestMounts = computed(() =>
   props.guestStorage?.mounts.filter((mount) => mount.platformDiskId === selectedDisk.value?.id) ?? [],
 );
-const selectedGuestMount = computed(() =>
-  matchingGuestMounts.value.find((mount) => mount.mountPath === selectedMountPath.value) ?? matchingGuestMounts.value[0] ?? null,
+// 多选：保留用户勾选顺序，后面的目录优先作为首个目标的自然顺序。
+const checkedGuestMounts = computed(() =>
+  selectedMountPaths.value
+    .map((path) => matchingGuestMounts.value.find((mount) => mount.mountPath === path))
+    .filter((mount): mount is NonNullable<typeof mount> => Boolean(mount)),
 );
-const pendingCapacityBytes = computed(() => Math.max(0, selectedGuestMount.value?.pendingCapacityBytes ?? 0));
+const selectedGuestMount = computed(() => checkedGuestMounts.value[0] ?? null);
+const pendingCapacityBytes = computed(() =>
+  checkedGuestMounts.value.reduce((max, mount) => Math.max(max, mount.pendingCapacityBytes), 0),
+);
+// 未勾选任何目录时也要提示磁盘上还有上次未分配的容量，引导用户勾选目录续作。
+const availablePendingCapacityBytes = computed(() =>
+  matchingGuestMounts.value.reduce((max, mount) => Math.max(max, mount.pendingCapacityBytes), 0),
+);
+// 扩展原盘时总增量由各目录的独立增量汇总得到；新增磁盘只有一个步进器。
+const extendDeltaGiB = computed(() =>
+  checkedGuestMounts.value.reduce((sum, mount) => sum + mountDeltaGiB(mount), 0),
+);
+const diskDelta = computed(() => (diskMode.value === "add" ? manualDiskDelta.value : extendDeltaGiB.value));
 const hasPendingCapacity = computed(() => diskMode.value === "extend" && pendingCapacityBytes.value > 512 * 1024 ** 2);
+// 磁盘上存在上次已扩、尚未分配的容量：即使用户还没勾选目录，也要提示可续作。
+const hasAvailablePendingCapacity = computed(() => diskMode.value === "extend" && availablePendingCapacityBytes.value > 512 * 1024 ** 2);
 const reconcileExistingCapacity = computed(() => hasPendingCapacity.value && diskDelta.value === 0);
 const diskChangeActive = computed(() => diskDelta.value > 0 || reconcileExistingCapacity.value);
 const detectedNewMountDirectory = computed(() => props.guestStorage?.directories.find((item) => item.path === newMountPath.value));
@@ -98,10 +117,19 @@ const canRetrySystemLogin = computed(() => Boolean(
   && (!useJumpServer.value || (jumpHost.value.trim() && jumpPort.value > 0 && jumpLogin.value.trim() && jumpPassword.value)),
 ));
 const diskAutoApplyBlocked = computed(() => diskDelta.value > 0 && !props.loadingGuestStorage && !guestAutoApplyAvailable.value);
+// 只有填了增量的目录才参与校验，未填增量的目录仅作为“可扩容候选”展示。
+const increasingMounts = computed(() => checkedGuestMounts.value.filter((mount) => mountDeltaGiB(mount) > 0));
 const guestStorageValidationError = computed(() => {
   if (!diskChangeActive.value) return "";
   if (props.loadingGuestStorage || !guestAutoApplyAvailable.value) return "";
+  if (diskMode.value === "extend" && !checkedGuestMounts.value.length) return "请至少勾选一个要扩容的目录后填写增量";
   if (diskMode.value === "extend" && !selectedGuestMount.value) return "所选虚拟磁盘没有匹配到可扩容的系统目录";
+  if (diskMode.value === "extend" && increasingMounts.value.length > 1 && increasingMounts.value.some((mount) => !mount.logicalVolume)) {
+    return "同时扩容多个目录只支持各自独立的 LVM 逻辑卷目录；非 LVM 目录请单独扩容";
+  }
+  if (diskMode.value === "extend" && mountDeviceKeys(increasingMounts.value).size < increasingMounts.value.length) {
+    return "多个目录不能共用同一个逻辑卷或分区，请分别填写增量";
+  }
   if (diskMode.value === "add" && !isAllowedNewMountPath(newMountPath.value)) return "新磁盘挂载目录仅允许位于 /data、/mnt、/srv 或 /opt 下";
   return "";
 });
@@ -130,7 +158,8 @@ const diskAction = computed({
   set: (value: string) => {
     if (value === "add") {
       diskMode.value = "add";
-      if (!diskDelta.value) diskDelta.value = 20;
+      // 新增磁盘容量默认 0，由用户显式增加，避免默认值被误提交。
+      mountDeltas.value = {};
       return;
     }
     selectedDiskId.value = value;
@@ -162,11 +191,14 @@ watch(
 watch(
   [() => props.guestStorage, selectedDiskId, diskMode],
   () => {
-    if (diskMode.value === "extend") {
-      if (!matchingGuestMounts.value.some((mount) => mount.mountPath === selectedMountPath.value)) {
-        selectedMountPath.value = matchingGuestMounts.value[0]?.mountPath ?? "";
-      }
-    }
+    if (diskMode.value !== "extend") return;
+    const available = matchingGuestMounts.value;
+    // 目录默认不勾选：容量增量由用户主动勾选目录后填写，避免误扩。
+    const kept = selectedMountPaths.value.filter((path) => available.some((mount) => mount.mountPath === path));
+    if (kept.length !== selectedMountPaths.value.length) selectedMountPaths.value = kept;
+    // 目录刷新后可能已消失或被重新挂载，清理不再存在的目录增量。
+    const keptDeltas = Object.entries(mountDeltas.value).filter(([path]) => available.some((mount) => mount.mountPath === path));
+    if (keptDeltas.length !== Object.keys(mountDeltas.value).length) mountDeltas.value = Object.fromEntries(keptDeltas);
   },
   { immediate: true },
 );
@@ -184,10 +216,11 @@ function normalizedModel(state: typeof cpuDelta) {
 function resetForm() {
   cpuDelta.value = 0;
   memoryDelta.value = 0;
-  diskDelta.value = 0;
+  manualDiskDelta.value = 0;
+  mountDeltas.value = {};
   diskMode.value = "extend";
   selectedDiskId.value = props.disks[0]?.id ?? "";
-  selectedMountPath.value = "";
+  selectedMountPaths.value = [];
   newMountPath.value = "/data";
   systemLogin.value = "root";
   systemPassword.value = "";
@@ -199,10 +232,14 @@ function resetForm() {
   rememberSystemCredentials.value = false;
 }
 
-function adjust(resource: ResourceKey, direction: number) {
-  const state = resource === "cpu" ? cpuDelta : resource === "memory" ? memoryDelta : diskDelta;
-  const step = resource === "cpu" ? 1 : resource === "memory" ? 2 : 20;
+function adjust(resource: "cpu" | "memory", direction: number) {
+  const state = resource === "cpu" ? cpuDelta : memoryDelta;
+  const step = resource === "cpu" ? 1 : 2;
   state.value = Math.max(0, state.value + direction * step);
+}
+
+function adjustDisk(direction: number) {
+  manualDiskDelta.value = Math.max(0, manualDiskDelta.value + direction * 10);
 }
 
 function close() {
@@ -256,10 +293,21 @@ function submit() {
             name: `${props.vm.name} data disk`,
           };
     if (guestAutoApplyAvailable.value) {
-      const guestMount = diskMode.value === "extend" ? selectedGuestMount.value : null;
-      request.storageTarget = {
-        mountPath: diskMode.value === "extend" ? guestMount?.mountPath ?? "" : normalizeMountPath(newMountPath.value),
-      };
+      if (diskMode.value === "extend") {
+        const mounts = increasingMounts.value;
+        // 各目录填写的 GiB 增量直接作为相对权重提交；只提交真实填了增量的目录。
+        if (mounts.length > 1) {
+          request.storageTarget = {
+            mountPaths: mounts.map((mount) => ({ mountPath: mount.mountPath, weight: mountDeltaGiB(mount) })),
+          };
+        } else {
+          // 只扩一个目录时用单目录契约；没有填增量则只续作既有未分配容量。
+          const target = mounts[0] ?? firstTargetMount.value;
+          request.storageTarget = { mountPath: target?.mountPath ?? "" };
+        }
+      } else {
+        request.storageTarget = { mountPath: normalizeMountPath(newMountPath.value) };
+      }
       if (systemPassword.value) {
         request.systemCredentials = {
           username: systemLogin.value.trim(),
@@ -274,6 +322,68 @@ function submit() {
 function formatGiB(value: number) {
   return Math.round(value / gib);
 }
+
+function toggleMountPath(mountPath: string) {
+  const current = selectedMountPaths.value;
+  if (current.includes(mountPath)) {
+    // 允许取消全部勾选：此时磁盘增量为 0，提交按钮由 changedCount 控制。
+    selectedMountPaths.value = current.filter((item) => item !== mountPath);
+    const next = { ...mountDeltas.value };
+    delete next[mountPath];
+    mountDeltas.value = next;
+    return;
+  }
+  const mount = matchingGuestMounts.value.find((item) => item.mountPath === mountPath);
+  if (!mount) return;
+  selectedMountPaths.value = [...current, mountPath];
+}
+
+function mountDeltaGiB(mount: { mountPath: string }) {
+  const value = mountDeltas.value[mount.mountPath];
+  return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+}
+
+function setMountDelta(mountPath: string, value: number) {
+  const parsed = Number(value);
+  const next = { ...mountDeltas.value };
+  if (!Number.isFinite(parsed) || parsed <= 0) delete next[mountPath];
+  // 单个目录的增量不允许超过存储当前余量，避免提交后才被容量校验拦下。
+  else next[mountPath] = Math.max(0, Math.min(Math.floor(props.storageFreeGiB), Math.round(parsed)));
+  mountDeltas.value = next;
+}
+
+// 与顶部 CPU／内存步进器同一套交互：每次 ±10 GiB，减到 0 后禁用减号。
+function adjustMountDelta(mountPath: string, direction: number) {
+  setMountDelta(mountPath, mountDeltaGiB({ mountPath }) + direction * 10);
+}
+
+function mountDeviceKey(mount: { logicalVolume: boolean; source: string; guestPartitionPath?: string }) {
+  return mount.logicalVolume ? mount.source : mount.guestPartitionPath || mount.source;
+}
+
+function mountDeviceKeys(mounts: Array<{ logicalVolume: boolean; source: string; guestPartitionPath?: string }>) {
+  return new Set(mounts.map((mount) => mountDeviceKey(mount)));
+}
+
+// 提交给后端的 weight 就是各目录填写的 GiB 增量，新增容量按权重拆分后与填写值一致。
+// 首个目标额外接收该目录此前累计的未分配空间，与后端 applyGuestStorageResize 的口径一致。
+function mountAddedGiB(mount: { mountPath: string; pendingCapacityBytes: number }) {
+  const pending = firstTargetMount.value?.mountPath === mount.mountPath ? Math.max(0, mount.pendingCapacityBytes) : 0;
+  return mountDeltaGiB(mount) + formatGiB(pending);
+}
+
+const allocatedDeltaText = computed(() =>
+  increasingMounts.value
+    .map((mount) => `${mount.mountPath} +${mountDeltaGiB(mount)} GiB`)
+    .join("，"),
+);
+
+// 提交计划的首个目标：填了增量时是最先勾选且填了增量的目录，否则回退到待分配最多的已选目录。
+const firstTargetMount = computed(() =>
+  increasingMounts.value[0]
+  ?? [...checkedGuestMounts.value].sort((left, right) => right.pendingCapacityBytes - left.pendingCapacityBytes)[0]
+  ?? null,
+);
 
 function diskDeviceLabel(disk: VmDisk) {
   return disk.displayName || disk.device || disk.name || "虚拟硬盘";
@@ -343,7 +453,8 @@ function isAllowedNewMountPath(value: string) {
             <div class="vm-resize-row vm-resize-disk-row">
               <span class="vm-resize-resource"><el-icon><Files /></el-icon><strong>虚拟硬盘</strong></span>
               <span class="vm-resize-value disk current" data-label="当前配置"><span><strong>{{ currentDiskTotalGiB }}</strong><small>GiB</small></span><em>{{ disks.length }} 块 · {{ diskSizeSummary || "读取中" }}<template v-if="diskSizeSummary"> GiB</template></em></span>
-              <div class="vm-resize-stepper disk" data-label="增加"><button type="button" :disabled="diskDelta <= 0" aria-label="减少磁盘" @click="adjust('disk', -1)"><el-icon><Minus /></el-icon></button><label><input v-model.number="diskDeltaInput" type="number" min="0" step="20" aria-label="磁盘增加量" /></label><button type="button" aria-label="增加磁盘" @click="adjust('disk', 1)"><el-icon><Plus /></el-icon></button></div>
+              <div v-if="diskMode === 'add'" class="vm-resize-stepper disk" data-label="增加"><button type="button" :disabled="manualDiskDelta <= 0" aria-label="减少磁盘" @click="adjustDisk(-1)"><el-icon><Minus /></el-icon></button><label><input v-model.number="manualDiskDeltaInput" type="number" min="0" step="10" aria-label="新增磁盘容量" /></label><button type="button" aria-label="增加磁盘" @click="adjustDisk(1)"><el-icon><Plus /></el-icon></button></div>
+              <span v-else class="vm-resize-value disk increase-summary" data-label="增加"><span><strong>{{ diskDelta }}</strong><small>GiB</small></span><em>{{ checkedGuestMounts.length ? `由下方 ${checkedGuestMounts.length} 个目录汇总` : "未勾选目录" }}</em></span>
               <span class="vm-resize-value disk target" data-label="扩容后"><span><strong>{{ targetDiskTotalGiB }}</strong><small>GiB</small></span><em v-if="diskMode === 'extend' && selectedDisk">{{ diskDeviceLabel(selectedDisk) }} {{ formatGiB(selectedDisk.virtualSizeBytes) }} → {{ targetSelectedDiskGiB }}</em><em v-else>新增 {{ diskDelta }} GiB · 共 {{ diskCount }} 块</em></span>
               <span class="vm-resize-state" :class="diskChangeActive ? 'warning' : 'success'">{{ reconcileExistingCapacity ? "待生效" : diskDelta ? "后端规划" : "未变更" }}</span>
             </div>
@@ -359,7 +470,7 @@ function isAllowedNewMountPath(value: string) {
                   <el-option-group label="新磁盘"><el-option label="新增磁盘 · 挂载空目录" value="add"><span class="vm-resize-disk-option"><strong>新增磁盘</strong><small>挂载空目录</small></span></el-option></el-option-group>
                 </el-select></label>
                 <span v-if="guestStorage?.supported" class="vm-resize-auto"><el-icon><CircleCheck /></el-icon>自动生效</span>
-                <span v-if="reconcileExistingCapacity" class="vm-resize-pending">待分配 {{ formatGiB(pendingCapacityBytes) }} GiB</span>
+                <span v-if="hasAvailablePendingCapacity && diskDelta === 0" class="vm-resize-pending">待分配 {{ formatGiB(availablePendingCapacityBytes) }} GiB</span>
               </div>
             </header>
 
@@ -393,21 +504,45 @@ function isAllowedNewMountPath(value: string) {
             </div>
 
             <template v-else-if="diskMode === 'extend'">
-              <div v-if="matchingGuestMounts.length" class="vm-resize-mounts" role="radiogroup" aria-label="选择扩容目录">
-                <button v-for="mount in matchingGuestMounts" :key="mount.mountPath" type="button" role="radio" :aria-checked="selectedGuestMount?.mountPath === mount.mountPath" :class="{ active: selectedGuestMount?.mountPath === mount.mountPath }" @click="selectedMountPath = mount.mountPath">
-                  <span class="vm-resize-radio"></span>
-                  <span class="vm-resize-mount-copy"><strong>{{ mount.mountPath === "/" ? "根目录" : mount.mountPath }}</strong><small>{{ mount.source }} · {{ mount.filesystem.toUpperCase() }}</small></span>
-                  <span class="vm-resize-mount-size"><small>当前</small><strong>{{ formatGiB(mount.sizeBytes) }} GiB</strong></span>
-                  <el-icon><ArrowRight /></el-icon>
-                  <span class="vm-resize-mount-size target"><small>完成后</small><strong>{{ formatGiB(mount.sizeBytes + mount.pendingCapacityBytes) + diskDelta }} GiB</strong></span>
-                </button>
+              <div v-if="matchingGuestMounts.length" class="vm-resize-mounts" role="group" aria-label="选择扩容目录与增量">
+                <div v-for="mount in matchingGuestMounts" :key="mount.mountPath" class="vm-resize-mount-card" :class="{ active: selectedMountPaths.includes(mount.mountPath), muted: !selectedMountPaths.includes(mount.mountPath) }">
+                  <button class="vm-resize-mount-head" type="button" role="checkbox" :aria-checked="selectedMountPaths.includes(mount.mountPath)" @click="toggleMountPath(mount.mountPath)">
+                    <span class="vm-resize-radio"></span>
+                    <span class="vm-resize-mount-copy"><strong>{{ mount.mountPath === "/" ? "根目录" : mount.mountPath }}</strong><small>{{ mount.source }} · {{ mount.filesystem.toUpperCase() }}</small></span>
+                    <span class="vm-resize-mount-size"><small>当前</small><strong>{{ formatGiB(mount.sizeBytes) }} GiB</strong></span>
+                    <el-icon><ArrowRight /></el-icon>
+                    <span class="vm-resize-mount-size target"><small>完成后</small><strong>{{ formatGiB(mount.sizeBytes) + mountAddedGiB(mount) }} GiB</strong></span>
+                  </button>
+                  <div class="vm-resize-mount-increase" :class="{ disabled: !selectedMountPaths.includes(mount.mountPath) }">
+                    <span>增加</span>
+                    <div class="vm-resize-stepper" data-label="增加">
+                      <button type="button" :disabled="!selectedMountPaths.includes(mount.mountPath) || mountDeltaGiB(mount) <= 0" :aria-label="`减少 ${mount.mountPath} 增加容量`" @click="adjustMountDelta(mount.mountPath, -1)"><el-icon><Minus /></el-icon></button>
+                      <label><input :value="mountDeltaGiB(mount)" type="number" min="0" step="10" :disabled="!selectedMountPaths.includes(mount.mountPath)" :aria-label="`${mount.mountPath} 增加容量（GiB）`" @input="setMountDelta(mount.mountPath, Number(($event.target as HTMLInputElement).value))" /></label>
+                      <button type="button" :disabled="!selectedMountPaths.includes(mount.mountPath)" :aria-label="`增加 ${mount.mountPath} 增加容量`" @click="adjustMountDelta(mount.mountPath, 1)"><el-icon><Plus /></el-icon></button>
+                    </div>
+                    <span>GiB</span>
+                    <em v-if="!selectedMountPaths.includes(mount.mountPath)">勾选后可填写增量</em>
+                    <em v-else-if="mount.pendingCapacityBytes > 512 * 1024 ** 2">含待分配 {{ formatGiB(mount.pendingCapacityBytes) }} GiB</em>
+                    <em v-else-if="!mount.logicalVolume && increasingMounts.length > 1">非 LVM 目录不能与其它目录同时填写增量</em>
+                  </div>
+                </div>
               </div>
               <div v-else class="vm-resize-guest-state error"><el-icon><Warning /></el-icon><strong>该虚拟磁盘没有匹配到可扩容目录</strong></div>
+              <p v-if="increasingMounts.length > 1" class="vm-resize-mount-hint">
+                已为 {{ increasingMounts.length }} 个目录分别填写增量（{{ allocatedDeltaText }}），合计 {{ diskDelta }} GiB。
+              </p>
+              <p v-else-if="increasingMounts.length === 1" class="vm-resize-mount-hint">
+                本次只为 {{ allocatedDeltaText }} 扩容，其余已选目录保持当前容量。
+              </p>
+              <p v-else-if="!checkedGuestMounts.length" class="vm-resize-mount-hint">
+                请勾选需要扩容的目录；未勾选的目录保持当前容量，磁盘不增加。
+                <template v-if="hasAvailablePendingCapacity">当前磁盘还有 {{ formatGiB(availablePendingCapacityBytes) }} GiB 已扩未分配容量，勾选目录即可续作。</template>
+              </p>
               <div v-if="selectedGuestMount" class="vm-resize-chain">
                 <span><small>虚拟磁盘</small><strong>{{ selectedGuestMount.guestDiskPath }}</strong></span><el-icon><ArrowRight /></el-icon>
                 <span><small>末尾分区</small><strong>{{ selectedGuestMount.guestPartitionPath || "整盘" }}</strong></span><el-icon><ArrowRight /></el-icon>
                 <span><small>{{ selectedGuestMount.logicalVolume ? "LVM" : "文件系统" }}</small><strong>{{ selectedGuestMount.logicalVolume ? "PV / LV 扩展" : "分区扩展" }}</strong></span><el-icon><ArrowRight /></el-icon>
-                <span><small>自动生效</small><strong>{{ selectedGuestMount.mountPath }}</strong></span>
+                <span><small>自动生效</small><strong>{{ increasingMounts.map((mount) => mount.mountPath).join("、") || checkedGuestMounts.map((mount) => mount.mountPath).join("、") }}</strong></span>
               </div>
             </template>
 
@@ -575,17 +710,28 @@ function isAllowedNewMountPath(value: string) {
 .vm-resize-jump-fields :deep(.el-input__inner) { color: var(--vrc-text); font-size: var(--vrc-font-size-body); font-weight: var(--vrc-font-weight-regular); }
 .vm-resize-state-loader { width: 14px; height: 14px; border: 2px solid var(--vrc-border); border-top-color: var(--vrc-accent); border-radius: 50%; animation: vm-resize-spin 0.8s linear infinite; }
 .vm-resize-mounts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.vm-resize-mounts button { display: grid; grid-template-columns: 14px minmax(0, 1fr) 52px 14px 58px; gap: 7px; align-items: center; min-width: 0; min-height: 50px; padding: 6px 9px; color: var(--vrc-text); text-align: left; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; cursor: pointer; }
-.vm-resize-mounts button.active { background: var(--vrc-surface); border-color: color-mix(in srgb, var(--vrc-accent) 55%, var(--vrc-border)); }
-.vm-resize-mounts button:focus-visible { outline: none; border-color: var(--vrc-active-border); box-shadow: var(--vrc-focus-ring); }
+.vm-resize-mount-card { display: grid; gap: 6px; min-width: 0; padding: 6px 9px 7px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; }
+.vm-resize-mount-card.active { border-color: color-mix(in srgb, var(--vrc-accent) 55%, var(--vrc-border)); }
+/* 未勾选的目录只是可扩容候选，弱化展示并禁止填写增量。 */
+.vm-resize-mount-card.muted { background: var(--vrc-surface-muted); }
+.vm-resize-mount-card.muted .vm-resize-mount-size.target strong { color: var(--vrc-text-subtle); }
+.vm-resize-mount-head { display: grid; grid-template-columns: 14px minmax(0, 1fr) 52px 14px 58px; gap: 7px; align-items: center; min-width: 0; padding: 0; color: var(--vrc-text); text-align: left; background: transparent; border: 0; cursor: pointer; }
+.vm-resize-mount-head:focus-visible { outline: none; box-shadow: var(--vrc-focus-ring); }
 .vm-resize-radio { width: 12px; height: 12px; border: 1px solid var(--vrc-border-strong); border-radius: 50%; }
-.vm-resize-mounts button.active .vm-resize-radio { background: var(--vrc-accent); border: 3px solid var(--vrc-surface); box-shadow: 0 0 0 1px var(--vrc-accent); }
+.vm-resize-mount-card.active .vm-resize-radio { background: var(--vrc-accent); border: 3px solid var(--vrc-surface); box-shadow: 0 0 0 1px var(--vrc-accent); }
 .vm-resize-mount-copy, .vm-resize-mount-size { display: grid; gap: 2px; min-width: 0; }
 .vm-resize-mount-copy strong, .vm-resize-mount-size strong { overflow: hidden; font-size: 12px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
 .vm-resize-mount-copy small, .vm-resize-mount-size small { overflow: hidden; color: var(--vrc-text-subtle); font-size: 10px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
 .vm-resize-mount-size { text-align: right; }
 .vm-resize-mount-size.target { color: var(--vrc-accent); }
-.vm-resize-mounts button > .el-icon, .vm-resize-chain > .el-icon { color: var(--vrc-text-subtle); font-size: 11px; }
+.vm-resize-mount-head > .el-icon, .vm-resize-chain > .el-icon { color: var(--vrc-text-subtle); font-size: 11px; }
+.vm-resize-mount-increase { display: flex; align-items: center; gap: 6px; min-width: 0; padding-top: 6px; color: var(--vrc-text-subtle); font-size: 11px; border-top: 1px dashed var(--vrc-border); }
+.vm-resize-mount-increase.disabled { opacity: 0.55; }
+.vm-resize-mount-increase > em { min-width: 0; overflow: hidden; color: var(--vrc-text-subtle); font-size: 10px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+/* 复用顶部 CPU／内存步进器的尺寸，保证同一弹窗内增量输入样式一致。 */
+.vm-resize-mount-increase > .vm-resize-stepper { justify-self: start; width: 156px; }
+.vm-resize-value.disk.increase-summary em { white-space: nowrap; }
+.vm-resize-mount-hint { margin: 6px 0 0; padding: 6px 8px; color: var(--vrc-text-muted); font-size: 11px; background: var(--vrc-surface-muted); border-radius: 4px; }
 .vm-resize-new-mount { display: grid; grid-template-columns: minmax(190px, 1.35fr) repeat(3, minmax(92px, 1fr)); gap: 8px; }
 .vm-resize-new-mount > label, .vm-resize-new-mount > div { display: grid; gap: 3px; min-width: 0; min-height: 50px; padding: 6px 9px; background: var(--vrc-surface); border: 1px solid var(--vrc-border); border-radius: 5px; }
 .vm-resize-new-mount span { color: var(--vrc-text-subtle); font-size: 9px; }

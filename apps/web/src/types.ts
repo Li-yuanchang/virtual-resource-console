@@ -344,7 +344,15 @@ export interface VmResizeDiskRequest {
 }
 
 export interface VmResizeStorageTarget {
+  /** 单目录扩容（兼容旧契约）。 */
+  mountPath?: string;
+  /** 多目录同时扩容，weight 为相对分配权重。 */
+  mountPaths?: VmResizeStorageTargetPath[];
+}
+
+export interface VmResizeStorageTargetPath {
   mountPath: string;
+  weight?: number;
 }
 
 export interface VmSystemCredentials {
@@ -395,9 +403,18 @@ export interface VmResizeRequest {
 }
 
 export interface VmResizeStorageResult {
-  status: "completed" | "failed";
+  status: "completed" | "failed" | "partial";
   mountPath: string;
   sizeBytes?: number;
+  message: string;
+  targets?: VmResizeStorageTargetResult[];
+}
+
+export interface VmResizeStorageTargetResult {
+  mountPath: string;
+  status: "completed" | "failed";
+  sizeBytes?: number;
+  previousSizeBytes?: number;
   message: string;
 }
 
@@ -794,6 +811,10 @@ export interface ProvisionTaskVm {
   status: ProvisionTaskStatus;
   currentStep?: ProvisionTaskStepKey;
   progressPercent?: number;
+  /** 创建时提交的规格，用于在任务执行期间保持配置可见。 */
+  cpu?: number;
+  memoryGiB?: number;
+  diskGiB?: number;
   installPackageTotal?: number;
   installPackageDone?: number;
   message?: string;

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import type { ComponentPublicInstance } from "vue";
 import RFB from "@novnc/novnc";
 import type { ITheme } from "@xterm/xterm";
 import { ElDialog } from "element-plus";
@@ -435,18 +436,9 @@ const provisionTaskCurrentCopy = computed(() => {
   return `当前 ${currentProvisionVmIndex.value + 1} / ${count}：${current.name}`;
 });
 const consoleTaskStatusTone = computed(() => `status-${props.provisionTask?.status ?? "pending"}`);
-const consoleTaskTargetText = computed(() => {
-  const current = currentProvisionVm.value;
-  if (!current) return "等待 VM 控制台";
-  return [current.name, current.ip].filter(Boolean).join(" · ");
-});
 const consoleTaskStatusRows = computed(() => {
   const current = currentProvisionVm.value;
   return [
-    {
-      label: "当前对象",
-      value: consoleTaskTargetText.value,
-    },
     {
       label: "执行步骤",
       value: provisionTaskStatusText.value,
@@ -739,6 +731,7 @@ onBeforeUnmount(() => {
   clearConsoleFrameWatchTimer();
   clearConsoleStageReconnectTimer();
   stopConsoleCanvasProbe();
+  stopProvisionPreviewSampler();
 });
 
 onMounted(async () => {
@@ -1864,6 +1857,81 @@ function hasNonBlankConsoleCanvas(): boolean {
   return canvas ? hasNonBlankCanvasPixels(canvas) : false;
 }
 
+/* ---- 创建任务左栏 VM 缩略图：从主控制台 noVNC canvas 采样，blur-fill 绘制 ---- */
+
+const PROVISION_PREVIEW_WIDTH = 184;
+const PROVISION_PREVIEW_HEIGHT = 96;
+const PROVISION_PREVIEW_INTERVAL_MS = 800;
+
+const provisionPreviewLive = ref(false);
+let provisionPreviewCanvasEl: HTMLCanvasElement | null = null;
+let provisionPreviewTimer: number | null = null;
+
+function setProvisionPreviewCanvas(el: Element | ComponentPublicInstance | null) {
+  provisionPreviewCanvasEl = el instanceof HTMLCanvasElement ? el : null;
+}
+
+function startProvisionPreviewSampler() {
+  if (provisionPreviewTimer != null) return;
+  drawProvisionPreviewFrame();
+  provisionPreviewTimer = window.setInterval(drawProvisionPreviewFrame, PROVISION_PREVIEW_INTERVAL_MS);
+}
+
+function stopProvisionPreviewSampler() {
+  if (provisionPreviewTimer != null) {
+    window.clearInterval(provisionPreviewTimer);
+    provisionPreviewTimer = null;
+  }
+  provisionPreviewCanvasEl = null;
+  provisionPreviewLive.value = false;
+}
+
+function drawProvisionPreviewFrame() {
+  const source = screenRef.value?.querySelector("canvas") as HTMLCanvasElement | null;
+  if (!source || !source.width || !source.height) return;
+  if (!provisionPreviewLive.value) {
+    // 首帧等待画面真正渲染（RFB 初始可能全黑），非空后才显示缩略图
+    if (!hasNonBlankCanvasPixels(source)) return;
+    provisionPreviewLive.value = true;
+  }
+  const dest = provisionPreviewCanvasEl;
+  const ctx = dest?.getContext("2d");
+  if (!dest || !ctx) return;
+  if (dest.width !== PROVISION_PREVIEW_WIDTH || dest.height !== PROVISION_PREVIEW_HEIGHT) {
+    dest.width = PROVISION_PREVIEW_WIDTH;
+    dest.height = PROVISION_PREVIEW_HEIGHT;
+  }
+  ctx.clearRect(0, 0, dest.width, dest.height);
+  // 底层：等比放大铺满 + 模糊压暗，把源画面比例变化产生的空边藏进模糊纹理
+  paintProvisionPreviewLayer(ctx, source, "cover", "blur(7px) brightness(0.7)");
+  // 顶层：等比完整居中，不裁剪不变形
+  paintProvisionPreviewLayer(ctx, source, "contain", "none");
+}
+
+function paintProvisionPreviewLayer(ctx: CanvasRenderingContext2D, source: HTMLCanvasElement, mode: "cover" | "contain", filter: string) {
+  const dest = ctx.canvas;
+  const scale = mode === "cover"
+    ? Math.max(dest.width / source.width, dest.height / source.height) * 1.12
+    : Math.min(dest.width / source.width, dest.height / source.height);
+  const width = source.width * scale;
+  const height = source.height * scale;
+  ctx.filter = filter;
+  ctx.drawImage(source, (dest.width - width) / 2, (dest.height - height) / 2, width, height);
+  ctx.filter = "none";
+}
+
+watch(
+  () => [isProvisionConsole.value, connected.value, effectiveVisible.value, isCliConsole.value] as const,
+  ([isProvision, isConnected, visible, cli]) => {
+    if (isProvision && isConnected && visible && !cli) {
+      startProvisionPreviewSampler();
+    } else {
+      stopProvisionPreviewSampler();
+    }
+  },
+  { immediate: true },
+);
+
 function startProvisionBlankConsoleWatch(delayMs?: number) {
   clearProvisionBlankConsoleWatch();
   if (!isProvisionConsole.value || props.provisionTask?.status === "failed") return;
@@ -2965,7 +3033,9 @@ function selectProvisionTarget(item: ProvisionConsoleTargetItem) {
             :disabled="!item.target"
             @click="selectProvisionTarget(item)"
           >
-            <span class="console-vm-preview" :style="{ '--mini-progress': `${provisionVmPercent(item)}%` }"></span>
+            <span class="console-vm-preview" :style="{ '--mini-progress': `${provisionVmPercent(item)}%` }">
+              <canvas v-if="isProvisionTargetActive(item) && provisionPreviewLive" :ref="setProvisionPreviewCanvas" class="console-vm-preview-frame" aria-hidden="true"></canvas>
+            </span>
             <span class="console-vm-copy">
               <strong>{{ item.name }}</strong>
               <span>{{ [item.ip, item.message || provisionStepStatusText(item.status)].filter(Boolean).join(" · ") }}</span>

@@ -415,7 +415,7 @@ interface IpPoolEditorDraft {
   vlan: string;
 }
 
-type MaintenanceCleanupDecision = "eligible" | "retained" | "skipped" | "cleaned" | "failed";
+type MaintenanceCleanupDecision = "eligible" | "retained" | "skipped" | "orphan" | "cleaned" | "failed";
 
 interface MaintenanceGeneratedIsoEntry {
   id: string;
@@ -445,11 +445,41 @@ interface MaintenanceGeneratedIsoReport {
     eligible: number;
     retained: number;
     skipped: number;
+    orphan: number;
     cleaned: number;
     failed: number;
     localBytes: number;
   };
   items: MaintenanceGeneratedIsoEntry[];
+}
+
+/** ISO 存储库健康检查（仅 XenServer）。 */
+type IsoStorageNodeStatus = "healthy" | "stale" | "unmounted" | "unreachable" | "no-xenserver";
+
+interface IsoStorageNode {
+  connectionId: string;
+  host: string;
+  hostName?: string;
+  status: IsoStorageNodeStatus;
+  mountPath?: string;
+  stuckProcessCount: number;
+  stuckProcesses: string[];
+  srName?: string;
+  message: string;
+}
+
+interface IsoStorageScanReport {
+  generatedAt: string;
+  summary: { total: number; healthy: number; stale: number; unmounted: number; unreachable: number };
+  nodes: IsoStorageNode[];
+}
+
+interface IsoStorageRepairResult {
+  connectionId: string;
+  host: string;
+  hostName?: string;
+  repaired: boolean;
+  message: string;
 }
 
 const VM_SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -1174,9 +1204,43 @@ const maintenanceIsoSummary = computed(() => maintenanceIsoReport.value?.summary
   eligible: 0,
   retained: 0,
   skipped: 0,
+  orphan: 0,
   cleaned: 0,
   failed: 0,
   localBytes: 0,
+});
+/** 孤儿登记：远端无从校验的滞留记录，可批量删除本地登记。 */
+const maintenanceIsoOrphanItems = computed(() =>
+  (maintenanceIsoReport.value?.items ?? []).filter((item) => item.decision === "orphan"),
+);
+const maintenanceIsoOrphanSelected = ref<string[]>([]);
+const maintenanceIsoOrphanPurging = ref(false);
+const isoStorageReport = ref<IsoStorageScanReport | null>(null);
+const isoStorageScanning = ref(false);
+const isoStorageRepairing = ref(false);
+const isoStorageStatus = ref("");
+const isoStorageError = ref("");
+const isoStorageSelected = ref<string[]>([]);
+/** 状态上确实需要修复的节点：僵死或未挂载。 */
+const isoStorageBrokenNodes = computed(() =>
+  (isoStorageReport.value?.nodes ?? []).filter((node) => node.status === "stale" || node.status === "unmounted"),
+);
+/** 孤儿登记的实际删除目标：同样以判定结果为准，勾选只收窄范围。 */
+const maintenanceOrphanTargets = computed(() => {
+  const orphans = maintenanceIsoOrphanItems.value;
+  if (!maintenanceIsoOrphanSelected.value.length) return orphans;
+  return orphans.filter((item) => maintenanceIsoOrphanSelected.value.includes(item.id));
+});
+
+/**
+ * 实际修复目标：以问题节点为基准，只保留其中被勾选的部分。
+ * 不能直接用 el-table 的 selection——它在重渲染时会带上历史选中项，
+ * 出现过"僵死 0 个却显示修复 3 个"的假象。这里始终从状态推导，勾选只能收窄范围。
+ */
+const isoStorageRepairTargets = computed(() => {
+  const broken = isoStorageBrokenNodes.value;
+  if (!isoStorageSelected.value.length) return broken;
+  return broken.filter((node) => isoStorageSelected.value.includes(node.connectionId));
 });
 const maintenanceIsoActiveItems = computed(() =>
   maintenanceIsoReport.value?.items.filter((item) => item.status !== "deleted" && item.decision !== "cleaned") ?? [],
@@ -1715,6 +1779,9 @@ watch(
 watch(settingsPanel, (panel) => {
   if (panel === "maintenance" && !maintenanceIsoReport.value && !maintenanceIsoLoading.value) {
     void loadMaintenanceGeneratedIsos({ silent: true });
+  }
+  if (panel === "maintenance" && !isoStorageReport.value && !isoStorageScanning.value) {
+    void loadIsoStorageHealth();
   }
   if (panel === "logs" && !persistentAuditEntries.value.length && !persistentAuditLoading.value) {
     void loadPersistentAudit();
@@ -2267,6 +2334,116 @@ async function cleanupMaintenanceGeneratedIsos() {
   } finally {
     maintenanceIsoCleaning.value = false;
   }
+}
+
+async function loadIsoStorageHealth() {
+  if (isoStorageScanning.value) return;
+  isoStorageScanning.value = true;
+  isoStorageStatus.value = "正在扫描 XenServer ISO 存储库";
+  isoStorageError.value = "";
+  try {
+    const result = await postJson<{ report: IsoStorageScanReport }>("/api/maintenance/iso-storage/scan", { confirmToken: "CONFIRMED" });
+    isoStorageReport.value = result.report;
+    const summary = result.report.summary;
+    const unhealthy = summary.stale + summary.unmounted + summary.unreachable;
+    isoStorageStatus.value = `扫描完成，共 ${summary.total} 个节点，正常 ${summary.healthy} 个，异常 ${unhealthy} 个`;
+    isoStorageSelected.value = result.report.nodes
+      .filter((node) => node.status === "stale" || node.status === "unmounted")
+      .map((node) => node.connectionId);
+  } catch (error) {
+    isoStorageStatus.value = "";
+    isoStorageError.value = error instanceof Error ? error.message : "扫描 ISO 存储库失败";
+    ElMessage.error({ message: isoStorageError.value, duration: VRC_TOAST_DURATION_MS });
+  } finally {
+    isoStorageScanning.value = false;
+  }
+}
+
+async function repairIsoStorageNodes() {
+  const targets = isoStorageRepairTargets.value;
+  if (!targets.length) return;
+  await confirmVrcAction({
+    heading: "修复 ISO 存储库挂载",
+    tone: "维护操作",
+    summary: `将对 ${targets.length} 个节点执行：卸载僵死挂载 → 清理 D 状态进程 → 重新挂载 SR。`,
+    detail: [
+      ...targets.map((node) => `${node.hostName || node.host}（${node.status === "stale" ? "僵死" : "未挂载"}，D 状态进程 ${node.stuckProcessCount} 个）`),
+      "修复期间这些节点上的 ISO 存储会短暂不可用；若某个 VM 正在从 ISO 安装系统，安装会中断。",
+      "若修复后仍卡住，通常是有 VM 的光驱占用该 ISO，需要先弹出光驱再重试。",
+    ].join("\n"),
+    confirmButtonText: "确认修复",
+  });
+  isoStorageRepairing.value = true;
+  try {
+    const result = await postJson<{ results: IsoStorageRepairResult[] }>("/api/maintenance/iso-storage/repair", {
+      connectionIds: targets.map((node) => node.connectionId),
+      confirmToken: "CONFIRMED",
+    });
+    const repaired = result.results.filter((item) => item.repaired).length;
+    const message = `修复完成：成功 ${repaired}/${result.results.length} 个节点`;
+    const failed = result.results.filter((item) => !item.repaired);
+    ElMessage({ message: failed.length ? `${message}；${failed[0].message}` : message, type: failed.length ? "warning" : "success", duration: VRC_TOAST_DURATION_MS });
+    pushActivity("修复 ISO 存储库挂载", {
+      detail: failed.length ? `${message}；${failed.map((item) => `${item.hostName || item.host}: ${item.message}`).join("；")}` : message,
+      target: "设置 / 维护",
+      request: "POST /api/maintenance/iso-storage/repair",
+      status: failed.length ? "warning" : "success",
+    });
+    await loadIsoStorageHealth();
+  } catch (error) {
+    ElMessage.error({ message: error instanceof Error ? error.message : "修复 ISO 存储库失败", duration: VRC_TOAST_DURATION_MS });
+  } finally {
+    isoStorageRepairing.value = false;
+  }
+}
+
+async function purgeOrphanIsoRecords() {
+  const count = maintenanceOrphanTargets.value.length;
+  if (!count) return;
+  await confirmVrcAction({
+    heading: "删除孤儿镜像登记",
+    tone: "维护操作",
+    summary: `将删除 ${count} 条无法校验远端的残留登记记录。`,
+    detail: "这些记录在生成阶段中断、从未写入远端介质标识，或对应平台连接已删除，因此无法验证远端文件。\n本操作只删除 VRC 本地登记，不会删除任何平台上的实际文件；如需清理远端请先人工确认。" ,
+    confirmButtonText: "确认删除登记",
+  });
+  maintenanceIsoOrphanPurging.value = true;
+  try {
+    const ids = maintenanceOrphanTargets.value.length && maintenanceOrphanTargets.value.length < maintenanceIsoOrphanItems.value.length
+      ? maintenanceOrphanTargets.value.map((item) => item.id)
+      : undefined;
+    const result = await postJson<{ purged: string[]; refused: Array<{ id: string; reason: string }> }>(
+      "/api/maintenance/generated-isos/purge-orphan",
+      { ids, confirmToken: "CONFIRMED" },
+    );
+    const message = `已删除 ${result.purged.length} 条孤儿登记${result.refused.length ? `，拒绝 ${result.refused.length} 条` : ""}`;
+    maintenanceIsoOrphanSelected.value = [];
+    await loadMaintenanceGeneratedIsos({ silent: true });
+    maintenanceIsoStatus.value = message;
+    ElMessage({ message, type: result.refused.length ? "warning" : "success", duration: VRC_TOAST_DURATION_MS });
+  } catch (error) {
+    ElMessage.error({ message: error instanceof Error ? error.message : "删除孤儿登记失败", duration: VRC_TOAST_DURATION_MS });
+  } finally {
+    maintenanceIsoOrphanPurging.value = false;
+  }
+}
+
+/** 只有孤儿登记允许勾选删除；其它状态的记录不能通过本入口批量处理。 */
+function isMaintenanceOrphanRow(row: MaintenanceGeneratedIsoEntry) {
+  return row.decision === "orphan";
+}
+
+function handleMaintenanceOrphanSelection(rows: MaintenanceGeneratedIsoEntry[]) {
+  maintenanceIsoOrphanSelected.value = rows.map((item) => item.id);
+}
+
+function handleIsoStorageSelection(rows: IsoStorageNode[]) {
+  isoStorageSelected.value = rows.map((node) => node.connectionId);
+}
+
+/** 只有僵死或未挂载的节点才允许勾选修复；正常和不可达节点无需处理。 */
+function isIsoStorageNodeSelectable(row: IsoStorageNode) {
+  return row.status === "stale" || row.status === "unmounted";
 }
 
 function syncIpPoolDraftFromSelection() {
@@ -5121,7 +5298,7 @@ async function handleVmResize(request: VmResizeRequest) {
       detail: [
         ...changes,
         "后端将按平台能力选择在线执行，或正常关机后修改并自动恢复运行。",
-        request.storageTarget ? `系统内容量生效目录：${request.storageTarget.mountPath}` : "本次不包含操作系统文件系统调整。",
+        request.storageTarget ? `系统内容量生效目录：${describeStorageTarget(request)}` : "本次不包含操作系统文件系统调整。",
         "扩容只允许增加，磁盘与文件系统扩展后不能通过 VRC 缩小。",
       ].join("\n"),
       confirmButtonText: "确认扩容",
@@ -5161,16 +5338,19 @@ async function handleVmResize(request: VmResizeRequest) {
       powerState: response.result.restarted ? "running" : vm.powerState,
     });
     vmResizeDisks.value = response.result.disks;
-    const storageFailed = response.result.storage?.status === "failed";
-    showToast(storageFailed ? "warning" : "success", response.result.message);
+    const storageStatus = response.result.storage?.status;
+    // completed 表示全部目录生效；partial 表示多目录里部分失败，同样需要提示用户。
+    const storageFailed = storageStatus === "failed";
+    const storagePartial = storageStatus === "partial";
+    showToast(storageFailed || storagePartial ? "warning" : "success", response.result.message);
     void refreshVmRowQuietly(updatedVm, { attempts: 2, intervalMs: 800 });
-    pushActivity(storageFailed ? "虚拟硬件已扩容，系统内容量生效失败" : "虚拟机扩容完成", {
+    pushActivity(storageFailed || storagePartial ? "虚拟硬件已扩容，系统内容量生效失败" : "虚拟机扩容完成", {
       target,
       detail: `${changes.join("；")}；${response.result.storage?.message || (response.result.restarted ? "已自动开机" : "在线完成")}`,
       request: "POST /api/vms/resize",
-      status: storageFailed ? "error" : "success",
+      status: storageFailed || storagePartial ? "error" : "success",
     });
-    if (storageFailed) {
+    if (storageFailed || storagePartial) {
       await Promise.all([loadVmResizeDisks(vm), loadVmResizeGuestStorage(vm)]);
       return;
     }
@@ -5202,8 +5382,19 @@ function describeVmResizeChanges(vm: VmNode, request: VmResizeRequest) {
       changes.push(`磁盘：新增 ${formatBytes(request.disk.sizeBytes)}`);
     }
   }
-  if (request.storageTarget) changes.push(`操作系统：自动生效至 ${request.storageTarget.mountPath}`);
+  if (request.storageTarget) changes.push(`操作系统：自动生效至 ${describeStorageTarget(request)}`);
   return changes;
+}
+
+function describeStorageTarget(request: VmResizeRequest) {
+  const target = request.storageTarget;
+  if (!target) return "";
+  if (target.mountPaths?.length) {
+    return target.mountPaths
+      .map((item) => (item.weight ? `${item.mountPath} +${item.weight} GiB` : item.mountPath))
+      .join("、");
+  }
+  return target.mountPath || "";
 }
 
 function openGlobalVmSchedule() {
@@ -6841,6 +7032,9 @@ function maintenanceIsoDecisionLabel(item: MaintenanceGeneratedIsoEntry) {
   if (item.decision === "retained") return "暂保留";
   if (item.decision === "cleaned") return "已清理";
   if (item.decision === "failed") return "清理失败";
+  // orphan 是独立状态：远端无从校验，只能删本地登记。
+  // 漏掉这一支会让用户看到"需检查"却查不到统计里的对应数字。
+  if (item.decision === "orphan") return "孤儿登记";
   return item.reason.includes("任务仍在执行") ? "任务进行中" : "需检查";
 }
 
@@ -8513,6 +8707,10 @@ serverStore: disabled</pre>
                   <strong>{{ maintenanceIsoSummary.retained }}</strong>
                 </article>
                 <article>
+                  <span>孤儿登记</span>
+                  <strong>{{ maintenanceIsoSummary.orphan }}</strong>
+                </article>
+                <article>
                   <span>需检查</span>
                   <strong>{{ maintenanceIsoSummary.failed + maintenanceIsoSummary.skipped }}</strong>
                 </article>
@@ -8538,8 +8736,24 @@ serverStore: disabled</pre>
                     {{ maintenanceIsoScannedAt ? `最后扫描 ${maintenanceIsoScannedAt} · ` : "" }}显示
                     {{ maintenanceIsoVisibleItems.length }} / {{ maintenanceIsoActiveItems.length }} 条
                   </span>
+                  <!-- 孤儿登记不是独立列表，直接在本表格里勾选删除，避免同一批数据渲染两遍 -->
+                  <el-button
+                    v-if="maintenanceIsoOrphanItems.length"
+                    class="ip-pool-command-button"
+                    size="small"
+                    :loading="maintenanceIsoOrphanPurging"
+                    @click="purgeOrphanIsoRecords"
+                  >
+                    {{ maintenanceIsoOrphanPurging ? "删除中" : `删除孤儿登记（${maintenanceOrphanTargets.length}）` }}
+                  </el-button>
                 </div>
-                <el-table :data="maintenanceIsoVisibleItems" row-key="id" class="maintenance-iso-table">
+                <el-table
+                  :data="maintenanceIsoVisibleItems"
+                  row-key="id"
+                  class="maintenance-iso-table"
+                  @selection-change="handleMaintenanceOrphanSelection"
+                >
+                  <el-table-column type="selection" width="42" :selectable="isMaintenanceOrphanRow" />
                   <el-table-column label="介质" min-width="300">
                     <template #default="{ row }">
                       <span class="maintenance-iso-main">
@@ -8579,6 +8793,98 @@ serverStore: disabled</pre>
                   </el-table-column>
                 </el-table>
               </div>
+
+            </section>
+
+            <section class="settings-card maintenance-card">
+              <div class="settings-card-head settings-section-head maintenance-card-head">
+                <div>
+                  <strong>ISO 存储库健康（XenServer）</strong>
+                  <span>检测 SMB/CIFS 挂载是否僵死。僵死时访问会阻塞、创建任务会超时，可一键恢复。</span>
+                </div>
+                <div class="maintenance-head-actions">
+                  <el-button class="ip-pool-command-button" size="small" :loading="isoStorageScanning" @click="loadIsoStorageHealth()">
+                    {{ isoStorageScanning ? "扫描中" : "重新扫描" }}
+                  </el-button>
+                  <el-button
+                    class="ip-pool-command-button primary"
+                    size="small"
+                    :loading="isoStorageRepairing"
+                    :disabled="!isoStorageRepairTargets.length"
+                    @click="repairIsoStorageNodes"
+                  >
+                    {{ isoStorageRepairing ? "修复中" : `修复僵死节点（${isoStorageRepairTargets.length}）` }}
+                  </el-button>
+                </div>
+              </div>
+              <div v-if="isoStorageStatus" class="maintenance-iso-status">
+                <span>扫描状态：</span>
+                <strong>{{ isoStorageStatus }}</strong>
+              </div>
+              <p v-if="isoStorageError" class="maintenance-iso-reason">{{ isoStorageError }}</p>
+
+              <div class="maintenance-summary-grid">
+                <article>
+                  <span>节点总数</span>
+                  <strong>{{ isoStorageReport?.summary.total ?? 0 }}</strong>
+                </article>
+                <article>
+                  <span>正常</span>
+                  <strong>{{ isoStorageReport?.summary.healthy ?? 0 }}</strong>
+                </article>
+                <article>
+                  <span>僵死</span>
+                  <strong>{{ isoStorageReport?.summary.stale ?? 0 }}</strong>
+                </article>
+                <article>
+                  <span>未挂载</span>
+                  <strong>{{ isoStorageReport?.summary.unmounted ?? 0 }}</strong>
+                </article>
+                <article>
+                  <span>不可达</span>
+                  <strong>{{ isoStorageReport?.summary.unreachable ?? 0 }}</strong>
+                </article>
+              </div>
+
+              <div v-if="isoStorageReport?.nodes.length" class="maintenance-iso-table-wrap">
+                <el-table
+                  :data="isoStorageReport.nodes"
+                  row-key="connectionId"
+                  class="maintenance-iso-table"
+                  @selection-change="handleIsoStorageSelection"
+                >
+                  <el-table-column type="selection" width="42" :selectable="isIsoStorageNodeSelectable" />
+                  <el-table-column label="节点" min-width="160">
+                    <template #default="{ row }">
+                      <strong>{{ row.hostName || row.host }}</strong>
+                      <small class="maintenance-iso-path">{{ row.host }}</small>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="挂载点" min-width="200">
+                    <template #default="{ row }">
+                      <span class="maintenance-iso-path">{{ row.mountPath || "未挂载" }}</span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="状态" width="92" align="center">
+                    <template #default="{ row }">
+                      <span class="maintenance-iso-decision" :class="`decision-${row.status === 'healthy' ? 'eligible' : row.status === 'unreachable' ? 'skipped' : 'orphan'}`">
+                        {{ row.status === "healthy" ? "正常" : row.status === "unmounted" ? "未挂载" : row.status === "unreachable" ? "不可达" : "僵死" }}
+                      </span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="死进程" width="80" align="right">
+                    <template #default="{ row }">
+                      <span :class="{ 'maintenance-iso-stuck': row.stuckProcessCount > 0 }">{{ row.stuckProcessCount }}</span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="说明" min-width="260">
+                    <template #default="{ row }">
+                      <span class="maintenance-iso-reason">{{ row.message }}</span>
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </div>
+              <p v-else-if="!isoStorageScanning" class="maintenance-iso-reason">未扫描到 XenServer 连接。</p>
             </section>
           </section>
 

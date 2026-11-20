@@ -3369,6 +3369,10 @@ textarea,
   outline: none;
 }
 
+/* 内嵌模式：画面按容器 100% 填满显示。
+   等比缩放（object-fit: contain）会在下方/右侧留下整块黑边，
+   浅色桌面（如 Kylin）下形成明显明暗断裂，故保持填满，
+   比例失真的取舍由远端 resizeSession 适配解决 */
 .console-dialog.is-console-embedded:not(.is-console-expanded) .console-screen canvas {
   width: 100% !important;
   height: 100% !important;
@@ -4170,16 +4174,42 @@ textarea,
   background: var(--vrc-surface);
 }
 
+/* Element Plus 会给 popper 内联 min-width = 触发器宽度，这里统一取消，
+   把宽度交给下方 ISO 专属规则控制。 */
 .el-select__popper.el-popper.vrc-provision-select-dropdown {
   width: auto !important;
+  min-width: 0 !important;
   max-width: min(920px, calc(100vw - 48px));
   border-color: var(--vrc-border);
   box-shadow: none;
 }
 
+/* 弹层比触发器更宽：ISO 文件名普遍超过输入框宽度，跟随触发器宽度会把名字截断。
+   固定 440px（窄窗口按视口收缩），保证文件名一行可读、徽标与对勾不被挤压。 */
+.el-select__popper.el-popper.vrc-provision-select-dropdown.vrc-provision-iso-dropdown {
+  width: min(440px, calc(100vw - 32px)) !important;
+  min-width: 0 !important;
+  max-width: min(440px, calc(100vw - 32px));
+}
+
+/* Element Plus 会按选项内容给内层 dropdown 写入内联 min-width（实测 554px），
+   它会撑破定宽的 popper，把滚动条画到弹层之外。这里必须用 !important 清零，
+   再把宽度统一交给 popper。 */
 .el-select-dropdown.vrc-provision-iso-dropdown {
-  width: fit-content;
-  max-width: min(920px, calc(100vw - 48px));
+  box-sizing: border-box;
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  overflow: hidden;
+}
+
+/* 兜底：滚动容器及其视图同样锁宽，避免任何子级把内层撑开。 */
+.el-select__popper.el-popper.vrc-provision-iso-dropdown .el-scrollbar,
+.el-select__popper.el-popper.vrc-provision-iso-dropdown .el-scrollbar__wrap,
+.el-select__popper.el-popper.vrc-provision-iso-dropdown .el-scrollbar__view {
+  box-sizing: border-box;
+  min-width: 0 !important;
+  max-width: 100%;
 }
 
 .vrc-provision-select-dropdown .el-select-dropdown__list {
@@ -4187,46 +4217,124 @@ textarea,
 }
 
 .vrc-provision-iso-dropdown .el-select-group__title {
-  height: 26px;
-  padding: 0 10px;
-  color: var(--vrc-text-subtle);
-  font-size: 11px;
-  font-weight: 400;
-  line-height: 26px;
-}
-
-/* 镜像下拉面板头部的刷新入口：宿主机新增/删除 ISO 后缓存不会自动感知，
-   且必须放在面板内，镜像为空（列表为空）时用户仍能点到刷新。 */
-.vrc-provision-iso-dropdown .iso-dropdown-header {
-  position: sticky;
-  top: 0;
-  z-index: 1;
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  height: 32px;
-  padding: 0 6px 0 10px;
+  gap: 6px;
+  box-sizing: border-box;
+  height: auto;
+  min-height: 22px;
+  padding: 6px 10px 2px;
   color: var(--vrc-text-subtle);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+/* 分组标题右侧拉一条 1px 细线，替代原先厚重的分组条，弱化层级只做区隔。 */
+.vrc-provision-iso-dropdown .el-select-group__title::after {
+  flex: 1;
+  height: 1px;
+  background: var(--vrc-border);
+  content: "";
+}
+
+.vrc-provision-iso-dropdown .el-select-dropdown__list > .el-select-group__wrap:first-child > .el-select-group__title {
+  padding-top: 2px;
+}
+
+/* el-select 的 header 容器自带 margin-bottom:12px 与一条 border-bottom，
+   会和 tools 的分割线叠成双线并撑高间距，这里统一清零，只保留 tools 的一条分割线。 */
+.vrc-provision-iso-dropdown .el-select-dropdown__header {
+  margin: 0;
+  padding: 0;
+  border-bottom: 0;
+}
+
+/* 头部 = 「搜索框 + 刷新按钮」，与列表之间只隔一条分割线。
+   头部与列表容器是兄弟节点，不叠加列表内边距，因此左右用 10px 对齐选项文字。 */
+.vrc-provision-iso-dropdown .iso-dropdown-tools {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 6px 10px;
   background: var(--vrc-surface);
   border-bottom: 1px solid var(--vrc-border);
 }
 
-.vrc-provision-iso-dropdown .iso-dropdown-header-label {
-  overflow: hidden;
-  font-size: 11px;
-  font-weight: 400;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+.vrc-provision-iso-dropdown .iso-dropdown-search {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 7px;
+  background: var(--vrc-surface-muted);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
-.vrc-provision-iso-dropdown .iso-dropdown-header .iso-refresh-button {
-  flex: 0 0 auto;
+.vrc-provision-iso-dropdown .iso-dropdown-search:focus-within {
+  background: var(--vrc-surface);
+  border-color: var(--vrc-border-strong);
+}
+
+.vrc-provision-iso-dropdown .iso-search-icon {
+  display: block;
+  flex: 0 0 13px;
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: var(--vrc-text-subtle);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+/* 外层 label 已有容器边框，这里必须彻底清掉原生 input 的边框/内阴影，
+   否则会出现“双线边框”。 */
+.vrc-provision-iso-dropdown .iso-dropdown-search > input,
+.vrc-provision-iso-dropdown .iso-dropdown-search > input:hover,
+.vrc-provision-iso-dropdown .iso-dropdown-search > input:focus,
+.vrc-provision-iso-dropdown .iso-dropdown-search > input:focus-visible {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0;
+  color: var(--vrc-text);
+  font: inherit;
+  font-size: 11px;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  box-shadow: none;
+}
+
+.vrc-provision-iso-dropdown .iso-dropdown-search input::placeholder {
+  color: var(--vrc-text-subtle);
+}
+
+.vrc-provision-iso-dropdown .iso-dropdown-search input:disabled {
+  cursor: not-allowed;
+}
+
+/* 刷新按钮：头部行唯一入口，分组为空时同样可用。 */
+.vrc-provision-iso-dropdown .iso-refresh-button {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   padding: 0;
   color: var(--vrc-text-muted);
   background: transparent;
@@ -4236,88 +4344,249 @@ textarea,
   transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
-.vrc-provision-iso-dropdown .iso-dropdown-header .iso-refresh-button:hover:not(:disabled) {
+.vrc-provision-iso-dropdown .iso-refresh-button:hover:not(:disabled) {
   color: var(--vrc-text);
   background: var(--vrc-surface-muted);
   border-color: var(--vrc-border);
 }
 
-.vrc-provision-iso-dropdown .iso-dropdown-header .iso-refresh-button:disabled {
+.vrc-provision-iso-dropdown .iso-refresh-button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
 
-.vrc-provision-iso-dropdown .el-select-group__wrap:not(:last-of-type)::after {
-  right: 10px;
-  left: 10px;
-  background: var(--vrc-border);
+.vrc-provision-iso-dropdown .iso-refresh-button .vrc-toolbar-icon {
+  width: 14px;
+  height: 14px;
 }
 
-.vrc-provision-select-dropdown .el-select-dropdown__item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(72px, max-content);
-  align-items: center;
-  gap: 12px;
-  height: 30px;
+/* 列表最大高度固定，超出内部滚动，避免镜像多时把弹窗撑高。
+   上下各留 4px，保证首尾选项与弹层圆角之间不贴边。 */
+.vrc-provision-iso-dropdown .el-select-dropdown__list {
+  box-sizing: border-box;
+  width: 100%;
   min-width: 0;
-  padding: 0 10px;
-  color: var(--vrc-text);
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 30px;
+  max-height: 288px;
+  padding: 2px 4px 4px;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
-.vrc-provision-select-dropdown .el-select-dropdown__item span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+/* Element Plus 默认给每个选项 margin-bottom: 6px，会在列表尾部堆出多余空隙。 */
+.vrc-provision-iso-dropdown .el-select-dropdown__item {
+  margin: 0;
 }
 
-.vrc-provision-select-dropdown .el-select-dropdown__item.is-selected {
-  color: var(--vrc-accent);
-  font-weight: 500;
-  background: var(--vrc-accent-soft);
+/* 弹层被 teleport 到 body，不在 .app-shell 内，拿不到项目统一的滚动条样式，
+   会回落到系统原生滚动条（macOS 上表现为带导轨阴影与渐隐）。这里补齐同一套规范：
+   导轨全透明、滑块只在悬停/聚焦时显现、4px 圆角细条。 */
+.vrc-provision-iso-dropdown .el-select-dropdown__list {
+  scrollbar-width: thin;
 }
 
-.vrc-provision-select-dropdown .el-select-dropdown__item.is-hovering {
-  background: var(--vrc-surface-muted);
+/* scrollbar-color 只在 Firefox 生效（见下方说明），Chromium 交给 webkit 伪元素。 */
+@supports (-moz-appearance: none) {
+  .vrc-provision-iso-dropdown .el-select-dropdown__list {
+    scrollbar-color: transparent transparent;
+  }
+
+  .vrc-provision-iso-dropdown:hover .el-select-dropdown__list,
+  .vrc-provision-iso-dropdown .el-select-dropdown__list:focus-within {
+    scrollbar-color: color-mix(in srgb, var(--vrc-text-muted) 22%, var(--vrc-surface)) transparent;
+  }
 }
 
-.vrc-provision-select-dropdown .option-subtitle {
-  min-width: 0;
-  max-width: 180px;
-  margin-left: 0;
-  overflow: hidden;
-  color: var(--vrc-text-subtle);
-  font-size: 11px;
-  font-weight: 400;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.vrc-provision-iso-dropdown .el-select-dropdown__list::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.vrc-provision-iso-dropdown .el-select-dropdown__list::-webkit-scrollbar-track,
+.vrc-provision-iso-dropdown .el-select-dropdown__list::-webkit-scrollbar-corner {
+  background: transparent;
+  box-shadow: none;
+  border: 0;
+}
+
+.vrc-provision-iso-dropdown .el-select-dropdown__list::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+  box-shadow: none;
+}
+
+/* 注意：这里不能再用 scrollbar-color 做悬停着色。
+   Chromium 一旦命中 scrollbar-color，就会切到标准滚动条渲染路径，
+   让下方 ::-webkit-scrollbar-thumb 的 border / background-clip 失效，
+   滑块退化成整块实色（视觉上就是“变深色块”）。悬停着色统一交给 webkit 伪元素。 */
+.vrc-provision-iso-dropdown:hover .el-select-dropdown__list::-webkit-scrollbar-thumb,
+.vrc-provision-iso-dropdown .el-select-dropdown__list:focus-within::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--vrc-text-muted) 22%, var(--vrc-surface));
+}
+
+.vrc-provision-iso-dropdown:hover .el-select-dropdown__list::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--vrc-text-muted) 32%, var(--vrc-surface));
+}
+
+/* 滑块拖动时同样不加深到主题深色。 */
+.vrc-provision-iso-dropdown:hover .el-select-dropdown__list::-webkit-scrollbar-thumb:active {
+  background-color: color-mix(in srgb, var(--vrc-text-muted) 38%, var(--vrc-surface));
 }
 
 .vrc-provision-iso-dropdown .el-select-dropdown__item {
-  grid-template-columns: minmax(0, 1fr);
-  align-items: start;
-  gap: 2px;
-  width: max-content;
-  max-width: min(900px, calc(100vw - 68px));
-  min-width: 100%;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 16px;
+  align-items: center;
+  column-gap: 8px;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
   height: auto;
-  min-height: 44px;
-  padding: 6px 10px;
+  min-height: 46px;
+  padding: 5px 8px;
+  color: var(--vrc-text);
+  font-size: 12px;
+  font-weight: 400;
   line-height: 16px;
+  border-radius: 5px;
 }
 
-.vrc-provision-iso-dropdown .el-select-dropdown__item .option-title {
-  width: 100%;
-  line-height: 16px;
+.vrc-provision-iso-dropdown .el-select-dropdown__item.is-hovering {
+  color: var(--vrc-text);
+  background: var(--vrc-surface-muted);
 }
 
-.vrc-provision-iso-dropdown .el-select-dropdown__item .option-subtitle {
-  width: 100%;
-  max-width: none;
+.vrc-provision-iso-dropdown .el-select-dropdown__item.is-selected {
+  color: var(--vrc-text);
+  font-weight: 400;
+  background: var(--vrc-accent-soft);
+}
+
+/* 系统族徽标：30px 方块，颜色按族取状态色淡底，不引入新色板。 */
+.iso-option-badge {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  color: var(--vrc-accent);
+  background: var(--vrc-accent-soft);
+  border-radius: 6px;
+  font-size: 9px;
+  font-weight: var(--vrc-font-weight-heading);
+  letter-spacing: -0.2px;
+}
+
+.iso-option-badge[data-family="windows"] {
+  color: var(--vrc-info);
+  background: var(--vrc-status-info-soft);
+}
+
+.iso-option-badge[data-family="ubuntu"] {
+  color: var(--vrc-warning);
+  background: var(--vrc-status-warning-soft);
+}
+
+.iso-option-badge[data-family="kylin"] {
+  color: var(--vrc-danger);
+  background: var(--vrc-status-danger-soft);
+}
+
+.iso-option-badge[data-family="dvd"],
+.iso-option-badge[data-family="tools"],
+.iso-option-badge[data-family="iso"] {
+  color: var(--vrc-text-muted);
+  background: var(--vrc-surface-muted);
+}
+
+.vrc-provision-iso-dropdown .iso-option-body {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.vrc-provision-iso-dropdown .iso-option-title {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.vrc-provision-iso-dropdown .el-select-dropdown__item.is-selected .iso-option-title {
+  color: var(--vrc-accent);
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.vrc-provision-iso-dropdown .iso-option-mark {
+  color: inherit;
+  background: color-mix(in srgb, var(--vrc-accent) 16%, transparent);
+  border-radius: 2px;
+}
+
+.vrc-provision-iso-dropdown .iso-option-sub {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+  font-weight: 400;
   line-height: 14px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.iso-option-dot {
+  display: inline-block;
+  flex: 0 0 4px;
+  width: 4px;
+  height: 4px;
+  background: var(--vrc-text-subtle);
+  border-radius: 50%;
+}
+
+.iso-option-dot.shared {
+  background: var(--vrc-accent);
+}
+
+.iso-option-dot.dvd {
+  background: var(--vrc-warning);
+}
+
+.vrc-provision-iso-dropdown .iso-option-check {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  color: var(--vrc-accent);
+  opacity: 0;
+}
+
+.vrc-provision-iso-dropdown .iso-option-check svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.2;
+}
+
+.vrc-provision-iso-dropdown .el-select-dropdown__item.is-selected .iso-option-check {
+  opacity: 1;
+}
+
+/* 空态 / 搜索无结果 / 加载中：统一走 el-select 的 empty 插槽。 */
+.vrc-provision-iso-dropdown .iso-dropdown-empty {
+  padding: 18px 12px 20px;
+  color: var(--vrc-text-subtle);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
 }
 
 .provision-actions {
@@ -7401,6 +7670,8 @@ button:focus-visible,
   box-shadow: var(--vrc-terminal-shadow);
 }
 
+/* 内嵌模式：留白统一由这一层提供（上下左右各 10px），
+   卡片与终端都不再贴面板边框；rail 自身归零避免留白二次叠加 */
 .console-dialog.is-console-embedded .console-layout {
   grid-template-columns: 280px minmax(0, 1fr);
   gap: 10px;
@@ -7412,8 +7683,13 @@ button:focus-visible,
   border-radius: 7px;
 }
 
+/* 内嵌模式：外层面板已提供留白，rail 自身归零，
+   卡片宽度吸收掉这层间距，左右边缘与上方任务表格对齐 */
 .console-dialog.is-console-embedded .console-task-rail {
-  padding: 10px;
+  gap: 8px;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
 }
 
 .console-dialog.is-console-embedded .task-rail-head {
@@ -7424,12 +7700,18 @@ button:focus-visible,
   padding: 9px;
 }
 
+/* 任务 ID 是低价值的机器串，弱化为次级；「当前 N/M：VM 名」提为主行 */
 .console-dialog.is-console-embedded .console-task-hero-top strong {
-  font-size: 12px;
-  font-weight: 500;
+  color: var(--vrc-text-subtle);
+  font-size: 11px;
+  font-weight: 400;
 }
 
-.console-dialog.is-console-embedded .console-task-hero-top p,
+.console-dialog.is-console-embedded .console-task-hero-top p {
+  color: var(--vrc-text);
+  font-size: 12px;
+}
+
 .console-dialog.is-console-embedded .console-vm-copy span {
   font-size: 11px;
 }
@@ -7452,7 +7734,19 @@ button:focus-visible,
 
 .console-dialog.is-console-embedded .console-window {
   min-height: 0;
+  border: 0;
   border-radius: 7px;
+  box-shadow: none;
+}
+
+/* 内嵌模式终端画面与窗口边缘之间保留呼吸间距（含放大态），
+   同时把水印内缩同样的距离，避免压到边框上 */
+.console-dialog.is-console-embedded .console-frame {
+  padding: 8px;
+}
+
+.console-dialog.is-console-embedded .console-security-watermark {
+  inset: 16px;
 }
 
 .console-dialog.is-console-expanded .console-layout {
@@ -7512,7 +7806,6 @@ button:focus-visible,
   min-width: 0;
   padding: 10px;
   background: var(--vrc-surface-raised);
-  border: 1px solid var(--vrc-border);
   border-radius: 8px;
 }
 
@@ -7574,7 +7867,6 @@ button:focus-visible,
   padding: 10px 11px;
   color: var(--vrc-accent);
   background: linear-gradient(180deg, color-mix(in srgb, currentColor 7%, var(--vrc-surface)), var(--vrc-surface));
-  border: 1px solid var(--vrc-border);
   border-radius: 8px;
 }
 
@@ -7643,8 +7935,7 @@ button:focus-visible,
   gap: 4px 8px;
   min-width: 0;
   margin: 0;
-  padding: 8px 0 0;
-  border-top: 1px solid color-mix(in srgb, var(--vrc-border) 74%, transparent);
+  padding: 4px 0 0;
 }
 
 .console-task-status-list dt {
@@ -7682,6 +7973,7 @@ button:focus-visible,
 
 .console-vm-tab.active {
   border-color: color-mix(in srgb, var(--vrc-accent) 42%, var(--vrc-border));
+  background: color-mix(in srgb, var(--vrc-accent) 6%, var(--vrc-surface));
   box-shadow: none;
 }
 
@@ -7690,14 +7982,26 @@ button:focus-visible,
   opacity: 0.58;
 }
 
+/* 缩略图占位：迷你终端造型（顶部工具条 + 深色屏 + 淡文本线），真实画面由 .console-vm-preview-frame 覆盖 */
 .console-vm-preview {
   position: relative;
   width: 92px;
   height: 48px;
   overflow: hidden;
-  background: linear-gradient(90deg, var(--vrc-terminal-toolbar) 0 30%, var(--vrc-surface-muted) 30% 100%);
-  border: 1px solid var(--vrc-border);
+  background:
+    repeating-linear-gradient(180deg, color-mix(in srgb, var(--vrc-terminal-text) 10%, transparent) 0 1px, transparent 1px 6px) no-repeat 8px 14px / calc(100% - 16px) calc(100% - 22px),
+    var(--vrc-terminal-surface);
   border-radius: 5px;
+}
+
+.console-vm-preview::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 9px;
+  content: "";
+  background: var(--vrc-terminal-toolbar);
 }
 
 .console-vm-preview::after {
@@ -7706,9 +8010,19 @@ button:focus-visible,
   bottom: 9px;
   left: 36%;
   height: 4px;
+  z-index: 2;
   content: "";
   background: linear-gradient(90deg, var(--vrc-info) var(--mini-progress, 0%), var(--vrc-border-strong) var(--mini-progress, 0%));
   border-radius: 999px;
+}
+
+.console-vm-preview-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
 }
 
 .console-vm-copy {
@@ -11179,7 +11493,8 @@ button:focus-visible,
 
 .maintenance-summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* 自适应列数：卡片数量变化时不会出现"最后一张独占一行、右侧大片空白"的错位。 */
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 8px;
   padding: 10px 16px 14px;
   border-bottom: 1px solid var(--vrc-border);
@@ -11290,6 +11605,24 @@ button:focus-visible,
 
 .maintenance-iso-table.el-table .el-table__body tr:last-child td.el-table__cell {
   border-bottom: 0;
+}
+
+/* 勾选列：表头与表体统一居中，且去掉 .cell 的横向内边距差异，
+   否则表头勾选框与行内勾选框会左右错位。 */
+.maintenance-iso-table.el-table th.el-table__cell.el-table-column--selection,
+.maintenance-iso-table.el-table td.el-table__cell.el-table-column--selection {
+  padding: 0;
+  vertical-align: middle;
+}
+
+.maintenance-iso-table.el-table th.el-table__cell.el-table-column--selection > .cell,
+.maintenance-iso-table.el-table td.el-table__cell.el-table-column--selection > .cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  height: 100%;
+  line-height: 1;
 }
 
 .maintenance-iso-main,
@@ -13279,9 +13612,11 @@ button:focus-visible,
 
 .vm-task-row {
   display: grid;
-  grid-template-columns: 34px minmax(180px, 1.25fr) minmax(130px, 0.78fr) 96px minmax(260px, 1.45fr);
-  gap: 10px;
+  grid-template-columns: 34px minmax(150px, 1.2fr) minmax(120px, 0.72fr) 74px 74px 74px 92px minmax(180px, 1.35fr);
+  gap: 8px;
   align-items: center;
+  /* 规格列增加后保持最小可读宽度，窄屏由 .vm-task-body 横向滚动承接 */
+  min-width: 860px;
   min-height: 42px;
   padding: 0 10px;
   color: var(--vrc-text);
@@ -13317,6 +13652,45 @@ button:focus-visible,
 
 .vm-task-row strong {
   font-weight: 400;
+}
+
+/* 创建过程中名称不可选中，提供显式复制入口 */
+.vm-task-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.vm-task-name > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vm-task-copy {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  color: var(--vrc-text-subtle);
+  font-size: 12px;
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.vm-task-copy:hover {
+  color: var(--vrc-accent);
+  background: var(--vrc-accent-soft);
+}
+
+.vm-task-copy.is-copied {
+  color: var(--vrc-success);
 }
 
 .vm-task-status {
@@ -14732,4 +15106,74 @@ button:focus-visible,
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--vrc-text);
+}
+
+/* ===== 设置 / 维护：ISO 存储库健康检查 ===== */
+.maintenance-iso-name {
+  display: block;
+  overflow: hidden;
+  color: var(--vrc-text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.maintenance-iso-path {
+  display: block;
+  overflow: hidden;
+  color: var(--vrc-text-subtle);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.maintenance-iso-reason {
+  display: block;
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.maintenance-iso-decision {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 20px;
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 20px;
+  white-space: nowrap;
+  border-radius: 4px;
+}
+
+.maintenance-iso-decision.decision-eligible {
+  color: var(--vrc-success);
+  background: var(--vrc-status-success-soft);
+}
+
+.maintenance-iso-decision.decision-orphan {
+  color: var(--vrc-warning);
+  background: var(--vrc-status-warning-soft);
+}
+
+.maintenance-iso-decision.decision-skipped,
+.maintenance-iso-decision.decision-retained {
+  color: var(--vrc-text-subtle);
+  background: var(--vrc-surface-muted);
+}
+
+.maintenance-iso-decision.decision-failed {
+  color: var(--vrc-danger);
+  background: var(--vrc-status-danger-soft, var(--vrc-surface-muted));
+}
+
+.maintenance-iso-stuck {
+  color: var(--vrc-danger);
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.maintenance-iso-table-wrap {
+  margin: 12px 16px 16px;
 }

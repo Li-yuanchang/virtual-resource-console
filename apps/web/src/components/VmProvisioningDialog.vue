@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import type { ITheme } from "@xterm/xterm";
-import { ArrowDown, ArrowUp, Close, Loading, WarningFilled } from "@element-plus/icons-vue";
+import { ArrowDown, ArrowUp, Close, DocumentCopy, Loading, WarningFilled } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import ConsoleDialog from "./ConsoleDialog.vue";
 import VrcOverflowTooltip from "./VrcOverflowTooltip.vue";
@@ -38,7 +38,14 @@ import { validateProvisioningIpPool } from "../domain/ipPoolValidation";
 import { replaceVmNameIpPrefix, vmNamePrefixFromIp as buildVmNamePrefixFromIp } from "../domain/vmNamePrefix";
 import { matchesIsoNamePattern } from "../domain/isoTemplateMatch";
 import { getProviderBrand } from "../domain/providerBrand";
-import { groupIsoImagesBySource, isoSourceLabel, resolveProvisioningStrategy } from "../domain/provisioningStrategies";
+import {
+  filterIsoImages,
+  isoOptionSourceText as isoOptionSourceTextOf,
+  isoSourceDotClass as isoSourceDotClassOf,
+  resolveIsoBadge,
+  splitHighlightSegments,
+} from "../domain/isoImageBadge";
+import { groupIsoImagesBySource, resolveProvisioningStrategy } from "../domain/provisioningStrategies";
 import { secureJsonRequest } from "../domain/secureRequest";
 
 interface StorageTotals {
@@ -181,7 +188,10 @@ const isoImages = ref<IsoImage[]>([]);
 const toolsIsoImage = ref<IsoImage | null>(null);
 /** 用于在面板内点击刷新后让下拉保持展开，避免刷新一次就要重新点开。 */
 const isoSelectRef = ref<{ focus: () => void; blur: () => void } | null>(null);
+const isoSearchRef = ref<HTMLInputElement | null>(null);
 const isoSelectOpen = ref(false);
+/** 弹层内搜索关键字：自行过滤而非使用 el-select 的 filterable，保证分组标题与徽标不被破坏。 */
+const isoSearchKeyword = ref("");
 const loadingProvisioningConfig = ref(false);
 const loadingIsoImages = ref(false);
 const loadingIpLeases = ref(false);
@@ -273,7 +283,9 @@ const templateIsoMismatchMessage = computed(() => {
   if (provisioningForm.sourceType !== "iso" || !template?.isoNamePattern || !image) return "";
   return matchesIsoNamePattern(image, template.isoNamePattern) ? "" : `系统环境与镜像不匹配：${template.name} 需要 ${template.isoNamePattern}`;
 });
-const isoOptionGroups = computed(() => groupIsoImagesBySource(isoImages.value));
+/** 按弹层内搜索词过滤后再分组；分组标题右侧的数量即过滤后的数量。 */
+const isoFilteredImages = computed(() => filterIsoImages(isoImages.value, isoSearchKeyword.value).images);
+const isoOptionGroups = computed(() => groupIsoImagesBySource(isoFilteredImages.value));
 const selectedToolsIsoImage = computed(() => toolsIsoImage.value);
 const provisioningAccountPolicy = computed(() =>
   provisioningStrategy.value.accountPolicy({
@@ -792,27 +804,35 @@ function refreshIsoImages() {
   });
 }
 
-/** 下拉面板标题：镜像为空时也要给出可读说明，避免用户误以为没有刷新入口。 */
-const isoDropdownHeaderLabel = computed(() => {
-  const count = isoImages.value.length;
-  if (loadingIsoImages.value) return "正在读取镜像资源";
-  return count ? `系统镜像 · ${count} 个` : "当前平台未读到 ISO";
-});
-
+/** 弹层每次收起时清空搜索词，避免下次展开看到一个意外的过滤结果。 */
 function handleIsoSelectVisibleChange(open: boolean) {
   isoSelectOpen.value = open;
-  if (!open || provisioningForm.sourceType !== "iso") return;
+  if (!open) {
+    isoSearchKeyword.value = "";
+    return;
+  }
+  if (provisioningForm.sourceType !== "iso") return;
   if (!isoImages.value.length && !loadingIsoImages.value) {
     void loadIsoImages(dialogSessionId, { forceRefresh: true });
   }
+  // 展开后把焦点交给搜索框，用户直接输入即可过滤。
+  requestAnimationFrame(() => isoSearchRef.value?.focus({ preventScroll: true }));
 }
 
-function isoOptionDescription(image: IsoImage) {
-  if (image.sourceType === "host-dvd") {
-    const deviceName = typeof image.metadata?.deviceName === "string" ? image.metadata.deviceName.trim() : "";
-    return `${deviceName || "物理光驱"} · ${formatBytes(image.sizeBytes ?? 0)}`;
-  }
-  return `${image.storageRepository || isoSourceLabel(image)} · ${formatBytes(image.sizeBytes ?? 0)}`;
+function isoBadgeOf(image: IsoImage) {
+  return resolveIsoBadge(image);
+}
+
+function isoSourceDotClass(image: IsoImage) {
+  return isoSourceDotClassOf(image);
+}
+
+function isoOptionSourceText(image: IsoImage) {
+  return isoOptionSourceTextOf(image);
+}
+
+function isoHighlightSegments(name: string) {
+  return splitHighlightSegments(name, isoSearchKeyword.value);
 }
 
 async function loadIpLeases(sessionId = dialogSessionId) {
@@ -855,7 +875,10 @@ watch(
   () => {
     if (!props.visible) return;
     applyEnvironmentTemplate();
-    scheduleIpProbe();
+    // 不在这里触发 IP 探测：切换 ISO 时 syncEnvironmentTemplateToIso() 会隐式改写
+    // environmentTemplateId，若在此探测，每换一次镜像就重跑一遍 ping。
+    // 模板本身不改变候选 IP 集合，真正需要重探测的是 IP 池、占用/租约和自定义 IP，
+    // 它们各自有独立的 watch 负责调度。
   },
 );
 
@@ -1159,7 +1182,11 @@ function setVmDraftText(index: number, field: "name" | "ip" | "rootPassword" | "
   setVmDraftOverride(index, field, String(value));
   if (field === "ip") {
     const name = vmDraftOverrides[index]?.name?.trim();
-    if (!name) setVmDraftOverride(index, "name", defaultVmNameForIp(String(value), index));
+    // 只有 IP 有效时才补默认名，避免输入过程中用半截 IP 生成一个还会变的临时名称。
+    if (!name && String(value).trim()) {
+      const nextName = defaultVmNameForIp(String(value).trim(), index);
+      if (nextName) setVmDraftOverride(index, "name", nextName);
+    }
     provisioningForm.preferredIp = String(value);
   }
 }
@@ -1228,6 +1255,21 @@ function provisionVmProgressText(vm: ProvisionTaskVm) {
   return vm.message || progressStepText(vm.status === "failed" ? "failed" : vm.status === "warning" ? "warning" : vm.status === "success" ? "success" : vm.status === "running" ? "running" : "pending");
 }
 
+// 创建过程中表单已锁定，名称无法从输入框选中复制，这里提供一键复制。
+const copiedVmName = ref("");
+let copiedVmNameTimer = 0;
+
+async function copyVmName(name: string) {
+  try {
+    await navigator.clipboard.writeText(name);
+    copiedVmName.value = name;
+  } catch {
+    copiedVmName.value = "";
+  }
+  window.clearTimeout(copiedVmNameTimer);
+  copiedVmNameTimer = window.setTimeout(() => { copiedVmName.value = ""; }, 1400);
+}
+
 function provisionPlanItemStatusText(item: ProvisioningPlanItem) {
   if (!item.ip) return "待分配";
   const status = ipProbeResults.value[item.ip]?.status;
@@ -1276,8 +1318,10 @@ function submitProvisioning() {
     // 默认勾选绑定堡垒机；取消时不传，服务端按"未开启"处理，%post 不写 sshd 限制。
     bastionAccessEnabled: provisioningForm.bastionAccessEnabled,
     bastionAllowFrom: provisioningForm.bastionAccessEnabled ? bastionAllowFrom.value : undefined,
-    planItems: plan.items.map((item) => ({
-      name: item.name,
+    planItems: plan.items.map((item, index) => ({
+      // 名称为空只出现在 IP 尚未确定的阶段（该阶段本身被阻断），
+      // 这里兜底一次，保证任何情况下都不会把空名称发给后端。
+      name: item.name?.trim() || defaultVmNameForIp(item.ip, index),
       ip: item.ip,
       loginUsername: item.loginUsername,
       rootPassword: item.rootPassword,
@@ -1513,7 +1557,11 @@ function defaultVmNameForIp(ip: string, index: number) {
 
 function resolveVmNameForAssignedIp(name: string | undefined, ip: string, index: number) {
   const currentName = name?.trim();
-  if (!currentName) return defaultVmNameForIp(ip, index);
+  if (!currentName) {
+    // IP 未确定时名称保持留空：此时生成 vm-01 之类的临时名会在 IP 分配后跳变成 IP 前缀，
+    // 用户看到名称反复变化反而更难判断，留空直到 IP 确定再一次性给出最终名称。
+    return ip ? defaultVmNameForIp(ip, index) : "";
+  }
   const assignedPrefix = vmNamePrefixFromIp(ip);
   if (!assignedPrefix) return currentName;
   const synchronizedName = replaceVmNameIpPrefix(currentName, assignedPrefix);
@@ -1708,7 +1756,6 @@ type ProvisioningSourceType = "iso" | "template";
                 ref="isoSelectRef"
                 v-model="provisioningForm.isoId"
                 placeholder="选择 ISO"
-                filterable
                 :loading="loadingIsoImages"
                 :disabled="provisioningFormLocked"
                 popper-class="vrc-provision-select-dropdown vrc-provision-iso-dropdown"
@@ -1716,13 +1763,29 @@ type ProvisioningSourceType = "iso" | "template";
                 :offset="0"
                 :show-arrow="false"
                 :fallback-placements="['bottom-start', 'top-start']"
-                loading-text="正在读取镜像资源"
-                no-data-text="当前平台未读到 ISO"
                 @visible-change="handleIsoSelectVisibleChange"
               >
+                <!-- 头部 = 「搜索 + 刷新」，固定在弹层顶部。
+                     必须放在面板内：分组为空时列表没有任何行，仍需保留刷新入口。 -->
                 <template #header>
-                  <div class="iso-dropdown-header">
-                    <span class="iso-dropdown-header-label">{{ isoDropdownHeaderLabel }}</span>
+                  <div class="iso-dropdown-tools">
+                    <label class="iso-dropdown-search">
+                      <svg class="iso-search-icon" viewBox="0 0 14 14" aria-hidden="true">
+                        <circle cx="6.2" cy="6.2" r="3.9" />
+                        <path d="m9.2 9.2 2.8 2.8" />
+                      </svg>
+                      <input
+                        ref="isoSearchRef"
+                        v-model="isoSearchKeyword"
+                        type="text"
+                        placeholder="搜索 ISO 名称、存储库"
+                        autocomplete="off"
+                        aria-label="搜索系统镜像"
+                        :disabled="!isoImages.length"
+                        @keydown.stop
+                        @mousedown.stop
+                      />
+                    </label>
                     <button
                       type="button"
                       class="iso-refresh-button"
@@ -1736,12 +1799,35 @@ type ProvisioningSourceType = "iso" | "template";
                     </button>
                   </div>
                 </template>
-                <el-option-group v-for="group in isoOptionGroups" :key="group.label" :label="group.label">
+                <el-option-group v-for="group in isoOptionGroups" :key="group.label" :label="`${group.label} · ${group.options.length}`">
                   <el-option v-for="image in group.options" :key="image.id" :label="image.name" :value="image.id">
-                    <span class="option-title">{{ image.name }}</span>
-                    <small class="option-subtitle">{{ isoOptionDescription(image) }}</small>
+                    <span class="iso-option-badge" :data-family="isoBadgeOf(image).family">{{ isoBadgeOf(image).text }}</span>
+                    <span class="iso-option-body">
+                      <span class="iso-option-title">
+                        <template v-for="(segment, index) in isoHighlightSegments(image.name)" :key="index">
+                          <mark v-if="segment.matched" class="iso-option-mark">{{ segment.text }}</mark>
+                          <template v-else>{{ segment.text }}</template>
+                        </template>
+                      </span>
+                      <small class="iso-option-sub">
+                        <i class="iso-option-dot" :class="isoSourceDotClass(image)"></i>
+                        {{ isoOptionSourceText(image) }} · {{ formatBytes(image.sizeBytes ?? 0) }}
+                      </small>
+                    </span>
+                    <span class="iso-option-check" aria-hidden="true">
+                      <svg viewBox="0 0 12 12">
+                        <path d="m2.4 6.4 2.4 2.4 4.8-5.2" />
+                      </svg>
+                    </span>
                   </el-option>
                 </el-option-group>
+                <template #empty>
+                  <div class="iso-dropdown-empty">
+                    <template v-if="loadingIsoImages">正在读取镜像资源…</template>
+                    <template v-else-if="!isoImages.length">当前平台未读到 ISO</template>
+                    <template v-else>没有匹配「{{ isoSearchKeyword }}」的镜像</template>
+                  </div>
+                </template>
               </el-select>
             </label>
             <label v-else class="form-field iso-field">
@@ -1926,14 +2012,25 @@ type ProvisioningSourceType = "iso" | "template";
               <span>序号</span>
               <span>名称</span>
               <span>IP</span>
+              <span>CPU</span>
+              <span>内存</span>
+              <span>磁盘</span>
               <span>状态</span>
               <span>当前进度</span>
             </div>
             <div class="vm-task-body vrc-scroll-container">
               <div v-for="(vm, index) in provisionTask?.vms ?? []" :key="`${vm.name}:${vm.ip ?? index}`" class="vm-task-row">
                 <span class="vm-draft-index">{{ index + 1 }}</span>
-                <strong>{{ vm.name }}</strong>
+                <span class="vm-task-name">
+                  <strong>{{ vm.name }}</strong>
+                  <button type="button" class="vm-task-copy" :class="{ 'is-copied': copiedVmName === vm.name }" :title="copiedVmName === vm.name ? '已复制' : `复制名称 ${vm.name}`" :aria-label="copiedVmName === vm.name ? '已复制' : `复制名称 ${vm.name}`" @click="copyVmName(vm.name)">
+                    <el-icon><DocumentCopy /></el-icon>
+                  </button>
+                </span>
                 <span>{{ vm.ip || "-" }}</span>
+                <span>{{ vm.cpu != null ? `${vm.cpu} vCPU` : "-" }}</span>
+                <span>{{ vm.memoryGiB != null ? `${vm.memoryGiB} GiB` : "-" }}</span>
+                <span>{{ vm.diskGiB != null ? `${vm.diskGiB} GiB` : "-" }}</span>
                 <span class="vm-task-status vm-state-inline" :class="vmTaskStatusClass(vm.status)">
                   <template v-if="vm.status === 'running'">
                     <span class="vm-action-stage-copy">{{ provisionVmStatusText(vm.status) }}</span>
@@ -2003,7 +2100,7 @@ type ProvisioningSourceType = "iso" | "template";
                 @click="setActiveDraftIndex(index)"
               >
                 <span class="vm-draft-index">{{ index + 1 }}</span>
-                <el-input class="vm-plan-inline-input" :model-value="item.name" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftText(index, 'name', $event)" />
+                <el-input class="vm-plan-inline-input" :model-value="item.name" placeholder="选择 IP 后生成" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftText(index, 'name', $event)" />
                 <el-input class="vm-plan-inline-input" :model-value="item.ip" placeholder="待分配" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftText(index, 'ip', $event)" />
                 <el-input-number class="vm-plan-inline-number" :model-value="item.cpu" :min="1" :max="256" controls-position="right" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftNumber(index, 'cpu', $event)" />
                 <el-input-number class="vm-plan-inline-number" :model-value="item.memoryGiB" :min="1" :max="2048" controls-position="right" :disabled="provisioningFormLocked" @focus="setActiveDraftIndex(index)" @update:model-value="setVmDraftNumber(index, 'memoryGiB', $event)" />
