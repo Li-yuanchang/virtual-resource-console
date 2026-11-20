@@ -7,7 +7,9 @@ import {
   isGuestAuthenticationError,
   isGuestAgentUnavailableError,
   linkGuestStorageToPlatformDisks,
+  normalizeResizeTargetPlan,
   preflightGuestStorageResize,
+  type GuestResizeTargetPlan,
   type GuestStorageAccess,
 } from "./guestStorage.js";
 import type { VirtualizationProvider } from "./providers/provider.js";
@@ -87,6 +89,17 @@ export async function executeVmResize(input: ExecuteVmResizeInput): Promise<VmRe
   if (!provider.resizeVm) throw new Error("当前平台暂未启用虚拟机扩容。");
   if (request.disk && !request.storageTarget) throw new VmResizeValidationError("磁盘扩容必须选择最终生效目录。");
   if (!request.disk && request.storageTarget) throw new VmResizeValidationError("生效目录必须与磁盘扩容同时提交。");
+  let targetPlan: GuestResizeTargetPlan[] = [];
+  if (request.disk && request.storageTarget) {
+    try {
+      targetPlan = normalizeResizeTargetPlan(request.storageTarget);
+    } catch (error) {
+      throw new VmResizeValidationError(error instanceof Error ? error.message : String(error));
+    }
+    if (request.disk.mode === "add" && targetPlan.length > 1) {
+      throw new VmResizeValidationError("新增磁盘只能挂载到一个目录。");
+    }
+  }
 
   let storageContext: Awaited<ReturnType<typeof resolveStorageContext>> | undefined;
   let storagePreflight: Awaited<ReturnType<typeof preflightGuestStorageResize>> | undefined;

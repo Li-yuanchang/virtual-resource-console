@@ -85,6 +85,10 @@ export function createProvisionTask(input: CreateProvisionTaskInput): ProvisionT
       ip: item.ip,
       status: "pending",
       currentStep: "plan",
+      // 任务执行期间表单会锁定，规格需要随任务一起保留，避免用户看不到自己在建什么。
+      cpu: item.cpu,
+      memoryGiB: item.memoryGiB,
+      diskGiB: item.diskGiB,
       message: "等待创建",
     })),
   });
@@ -149,14 +153,36 @@ export function markProvisionTaskStepIfUnfinished(
   return markProvisionTaskStep(taskId, stepKey, status, message);
 }
 
+/**
+ * 批量更新任务内的 VM 记录。
+ *
+ * 调用方（如 provisioningVerifier）通常只重建自己关心的进度字段，
+ * 不会重复提供创建时提交的规格等静态字段。这里按名称与已有记录合并，
+ * 避免整体替换把 cpu/memoryGiB/diskGiB 等字段冲掉，导致界面只剩 "-"。
+ */
 export function updateProvisionTaskVms(taskId: string, vms: ProvisionTaskVm[], message?: string): ProvisionTask | undefined {
   const now = new Date().toISOString();
   return patchProvisionTask(taskId, (task) => ({
     ...task,
-    vms,
+    vms: mergeProvisionTaskVms(task.vms, vms),
     message: message || task.message,
     updatedAt: now,
   }));
+}
+
+/** 按 VM 名称合并新旧记录：新值优先，调用方未提供的字段沿用旧值。 */
+export function mergeProvisionTaskVms(previousVms: ProvisionTaskVm[], nextVms: ProvisionTaskVm[]): ProvisionTaskVm[] {
+  const previousByName = new Map(previousVms.map((vm) => [vm.name, vm]));
+  return nextVms.map((vm) => {
+    const previous = previousByName.get(vm.name);
+    if (!previous) return vm;
+    const merged: Record<string, unknown> = { ...previous };
+    // 显式写入新值；undefined 表示调用方未提供该字段，保留旧值而非抹掉。
+    for (const [key, value] of Object.entries(vm)) {
+      if (value !== undefined) merged[key] = value;
+    }
+    return merged as unknown as ProvisionTaskVm;
+  });
 }
 
 export function updateProvisionTaskVm(taskId: string, vmName: string, patch: Partial<ProvisionTaskVm>, message?: string): ProvisionTask | undefined {

@@ -5,9 +5,11 @@ import {
   buildGuestAuthenticationInventory,
   buildGuestExecutionUnavailableInventory,
   buildExtendFilesystemCommand,
+  distributeResizeGrowth,
   isGuestAuthenticationError,
   isGuestAgentUnavailableError,
   linkGuestStorageToPlatformDisks,
+  normalizeResizeTargetPlan,
   parseGuestStorageInventory,
   resolveGuestStorageTransport,
 } from "../src/guestStorage.js";
@@ -90,6 +92,67 @@ test("builds separate commands for extending an LVM mount and formatting a new d
   assert.match(addCommand, /mkfs\.xfs -f "\$partition"/);
   assert.match(addCommand, /UUID=\$uuid/);
   assert.match(addCommand, /mount "\$mount_path"/);
+});
+
+test("normalizes single and multi directory resize targets", () => {
+  assert.deepEqual(normalizeResizeTargetPlan({ mountPath: "/home" }), [{ mountPath: "/home", weight: 1 }]);
+  assert.deepEqual(
+    normalizeResizeTargetPlan({ mountPaths: [{ mountPath: "/" }, { mountPath: "/home", weight: 3 }] }),
+    [{ mountPath: "/", weight: 0 }, { mountPath: "/home", weight: 3 }],
+  );
+  assert.deepEqual(
+    normalizeResizeTargetPlan({ mountPaths: [{ mountPath: "/" }, { mountPath: "/home" }] }),
+    [{ mountPath: "/", weight: 1 }, { mountPath: "/home", weight: 1 }],
+  );
+  // 重复目录只保留第一次出现的条目，后续同名权重被忽略
+  assert.deepEqual(
+    normalizeResizeTargetPlan({ mountPaths: [{ mountPath: "/" }, { mountPath: "/", weight: 2 }] }),
+    [{ mountPath: "/", weight: 1 }],
+  );
+  assert.throws(() => normalizeResizeTargetPlan({}), /至少一个最终生效目录/);
+});
+
+test("splits new capacity across directories without losing bytes", () => {
+  const total = 250 * 1024 ** 3;
+  const shares = distributeResizeGrowth([
+    { mountPath: "/", weight: 23 },
+    { mountPath: "/home", weight: 76 },
+  ], total);
+
+  assert.equal(shares.length, 2);
+  assert.equal(shares.reduce((sum, item) => sum + item.bytes, 0), total);
+  assert.ok(shares[1].bytes > shares[0].bytes);
+
+  const even = distributeResizeGrowth([{ mountPath: "/", weight: 1 }, { mountPath: "/home", weight: 1 }], 101);
+  assert.deepEqual(even.map((item) => item.bytes), [50, 51]);
+});
+
+test("maps per-directory GiB increments to the same split", () => {
+  // 前端把目录卡片里填写的 GiB 增量直接作为 weight 提交，拆分结果必须与填写值一致。
+  const total = 60 * 1024 ** 3;
+  const plan = normalizeResizeTargetPlan({
+    mountPaths: [
+      { mountPath: "/", weight: 40 },
+      { mountPath: "/home", weight: 20 },
+    ],
+  });
+  const shares = distributeResizeGrowth(plan, total);
+
+  assert.deepEqual(shares.map((item) => Math.round(item.bytes / 1024 ** 3)), [40, 20]);
+  // weight 表示 GiB 相对值，超过 100 仍应是合法输入。
+  assert.deepEqual(normalizeResizeTargetPlan({ mountPaths: [{ mountPath: "/", weight: 512 }] }), [{ mountPath: "/", weight: 512 }]);
+});
+
+test("guards shared volume group free space only for follow-up directories", () => {
+  const inventory = parseGuestStorageInventory("192.168.129.21", centosStorageOutput);
+  const plain = buildExtendFilesystemCommand(inventory.mounts[1], 10 * 1024 ** 3);
+  const guarded = buildExtendFilesystemCommand(inventory.mounts[1], 10 * 1024 ** 3, { requireFreeSpace: true });
+
+  assert.doesNotMatch(plain, /卷组 \$vg_name 剩余空闲/);
+  assert.match(guarded, /vgs --noheadings --units b --nosuffix -o vg_free/);
+  assert.match(guarded, /exit 50/);
+  // 空闲校验必须出现在 lvextend 之前，避免普通 lvextend 直接失败。
+  assert.ok(guarded.indexOf("exit 50") < guarded.indexOf("lvextend -L"));
 });
 
 test("classifies Guest authentication failures without masking unrelated SSH errors", () => {

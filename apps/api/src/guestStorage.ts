@@ -9,6 +9,7 @@ import type {
   VmResizeDiskRequest,
   VmResizeStorageResult,
   VmResizeStorageTarget,
+  VmResizeStorageTargetResult,
   XenConnectionInput,
 } from "./types.js";
 
@@ -74,6 +75,7 @@ interface PhysicalVolumeRow {
 export interface GuestStoragePreflight {
   inventory: GuestStorageInventory;
   mount?: GuestStorageMount;
+  mounts?: GuestStorageMount[];
   platformDisk?: VmDisk;
 }
 
@@ -188,6 +190,42 @@ export function linkGuestStorageToPlatformDisks(
   return { ...inventory, mounts: linkedMounts };
 }
 
+export interface GuestResizeTargetPlan {
+  mountPath: string;
+  /** 相对分配权重，用于把本次新增容量拆给多个目录。 */
+  weight: number;
+}
+
+/**
+ * Normalizes a resize storage target into an ordered, de-duplicated target plan.
+ * Supports both the legacy single `mountPath` and the multi-directory `mountPaths` contract.
+ */
+export function normalizeResizeTargetPlan(target: VmResizeStorageTarget): GuestResizeTargetPlan[] {
+  const requested = target.mountPaths?.length
+    ? target.mountPaths
+    : target.mountPath
+      ? [{ mountPath: target.mountPath }]
+      : [];
+  const seen = new Set<string>();
+  const plan: GuestResizeTargetPlan[] = [];
+  for (const item of requested) {
+    const mountPath = normalizeMountPath(item.mountPath ?? "");
+    if (!mountPath.startsWith("/") || seen.has(mountPath)) continue;
+    seen.add(mountPath);
+    plan.push({ mountPath, weight: Math.max(0, item.weight ?? 0) });
+  }
+  if (!plan.length) throw new Error("磁盘扩容必须选择至少一个最终生效目录。");
+  const explicit = plan.filter((item) => item.weight > 0).length;
+  if (explicit === 0) {
+    return plan.map((item) => ({ ...item, weight: 1 }));
+  }
+  return plan.map((item) => ({ ...item, weight: item.weight > 0 ? item.weight : 0 }));
+}
+
+export function describeResizeTargetPlan(plan: GuestResizeTargetPlan[]): string {
+  return plan.map((item) => item.mountPath).join("、");
+}
+
 export async function preflightGuestStorageResize(
   access: GuestStorageAccess,
   disk: VmResizeDiskRequest,
@@ -199,20 +237,45 @@ export async function preflightGuestStorageResize(
   if (disk.mode === "extend") {
     const platformDisk = platformDisks.find((item) => item.id === disk.diskId || item.providerId === disk.diskId);
     if (!platformDisk) throw new Error("扩展原盘失败：目标磁盘不属于当前虚拟机。");
-    const mount = inventory.mounts.find(
-      (item) =>
-        item.mountPath === normalizeMountPath(target.mountPath) &&
-        item.platformDiskId === disk.diskId,
-    );
-    if (!mount) throw new Error("所选目录与目标虚拟磁盘不匹配，请刷新系统存储信息后重新选择。");
-    await runGuestCommand(access, buildGuestToolPreflightCommand("extend", mount), guestCommandTimeoutMs);
-    return { inventory, mount, platformDisk };
+    const plan = normalizeResizeTargetPlan(target);
+    const mounts = plan.map((item) => {
+      const mount = inventory.mounts.find(
+        (candidate) => candidate.mountPath === item.mountPath && candidate.platformDiskId === disk.diskId,
+      );
+      if (!mount) {
+        throw new Error(`目录 ${item.mountPath} 与目标虚拟磁盘不匹配，请刷新系统存储信息后重新选择。`);
+      }
+      return mount;
+    });
+    await runGuestCommand(access, buildGuestToolPreflightCommand("extend", mounts), guestCommandTimeoutMs);
+    await assertExtendTargetsIndependentlyExtendable(access, mounts);
+    return { inventory, mount: mounts[0], mounts, platformDisk };
   }
-  const mountPath = normalizeMountPath(target.mountPath);
+  const plan = normalizeResizeTargetPlan(target);
+  if (plan.length > 1) throw new Error("新增磁盘只能挂载到一个目录。");
+  const mountPath = plan[0].mountPath;
   assertSafeNewMountPath(mountPath);
   await runGuestCommand(access, buildMountPathPreflightCommand(mountPath), guestCommandTimeoutMs);
   await runGuestCommand(access, buildGuestToolPreflightCommand("add"), guestCommandTimeoutMs);
   return { inventory };
+}
+
+/**
+ * Rejects multi-directory plans whose targets could not be extended one by one.
+ * A target without its own LVM volume or partition cannot absorb an isolated increment.
+ */
+async function assertExtendTargetsIndependentlyExtendable(access: GuestStorageAccess, mounts: GuestStorageMount[]): Promise<void> {
+  if (mounts.length <= 1) return;
+  const names = new Set<string>();
+  for (const mount of mounts) {
+    const key = mount.logicalVolume ? mount.source : mount.guestPartitionPath || mount.source;
+    const descriptor = mount.logicalVolume ? `LVM 逻辑卷 ${mount.source}` : mount.guestPartitionPath ? `分区 ${mount.guestPartitionPath}` : `块设备 ${mount.source}`;
+    if (names.has(key)) throw new Error(`目录 ${mount.mountPath} 与其它目录共用 ${descriptor}，无法分别分配容量。`);
+    names.add(key);
+    if (!mount.logicalVolume && mounts.length > 1) {
+      throw new Error(`目录 ${mount.mountPath} 不是独立 LVM 逻辑卷，暂不支持与其它目录一起扩容；请单独扩容该目录。`);
+    }
+  }
 }
 
 export async function applyGuestStorageResize(input: {
@@ -223,39 +286,95 @@ export async function applyGuestStorageResize(input: {
   preflight: GuestStoragePreflight;
 }): Promise<VmResizeStorageResult> {
   const { access, disk, target, restartAfterResize, preflight } = input;
-  const mountPath = normalizeMountPath(target.mountPath);
+  let plan: GuestResizeTargetPlan[];
+  try {
+    plan = normalizeResizeTargetPlan(target);
+  } catch (error) {
+    return {
+      status: "failed",
+      mountPath: "",
+      message: `虚拟硬件已扩容，但系统内容量自动生效失败：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  const mountPath = plan[0].mountPath;
   try {
     await waitForGuestStorage(access);
     if (disk.mode === "extend") {
-      if (!preflight.mount) throw new Error("扩展原盘缺少系统挂载信息。");
+      const mounts = preflight.mounts?.length ? preflight.mounts : preflight.mount ? [preflight.mount] : [];
+      if (!mounts.length) throw new Error("扩展原盘缺少系统挂载信息。");
       if (!preflight.platformDisk) throw new Error("扩展原盘缺少平台磁盘信息。");
-      await waitForGuestDiskSize(access, preflight.mount.guestDiskPath, disk.sizeBytes);
+      await waitForGuestDiskSize(access, mounts[0].guestDiskPath, disk.sizeBytes);
       const platformIncreaseBytes = Math.max(0, disk.sizeBytes - preflight.platformDisk.virtualSizeBytes);
-      const guestIncreaseBytes = platformIncreaseBytes + preflight.mount.pendingCapacityBytes;
+      const guestIncreaseBytes = platformIncreaseBytes + mounts[0].pendingCapacityBytes;
       if (guestIncreaseBytes <= diskSizeToleranceBytes) {
-        throw new Error(`虚拟机操作系统未发现可分配到 ${mountPath} 的新增容量。`);
+        throw new Error(`虚拟机操作系统未发现可分配到 ${describeResizeTargetPlan(plan)} 的新增容量。`);
       }
-      await extendGuestFilesystem(access, preflight.mount, guestIncreaseBytes, restartAfterResize);
-    } else {
-      const inventoryAfter = await rescanAndInspectGuestStorage(access, preflight.inventory.disks.length + 1);
-      const newDisk = resolveNewGuestDisk(preflight.inventory, inventoryAfter, disk.sizeBytes);
-      if (!newDisk) throw new Error("虚拟机操作系统未识别到本次新增的虚拟磁盘。");
-      await runGuestCommand(access, buildAddFilesystemCommand(newDisk.path, mountPath), guestCommandTimeoutMs);
+      const shares = distributeResizeGrowth(plan, guestIncreaseBytes);
+      const targets: VmResizeStorageTargetResult[] = [];
+      let failures = 0;
+      for (const [index, mount] of mounts.entries()) {
+        const share = shares[index] ?? { mountPath: mount.mountPath, bytes: 0 };
+        // 后续目录与首个目录共用 VG 时，先扩的目录可能已经占掉空闲空间。
+        const requireFreeSpace = mounts.length > 1 && index > 0;
+        try {
+          await extendGuestFilesystem(access, mount, share.bytes, restartAfterResize, { requireFreeSpace });
+          targets.push({ mountPath: mount.mountPath, status: "completed", message: "扩容命令已执行" });
+        } catch (error) {
+          failures += 1;
+          targets.push({
+            mountPath: mount.mountPath,
+            status: "failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      const verified = await inspectGuestStorage(access);
+      const results = targets.map((item, index) => {
+        const current = verified.mounts.find((entry) => entry.mountPath === item.mountPath);
+        if (!current) {
+          failures += item.status === "failed" ? 0 : 1;
+          return { ...item, status: "failed" as const, message: `操作系统回读未发现挂载目录 ${item.mountPath}。` };
+        }
+        const previousSizeBytes = mounts[index]?.sizeBytes;
+        if (item.status === "failed") {
+          return { ...item, sizeBytes: current.sizeBytes, previousSizeBytes };
+        }
+        const expectedBytes = shares[index]?.bytes ?? 0;
+        const expectedMinimumBytes = (previousSizeBytes ?? current.sizeBytes)
+          + Math.max(0, expectedBytes - filesystemSizeToleranceBytes);
+        if (current.sizeBytes < expectedMinimumBytes) {
+          failures += 1;
+          return {
+            ...item,
+            status: "failed" as const,
+            sizeBytes: current.sizeBytes,
+            previousSizeBytes,
+            message: `容量回读未达目标：当前 ${formatGiB(current.sizeBytes)} GiB，预期至少 ${formatGiB(expectedMinimumBytes)} GiB。`,
+          };
+        }
+        return { ...item, sizeBytes: current.sizeBytes, previousSizeBytes, message: "系统内容量已生效" };
+      });
+      const first = results[0];
+      return {
+        status: failures === 0 ? "completed" : failures === results.length ? "failed" : "partial",
+        mountPath: first.mountPath,
+        sizeBytes: first.sizeBytes,
+        targets: results,
+        message: failures === 0
+          ? `系统内容量已生效：${describeResizeTargetPlan(plan)}`
+          : `系统内容量部分生效（${results.length - failures}/${results.length}）：${results
+              .map((item) => `${item.mountPath}${item.status === "completed" ? "成功" : `失败（${item.message}）`}`)
+              .join("；")}`,
+      };
     }
+    const inventoryAfter = await rescanAndInspectGuestStorage(access, preflight.inventory.disks.length + 1);
+    const newDisk = resolveNewGuestDisk(preflight.inventory, inventoryAfter, disk.sizeBytes);
+    if (!newDisk) throw new Error("虚拟机操作系统未识别到本次新增的虚拟磁盘。");
+    await runGuestCommand(access, buildAddFilesystemCommand(newDisk.path, mountPath), guestCommandTimeoutMs);
     const verified = await inspectGuestStorage(access);
     const mount = verified.mounts.find((item) => item.mountPath === mountPath);
     if (!mount) throw new Error(`操作系统回读未发现挂载目录 ${mountPath}。`);
-    if (disk.mode === "extend" && preflight.mount && preflight.platformDisk) {
-      const platformIncreaseBytes = Math.max(0, disk.sizeBytes - preflight.platformDisk.virtualSizeBytes);
-      const expectedIncreaseBytes = platformIncreaseBytes + preflight.mount.pendingCapacityBytes;
-      const expectedMinimumBytes = preflight.mount.sizeBytes + Math.max(0, expectedIncreaseBytes - filesystemSizeToleranceBytes);
-      if (mount.sizeBytes < expectedMinimumBytes) {
-        throw new Error(
-          `操作系统容量回读未达目标：${mountPath} 当前 ${formatGiB(mount.sizeBytes)} GiB，预期至少 ${formatGiB(expectedMinimumBytes)} GiB。`,
-        );
-      }
-    }
-    if (disk.mode === "add" && mount.sizeBytes < disk.sizeBytes - filesystemSizeToleranceBytes) {
+    if (mount.sizeBytes < disk.sizeBytes - filesystemSizeToleranceBytes) {
       throw new Error(
         `新磁盘容量回读未达目标：${mountPath} 当前 ${formatGiB(mount.sizeBytes)} GiB，虚拟磁盘 ${formatGiB(disk.sizeBytes)} GiB。`,
       );
@@ -264,6 +383,7 @@ export async function applyGuestStorageResize(input: {
       status: "completed",
       mountPath,
       sizeBytes: mount.sizeBytes,
+      targets: [{ mountPath, status: "completed", sizeBytes: mount.sizeBytes, message: "系统内容量已生效" }],
       message: `系统内容量已生效：${mountPath}`,
     };
   } catch (error) {
@@ -273,6 +393,36 @@ export async function applyGuestStorageResize(input: {
       message: `虚拟硬件已扩容，但系统内容量自动生效失败：${error instanceof Error ? error.message : String(error)}`,
     };
   }
+}
+
+/**
+ * Splits the new capacity across target directories by relative weight.
+ * Unweighted plans share the increment evenly; the remainder always lands on the last target
+ * so the sum never exceeds the measured increment.
+ */
+export function distributeResizeGrowth(
+  plan: GuestResizeTargetPlan[],
+  totalBytes: number,
+): Array<{ mountPath: string; bytes: number }> {
+  const total = Math.max(0, Math.floor(totalBytes));
+  const weights = plan.map((item) => Math.max(0, item.weight));
+  const weightSum = weights.reduce((sum, item) => sum + item, 0);
+  if (!plan.length) return [];
+  if (weightSum <= 0) {
+    const base = Math.floor(total / plan.length);
+    return plan.map((item, index) => ({
+      mountPath: item.mountPath,
+      bytes: index === plan.length - 1 ? total - base * (plan.length - 1) : base,
+    }));
+  }
+  const result = plan.map((item, index) => ({
+    mountPath: item.mountPath,
+    bytes: Math.floor((total * weights[index]) / weightSum),
+  }));
+  const allocated = result.reduce((sum, item) => sum + item.bytes, 0);
+  const last = result[result.length - 1];
+  if (last) last.bytes += total - allocated;
+  return result;
 }
 
 function splitSections(output: string): { lsblk: string[]; starts: string[]; df: string[]; pvs: string[]; directories: string[] } {
@@ -447,17 +597,20 @@ fi
 `;
 }
 
-function buildGuestToolPreflightCommand(mode: "extend" | "add", mount?: GuestStorageMount): string {
+function buildGuestToolPreflightCommand(mode: "extend" | "add", mount?: GuestStorageMount | GuestStorageMount[]): string {
+  const mounts = Array.isArray(mount) ? mount : mount ? [mount] : [];
   const required = mode === "add"
     ? ["lsblk", "parted", "partprobe", "mkfs.xfs", "blkid", "mount"]
     : [
         "lsblk",
         "partprobe",
-        ...(mount?.logicalVolume ? ["pvresize", "lvextend", "findmnt"] : []),
-        ...(mount?.filesystem === "xfs" ? ["xfs_growfs"] : ["resize2fs"]),
+        ...(mounts.some((item) => item.logicalVolume) ? ["pvresize", "lvextend", "findmnt"] : []),
+        ...(mounts.some((item) => item.filesystem === "xfs") ? ["xfs_growfs"] : []),
+        ...(mounts.some((item) => item.filesystem !== "xfs") ? ["resize2fs"] : []),
       ];
-  const requiredList = required.map(shellQuote).join(" ");
-  const partitionToolCheck = mode === "extend" && mount?.guestPartitionPath
+  const uniqueRequired = Array.from(new Set(required));
+  const requiredList = uniqueRequired.map(shellQuote).join(" ");
+  const partitionToolCheck = mode === "extend" && mounts.some((item) => item.guestPartitionPath)
     ? "command -v growpart >/dev/null 2>&1 || command -v parted >/dev/null 2>&1 || command -v sfdisk >/dev/null 2>&1 || { echo '操作系统缺少 growpart/parted/sfdisk' >&2; exit 35; }"
     : "true";
   return String.raw`
@@ -469,13 +622,35 @@ ${partitionToolCheck}
 `;
 }
 
-export function buildExtendFilesystemCommand(mount: GuestStorageMount, increaseBytes = 0): string {
+export function buildExtendFilesystemCommand(
+  mount: GuestStorageMount,
+  increaseBytes = 0,
+  options: { requireFreeSpace?: boolean } = {},
+): string {
   const disk = shellQuote(mount.guestDiskPath);
   const partition = mount.guestPartitionPath ? shellQuote(mount.guestPartitionPath) : "";
   const source = shellQuote(mount.source);
   const mountPath = shellQuote(mount.mountPath);
   const partitionNumber = mount.guestPartitionPath ? partitionIndex(mount.guestPartitionPath) : 0;
   const lvmIncreaseMiB = Math.max(1, Math.floor(increaseBytes / 1024 ** 2) - 32);
+  // 多目录共享同一 VG 时，先扩的目录可能把 VG 空闲吃干，后扩的目录必须在执行前确认仍有足够空闲，
+  // 否则普通 lvextend 会报容量不足，而截断到空闲量又会静默少扩。
+  const freeSpaceGuard = options.requireFreeSpace
+    ? String.raw`
+  lv_path="$(findmnt -n -o SOURCE --target "$mount_path" 2>/dev/null | head -n 1)"
+  [ -n "$lv_path" ] || { echo "无法读取挂载目录 $mount_path 对应的逻辑卷" >&2; exit 44; }
+  lv_path="$(readlink -f "$lv_path" 2>/dev/null || printf '%s' "$lv_path")"
+  lv_name="$(basename "$lv_path")"
+  vg_name="$(lvs --noheadings -o vg_name "$lv_path" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$vg_name" ] || { echo "无法识别 $lv_path 所属卷组" >&2; exit 45; }
+  vg_free_bytes="$(vgs --noheadings --units b --nosuffix -o vg_free "$vg_name" 2>/dev/null | tr -d '[:space:]' | cut -d. -f1)"
+  [ -n "$vg_free_bytes" ] || { echo "无法读取卷组 $vg_name 的空闲容量" >&2; exit 45; }
+  if [ "$vg_free_bytes" -lt ${lvmIncreaseMiB * 1024 * 1024} ]; then
+    echo "卷组 $vg_name 剩余空闲 $(($vg_free_bytes / 1024 / 1024)) MiB，不足以按计划为 $mount_path 分配 ${lvmIncreaseMiB} MiB" >&2
+    exit 50
+  fi
+`
+    : "";
   return String.raw`
 set -eu
 disk=${disk}
@@ -538,6 +713,7 @@ fi
 if ${mount.logicalVolume ? "true" : "false"}; then
   [ -n "$partition" ] || { echo "LVM 未识别到物理分区" >&2; exit 42; }
   pvresize "$partition"
+${freeSpaceGuard}
   mounted_source="$(findmnt -n -o SOURCE --target "$mount_path" 2>/dev/null | head -n 1)"
   [ -n "$mounted_source" ] || { echo "无法读取挂载目录 $mount_path 对应的逻辑卷" >&2; exit 44; }
   source="$mounted_source"
@@ -556,8 +732,9 @@ async function extendGuestFilesystem(
   mount: GuestStorageMount,
   increaseBytes: number,
   allowRestart: boolean,
+  options: { requireFreeSpace?: boolean } = {},
 ): Promise<void> {
-  const command = buildExtendFilesystemCommand(mount, increaseBytes);
+  const command = buildExtendFilesystemCommand(mount, increaseBytes, options);
   const firstOutput = await runGuestCommand(access, command, guestCommandTimeoutMs);
   if (!firstOutput.includes(guestPartitionRebootMarker)) return;
   if (!allowRestart) {

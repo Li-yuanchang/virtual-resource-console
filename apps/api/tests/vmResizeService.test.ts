@@ -138,6 +138,60 @@ test("backend rejects a system directory without a disk action", async () => {
   );
 });
 
+test("backend rejects a new disk mounted on multiple directories before provider mutation", async () => {
+  let mutated = false;
+  const provider = {
+    type: "vmware",
+    resizeVm: async () => {
+      mutated = true;
+      throw new Error("must not run");
+    },
+  } as unknown as VirtualizationProvider<XenConnectionInput>;
+
+  await assert.rejects(
+    executeVmResize({
+      provider,
+      connection,
+      vmId: "vm-1",
+      request: {
+        disk: { mode: "add", storageRepositoryId: "datastore-a", sizeBytes: 20 * 1024 ** 3 },
+        storageTarget: { mountPaths: [{ mountPath: "/data" }, { mountPath: "/srv" }] },
+        allowShutdown: true,
+        restartAfterResize: true,
+      },
+    }),
+    /新增磁盘只能挂载到一个目录/,
+  );
+  assert.equal(mutated, false);
+});
+
+test("backend rejects an empty multi-directory target before provider mutation", async () => {
+  let mutated = false;
+  const provider = {
+    type: "vmware",
+    resizeVm: async () => {
+      mutated = true;
+      throw new Error("must not run");
+    },
+  } as unknown as VirtualizationProvider<XenConnectionInput>;
+
+  await assert.rejects(
+    executeVmResize({
+      provider,
+      connection,
+      vmId: "vm-1",
+      request: {
+        disk: { mode: "extend", diskId: "disk-1", sizeBytes: 120 * 1024 ** 3 },
+        storageTarget: { mountPaths: [] },
+        allowShutdown: true,
+        restartAfterResize: true,
+      },
+    }),
+    /至少一个最终生效目录/,
+  );
+  assert.equal(mutated, false);
+});
+
 test("does not attempt guest SSH inspection for a powered-off VM", async () => {
   let guestCommandCalled = false;
   const provider = {
