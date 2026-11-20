@@ -905,6 +905,8 @@ async function countSourceRpms(source: InstallSourceRecord): Promise<number> {
         '[ -d "$packages_dir" ] || { printf "0\\n"; exit 0; }',
         'find "$packages_dir" -type f -name "*.rpm" | wc -l',
       ].join("\n"),
+      45000,
+      "count-source-rpms",
     );
     const parsed = Number(output.trim().split(/\s+/)[0]);
     return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
@@ -1015,25 +1017,119 @@ async function switchXenVmToDiskBoot(source: InstallSourceRecord): Promise<void>
   await prepareXenVmForInstalledBoot(source.connection, source.vm.name);
 }
 
+/**
+ * 在挂载前清理历史遗留的 VRC 临时挂载点与卡死的 mount/ls 进程。
+ *
+ * 背景：CIFS/SMB 存储链路异常时，`mount -o loop,ro` 会进入 D（不可中断）状态。
+ * D 状态进程收不到 kill 信号，只能等内核 I/O 超时；外层命令超时虽然会放弃等待，
+ * 但那个 mount 进程会永久残留在物理机上，持续占住 CIFS 会话，导致后续
+ * pbd-plug / xe 存储操作全部卡死。必须在每次挂载前主动清扫。
+ *
+ * 清理动作按风险从低到高：
+ * 1) umount -l：先释放挂载点（不阻塞，只摘链接）；
+ * 2) kill -9 遗留的 mount 进程：只匹配 `/tmp/vrc-source-iso-` 且确实已进入 D 状态，
+ *    避免误杀其它正常挂载；
+ * 3) 删除空的临时目录，避免路径被占用。
+ */
+export function buildScavengeSourceIsoLeftoversScript(): string {
+  return String.raw`
+set -u
+# 1) 尽力摘掉所有 VRC 临时挂载点（-l 只摘链接，不会阻塞）
+for mp in $(mount 2>/dev/null | awk '/\/tmp\/vrc-source-iso-/ {print $3}'); do
+  umount -l "$mp" >/dev/null 2>&1 || true
+done
+# 2) 清理卡在 D 状态的遗留 mount/ls 进程：只针对 VRC 临时挂载点路径，
+#    避免误杀其他业务挂载；D 状态收不到普通信号，这里仅作尝试并被忽略失败。
+for pid in $(ps -eo pid,comm 2>/dev/null | awk '$2 == "mount" || $2 == "ls" {print $1}'); do
+  [ -r "/proc/$pid/cmdline" ] || continue
+  cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$cmdline" in
+    *"/tmp/vrc-source-iso-"*)
+      state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+      [ "$state" = "D" ] || continue
+      kill -9 "$pid" >/dev/null 2>&1 || true
+      ;;
+  esac
+done
+# 3) 移除空的历史临时目录（非空则保留，不丢数据）
+for dir in /tmp/vrc-source-iso-*; do
+  [ -d "$dir" ] || continue
+  mountpoint -q "$dir" 2>/dev/null && continue
+  rmdir "$dir" >/dev/null 2>&1 || true
+done
+echo "SCAVENGE_OK"
+`;
+}
+
+/**
+ * 运行清理脚本；失败只记录不抛出，避免因清理失败阻断正常挂载流程。
+ */
+async function scavengeSourceIsoLeftovers(connection: XenConnectionInput): Promise<void> {
+  try {
+    await runRemoteCommand(connection, buildScavengeSourceIsoLeftoversScript(), 20_000, "scavenge-source-iso-leftovers");
+  } catch (error) {
+    console.warn(`[install-source] scavenge leftovers failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Builds the remote script that resolves and mounts a XenServer source ISO.
+ *
+ * 关键约束：`timeout cmd mount ...` 只能让 timeout 进程放弃等待，被挂起的 mount 子进程
+ * 会变成孤儿并继续停在 D 状态，长期占住 CIFS 会话。因此超时后必须再扫一遍并清理
+ * 属于本次挂载点的遗留 mount 进程，否则每次失败都会在物理机上累加一个僵尸进程。
+ */
+export function buildXenSourceIsoInfoScript(sourceIsoId: string): string {
+  return [
+    `iso_uuid='${escapeShellValue(sourceIsoId)}'`,
+    'sr_uuid="$(xe vdi-param-get uuid="$iso_uuid" param-name=sr-uuid 2>/dev/null)"',
+    'sr_type="$(xe sr-param-get uuid="$sr_uuid" param-name=type 2>/dev/null)"',
+    'location="$(xe vdi-param-get uuid="$iso_uuid" param-name=location 2>/dev/null)"',
+    'source_type="iso-library"',
+    'if [ "$sr_type" = "udev" ] && printf "%s" "$location" | grep -q "^/dev/"; then source_type="host-dvd"; remote_path="$location"; else remote_path="/var/run/sr-mount/$sr_uuid/$location"; fi',
+    'mount_dir="/tmp/vrc-source-iso-$iso_uuid"',
+    '[ -e "$remote_path" ] || { echo "未找到源 ISO 介质：$remote_path" >&2; exit 6; }',
+    'mkdir -p "$mount_dir"',
+    'current_source="$(mount | awk -v dir="$mount_dir" \'$3 == dir {print $1; exit}\')"',
+    '[ -z "$current_source" ] || [ "$current_source" = "$remote_path" ] || umount "$mount_dir" >/dev/null 2>&1 || true',
+    'if ! mountpoint -q "$mount_dir"; then',
+    '  mount_timeout=20',
+    '  if [ "$source_type" = "host-dvd" ]; then mount_args="-o ro"; else mount_args="-o loop,ro"; fi',
+    '  mount_rc=0',
+    '  if command -v timeout >/dev/null 2>&1; then',
+    '    timeout "$mount_timeout"s mount $mount_args "$remote_path" "$mount_dir" || mount_rc=$?',
+    '  else',
+    '    mount $mount_args "$remote_path" "$mount_dir" || mount_rc=$?',
+    '  fi',
+    '  if [ "$mount_rc" != "0" ]; then',
+    '    umount -l "$mount_dir" >/dev/null 2>&1 || true',
+    // timeout 放弃等待后，真正阻塞的 mount 子进程会变成孤儿继续卡在 D 状态，
+    // 这里针对本次挂载点定向清理，避免污染后续的 xe / pbd 操作。
+    '    for pid in $(ps -eo pid,comm 2>/dev/null | awk \'$2 == "mount" {print $1}\'); do',
+    '      [ -r "/proc/$pid/cmdline" ] || continue',
+    '      leftover_cmd="$(tr \'\\0\' \' \' < "/proc/$pid/cmdline" 2>/dev/null || true)"',
+    '      case "$leftover_cmd" in',
+    '        *"$mount_dir"*) kill -9 "$pid" >/dev/null 2>&1 || true ;;',
+    '      esac',
+    '    done',
+    '    echo "挂载源 ISO 失败或超时（${mount_timeout}s）：$remote_path；已清理本次遗留挂载进程" >&2',
+    '    exit 6',
+    '  fi',
+    'fi',
+    '[ -f "$mount_dir/.treeinfo" ] || [ -d "$mount_dir/repodata" ] || { echo "源 ISO 不是可用安装源：$remote_path" >&2; exit 6; }',
+    'printf "ISO\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$sr_uuid" "$location" "$remote_path" "$mount_dir" "$source_type"',
+  ].join("\n");
+}
+
 async function readXenSourceIsoInfo(connection: XenConnectionInput, sourceIsoId: string): Promise<XenSourceIsoInfo> {
+  // 每次挂载前清扫历史遗留，避免上一次 CIFS 卡死留下的 mount 进程占住会话后
+  // 让本次以及后续所有 xe 存储操作一起卡死。
+  await scavengeSourceIsoLeftovers(connection);
   const output = await runRemoteCommand(
     connection,
-    [
-      `iso_uuid='${escapeShellValue(sourceIsoId)}'`,
-      'sr_uuid="$(xe vdi-param-get uuid="$iso_uuid" param-name=sr-uuid 2>/dev/null)"',
-      'sr_type="$(xe sr-param-get uuid="$sr_uuid" param-name=type 2>/dev/null)"',
-      'location="$(xe vdi-param-get uuid="$iso_uuid" param-name=location 2>/dev/null)"',
-      'source_type="iso-library"',
-      'if [ "$sr_type" = "udev" ] && printf "%s" "$location" | grep -q "^/dev/"; then source_type="host-dvd"; remote_path="$location"; else remote_path="/var/run/sr-mount/$sr_uuid/$location"; fi',
-      'mount_dir="/tmp/vrc-source-iso-$iso_uuid"',
-      '[ -e "$remote_path" ] || { echo "未找到源 ISO 介质：$remote_path" >&2; exit 6; }',
-      'mkdir -p "$mount_dir"',
-      'current_source="$(mount | awk -v dir="$mount_dir" \'$3 == dir {print $1; exit}\')"',
-      '[ -z "$current_source" ] || [ "$current_source" = "$remote_path" ] || umount "$mount_dir" >/dev/null 2>&1 || true',
-      'if ! mountpoint -q "$mount_dir"; then if [ "$source_type" = "host-dvd" ]; then mount -o ro "$remote_path" "$mount_dir"; else mount -o loop,ro "$remote_path" "$mount_dir"; fi; fi',
-      '[ -f "$mount_dir/.treeinfo" ] || [ -d "$mount_dir/repodata" ] || { echo "源 ISO 不是可用安装源：$remote_path" >&2; exit 6; }',
-      'printf "ISO\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$sr_uuid" "$location" "$remote_path" "$mount_dir" "$source_type"',
-    ].join("\n"),
+    buildXenSourceIsoInfoScript(sourceIsoId),
+    45000,
+    "read-xen-source-iso",
   );
   const line = output.split(/\r?\n/).find((item) => item.startsWith("ISO\t"));
   const [, srUuid = "", location = "", remotePath = "", mountDir = "", sourceType = "iso-library"] = line?.split("\t") ?? [];
@@ -1316,7 +1412,11 @@ function runRemoteCommand(connection: XenConnectionInput, command: string, timeo
       callback();
     };
     const timer = setTimeout(() => {
-      settle(() => reject(new Error(`XenServer command timed out in ${label} after ${timeoutMs}ms`)));
+      // 超时时带上已经收到的 stderr，让调用方能看见脚本自身的报错而不是只有耗时。
+      const detail = stderr.trim().split(/\r?\n/).filter(Boolean).slice(-3).join(" / ");
+      settle(() => reject(new Error(
+        `XenServer command timed out in ${label} after ${timeoutMs}ms${detail ? `：${detail}` : ""}`,
+      )));
     }, timeoutMs);
     client
       .on("ready", () => {
@@ -1361,6 +1461,10 @@ function sshOptions(connection: XenConnectionInput): ConnectConfig {
     username: connection.username,
     password: connection.password,
     readyTimeout: 15000,
+    // 链路半开时 socket 不会自己断开，之前只能干等外层 45s 超时。
+    // keepalive 让它按存活探测快速失败，正常链路不受影响。
+    keepaliveInterval: 5000,
+    keepaliveCountMax: 3,
     algorithms: {
       kex: ["diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1", "diffie-hellman-group-exchange-sha1"],
       serverHostKey: ["ssh-rsa", "ssh-dss"],

@@ -11,9 +11,14 @@ import type { ProviderType, XenConnectionInput } from "./types.js";
 
 const defaultFailedRetentionMs = 7 * 24 * 60 * 60 * 1000;
 const recentMutableRetentionMs = 60 * 60 * 1000;
+/**
+ * 生成中断的登记记录超过该时长即视为孤儿：既拿不到远端介质标识、任务也早已结束，
+ * 既不可能被自动清理，也无法验证远端是否还有文件，只能删除本地登记解除滞留。
+ */
+const orphanStaleMs = 24 * 60 * 60 * 1000;
 const generatedDir = getVrcDataFile("generated-isos");
 
-export type GeneratedIsoCleanupDecision = "eligible" | "retained" | "skipped" | "cleaned" | "failed";
+export type GeneratedIsoCleanupDecision = "eligible" | "retained" | "skipped" | "orphan" | "cleaned" | "failed";
 
 export interface GeneratedIsoCleanupEntry {
   id: string;
@@ -43,6 +48,7 @@ export interface GeneratedIsoCleanupReport {
     eligible: number;
     retained: number;
     skipped: number;
+    orphan: number;
     cleaned: number;
     failed: number;
     localBytes: number;
@@ -125,8 +131,27 @@ function classifyGeneratedIso(
   if (!record.isoName.startsWith("vrc-") || !record.isoName.endsWith(".iso")) {
     return { ...base, decision: "skipped", reason: "登记文件不是 VRC 生成 ISO，禁止清理" };
   }
+  // 生成中断且滞留超过保留期：永远拿不到远端介质标识，远端也无从校验。
+  // 这类记录不允许走远端删除（没有可验证的标识），但必须允许删除本地登记，
+  // 否则会永久停在"跳过"状态，用户以为清理功能失效。
   if (!record.isoVdiUuid && record.providerType !== "proxmox") {
-    return { ...base, decision: "skipped", reason: "缺少远端介质标识，无法验证后删除" };
+    const stale = ageMs(record.updatedAt, input.now) >= orphanStaleMs;
+    if (!stale) {
+      return { ...base, decision: "skipped", reason: "生成进行中且尚未记录远端介质标识，完成后再评估" };
+    }
+    return {
+      ...base,
+      decision: "orphan",
+      reason: "生成中断且超过 24 小时未写入远端介质标识，远端无从校验；只能删除本地登记",
+    };
+  }
+  if (!record.connectionId) {
+    // 连接被删除后无法解析平台执行远端清理，登记同样永久滞留，归入可清理的孤儿。
+    return {
+      ...base,
+      decision: "orphan",
+      reason: "登记记录缺少连接 ID（连接可能已删除），无法远端校验；只能删除本地登记",
+    };
   }
   const cleanupAfter = resolveCleanupAfter(record, input.retentionMs);
   if (record.status === "failed" && !input.includeUnexpiredFailed && cleanupAfter.getTime() > input.now.getTime()) {
@@ -139,9 +164,6 @@ function classifyGeneratedIso(
   }
   if (["creating", "uploaded", "attached"].includes(record.status) && ageMs(record.updatedAt, input.now) < recentMutableRetentionMs) {
     return { ...base, decision: "retained", reason: "近期生成记录仍可能被任务使用，暂不自动清理" };
-  }
-  if (!record.connectionId) {
-    return { ...base, decision: "skipped", reason: "旧记录缺少连接 ID，不能猜测平台连接执行远端删除" };
   }
   return { ...base, cleanupAfter: cleanupAfter.toISOString(), decision: "eligible", reason: "满足 VRC 登记、任务结束、保留期和命名规则，可清理" };
 }
@@ -200,6 +222,7 @@ function buildGeneratedIsoCleanupReport(now: Date, retentionMs: number, items: G
     eligible: items.filter((item) => item.decision === "eligible").length,
     retained: items.filter((item) => item.decision === "retained").length,
     skipped: items.filter((item) => item.decision === "skipped").length,
+    orphan: items.filter((item) => item.decision === "orphan").length,
     cleaned: items.filter((item) => item.decision === "cleaned").length,
     failed: items.filter((item) => item.decision === "failed").length,
     localBytes: items.reduce((sum, item) => sum + item.localBytes, 0),
@@ -210,6 +233,38 @@ function buildGeneratedIsoCleanupReport(now: Date, retentionMs: number, items: G
     summary,
     items,
   };
+}
+
+/**
+ * 删除孤儿登记：只移除本地 JSON 记录，不对任何平台执行远端删除。
+ *
+ * 安全前提（任一不满足即拒绝）：记录当前被判为 orphan、任务不在执行中。
+ * 这些记录的远端介质本就无法校验，远端文件是否存在由人工确认；
+ * 本操作只解除本地滞留，不会误删平台上的实际文件。
+ */
+export function purgeOrphanGeneratedIsoRecords(ids?: string[]): { purged: string[]; refused: Array<{ id: string; reason: string }> } {
+  const now = new Date();
+  const activeTaskIds = resolveActiveTaskIds();
+  const targets = listGeneratedIsos().filter((record) => record.status !== "deleted");
+  const wanted = ids?.length ? new Set(ids) : undefined;
+  const purged: string[] = [];
+  const refused: Array<{ id: string; reason: string }> = [];
+  for (const record of targets) {
+    if (wanted && !wanted.has(record.id)) continue;
+    const classified = classifyGeneratedIso(record, {
+      now,
+      activeTaskIds,
+      retentionMs: defaultFailedRetentionMs,
+    });
+    if (classified.decision !== "orphan") {
+      refused.push({ id: record.id, reason: `当前状态不可删除登记：${classified.reason}` });
+      continue;
+    }
+    markGeneratedIsoStatus(record.id, "deleted", "已删除孤儿登记（远端介质未经本操作删除）");
+    cleanupLocalGeneratedIso(record);
+    purged.push(record.id);
+  }
+  return { purged, refused };
 }
 
 function resolveActiveTaskIds(): Set<string> {

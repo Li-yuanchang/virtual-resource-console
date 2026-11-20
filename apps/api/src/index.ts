@@ -40,7 +40,8 @@ import { listIpLeases, releaseIpLeases, reserveIpLeases } from "./ipLeaseStore.j
 import { getIpPoolPolicy, saveIpPoolPolicy } from "./ipPoolPolicy.js";
 import { buildIsoImageCacheKey, getIsoImageCache, saveIsoImageCache } from "./isoImageStore.js";
 import { attachIsoInstallProfileHints, defaultInstallProfileForIdentity } from "./isoInstallProfile.js";
-import { cleanupGeneratedIsoRecord, cleanupGeneratedIsoResidues, inspectGeneratedIsoResidues } from "./generatedIsoCleanupService.js";
+import { cleanupGeneratedIsoRecord, cleanupGeneratedIsoResidues, inspectGeneratedIsoResidues, purgeOrphanGeneratedIsoRecords } from "./generatedIsoCleanupService.js";
+import { repairIsoStorage, scanIsoStorage } from "./isoStorageHealthService.js";
 import { getGeneratedIso } from "./generatedIsoStore.js";
 import type { GeneratedIsoRecord } from "./generatedIsoStore.js";
 import { getProvisioningConfig, saveProvisioningConfig } from "./provisioningStore.js";
@@ -397,7 +398,18 @@ const vmResizeSchema = connectionSchema
       .optional(),
     storageTarget: z
       .object({
-        mountPath: z.string().trim().min(1).max(240),
+        mountPath: z.string().trim().min(1).max(240).optional(),
+        mountPaths: z
+          .array(
+            z.object({
+              mountPath: z.string().trim().min(1).max(240),
+              // weight 是相对分配权重，前端按目录填写 GiB 增量提交，因此不再限制在 100 以内。
+              weight: z.coerce.number().min(0).max(1024 * 1024).optional(),
+            }),
+          )
+          .min(1)
+          .max(8)
+          .optional(),
       })
       .optional(),
     systemCredentials: vmSystemCredentialsSchema.optional(),
@@ -420,6 +432,12 @@ const vmResizeSchema = connectionSchema
     }
     if (value.storageTarget && !value.disk) {
       context.addIssue({ code: "custom", path: ["storageTarget"], message: "生效目录必须与磁盘扩容同时提交" });
+    }
+    if (value.storageTarget && !value.storageTarget.mountPath && !value.storageTarget.mountPaths?.length) {
+      context.addIssue({ code: "custom", path: ["storageTarget"], message: "磁盘扩容必须选择至少一个最终生效目录" });
+    }
+    if (value.disk?.mode === "add" && (value.storageTarget?.mountPaths?.length ?? 0) > 1) {
+      context.addIssue({ code: "custom", path: ["storageTarget"], message: "新增磁盘只能挂载到一个目录" });
     }
   });
 
@@ -641,6 +659,18 @@ type ProvisionPreflightInput = z.infer<typeof provisionPreflightSchema>;
 
 const generatedIsoCleanupSchema = z.object({
   includeUnexpiredFailed: z.boolean().optional(),
+  confirmToken: z.literal("CONFIRMED"),
+});
+
+/** 批量删除孤儿登记：ids 省略表示删除全部可判定为 orphan 的记录。 */
+const generatedIsoPurgeOrphanSchema = z.object({
+  ids: z.array(z.string().min(1)).max(500).optional(),
+  confirmToken: z.literal("CONFIRMED"),
+});
+
+/** ISO 存储库修复：connectionIds 省略表示对全部 XenServer 连接执行。 */
+const isoStorageRepairSchema = z.object({
+  connectionIds: z.array(z.string().min(1)).max(200).optional(),
   confirmToken: z.literal("CONFIRMED"),
 });
 
@@ -1097,6 +1127,77 @@ server.post("/api/maintenance/generated-isos/cleanup", async (request, reply) =>
     operatedAt: new Date().toISOString(),
     report,
   };
+});
+
+/**
+ * 批量删除孤儿登记：只清理本地 JSON 记录，不对任何平台执行远端删除。
+ * 适用于生成中断后永远拿不到远端介质标识、又无法校验远端的滞留记录。
+ */
+server.post("/api/maintenance/generated-isos/purge-orphan", async (request, reply) => {
+  const parsed = generatedIsoPurgeOrphanSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "删除孤儿登记参数不完整，或未完成二次确认。",
+      issues: parsed.error.issues,
+    });
+  }
+  const result = purgeOrphanGeneratedIsoRecords(parsed.data.ids);
+  recordAudit({
+    title: "删除孤儿镜像登记",
+    action: "maintenance.generated-iso-purge-orphan",
+    request: auditRequestSummary({ ids: parsed.data.ids ?? "all" }),
+    detail: `删除 ${result.purged.length} 条，拒绝 ${result.refused.length} 条`,
+    status: result.refused.length > 0 ? "warning" : "success",
+  });
+  return {
+    operatedAt: new Date().toISOString(),
+    purged: result.purged,
+    refused: result.refused,
+  };
+});
+
+server.post("/api/maintenance/iso-storage/scan", async (request, reply) => {
+  try {
+    return {
+      operatedAt: new Date().toISOString(),
+      report: await scanIsoStorage(),
+    };
+  } catch (error) {
+    request.log.error({ error }, "failed to scan iso storage");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "扫描 ISO 存储库失败"),
+    });
+  }
+});
+
+server.post("/api/maintenance/iso-storage/repair", async (request, reply) => {
+  const parsed = isoStorageRepairSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      message: "修复参数不完整，或未完成二次确认。",
+      issues: parsed.error.issues,
+    });
+  }
+  try {
+    const results = await repairIsoStorage(parsed.data.connectionIds ?? []);
+    const repaired = results.filter((item) => item.repaired).length;
+    recordAudit({
+      title: "修复 ISO 存储库挂载",
+      action: "maintenance.iso-storage-repair",
+      request: auditRequestSummary({ connectionIds: parsed.data.connectionIds ?? "all" }),
+      detail: `修复 ${repaired}/${results.length} 节点`,
+      status: repaired === results.length ? "success" : "warning",
+    });
+    return {
+      operatedAt: new Date().toISOString(),
+      results,
+    };
+  } catch (error) {
+    request.log.error({ error }, "failed to repair iso storage");
+    return reply.status(502).send({
+      message: toClientErrorMessage(error, "修复 ISO 存储库失败"),
+    });
+  }
 });
 
 server.get("/api/inventory/events", (request, reply) => {

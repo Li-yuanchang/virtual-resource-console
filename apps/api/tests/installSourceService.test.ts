@@ -3,7 +3,9 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 import {
   buildXenInstalledHook,
+  buildScavengeSourceIsoLeftoversScript,
   buildXenIpArpProbeScript,
+  buildXenSourceIsoInfoScript,
   isXenInstallHostInProvisioningNetwork,
   parseXenIpArpProbeOutput,
   selectXenInstallHostAddress,
@@ -227,4 +229,45 @@ test("keeps non-RHEL ISO installs off the kickstart install source", () => {
   } as unknown as VmProvisionRequest;
 
   assert.equal(shouldUseXenKickstart(windows), false);
+});
+
+test("source ISO mount is bounded by a timeout and cleans up partial mounts", () => {
+  const script = buildXenSourceIsoInfoScript("iso-uuid-1");
+
+  // 存储链路卡死时 mount 会一直不返回，必须限时并清理半挂载状态，
+  // 否则外层只能干等到 45s 超时，且下一次继续卡在同一个挂载点。
+  assert.match(script, /timeout "\$mount_timeout"s mount \$mount_args/);
+  assert.match(script, /mount_timeout=20/);
+  assert.match(script, /umount -l "\$mount_dir" >\/dev\/null 2>&1 \|\| true/);
+  assert.match(script, /挂载源 ISO 失败或超时/);
+  // timeout 不可用时保持原有行为，不回退成失败。
+  assert.match(script, /else\n    mount \$mount_args "\$remote_path" "\$mount_dir" \|\| mount_rc=\$\?/);
+  assert.equal(spawnSync("sh", ["-n"], { input: script, encoding: "utf8" }).status, 0);
+});
+
+test("timed-out mount kills its own orphan process so CIFS sessions are not leaked", () => {
+  const script = buildXenSourceIsoInfoScript("iso-uuid-1");
+
+  // timeout 只会让父进程放弃等待，被挂起的 mount 子进程会变成孤儿停在 D 状态，
+  // 持续占住 CIFS 会话并拖死后续 xe/pbd 操作，因此超时分支必须定向清理本次挂载点。
+  assert.match(script, /for pid in \$\(ps -eo pid,comm 2>\/dev\/null \| awk/);
+  assert.match(script, /\*"\$mount_dir"\*\) kill -9 "\$pid"/);
+  assert.ok(
+    script.indexOf("kill -9 \"$pid\"") > script.indexOf("umount -l \"$mount_dir\""),
+    "清理必须发生在失败分支内、umount 之后",
+  );
+  assert.equal(spawnSync("sh", ["-n"], { input: script, encoding: "utf8" }).status, 0);
+});
+
+test("leftover scavenger only targets VRC temporary mount paths", () => {
+  const script = buildScavengeSourceIsoLeftoversScript();
+
+  // 每次挂载前主动清扫，避免上一次卡死留下的 mount 进程累积。
+  assert.match(script, /\/tmp\/vrc-source-iso-/);
+  assert.match(script, /umount -l "\$mp"/);
+  // 只处理 D 状态且命令行含 VRC 临时路径的进程，绝不误杀其它业务挂载。
+  assert.match(script, /\[ "\$state" = "D" \] \|\| continue/);
+  assert.match(script, /case "\$cmdline" in\n    \*"\/tmp\/vrc-source-iso-"\*\)/);
+  assert.match(script, /SCAVENGE_OK/);
+  assert.equal(spawnSync("sh", ["-n"], { input: script, encoding: "utf8" }).status, 0);
 });
