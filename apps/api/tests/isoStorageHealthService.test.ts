@@ -51,3 +51,13 @@ test("mount reachability probe rejects unsafe paths", () => {
   assert.doesNotMatch(script, /\$\(id\)/);
   assert.equal(spawnSync("sh", ["-n"], { input: script, encoding: "utf8" }).status, 0);
 });
+
+test("nodes without any SMB ISO repository are not classified as repairable", () => {
+  // 某些 XenServer 只挂了 DVD drives / XenServer Tools，本来就没有 SMB ISO 库。
+  // 这类节点不能算"未挂载"（那会让修复按钮把无关机器也列进去），必须单列为无此库。
+  const script = buildIsoStorageProbeScript();
+  assert.match(script, /SR_BEGIN/);
+  assert.match(script, /content-type=iso/);
+  // 扫描脚本必须能区分"有 SMB SR"和"完全没有 SMB SR"
+  assert.match(script, /\*SMB\*\)/);
+});

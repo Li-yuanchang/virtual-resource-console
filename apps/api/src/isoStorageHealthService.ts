@@ -16,7 +16,7 @@ import type { XenConnectionInput } from "./types.js";
  *   3) `pbd-unplug` + `pbd-plug`  重新建立 CIFS 会话
  */
 
-export type IsoStorageNodeStatus = "healthy" | "stale" | "unmounted" | "unreachable" | "no-xenserver";
+export type IsoStorageNodeStatus = "healthy" | "stale" | "unmounted" | "unreachable" | "not-applicable";
 
 export interface IsoStorageNodeReport {
   connectionId: string;
@@ -43,6 +43,7 @@ export interface IsoStorageScanReport {
     stale: number;
     unmounted: number;
     unreachable: number;
+    notApplicable: number;
   };
   nodes: IsoStorageNodeReport[];
 }
@@ -230,13 +231,24 @@ async function probeNode(summary: { id: string; host: string; name?: string }): 
     .map((parts) => ({ source: parts[0], mountPath: parts[1] }));
   const smbSr = sections.SR[0]?.split("\t") ?? [];
   const withStuck = { ...base, stuckProcessCount: stuck.length, stuckProcesses: stuck, srName: smbSr[1] || undefined };
+  // 该宿主机根本没有 SMB ISO 库时（只有 DVD/Tools），不存在"未挂载"可修的问题，
+  // 必须单独归类，否则会被误算进待修复节点，让修复按钮把无关机器也列进去。
+  if (!smbSr.length && !cifsMounts.length) {
+    return {
+      ...withStuck,
+      status: "not-applicable",
+      message: stuck.length
+        ? `未配置 SMB ISO 库，但存在 ${stuck.length} 个 D 状态进程`
+        : "未配置 SMB ISO 库，无需检查",
+    };
+  }
   if (!cifsMounts.length) {
     return {
       ...withStuck,
       status: "unmounted",
       message: stuck.length
-        ? `未挂载 CIFS，但存在 ${stuck.length} 个 D 状态进程，需要清理后才能重新挂载`
-        : "未挂载 CIFS 存储库（SR 处于断开状态）",
+        ? `已配置 SMB ISO 库但未挂载，且存在 ${stuck.length} 个 D 状态进程，需要清理后才能重新挂载`
+        : "已配置 SMB ISO 库但 CIFS 未挂载，SR 处于断开状态",
     };
   }
   // 逐个挂载点做限时可达性探测
@@ -293,6 +305,7 @@ export async function scanIsoStorage(): Promise<IsoStorageScanReport> {
       // 否则会出现"异常 0 个却显示修复 3 个"的矛盾。
       unmounted: nodes.filter((item) => item.status === "unmounted").length,
       unreachable: nodes.filter((item) => item.status === "unreachable").length,
+      notApplicable: nodes.filter((item) => item.status === "not-applicable").length,
     },
     nodes,
   };

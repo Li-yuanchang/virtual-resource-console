@@ -454,7 +454,7 @@ interface MaintenanceGeneratedIsoReport {
 }
 
 /** ISO 存储库健康检查（仅 XenServer）。 */
-type IsoStorageNodeStatus = "healthy" | "stale" | "unmounted" | "unreachable" | "no-xenserver";
+type IsoStorageNodeStatus = "healthy" | "stale" | "unmounted" | "unreachable" | "not-applicable";
 
 interface IsoStorageNode {
   connectionId: string;
@@ -470,7 +470,7 @@ interface IsoStorageNode {
 
 interface IsoStorageScanReport {
   generatedAt: string;
-  summary: { total: number; healthy: number; stale: number; unmounted: number; unreachable: number };
+  summary: { total: number; healthy: number; stale: number; unmounted: number; unreachable: number; notApplicable: number };
   nodes: IsoStorageNode[];
 }
 
@@ -1221,7 +1221,7 @@ const isoStorageRepairing = ref(false);
 const isoStorageStatus = ref("");
 const isoStorageError = ref("");
 const isoStorageSelected = ref<string[]>([]);
-/** 状态上确实需要修复的节点：僵死或未挂载。 */
+/** 状态上确实需要修复的节点：僵死或已配置但未挂载（不含"未配置 SMB 库"的节点）。 */
 const isoStorageBrokenNodes = computed(() =>
   (isoStorageReport.value?.nodes ?? []).filter((node) => node.status === "stale" || node.status === "unmounted"),
 );
@@ -2346,7 +2346,8 @@ async function loadIsoStorageHealth() {
     isoStorageReport.value = result.report;
     const summary = result.report.summary;
     const unhealthy = summary.stale + summary.unmounted + summary.unreachable;
-    isoStorageStatus.value = `扫描完成，共 ${summary.total} 个节点，正常 ${summary.healthy} 个，异常 ${unhealthy} 个`;
+    const skipped = summary.notApplicable;
+    isoStorageStatus.value = `扫描完成，共 ${summary.total} 个节点，正常 ${summary.healthy} 个，异常 ${unhealthy} 个${skipped ? `，未配置 SMB 库 ${skipped} 个` : ""}`;
     isoStorageSelected.value = result.report.nodes
       .filter((node) => node.status === "stale" || node.status === "unmounted")
       .map((node) => node.connectionId);
@@ -7197,6 +7198,8 @@ function formatVmDiskSummary(vm: VmNode) {
 
 function formatBytes(value: number) {
   if (!Number.isFinite(value)) return "-";
+  // 有就是有：非零但不足 0.1 MiB 时不能四舍五入成 0 MiB，否则用户会以为没有占用。
+  if (value > 0 && value < 0.1 * 1024 * 1024) return "<0.1 MiB";
   const gib = value / 1024 / 1024 / 1024;
   if (gib >= 1) return `${formatNumber(gib)} GiB`;
   return `${formatNumber(value / 1024 / 1024)} MiB`;
@@ -8813,7 +8816,7 @@ serverStore: disabled</pre>
                     :disabled="!isoStorageRepairTargets.length"
                     @click="repairIsoStorageNodes"
                   >
-                    {{ isoStorageRepairing ? "修复中" : `修复僵死节点（${isoStorageRepairTargets.length}）` }}
+                    {{ isoStorageRepairing ? "修复中" : `修复异常节点（${isoStorageRepairTargets.length}）` }}
                   </el-button>
                 </div>
               </div>
@@ -8862,19 +8865,24 @@ serverStore: disabled</pre>
                   </el-table-column>
                   <el-table-column label="挂载点" min-width="200">
                     <template #default="{ row }">
-                      <span class="maintenance-iso-path">{{ row.mountPath || "未挂载" }}</span>
+                      <span class="maintenance-iso-path">{{ row.status === "not-applicable" ? "—" : row.mountPath || "未挂载" }}</span>
                     </template>
                   </el-table-column>
                   <el-table-column label="状态" width="92" align="center">
                     <template #default="{ row }">
-                      <span class="maintenance-iso-decision" :class="`decision-${row.status === 'healthy' ? 'eligible' : row.status === 'unreachable' ? 'skipped' : 'orphan'}`">
-                        {{ row.status === "healthy" ? "正常" : row.status === "unmounted" ? "未挂载" : row.status === "unreachable" ? "不可达" : "僵死" }}
+                      <span class="maintenance-iso-decision" :class="`decision-${row.status === 'healthy' ? 'eligible' : (row.status === 'unreachable' || row.status === 'not-applicable') ? 'skipped' : 'orphan'}`">
+                        {{ row.status === "healthy" ? "正常"
+                          : row.status === "unmounted" ? "未挂载"
+                          : row.status === "unreachable" ? "不可达"
+                          : row.status === "not-applicable" ? "无此库"
+                          : "僵死" }}
                       </span>
                     </template>
                   </el-table-column>
-                  <el-table-column label="死进程" width="80" align="right">
+                  <el-table-column label="僵死进程" width="92" align="right">
                     <template #default="{ row }">
-                      <span :class="{ 'maintenance-iso-stuck': row.stuckProcessCount > 0 }">{{ row.stuckProcessCount }}</span>
+                      <span v-if="row.status === 'not-applicable'">—</span>
+                      <span v-else :class="{ 'maintenance-iso-stuck': row.stuckProcessCount > 0 }">{{ row.stuckProcessCount }}</span>
                     </template>
                   </el-table-column>
                   <el-table-column label="说明" min-width="260">
