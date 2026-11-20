@@ -178,57 +178,128 @@
 
   function initResize() {
     const current = { cpu: 5, memory: 10, disk: 140 };
-    const deltas = { cpu: 0, memory: 0, disk: 60 };
+    const deltas = { cpu: 0, memory: 0, disk: 0 };
+    // 新增磁盘模式独立步进器；扩展原盘时增量由各目录自己的输入汇总。
+    let addDiskDelta = 0;
     let diskMode = "extend";
-    let mount = "root";
+    // 目录默认不勾选、增量默认 0，由用户主动勾选后填写。
     const mounts = {
-      root: { path: "/", name: "根目录", current: 90, fs: "XFS" },
-      data: { path: "/home", name: "数据目录", current: 50, fs: "XFS" },
+      root: { path: "/", name: "根目录", current: 90, fs: "XFS", delta: 0, selected: false },
+      data: { path: "/home", name: "数据目录", current: 50, fs: "XFS", delta: 0, selected: false },
     };
     function number(id) { return Number($(id).value) || 0; }
+    function selectedMounts() { return Object.values(mounts).filter((mount) => mount.selected); }
+    function increasingMounts() { return selectedMounts().filter((mount) => mount.delta > 0); }
+    function extendDelta() { return selectedMounts().reduce((sum, mount) => sum + mount.delta, 0); }
     function update() {
       deltas.cpu = number("#cpu-delta");
       deltas.memory = number("#memory-delta");
-      deltas.disk = number("#disk-delta");
+      deltas.disk = diskMode === "extend" ? extendDelta() : addDiskDelta;
       $("#target-cpu").textContent = current.cpu + deltas.cpu;
       $("#target-memory").textContent = current.memory + deltas.memory;
       $("#target-disk").textContent = current.disk + deltas.disk;
       $("#disk-detail").textContent = diskMode === "extend" ? `磁盘 0 ${current.disk} → ${current.disk + deltas.disk}` : `新增 ${deltas.disk} GiB · 共 2 块`;
       $("#cpu-state").textContent = deltas.cpu ? "需关机" : "不变";
       $("#memory-state").textContent = deltas.memory ? "需关机" : "不变";
-      $("#disk-state").textContent = diskMode === "extend" ? "需关机" : "可在线";
-      $("#disk-state").className = `execution-state-static ${diskMode === "extend" ? "warning" : "online"}`;
+      $("#disk-state").textContent = deltas.disk ? (diskMode === "extend" ? "需关机" : "可在线") : "不变";
+      $("#disk-state").className = `execution-state-static ${deltas.disk ? (diskMode === "extend" ? "warning" : "online") : ""}`;
+      $("#disk-stepper").hidden = diskMode !== "add";
+      $("#disk-summary").hidden = diskMode === "add";
+      $("#disk-summary").innerHTML = selectedMounts().length
+        ? `由下方 <b>${selectedMounts().length}</b> 个目录汇总`
+        : "未勾选目录";
       $("#extend-options").hidden = diskMode !== "extend";
       $("#new-disk-options").hidden = diskMode !== "add";
+      $("#new-disk-size").textContent = `${addDiskDelta} GiB`;
+      const allocated = increasingMounts();
       $("#impact-mode").textContent = diskMode === "extend" ? "扩容目录" : "挂载目录";
-      $("#impact-path").textContent = diskMode === "extend" ? mounts[mount].path : $("#new-mount").value;
-      $("#impact-size").textContent = diskMode === "extend" ? `${mounts[mount].current} → ${mounts[mount].current + deltas.disk} GiB` : `${deltas.disk} GiB`;
+      $("#impact-path").textContent = diskMode === "extend" ? (allocated.map((mount) => mount.path).join("、") || "未选择") : $("#new-mount").value;
+      $("#impact-size").textContent = diskMode === "extend"
+        ? (allocated.map((mount) => `${mount.path} ${mount.current} → ${mount.current + mount.delta} GiB`).join("；") || "无变化")
+        : `${addDiskDelta} GiB`;
       $("#impact-storage").textContent = `${(1834 - deltas.disk).toLocaleString()} GiB`;
       $("#change-count").textContent = [deltas.cpu, deltas.memory, deltas.disk].filter(Boolean).length;
       $("#confirm-resize").disabled = !deltas.cpu && !deltas.memory && !deltas.disk;
       $("#resize-summary").textContent = diskMode === "extend" ? "需要短暂停机" : (deltas.cpu || deltas.memory ? "需要短暂停机" : "支持在线执行");
       $("#chain-disk").textContent = diskMode === "extend" ? `${current.disk} → ${current.disk + deltas.disk} GiB` : `新增 ${deltas.disk} GiB`;
-      $("#chain-final-label").textContent = diskMode === "extend" ? mounts[mount].path : "自动挂载";
-      $("#chain-final-value").textContent = diskMode === "extend" ? `${mounts[mount].current} → ${mounts[mount].current + deltas.disk} GiB` : $("#new-mount").value;
+      $("#chain-final-label").textContent = diskMode === "extend" ? (allocated.map((mount) => mount.path).join("、") || "未选择") : "自动挂载";
+      $("#chain-final-value").textContent = diskMode === "extend"
+        ? (allocated.map((mount) => `${mount.path} +${mount.delta} GiB`).join("、") || "无变化")
+        : $("#new-mount").value;
+      $("#mount-hint").hidden = diskMode !== "extend";
+      $("#mount-hint").textContent = allocated.length > 1
+        ? `已为 ${allocated.length} 个目录分别填写增量（${allocated.map((mount) => `${mount.path} +${mount.delta} GiB`).join("，")}），合计 ${deltas.disk} GiB。`
+        : allocated.length === 1
+          ? `本次只为 ${allocated[0].path} +${allocated[0].delta} GiB 扩容，其余已选目录保持当前容量。`
+          : selectedMounts().length
+            ? "请为已勾选的目录填写增量，保持 0 的目录不扩容。"
+            : "请勾选需要扩容的目录；未勾选的目录保持当前容量，磁盘不增加。";
+      $$("[data-mount-target]").forEach((element) => {
+        const mount = mounts[element.dataset.mountTarget];
+        element.textContent = `${mount.current + (mount.selected ? mount.delta : 0)} GiB`;
+      });
+      $$(".mount-option-static", $("#extend-options")).forEach((option) => {
+        const mount = mounts[option.dataset.mount];
+        option.classList.toggle("active", mount.selected);
+        option.classList.toggle("muted", !mount.selected);
+        $(".mount-head-static", option).setAttribute("aria-checked", String(mount.selected));
+        const increase = $(".mount-increase-static", option);
+        const input = $("input", increase);
+        increase.classList.toggle("disabled", !mount.selected);
+        input.disabled = !mount.selected;
+        // 取消勾选即视为不扩容，输入框同步归零，避免残留旧值造成误解。
+        input.value = String(mount.selected ? mount.delta : 0);
+        // 步进按钮与顶部 CPU／内存一致：未勾选禁用，减到 0 时禁用减号。
+        const [decrease, increaseButton] = $$("button[data-mount-step]", increase);
+        decrease.disabled = !mount.selected || mount.delta <= 0;
+        increaseButton.disabled = !mount.selected;
+        $(".mount-increase-note", increase).textContent = mount.selected ? "" : "勾选后可填写增量";
+      });
     }
     $$(".stepper-static").forEach((stepper) => {
       stepper.addEventListener("click", (event) => {
         const button = event.target.closest("button[data-step]");
         if (!button) return;
         const input = $("input", stepper);
-        input.value = Math.max(0, Number(input.value || 0) + Number(button.dataset.step));
+        const next = Math.max(0, Number(input.value || 0) + Number(button.dataset.step));
+        input.value = next;
+        if (stepper.id === "disk-stepper") addDiskDelta = next;
         update();
       });
-      $("input", stepper).addEventListener("input", update);
+      $("input", stepper).addEventListener("input", () => {
+        if (stepper.id === "disk-stepper") addDiskDelta = number("#disk-delta");
+        update();
+      });
     });
     $("#disk-mode").addEventListener("change", (event) => { diskMode = event.target.value; update(); });
     $("#new-mount").addEventListener("change", update);
     $("#extend-options").addEventListener("click", (event) => {
-      const option = event.target.closest("[data-mount]");
-      if (!option) return;
-      mount = option.dataset.mount;
-      $$("[data-mount]", $("#extend-options")).forEach((item) => item.classList.toggle("active", item === option));
+      // 目录步进按钮：与顶部 CPU／内存一致，每次 ±10 GiB。
+      const stepButton = event.target.closest("button[data-mount-step]");
+      if (stepButton) {
+        const option = stepButton.closest("[data-mount]");
+        const mount = mounts[option.dataset.mount];
+        if (!mount.selected) return;
+        mount.delta = Math.max(0, mount.delta + Number(stepButton.dataset.mountStep));
+        update();
+        return;
+      }
+      const head = event.target.closest(".mount-head-static");
+      if (!head) return;
+      const option = head.closest("[data-mount]");
+      // 目录默认都不勾选，也允许全部取消：取消后增量为 0，磁盘容量不变。
+      const mount = mounts[option.dataset.mount];
+      mount.selected = !mount.selected;
+      if (!mount.selected) mount.delta = 0;
       update();
+    });
+    $$("[data-mount-input]").forEach((input) => {
+      input.addEventListener("input", () => {
+        const mount = mounts[input.dataset.mountInput];
+        mount.delta = Math.max(0, Number(input.value) || 0);
+        if (mount.delta > 0) mount.selected = true;
+        update();
+      });
     });
     $("#confirm-resize").addEventListener("click", () => toast("扩容参数校验通过，原型未下发真实任务"));
     $("#cancel-resize").addEventListener("click", () => toast("已取消，本页为静态原型"));

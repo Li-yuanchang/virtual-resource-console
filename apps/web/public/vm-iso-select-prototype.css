@@ -1,0 +1,1042 @@
+/* VRC 创建虚拟机 · 系统镜像选择器原型
+   全部颜色/尺寸取自 src/styles.css 的 --vrc-* 变量，禁止硬编码色值。 */
+
+.isox-proto {
+  display: grid;
+  grid-auto-rows: max-content;
+  gap: 14px;
+  min-height: 100vh;
+  padding: 18px 20px 28px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  color: var(--vrc-text);
+  background: var(--vrc-bg);
+}
+
+.isox-proto code {
+  padding: 0 3px;
+  color: var(--vrc-text-muted);
+  background: var(--vrc-surface-muted);
+  border-radius: 3px;
+  font: 11px/16px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.isox-proto-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.isox-proto-header span {
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+}
+
+.isox-proto-header h1 {
+  margin: 4px 0 0;
+  font-size: 16px;
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.isox-proto-header p {
+  margin: 0;
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+}
+
+.isox-proto-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  height: auto;
+  min-height: 0;
+  padding: 8px 10px;
+  background: var(--vrc-surface);
+  border: 1px solid var(--vrc-border);
+  border-radius: var(--vrc-control-radius);
+}
+
+.isox-proto-toolbar .segmented {
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 2px;
+}
+
+.isox-proto-hint {
+  margin-left: auto;
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+}
+
+.isox-proto-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.isox-card {
+  display: grid;
+  align-content: start;
+  gap: 9px;
+  min-width: 0;
+  padding: 12px;
+  background: var(--vrc-surface);
+  border: 1px solid var(--vrc-border);
+  border-radius: var(--vrc-dialog-radius);
+}
+
+.isox-card[data-variant="a"] {
+  border-color: var(--vrc-active-border);
+}
+
+.isox-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.isox-card-head h2 {
+  margin: 4px 0 0;
+  font-size: 12px;
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.isox-card-tag {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  color: var(--vrc-accent);
+  background: var(--vrc-accent-soft);
+  border-radius: 4px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.isox-card-tag.ghost {
+  color: var(--vrc-text-subtle);
+  background: var(--vrc-surface-muted);
+}
+
+.isox-card-desc {
+  margin: 0;
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+  line-height: 17px;
+}
+
+.isox-fake-dialog {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  background: var(--vrc-surface-raised);
+  border: 1px solid var(--vrc-border);
+  border-radius: var(--vrc-control-radius);
+}
+
+.isox-field {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 0;
+  height: auto;
+}
+
+.isox-field > span {
+  color: var(--vrc-text-muted);
+  font-size: var(--vrc-font-size-label);
+}
+
+.isox-fake-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto 40px auto 40px;
+  gap: 6px;
+  align-items: center;
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+}
+
+.isox-fake-row strong {
+  color: var(--vrc-text);
+  font-weight: var(--vrc-font-weight-regular);
+}
+
+.isox-card-notes {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--vrc-text-muted);
+  font-size: 11px;
+  line-height: 17px;
+}
+
+.isox-card-notes li {
+  padding-left: 0;
+}
+
+.isox-card-notes li::marker {
+  color: var(--vrc-border-strong);
+  font-size: 10px;
+}
+
+.isox-proto-footer {
+  color: var(--vrc-text-subtle);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: normal;
+}
+
+/* ---------- 触发器（与正式组件 .form-field 输入框对齐） ---------- */
+
+.isox-select {
+  position: relative;
+  min-width: 0;
+}
+
+.isox-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: var(--vrc-control-height);
+  padding: 0 8px 0 9px;
+  color: var(--vrc-text);
+  background: var(--vrc-surface);
+  border: 1px solid var(--vrc-border);
+  border-radius: var(--vrc-control-radius);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.isox-trigger:hover {
+  border-color: var(--vrc-border-strong);
+}
+
+.isox-select.is-open .isox-trigger {
+  border-color: var(--vrc-accent);
+  box-shadow: var(--vrc-focus-ring);
+}
+
+.isox-proto .isox-trigger-icon {
+  display: grid;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  color: var(--vrc-text-subtle);
+}
+
+.isox-proto svg {
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.isox-proto .isox-trigger-icon svg {
+  width: 14px;
+  min-width: 14px;
+  max-width: 14px;
+  height: 14px;
+  min-height: 14px;
+  max-height: 14px;
+}
+
+.isox-trigger-text {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.isox-trigger-text.is-placeholder {
+  color: var(--vrc-text-subtle);
+}
+
+.isox-trigger-meta {
+  flex: 0 0 auto;
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.isox-proto .isox-trigger-arrow {
+  display: grid;
+  flex: 0 0 12px;
+  width: 12px;
+  min-width: 12px;
+  max-width: 12px;
+  height: 12px;
+  min-height: 12px;
+  max-height: 12px;
+  place-items: center;
+  color: var(--vrc-text-subtle);
+  transition: transform 0.15s ease;
+}
+
+.isox-select.is-open .isox-trigger-arrow {
+  transform: rotate(180deg);
+}
+
+.isox-proto .isox-trigger-arrow svg {
+  width: 12px;
+  min-width: 12px;
+  max-width: 12px;
+  height: 12px;
+  min-height: 12px;
+  max-height: 12px;
+  stroke-width: 1.8;
+}
+
+/* ---------- 弹层公共骨架 ---------- */
+
+.isox-panel {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  display: none;
+  overflow: hidden;
+  background-color: var(--vrc-surface);
+  border: 1px solid var(--vrc-border-strong);
+  border-radius: var(--vrc-dialog-radius);
+  box-shadow: var(--vrc-shadow);
+  isolation: isolate;
+}
+
+.isox-panel-list,
+.isox-panel-tools,
+.isox-panel-foot,
+.isox-panel-head {
+  background-color: var(--vrc-surface);
+}
+
+.isox-select.is-open .isox-panel {
+  display: block;
+}
+
+.isox-panel-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  border-bottom: 1px solid var(--vrc-border);
+}
+
+.isox-search {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 7px;
+  background: var(--vrc-surface-muted);
+  border: 1px solid transparent;
+  border-radius: 5px;
+}
+
+.isox-search:focus-within {
+  background: var(--vrc-surface);
+  border-color: var(--vrc-border-strong);
+}
+
+.isox-search svg {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  color: var(--vrc-text-subtle);
+  stroke-width: 1.8;
+}
+
+.isox-proto .isox-panel *::marker {
+  content: none;
+}
+
+.isox-proto .isox-panel-list > * {
+  margin: 0;
+}
+
+.isox-proto .isox-panel .isox-option::before {
+  border: 0;
+  box-shadow: none;
+}
+
+.isox-proto .isox-search-icon {
+  display: grid;
+  flex: 0 0 13px;
+  width: 13px;
+  height: 13px;
+  place-items: center;
+  color: var(--vrc-text-subtle);
+}
+
+.isox-proto .isox-search-icon svg {
+  flex: 0 0 13px;
+  width: 13px;
+  height: 13px;
+}
+
+.isox-proto .isox-search input,
+.isox-proto .isox-search input:focus,
+.isox-proto .isox-search input:focus-visible {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0;
+  color: var(--vrc-text);
+  background: none;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  box-shadow: none;
+  font-size: 11px;
+}
+
+.isox-proto .isox-search input::placeholder {
+  color: var(--vrc-text-subtle);
+}
+
+.isox-tool-button {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  place-items: center;
+  color: var(--vrc-text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.isox-tool-button:hover:not(:disabled) {
+  color: var(--vrc-text);
+  background: var(--vrc-surface-muted);
+  border-color: var(--vrc-border);
+}
+
+.isox-tool-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.isox-tool-button svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.7;
+}
+
+.isox-tool-button[data-spinning] svg {
+  animation: isox-spin 0.9s linear infinite;
+}
+
+@keyframes isox-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 方案 C 的固定表头 */
+.isox-panel-head {
+  display: none;
+  padding: 0 8px;
+  color: var(--vrc-text-subtle);
+  background: var(--vrc-surface-muted);
+  border-bottom: 1px solid var(--vrc-border);
+  font-size: 10px;
+  line-height: 22px;
+}
+
+.isox-panel-list {
+  max-height: 264px;
+  padding: 4px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  contain: paint;
+  overscroll-behavior: contain;
+}
+
+.isox-panel-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 8px;
+  height: 26px;
+  color: var(--vrc-text-subtle);
+  background: var(--vrc-surface);
+  border-top: 1px solid var(--vrc-border);
+  font-size: 10px;
+}
+
+.isox-panel-foot b {
+  color: var(--vrc-text-muted);
+  font-weight: var(--vrc-font-weight-regular);
+}
+
+/* ---------- 分组标题：极细的 “序号 + 名称 + 数量” 行 ---------- */
+
+.isox-proto div.isox-group {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  min-height: 22px;
+  margin: 0;
+  padding: 4px 6px 2px;
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+  line-height: 14px;
+  list-style: none;
+  white-space: nowrap;
+}
+
+.isox-proto .isox-group::marker,
+.isox-proto .isox-group::before {
+  display: none;
+  content: none;
+}
+
+.isox-proto .isox-group {
+  overflow: hidden;
+  flex-wrap: nowrap;
+}
+
+.isox-proto .isox-group-label {
+  flex: 0 0 auto;
+}
+
+.isox-proto .isox-group::before {
+  content: none;
+}
+
+.isox-group-label {
+  order: 1;
+  white-space: nowrap;
+}
+
+/* 旧原型样式给 i 元素加了左侧竖线，这里显式复位，保证圆点是纯色小圆点。 */
+.isox-proto .isox-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 4px;
+  min-width: 4px;
+  height: 4px;
+  margin: 0;
+  overflow: hidden;
+  border: 0;
+  border-left: 0;
+  box-shadow: none;
+  vertical-align: middle;
+  clip-path: circle(2px);
+}
+
+.isox-proto .isox-dot::before,
+.isox-proto .isox-dot::after {
+  display: none;
+  content: none;
+}
+
+.isox-proto .isox-dot {
+  background-color: var(--vrc-text-subtle);
+}
+
+.isox-proto .isox-dot.shared {
+  background-color: var(--vrc-accent);
+}
+
+.isox-proto .isox-dot.dvd {
+  background-color: var(--vrc-warning);
+}
+
+.isox-group::after {
+  order: 2;
+  flex: 1 1 auto;
+  min-width: 8px;
+  height: 1px;
+  background: var(--vrc-border);
+  content: "";
+}
+
+.isox-group-count {
+  flex: 0 0 auto;
+}
+
+.isox-group-count {
+  order: 3;
+  padding: 0 5px;
+  color: var(--vrc-text-muted);
+  background: var(--vrc-surface-muted);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.isox-proto .isox-group:first-child {
+  padding-top: 2px;
+}
+
+/* ---------- 通用选项行 ---------- */
+
+.isox-proto .isox-option {
+  position: relative;
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-width: 0;
+  padding: 0 8px 0 10px;
+  color: var(--vrc-text);
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.isox-option::marker,
+.isox-option::-webkit-details-marker {
+  display: none;
+  content: none;
+}
+
+.isox-option::before {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 2px;
+  height: 0;
+  background: var(--vrc-accent);
+  border-radius: 999px;
+  content: "";
+  transform: translateY(-50%);
+  transition: height 0.15s ease;
+}
+
+.isox-option:hover,
+.isox-option.is-active {
+  background: var(--vrc-surface-muted);
+}
+
+.isox-option.is-selected {
+  background: var(--vrc-accent-soft);
+}
+
+.isox-option.is-selected::before {
+  width: 2px;
+  height: 16px;
+}
+
+.isox-proto .isox-option .isox-option-title {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.isox-option-title strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: var(--vrc-font-weight-regular);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.isox-option.is-selected .isox-option-title strong {
+  color: var(--vrc-accent);
+  font-weight: var(--vrc-font-weight-heading);
+}
+
+.isox-option-sub {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+  line-height: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.isox-option-sub b {
+  color: var(--vrc-text-muted);
+  font-weight: var(--vrc-font-weight-regular);
+}
+
+.isox-option-side {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  color: var(--vrc-text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.isox-option-check {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  color: var(--vrc-accent);
+  opacity: 0;
+}
+
+.isox-option.is-selected .isox-option-check {
+  opacity: 1;
+}
+
+.isox-option-check svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 2.2;
+}
+
+/* ---------- 方案 A：两行摘要 ---------- */
+
+.isox-select[data-variant="a"] .isox-panel {
+  min-width: min(300px, calc(100vw - 48px));
+}
+
+.isox-select[data-variant="a"] .isox-option {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  min-height: 40px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  row-gap: 1px;
+}
+
+.isox-select[data-variant="a"] .isox-option .isox-option-title {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.isox-select[data-variant="a"] .isox-option-sub {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.isox-select[data-variant="a"] .isox-option-side {
+  grid-row: 1 / span 2;
+  grid-column: 2;
+}
+
+/* ---------- 方案 B：系统徽标卡片 ---------- */
+
+.isox-select[data-variant="b"] .isox-panel {
+  right: 0;
+  left: 0;
+  width: auto;
+  min-width: 0;
+  max-width: none;
+}
+
+.isox-select[data-variant="b"] .isox-option {
+  grid-template-columns: 30px minmax(0, 1fr) 16px;
+  align-items: center;
+  min-height: 48px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  column-gap: 8px;
+}
+
+.isox-badge {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  color: var(--vrc-accent);
+  background: var(--vrc-accent-soft);
+  border-radius: 6px;
+  font-size: 9px;
+  font-weight: var(--vrc-font-weight-heading);
+  letter-spacing: -0.2px;
+}
+
+.isox-badge[data-family="windows"] {
+  color: var(--vrc-info);
+  background: var(--vrc-status-info-soft);
+}
+
+.isox-badge[data-family="ubuntu"] {
+  color: var(--vrc-warning);
+  background: var(--vrc-status-warning-soft);
+}
+
+.isox-badge[data-family="kylin"] {
+  color: var(--vrc-danger);
+  background: var(--vrc-status-danger-soft);
+}
+
+.isox-badge[data-family="dvd"] {
+  color: var(--vrc-text-muted);
+  background: var(--vrc-surface-muted);
+}
+
+.isox-select[data-variant="b"] .isox-option-body {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.isox-select[data-variant="b"] .isox-option-body .isox-option-title strong {
+  font-size: 12px;
+}
+
+/* ---------- 方案 C：单行表格 ---------- */
+
+.isox-select[data-variant="c"] .isox-panel-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px 48px 14px;
+  column-gap: 8px;
+  align-items: center;
+  padding-left: 12px;
+}
+
+/* 方案 C 的弹层比卡片宽，向右展开并以视口为上限，避免被卡片裁掉。 */
+.isox-select[data-variant="c"] .isox-panel {
+  right: 0;
+  left: 0;
+  width: auto;
+  min-width: 0;
+}
+
+.isox-select[data-variant="c"] .isox-group {
+  padding: 5px 6px 2px;
+  background: var(--vrc-surface);
+  border: 0;
+}
+
+.isox-select[data-variant="c"] .isox-group-label {
+  color: var(--vrc-text-muted);
+}
+
+.isox-select[data-variant="c"] .isox-group:first-child {
+  padding-top: 5px;
+}
+
+.isox-select[data-variant="c"] .isox-option {
+  grid-template-columns: minmax(0, 1fr) 72px 48px 14px;
+  align-items: center;
+  height: 30px;
+  column-gap: 8px;
+  border-radius: 4px;
+}
+
+.isox-select[data-variant="c"] .isox-option::before {
+  top: 4px;
+  height: auto;
+  bottom: 4px;
+  transform: none;
+}
+
+.isox-select[data-variant="c"] .isox-option.is-selected::before {
+  width: 2px;
+  height: auto;
+}
+
+.isox-select[data-variant="c"] .isox-option:not(.is-selected)::before {
+  display: none;
+}
+
+.isox-select[data-variant="c"] .isox-option-title strong {
+  font-size: 11.5px;
+}
+
+.isox-select[data-variant="c"] .isox-option:nth-child(even) {
+  background: color-mix(in srgb, var(--vrc-surface-muted) 52%, transparent);
+}
+
+.isox-select[data-variant="c"] .isox-option:nth-child(even).is-selected {
+  background: var(--vrc-accent-soft);
+}
+
+.isox-select[data-variant="c"] .isox-source {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--vrc-text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.isox-select[data-variant="c"] .isox-option-size {
+  color: var(--vrc-text-muted);
+  font-size: 10px;
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 空态 / 加载态 ---------- */
+
+.isox-panel-list:has(> .isox-empty) {
+  display: grid;
+  place-items: center;
+  max-height: none;
+  overflow: hidden;
+}
+
+.isox-panel-list:has(> .isox-skeleton) {
+  max-height: none;
+}
+
+.isox-empty {
+  display: grid;
+  gap: 4px;
+  padding: 18px 12px 20px;
+  place-items: center;
+  text-align: center;
+}
+
+.isox-empty strong {
+  color: var(--vrc-text);
+  font-size: 12px;
+  font-weight: var(--vrc-font-weight-regular);
+}
+
+.isox-empty span {
+  max-width: 240px;
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.isox-empty button {
+  height: 26px;
+  margin-top: 4px;
+  padding: 0 10px;
+  color: var(--vrc-text);
+  background: var(--vrc-surface);
+  border: 1px solid var(--vrc-border);
+  border-radius: 5px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.isox-empty button:hover {
+  border-color: var(--vrc-border-strong);
+  background: var(--vrc-surface-muted);
+}
+
+.isox-skeleton {
+  display: grid;
+  gap: 8px;
+  padding: 10px 10px 14px;
+}
+
+.isox-skeleton i {
+  display: block;
+  height: 10px;
+  background: linear-gradient(90deg, var(--vrc-surface-muted) 0%, var(--vrc-border) 50%, var(--vrc-surface-muted) 100%);
+  background-size: 200% 100%;
+  border-radius: 999px;
+  animation: isox-shimmer 1.2s linear infinite;
+}
+
+.isox-skeleton i:nth-child(1) {
+  width: 58%;
+}
+
+.isox-skeleton i:nth-child(2) {
+  width: 76%;
+}
+
+.isox-skeleton i:nth-child(3) {
+  width: 46%;
+}
+
+@keyframes isox-shimmer {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -60% 0;
+  }
+}
+
+.isox-mark {
+  color: var(--vrc-accent);
+  font-style: normal;
+}
+
+/* ---------- 窄屏 ---------- */
+
+@media (max-width: 1180px) {
+  .isox-proto-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* 三分栏在中等宽度下弹层空间不足，直接退成单列，保证弹层不被挤压。 */
+/* prototype-pages.css 给 html/body 设了 min-width: 760px，窄屏会把内容整体挤出去。 */
+@media (max-width: 800px) {
+  html,
+  body {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 980px) {
+  .isox-proto-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .isox-proto {
+    padding: 12px;
+  }
+
+  .isox-proto-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .isox-proto-hint {
+    margin-left: 0;
+  }
+
+  .isox-proto-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .isox-panel {
+    right: 0;
+    left: 0;
+    width: auto;
+    min-width: 0;
+  }
+
+  .isox-panel-list {
+    max-height: 220px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .isox-tool-button[data-spinning] svg,
+  .isox-skeleton i {
+    animation: none;
+  }
+}

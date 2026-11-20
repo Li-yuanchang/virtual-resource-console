@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="graphite-sage">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="./public/favicon.svg">
+    <link rel="stylesheet" href="./src/styles.css">
+    <link rel="stylesheet" href="./public/prototype-base.css">
+    <link rel="stylesheet" href="./public/prototype-pages.css">
+    <link rel="stylesheet" href="./public/vm-iso-select-prototype.css">
+    <title>VRC 系统镜像下拉框原型</title>
+  </head>
+  <body class="static-prototype" data-prototype="vm-iso-select">
+    <main class="isox-proto">
+      <header class="isox-proto-header">
+        <div>
+          <span>VRC / 创建虚拟机 · 操作原型</span>
+          <h1>系统镜像选择器</h1>
+        </div>
+        <p>三套下拉框方案对比 · 触发同一个弹层，可直接操作测试</p>
+      </header>
+
+      <div class="isox-proto-toolbar" role="group" aria-label="原型控制">
+        <div class="segmented" data-iso-scenario="data">
+          <button type="button" data-value="data">有镜像（12 个）</button>
+          <button type="button" data-value="empty">空列表</button>
+          <button type="button" data-value="loading">读取中</button>
+        </div>
+        <div class="segmented" data-iso-scenario="theme">
+          <button type="button" data-value="graphite-sage">Graphite Sage</button>
+          <button type="button" data-value="basalt-copper">Basalt Copper</button>
+          <button type="button" data-value="mist-teal">Mist Teal</button>
+        </div>
+        <span class="isox-proto-hint">点击输入框展开 · ↑↓ 移动 · Enter 选择 · Esc 关闭 · 输入文字过滤</span>
+      </div>
+
+      <div class="isox-proto-grid">
+        <section class="isox-card" data-variant="a">
+          <header class="isox-card-head">
+            <div>
+              <span class="isox-card-tag">方案 A · 推荐</span>
+              <h2>摘要行 + 搜索 + 分组扁平列表</h2>
+            </div>
+            <span class="isox-card-tag ghost">改动最小</span>
+          </header>
+          <p class="isox-card-desc">每行两行文本：名称 + “来源 · 大小”，右侧对勾只标记当前选中项。搜索固定 30px，头部菜单 28px，选中态只用左侧 2px 竖条 + 浅底，避免现在那种整行变绿变蓝的色块。</p>
+          <div class="isox-fake-dialog">
+            <label class="isox-field">
+              <span>系统镜像</span>
+              <div class="isox-select" data-iso-select data-variant="a"></div>
+            </label>
+            <div class="isox-fake-row"><span>安装类型</span><strong>CLI</strong><span>CPU</span><strong>4</strong><span>内存 GiB</span><strong>8</strong></div>
+          </div>
+          <ul class="isox-card-notes">
+            <li>刷新按钮从“飘在头部右侧”改为搜索框内的文字级图标，鼠标悬停才显底色。</li>
+            <li>分组之间用 <code>序号 + 名称 + 数量</code> 细分隔线，替代现在厚重的分组标题条。</li>
+            <li>每行高度 42px，列表最大高度 300px，超出内部滚动，不影响弹窗高度。</li>
+          </ul>
+        </section>
+
+        <section class="isox-card" data-variant="b">
+          <header class="isox-card-head">
+            <div>
+              <span class="isox-card-tag">方案 B</span>
+              <h2>镜像卡片列表（L0 徽标 + 元信息）</h2>
+            </div>
+            <span class="isox-card-tag ghost">信息最全</span>
+          </header>
+          <p class="isox-card-desc">每行左侧是系统族徽标（CentOS/Ubuntu/Windows/麒麟…），主体两行：ISO 文件名 + 存储库路径；右侧大小与对勾。适合镜像多、需要一眼区分系统的场景，但行高 52px，同样面积可见条数更少。</p>
+          <div class="isox-fake-dialog">
+            <label class="isox-field">
+              <span>系统镜像</span>
+              <div class="isox-select" data-iso-select data-variant="b"></div>
+            </label>
+            <div class="isox-fake-row"><span>安装类型</span><strong>CLI</strong><span>CPU</span><strong>4</strong><span>内存 GiB</span><strong>8</strong></div>
+          </div>
+          <ul class="isox-card-notes">
+            <li>徽标用主题色 8% 淡底 + 同色文字，不引入新色板。</li>
+            <li>第二行把“共享/本地”做成 4px 小圆点 + 文字，比整块标签更轻。</li>
+            <li>文件后半段用省略号截断，完整路径放 <code>title</code>。</li>
+          </ul>
+        </section>
+
+        <section class="isox-card" data-variant="c">
+          <header class="isox-card-head">
+            <div>
+              <span class="isox-card-tag">方案 C</span>
+              <h2>极简单行 + 右侧来源列</h2>
+            </div>
+            <span class="isox-card-tag ghost">密度最高</span>
+          </header>
+          <p class="isox-card-desc">单行 32px，三列栅格：文件名 / 来源 / 大小，斑马纹 + 悬停底色。最快扫读、最省高度，代价是失去“分组”语义，来源信息挤在同一行右侧。</p>
+          <div class="isox-fake-dialog">
+            <label class="isox-field">
+              <span>系统镜像</span>
+              <div class="isox-select" data-iso-select data-variant="c"></div>
+            </label>
+            <div class="isox-fake-row"><span>安装类型</span><strong>CLI</strong><span>CPU</span><strong>4</strong><span>内存 GiB</span><strong>8</strong></div>
+          </div>
+          <ul class="isox-card-notes">
+            <li>表头行固定显示“镜像 / 来源 / 大小”，列表是严格对齐的表格感。</li>
+            <li>选中态换成行首 2px 主题色竖条，不再整行染色。</li>
+            <li>需要分组时可在“来源”列做排序置顶，而不是插入分组标题。</li>
+          </ul>
+        </section>
+      </div>
+
+      <footer class="isox-proto-footer">
+        <span>确认方案后，按对应 DOM 结构改造 <code>VmProvisioningDialog</code> 的镜像选择器头部/选项模板，并同步 <code>styles.css</code> 中 <code>.vrc-provision-iso-dropdown</code> 样式。</span>
+      </footer>
+    </main>
+
+    <script src="./public/prototype-base.js"></script>
+    <script src="./public/vm-iso-select-prototype.js"></script>
+  </body>
+</html>

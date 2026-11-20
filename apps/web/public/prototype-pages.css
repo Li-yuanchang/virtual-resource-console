@@ -1160,21 +1160,117 @@ body {
 
 .mount-option-static {
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr) 62px;
-  gap: 8px;
-  align-items: center;
-  min-height: 50px;
+  gap: 6px;
+  min-width: 0;
   padding: 7px 9px;
   color: var(--vrc-text);
   text-align: left;
   background: var(--vrc-surface);
   border: 1px solid var(--vrc-border);
   border-radius: 5px;
-  cursor: pointer;
 }
 
 .mount-option-static.active {
   border-color: var(--vrc-active-border);
+}
+
+.mount-option-static.muted {
+  background: var(--vrc-surface-muted);
+}
+
+.mount-option-static.muted .mount-size-static.target strong {
+  color: var(--vrc-text-subtle);
+}
+
+.mount-head-static {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) 52px 12px 62px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.chain-arrow-static {
+  color: var(--vrc-text-subtle);
+  font-size: 11px;
+  text-align: center;
+}
+
+.mount-increase-static {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding-top: 6px;
+  color: var(--vrc-text-subtle);
+  font-size: 9px;
+  border-top: 1px dashed var(--vrc-border);
+}
+
+.mount-increase-static.disabled {
+  opacity: 0.55;
+}
+
+/* 复用顶部 CPU／内存步进器的尺寸，保证同一弹窗内增量输入样式一致。 */
+.mount-stepper-static {
+  justify-self: start;
+  width: 156px;
+}
+
+.mount-stepper-static button:disabled {
+  color: var(--vrc-text-subtle);
+  background: var(--vrc-surface-muted);
+  cursor: not-allowed;
+}
+
+.mount-increase-static input:disabled {
+  color: var(--vrc-text-subtle);
+  cursor: not-allowed;
+}
+
+.mount-increase-note {
+  overflow: hidden;
+  color: var(--vrc-text-subtle);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mount-increase-static input {
+  width: 72px;
+  height: 24px;
+  padding: 0 6px;
+  color: var(--vrc-text);
+  font-size: 11px;
+  border-radius: 4px;
+}
+
+.mount-hint-static {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  color: var(--vrc-text-muted);
+  font-size: 9px;
+  background: var(--vrc-surface-muted);
+  border-radius: 4px;
+}
+
+.disk-summary-static {
+  color: var(--vrc-text-subtle);
+  font-size: 10px;
+  text-align: center;
+}
+
+.disk-summary-static b {
+  color: var(--vrc-accent);
+  font-weight: 500;
+}
+
+.mount-size-static.target strong {
+  color: var(--vrc-accent);
 }
 
 .mount-radio-static {
