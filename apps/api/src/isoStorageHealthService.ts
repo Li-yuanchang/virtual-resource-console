@@ -167,12 +167,15 @@ done
 `;
 }
 
-function parseSections(output: string): Record<string, string[]> {
-  const sections: Record<string, string[]> = { CIFS: [], DSTUCK: [], SR: [], REACH: [] };
+export function parseSections(output: string): Record<string, string[]> {
+  // FINAL 段由修复脚本输出（重挂后的 CIFS 挂载点列表），必须在此初始化，
+  // 否则 repairIsoStorage 读取 .FINAL.length 会抛 TypeError 使修复接口 502。
+  const sections: Record<string, string[]> = { CIFS: [], DSTUCK: [], SR: [], REACH: [], FINAL: [] };
   const names: Record<string, string> = {
     CIFS_BEGIN: "CIFS", CIFS_END: "CIFS",
     DSTUCK_BEGIN: "DSTUCK", DSTUCK_END: "DSTUCK",
     SR_BEGIN: "SR", SR_END: "SR",
+    FINAL_BEGIN: "FINAL", FINAL_END: "FINAL",
   };
   let current = "";
   for (const raw of output.split(/\r?\n/)) {

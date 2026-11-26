@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { buildIsoStorageProbeScript, buildIsoStorageRepairScript, buildMountReachabilityProbeScript } from "../src/isoStorageHealthService.js";
+import { buildIsoStorageProbeScript, buildIsoStorageRepairScript, buildMountReachabilityProbeScript, parseSections } from "../src/isoStorageHealthService.js";
 
 test("iso storage repair runs unload before kill before replug", () => {
   const script = buildIsoStorageRepairScript();
@@ -60,4 +60,35 @@ test("nodes without any SMB ISO repository are not classified as repairable", ()
   assert.match(script, /content-type=iso/);
   // 扫描脚本必须能区分"有 SMB SR"和"完全没有 SMB SR"
   assert.match(script, /\*SMB\*\)/);
+});
+
+test("parseSections captures the FINAL mount list emitted by the repair script", () => {
+  // 回归防护：修复脚本输出 FINAL_BEGIN/FINAL_END 段，repairIsoStorage 依赖
+  // parseSections(output).FINAL.length 判断是否真的重挂成功。
+  // 之前该段未在 sections 初始化，读取 .FINAL.length 抛 TypeError，
+  // 导致修复接口 502，且多节点修复会在第一个节点后中断。
+  const output = [
+    "STEP unload",
+    "STEP kill",
+    "KILLED\t0",
+    "REMAINING\t0",
+    "STEP replug",
+    "PLUGGED\tSMB ISO 库 (1)\tpbd-uuid-1",
+    "FINAL_BEGIN",
+    "/var/run/sr-mount/4cf55811-d981-98d6-8b9c-91e807a4a8da",
+    "FINAL_END",
+  ].join("\n");
+
+  const sections = parseSections(output);
+  assert.ok(Array.isArray(sections.FINAL), "FINAL 段必须存在，否则 .length 读取会抛异常");
+  assert.equal(sections.FINAL.length, 1);
+  assert.equal(sections.FINAL[0], "/var/run/sr-mount/4cf55811-d981-98d6-8b9c-91e807a4a8da");
+});
+
+test("parseSections reports an empty FINAL list when remount produced no mount point", () => {
+  // 修复失败（例如 VDI 被 VM 光驱占用）时 FINAL 段为空，
+  // 此时 repaired 必须为 false 而不是崩溃。
+  const output = ["REMAINING\t0", "FINAL_BEGIN", "FINAL_END"].join("\n");
+  const sections = parseSections(output);
+  assert.equal(sections.FINAL.length, 0);
 });
